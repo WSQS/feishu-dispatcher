@@ -45,7 +45,10 @@ async def main() -> int:
         await agent.aclose()
 
     joined = "".join(outputs)
-    print(f"\n=== captured {len(outputs)} chunks, total {len(joined)} chars ===", flush=True)
+    print(
+        f"\n=== captured {len(outputs)} chunks, total {len(joined)} chars ===",
+        flush=True,
+    )
     print(f"=== full output:\n{joined}", flush=True)
     return 0
 

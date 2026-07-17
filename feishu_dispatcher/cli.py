@@ -37,8 +37,11 @@ def main() -> None:
     if args.command == "start":
         import asyncio
 
-        from feishu_dispatcher.config import Config
+        from feishu_dispatcher.config import DEFAULT_CONFIG_PATH, Config
         from feishu_dispatcher.daemon import run
 
-        cfg = Config.load(args.config, allow_empty_chat_id=args.discover)
-        asyncio.run(run(cfg, discover=args.discover))
+        cfg_path = args.config or DEFAULT_CONFIG_PATH
+        cfg = Config.load(cfg_path, allow_empty_chat_id=args.discover)
+        # 会话持久化文件放在 config 同目录
+        store_path = cfg_path.parent / "sessions.json"
+        asyncio.run(run(cfg, discover=args.discover, store_path=store_path))

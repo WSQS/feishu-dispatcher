@@ -18,9 +18,12 @@ import logging
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
+from pathlib import Path
+
 from .acp_client import AcpAgent, AgentSpawn, OnOutput
-from .config import Config
+from .config import DEFAULT_CONFIG_PATH, Config
 from .feishu import FeishuBridge, IncomingMessage
+from .store import SessionRecord, SessionStore
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +43,18 @@ _USAGE = (
 )
 
 
-async def run(cfg: Config, *, discover: bool = False) -> None:
+async def run(
+    cfg: Config, *, discover: bool = False, store_path: Path | None = None
+) -> None:
     """启动 daemon：飞书 WS 长连接 + agent 调度。阻塞直到收到退出信号。
 
     ``discover=True`` 时只打印收到消息的 chat_id，不执行任何命令
-    （帮助用户发现群 id 后填进配置）。
+    （帮助用户发现群 id 后填进配置）。``store_path`` 是会话持久化文件
+    （默认 config 同目录的 sessions.json）。
     """
-    daemon = _Daemon(cfg, discover=discover)
+    if store_path is None:
+        store_path = DEFAULT_CONFIG_PATH.parent / "sessions.json"
+    daemon = _Daemon(cfg, discover=discover, store=SessionStore(store_path))
     await daemon.run()
 
 
@@ -57,6 +65,10 @@ class _AgentSession:
     thread_root_id: str
     project_name: str
     agent_label: str
+    #: agent 工作目录（持久化 + resume 用）
+    cwd: str = ""
+    #: 是否由 load_session 恢复而来（影响启动失败时的提示文案）
+    resumed: bool = False
     #: agent 实例（先建 session、再建 agent，故允许 None）
     agent: "AcpAgent | None" = None
     #: 当前回合的输出通道（card 或 text 模式）；回合间为 None
@@ -71,6 +83,8 @@ class _AgentSession:
 class _Daemon:
     cfg: Config
     discover: bool = False
+    #: 会话持久化（默认纯内存，不写盘）；run() 会注入文件版
+    store: SessionStore = field(default_factory=lambda: SessionStore(None))
     _bridge: FeishuBridge | None = None
     _sessions: dict[str, _AgentSession] = field(default_factory=dict)
     _seen_message_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
@@ -202,33 +216,67 @@ class _Daemon:
             )
             return
 
+        await self._safe_reply(
+            thread_root,
+            f"🚀 启动 {project.default_agent} 处理项目 {project_name}…\n任务: {task}",
+        )
+        self._launch(
+            thread_root=thread_root,
+            project_name=project_name,
+            agent_label=project.default_agent,
+            cwd=str(project.path),
+            agent_argv=agent_argv,
+            first_prompt=task,
+        )
+
+    def _make_agent(
+        self,
+        spawn: AgentSpawn,
+        on_output: OnOutput,
+        *,
+        resume_session_id: str | None = None,
+    ) -> AcpAgent:
+        """构造底层 agent（拆出来是测试注入点）。"""
+        return AcpAgent(spawn, on_output, resume_session_id=resume_session_id)
+
+    def _launch(
+        self,
+        *,
+        thread_root: str,
+        project_name: str,
+        agent_label: str,
+        cwd: str,
+        agent_argv: list[str],
+        first_prompt: str,
+        resume_session_id: str | None = None,
+    ) -> _AgentSession:
+        """建 session、接线 on_output、入队首条 prompt、启动 worker。
+
+        ``resume_session_id`` 非 None 时 agent 用 load_session 恢复（惰性重连）。
+        """
         sess = _AgentSession(
             thread_root_id=thread_root,
             project_name=project_name,
-            agent_label=project.default_agent,
+            agent_label=agent_label,
+            cwd=cwd,
+            resumed=resume_session_id is not None,
         )
 
         async def on_output(text: str) -> None:
             if sess.current_channel is not None:
                 sess.current_channel.feed(text)
 
-        agent = self._make_agent(
-            AgentSpawn(command=list(agent_argv), cwd=str(project.path)), on_output
+        sess.agent = self._make_agent(
+            AgentSpawn(command=list(agent_argv), cwd=cwd),
+            on_output,
+            resume_session_id=resume_session_id,
         )
-        sess.agent = agent
-        sess.queue.put_nowait(task)
+        sess.queue.put_nowait(first_prompt)
         self._sessions[thread_root] = sess
-        await self._safe_reply(
-            thread_root,
-            f"🚀 启动 {project.default_agent} 处理项目 {project_name}…\n任务: {task}",
-        )
         sess.worker = asyncio.create_task(
             self._agent_worker(sess), name=f"agent-{thread_root}"
         )
-
-    def _make_agent(self, spawn: AgentSpawn, on_output: OnOutput) -> AcpAgent:
-        """构造底层 agent（拆出来是测试注入点）。"""
-        return AcpAgent(spawn, on_output)
+        return sess
 
     def _make_channel(self, root: str, title: str):
         """按 cfg.stream_mode 创建输出通道。
@@ -255,14 +303,35 @@ class _Daemon:
             await sess.agent.start()
         except Exception as exc:
             logger.exception("agent 启动失败")
-            await self._safe_reply(root, f"❌ agent 启动失败: {str(exc)[:200]}")
+            if sess.resumed:
+                # 恢复失败：agent 侧会话多半已过期，丢弃记录并提示重开
+                self.store.remove(root)
+                await self._safe_reply(
+                    root, "❌ 会话恢复失败（可能已在 agent 侧过期）。发送 `/run` 重开。"
+                )
+            else:
+                await self._safe_reply(root, f"❌ agent 启动失败: {str(exc)[:200]}")
             await self._close_session(sess)
             return
-        await self._safe_reply(root, "▶️ agent 已就绪，开始执行…")
+        # 启动成功：落盘会话映射，供 daemon 重启后 load_session 恢复（幂等）
+        self.store.put(
+            SessionRecord(
+                thread_root_id=root,
+                project_name=sess.project_name,
+                agent_label=sess.agent_label,
+                session_id=sess.agent.session_id or "",
+                cwd=sess.cwd,
+            )
+        )
+        await self._safe_reply(
+            root,
+            "♻️ 已恢复会话，继续执行…" if sess.resumed else "▶️ agent 已就绪，开始执行…",
+        )
         try:
             while True:
                 prompt = await sess.queue.get()
                 if prompt is None:
+                    self.store.remove(root)  # 用户显式结束，不再恢复
                     await self._safe_reply(root, "🛑 agent 已停止。")
                     break
                 title = f"{sess.project_name} · {sess.agent_label}"
@@ -310,34 +379,95 @@ class _Daemon:
                 logger.debug("agent aclose 异常（忽略）", exc_info=True)
 
     async def _forward_to_agent(self, msg: IncomingMessage) -> None:
-        """话题内回复 → 入队给对应 agent（worker 串行消费）。"""
-        sess = self._sessions.get(msg.thread_root_id or "")
-        if sess is None:
-            logger.debug("话题 %s 无对应 agent，忽略", msg.thread_root_id)
-            return
+        """话题内回复 → 入队给对应 agent；agent 不在则尝试跨重启恢复。"""
+        thread_root = msg.thread_root_id or ""
         text = msg.text.strip()
+        sess = self._sessions.get(thread_root)
+        if sess is None:
+            # 无活跃 agent：尝试从持久化记录恢复（惰性重连），或明确提示——
+            # 不再静默忽略（那是重启后老话题回复石沉大海的根源）。
+            await self._recover_or_notify(
+                thread_root or msg.message_id, thread_root, text
+            )
+            return
         if not text:
             return
         if sess.worker is None or sess.worker.done():
             await self._safe_reply(
-                msg.thread_root_id or msg.message_id,
+                thread_root or msg.message_id,
                 "⚠️ 该 agent 已结束。发送 `/run ...` 新建任务。",
             )
             return
         if text == _STOP_CMD:
+            self.store.remove(thread_root)
             sess.queue.put_nowait(None)
             return
         sess.queue.put_nowait(text)
 
-    async def _list_agents(self, msg: IncomingMessage) -> None:
-        if not self._sessions:
-            await self._safe_reply(msg.message_id, "当前无活跃 agent。")
+    async def _recover_or_notify(
+        self, reply_target: str, thread_root: str, text: str
+    ) -> None:
+        """话题无活跃 agent：能恢复就用 load_session 惰性重连，否则明确提示用户。"""
+        rec = self.store.get(thread_root)
+        if rec is None:
+            await self._safe_reply(
+                reply_target,
+                "⚠️ 该话题没有活跃 agent（可能已 `/stop` 或从未启动）。发送 `/run` 新建任务。",
+            )
             return
+        if text == _STOP_CMD:
+            # 对孤儿话题发 /stop：直接忘记记录，不必为了停而先恢复
+            self.store.remove(thread_root)
+            await self._safe_reply(reply_target, "🛑 会话已结束。")
+            return
+        agent_argv = self.cfg.agents.get(rec.agent_label)
+        if not agent_argv:
+            self.store.remove(thread_root)  # agent 已不在配置，无法恢复
+            await self._safe_reply(
+                reply_target,
+                f"⚠️ 无法恢复会话：agent '{rec.agent_label}' 未配置。发送 `/run` 重开。",
+            )
+            return
+        if len(self._sessions) >= self.cfg.max_agents:
+            await self._safe_reply(
+                reply_target,
+                f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，无法恢复会话。"
+                "请先 `/stop` 一个再回复。",
+            )
+            return
+        if not text:
+            return  # 空回复不触发恢复
+        await self._safe_reply(reply_target, "♻️ 正在恢复会话…")
+        self._launch(
+            thread_root=thread_root,
+            project_name=rec.project_name,
+            agent_label=rec.agent_label,
+            cwd=rec.cwd,
+            agent_argv=agent_argv,
+            first_prompt=text,
+            resume_session_id=rec.session_id,
+        )
+
+    async def _list_agents(self, msg: IncomingMessage) -> None:
         lines = [
             f"• {s.project_name} (thread {s.thread_root_id}, 待执行 {s.queue.qsize()})"
             for s in self._sessions.values()
         ]
-        await self._safe_reply(msg.message_id, "活跃 agent:\n" + "\n".join(lines))
+        # 已持久化但当前未激活的会话（重启后回复对应话题即自动恢复）
+        dormant = [
+            r for tid, r in self.store.all().items() if tid not in self._sessions
+        ]
+        parts: list[str] = []
+        if lines:
+            parts.append("活跃 agent:\n" + "\n".join(lines))
+        if dormant:
+            parts.append(
+                f"可恢复会话 {len(dormant)} 个（回复对应话题即自动恢复）："
+                + "、".join(f"{r.project_name}" for r in dormant)
+            )
+        await self._safe_reply(
+            msg.message_id, "\n\n".join(parts) if parts else "当前无活跃 agent。"
+        )
 
     # ------------------------------------------------------------------ #
     # 发送辅助

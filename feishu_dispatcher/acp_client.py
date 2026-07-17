@@ -53,6 +53,7 @@ class _ClientImpl:
     def __init__(self, cb: _Callbacks) -> None:
         self._cb = cb
         self._fmt = _StreamFormatter()
+        self._suppress = False
 
     def on_connect(self, conn: Any) -> None:  # noqa: D401
         """Agent 侧握手完成时被 SDK 调用。"""
@@ -62,7 +63,14 @@ class _ClientImpl:
         """每个 prompt 回合开始时重置流式格式化状态（新卡片从头开始）。"""
         self._fmt.reset()
 
+    def set_suppress(self, on: bool) -> None:
+        """抑制输出转发。恢复会话时 load_session 会重放历史 session/update，
+        这些历史已在旧话题里、不该灌进新卡片，故 load 期间抑制。"""
+        self._suppress = on
+
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
+        if self._suppress:
+            return
         text = self._fmt.format(update)
         if text:
             await self._cb.on_output(text)
@@ -222,9 +230,17 @@ class AcpAgent:
         await agent.aclose()
     """
 
-    def __init__(self, spawn: AgentSpawn, on_output: OnOutput) -> None:
+    def __init__(
+        self,
+        spawn: AgentSpawn,
+        on_output: OnOutput,
+        *,
+        resume_session_id: str | None = None,
+    ) -> None:
         self._spawn = spawn
         self._on_output = on_output
+        #: 非 None 则恢复该 ACP 会话（load_session）而非新建（new_session）
+        self._resume_session_id = resume_session_id
         self._conn: acp.ClientSideConnection | None = None
         self._session_id: str | None = None
         self._transport_ctx: Any = None
@@ -294,9 +310,22 @@ class AcpAgent:
             init_resp.agent_capabilities,
         )
 
-        session = await self._conn.new_session(cwd=self._spawn.cwd)
-        self._session_id = session.session_id
-        logger.info("已创建 ACP session: %s", self._session_id)
+        if self._resume_session_id is not None:
+            # 恢复已有会话。load_session 期间 agent 会重放历史 session/update，
+            # 抑制转发避免旧对话灌进新卡片（历史已在旧飞书话题里）。
+            self._client_impl.set_suppress(True)
+            try:
+                await self._conn.load_session(
+                    cwd=self._spawn.cwd, session_id=self._resume_session_id
+                )
+            finally:
+                self._client_impl.set_suppress(False)
+            self._session_id = self._resume_session_id
+            logger.info("已恢复 ACP session: %s", self._session_id)
+        else:
+            session = await self._conn.new_session(cwd=self._spawn.cwd)
+            self._session_id = session.session_id
+            logger.info("已创建 ACP session: %s", self._session_id)
 
     async def prompt(self, text: str) -> None:
         """向 agent 发送一条 prompt 并等待其处理完毕。

@@ -8,6 +8,7 @@ from pathlib import Path
 from feishu_dispatcher.config import Config, Project
 from feishu_dispatcher.daemon import _Daemon
 from feishu_dispatcher.feishu import IncomingMessage
+from feishu_dispatcher.store import SessionRecord, SessionStore
 
 
 class FakeBridge:
@@ -48,15 +49,20 @@ class FakeBridge:
 
 
 class FakeAgent:
-    def __init__(self, spawn, on_output) -> None:
+    def __init__(self, spawn, on_output, *, resume_session_id=None) -> None:
         self.spawn = spawn
         self.on_output = on_output
+        self.resume_session_id = resume_session_id
         self.prompts: list[str] = []
         self.start_count = 0
         self.closed = False
+        self.session_id = resume_session_id
 
     async def start(self) -> None:
         self.start_count += 1
+        # 新会话给个假 id；恢复则沿用传入的 session_id
+        if self.session_id is None:
+            self.session_id = f"fake_sid_{id(self)}"
 
     async def prompt(self, text: str) -> None:
         self.prompts.append(text)
@@ -75,6 +81,7 @@ def make_daemon(
     agent_cls: type[FakeAgent] = FakeAgent,
     *,
     stream_mode: str = "text",
+    store: SessionStore | None = None,
 ) -> tuple[_Daemon, FakeBridge, list[FakeAgent]]:
     cfg = Config(
         app_id="a",
@@ -85,13 +92,13 @@ def make_daemon(
         throttle_window=0.01,
         stream_mode=stream_mode,
     )
-    daemon = _Daemon(cfg)
+    daemon = _Daemon(cfg, store=store or SessionStore(None))
     bridge = FakeBridge()
     daemon._bridge = bridge  # 绕过 run()，直接注入
     created: list[FakeAgent] = []
 
-    def factory(spawn, on_output):
-        agent = agent_cls(spawn, on_output)
+    def factory(spawn, on_output, *, resume_session_id=None):
+        agent = agent_cls(spawn, on_output, resume_session_id=resume_session_id)
         created.append(agent)
         return agent
 
@@ -215,7 +222,10 @@ async def test_shutdown_cancels_workers_and_stops_bridge():
 
 
 def make_daemon_with_limit(
-    max_agents: int, agent_cls: type[FakeAgent] = FakeAgent
+    max_agents: int,
+    agent_cls: type[FakeAgent] = FakeAgent,
+    *,
+    store: SessionStore | None = None,
 ) -> tuple[_Daemon, FakeBridge, list[FakeAgent]]:
     cfg = Config(
         app_id="a",
@@ -227,13 +237,13 @@ def make_daemon_with_limit(
         max_agents=max_agents,
         stream_mode="text",
     )
-    daemon = _Daemon(cfg)
+    daemon = _Daemon(cfg, store=store or SessionStore(None))
     bridge = FakeBridge()
     daemon._bridge = bridge
     created: list[FakeAgent] = []
 
-    def factory(spawn, on_output):
-        agent = agent_cls(spawn, on_output)
+    def factory(spawn, on_output, *, resume_session_id=None):
+        agent = agent_cls(spawn, on_output, resume_session_id=resume_session_id)
         created.append(agent)
         return agent
 
@@ -279,8 +289,9 @@ def make_daemon_with_whitelist(
     bridge = FakeBridge()
     daemon._bridge = bridge
     created: list[FakeAgent] = []
-    daemon._make_agent = lambda spawn, on_output: (
-        created.append(FakeAgent(spawn, on_output)) or created[-1]
+    daemon._make_agent = lambda spawn, on_output, *, resume_session_id=None: (
+        created.append(FakeAgent(spawn, on_output, resume_session_id=resume_session_id))
+        or created[-1]
     )
     return daemon, bridge, created
 
@@ -314,8 +325,9 @@ async def test_discover_mode_does_not_execute_commands():
     bridge = FakeBridge()
     daemon._bridge = bridge
     created: list[FakeAgent] = []
-    daemon._make_agent = lambda spawn, on_output: (
-        created.append(FakeAgent(spawn, on_output)) or created[-1]
+    daemon._make_agent = lambda spawn, on_output, *, resume_session_id=None: (
+        created.append(FakeAgent(spawn, on_output, resume_session_id=resume_session_id))
+        or created[-1]
     )
     await daemon._handle_message(root_msg("/run demo task"))
     assert created == []
@@ -377,3 +389,92 @@ async def test_card_mode_stop_command_closes_agent():
     await wait_until(lambda: created[0].closed)
     await wait_until(lambda: "om_root1" not in daemon._sessions)
     assert any("🛑" in t for t in bridge.texts("om_root1"))
+
+
+# ---------------------------------------------------------------------- #
+# 会话恢复（跨 daemon 重启）
+# ---------------------------------------------------------------------- #
+
+
+async def test_run_persists_session_record():
+    store = SessionStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: store.get("om_root1") is not None)
+    rec = store.get("om_root1")
+    assert rec.project_name == "demo"
+    assert rec.agent_label == "copilot"
+    assert rec.session_id == created[0].session_id
+    await daemon._shutdown()
+
+
+async def test_recovery_after_restart_uses_load_session():
+    store = SessionStore(None)  # 内存 store 跨两个 daemon 实例共享 = 模拟重启
+    d1, b1, c1 = make_daemon(store=store)
+    await d1._handle_message(root_msg("/run demo task1"))
+    await wait_until(lambda: store.get("om_root1") is not None)
+    saved_sid = store.get("om_root1").session_id
+    await d1._shutdown()  # 服务停止；store 记录保留
+
+    # 新 daemon，内存 _sessions 空
+    d2, b2, c2 = make_daemon(store=store)
+    assert d2._sessions == {}
+    # 在旧话题里回复 → 触发惰性恢复
+    await d2._handle_message(thread_msg("follow up", root="om_root1", mid="om_t2"))
+    await wait_until(lambda: c2 and c2[0].prompts == ["follow up"])
+    # 用 load_session 恢复：resume_session_id == 之前持久化的 session_id
+    assert c2[0].resume_session_id == saved_sid
+    assert c2[0].start_count == 1
+    assert any("恢复" in t for t in b2.texts("om_root1"))
+    await d2._shutdown()
+
+
+async def test_reply_to_unknown_topic_notifies_not_silent():
+    daemon, bridge, created = make_daemon()  # 空 store
+    await daemon._handle_message(thread_msg("hello", root="om_unknown", mid="om_x"))
+    assert created == []
+    assert any("没有活跃 agent" in t for t in bridge.texts("om_unknown"))
+
+
+async def test_stop_removes_persisted_record():
+    store = SessionStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: store.get("om_root1") is not None)
+    await daemon._handle_message(thread_msg("/stop"))
+    await wait_until(lambda: store.get("om_root1") is None)
+
+
+async def test_recovery_fails_when_agent_unconfigured():
+    store = SessionStore(None)
+    # 手工塞一条 agent 已不在配置里的记录
+    store.put(SessionRecord("om_orphan", "demo", "ghost", "sid_x", "C:/tmp/demo"))
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(thread_msg("hello", root="om_orphan", mid="om_y"))
+    assert created == []
+    assert any("未配置" in t for t in bridge.texts("om_orphan"))
+    assert store.get("om_orphan") is None  # 陈旧记录被清掉
+
+
+async def test_orphan_stop_forgets_without_recovering():
+    store = SessionStore(None)
+    store.put(SessionRecord("om_orphan", "demo", "copilot", "sid_x", "C:/tmp/demo"))
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(thread_msg("/stop", root="om_orphan", mid="om_z"))
+    assert created == []  # 没为了停而恢复
+    assert store.get("om_orphan") is None
+    assert any("已结束" in t for t in bridge.texts("om_orphan"))
+
+
+async def test_recovery_respects_max_agents():
+    store = SessionStore(None)
+    daemon, bridge, created = make_daemon_with_limit(max_agents=1, store=store)
+    # 占住唯一槽位
+    await daemon._handle_message(root_msg("/run demo task1", mid="om_r1"))
+    await wait_until(lambda: created and created[0].prompts == ["task1"])
+    # 另有一条可恢复记录，但已达上限 → 拒绝恢复
+    store.put(SessionRecord("om_orphan", "demo", "copilot", "sid_x", "C:/tmp/demo"))
+    await daemon._handle_message(thread_msg("hi", root="om_orphan", mid="om_r2"))
+    assert len(created) == 1  # 未恢复
+    assert any("上限" in t for t in bridge.texts("om_orphan"))
+    await daemon._shutdown()
