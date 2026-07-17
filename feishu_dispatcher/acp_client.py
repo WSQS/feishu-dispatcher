@@ -52,13 +52,18 @@ class _ClientImpl:
 
     def __init__(self, cb: _Callbacks) -> None:
         self._cb = cb
+        self._fmt = _StreamFormatter()
 
     def on_connect(self, conn: Any) -> None:  # noqa: D401
         """Agent 侧握手完成时被 SDK 调用。"""
         logger.debug("ACP client 侧已连接")
 
+    def reset_formatter(self) -> None:
+        """每个 prompt 回合开始时重置流式格式化状态（新卡片从头开始）。"""
+        self._fmt.reset()
+
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
-        text = _extract_text(update)
+        text = self._fmt.format(update)
         if text:
             await self._cb.on_output(text)
 
@@ -127,35 +132,72 @@ class _ClientImpl:
         return None
 
 
-def _extract_text(update: Any) -> str:
-    """从 session_update 的 discriminated union 里抽出可转发文本。"""
-    session_update = getattr(update, "session_update", None)
-    if session_update == "agent_message_chunk":
-        content = getattr(update, "content", None)
-        return getattr(content, "text", "") or ""
-    if session_update == "agent_thought_chunk":
-        content = getattr(update, "content", None)
-        thought = getattr(content, "text", "") or ""
-        return f"💭 {thought}" if thought else ""
-    if session_update == "tool_call":
-        title = getattr(update, "title", None)
-        return f"\n🔧 {title}\n" if title else ""
-    if session_update == "tool_call_update":
-        status = getattr(update, "status", None)
-        if status in {"completed", "failed"}:
-            title = getattr(update, "title", "") or ""
-            mark = "✅" if status == "completed" else "❌"
-            return f"{mark} {title}\n" if title else ""
-    if session_update == "plan":
-        marks = {"pending": "⬜", "in_progress": "🔄", "completed": "☑️"}
-        lines = [
-            f"{marks.get(getattr(e, 'status', ''), '⬜')} {getattr(e, 'content', '')}"
-            for e in (getattr(update, "entries", None) or [])
-        ]
-        return "\n📋 计划:\n" + "\n".join(lines) + "\n" if lines else ""
-    # 其余变体（plan_update/usage_update/current_mode_update/available_commands_update
-    # 等）有意忽略：P0 只转发对用户可读的主输出与进度。
-    return ""
+def _content_text(update: Any) -> str:
+    content = getattr(update, "content", None)
+    return getattr(content, "text", "") or ""
+
+
+class _StreamFormatter:
+    """把 ACP 流式 session_update 转成可转发文本，跨 chunk 维护状态。
+
+    关键：agent 的思考/回复是**逐 token** 流式（尤其 OpenCode），若每个
+    thought chunk 都加 💭 前缀会在卡片里刷成「💭 The💭 user💭 …」。故只在
+    一段连续 thought 的**开头**加一次 💭，后续 chunk 原样追加；thought 段
+    结束转入正式回复时插一个换行分隔。tool_call / plan 是离散事件，各自
+    完整成行并重置连续态。
+    """
+
+    def __init__(self) -> None:
+        self._last: str | None = None  # "thought" | "text" | None
+
+    def reset(self) -> None:
+        self._last = None
+
+    def format(self, update: Any) -> str:
+        kind = getattr(update, "session_update", None)
+        if kind == "agent_message_chunk":
+            text = _content_text(update)
+            if not text:
+                return ""
+            out = ("\n" if self._last == "thought" else "") + text
+            self._last = "text"
+            return out
+        if kind == "agent_thought_chunk":
+            text = _content_text(update)
+            if not text:
+                return ""
+            out = ("💭 " if self._last != "thought" else "") + text
+            self._last = "thought"
+            return out
+        if kind == "tool_call":
+            title = getattr(update, "title", None)
+            if not title:
+                return ""
+            self._last = None
+            return f"\n🔧 {title}\n"
+        if kind == "tool_call_update":
+            status = getattr(update, "status", None)
+            if status in {"completed", "failed"}:
+                title = getattr(update, "title", "") or ""
+                if not title:
+                    return ""
+                self._last = None
+                mark = "✅" if status == "completed" else "❌"
+                return f"{mark} {title}\n"
+            return ""
+        if kind == "plan":
+            marks = {"pending": "⬜", "in_progress": "🔄", "completed": "☑️"}
+            lines = [
+                f"{marks.get(getattr(e, 'status', ''), '⬜')} {getattr(e, 'content', '')}"
+                for e in (getattr(update, "entries", None) or [])
+            ]
+            if not lines:
+                return ""
+            self._last = None
+            return "\n📋 计划:\n" + "\n".join(lines) + "\n"
+        # 其余变体（plan_update/usage_update/current_mode_update/available_commands_update
+        # 等）有意忽略：P0 只转发对用户可读的主输出与进度。
+        return ""
 
 
 @dataclass
@@ -189,6 +231,7 @@ class AcpAgent:
         self._proc: Any = None
         self._closed = False
         self._stderr_task: asyncio.Task[None] | None = None
+        self._client_impl: _ClientImpl | None = None
 
     @property
     def session_id(self) -> str | None:
@@ -238,7 +281,8 @@ class AcpAgent:
         )
 
         cb = _Callbacks(on_output=self._on_output)
-        self._conn = acp.connect_to_agent(_ClientImpl(cb), writer, reader)
+        self._client_impl = _ClientImpl(cb)
+        self._conn = acp.connect_to_agent(self._client_impl, writer, reader)
 
         init_resp = await self._conn.initialize(
             protocol_version=_PROTOCOL_VERSION,
@@ -262,6 +306,9 @@ class AcpAgent:
         """
         if self._conn is None or self._session_id is None:
             raise RuntimeError("agent 尚未启动")
+        # 每个回合从头开始：重置流式格式化状态，让本轮首个 thought 重新加 💭
+        if self._client_impl is not None:
+            self._client_impl.reset_formatter()
         await self._conn.prompt(session_id=self._session_id, prompt=[text_block(text)])
 
     async def _drain_stderr(self, proc: Any) -> None:

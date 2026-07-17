@@ -1,4 +1,4 @@
-"""ACP session_update 文本抽取的单元测试。"""
+"""ACP session_update 流式格式化的单元测试。"""
 
 from __future__ import annotations
 
@@ -9,47 +9,48 @@ from acp import (
     update_tool_call,
 )
 
-from feishu_dispatcher.acp_client import _extract_text
+from feishu_dispatcher.acp_client import _StreamFormatter
+
+
+def fmt(update) -> str:
+    """单条 update 用全新格式化器（等价于旧的无状态 _extract_text）。"""
+    return _StreamFormatter().format(update)
+
+
+# --- 单条 update（无前置状态）------------------------------------------- #
 
 
 def test_agent_message_chunk_extracts_plain_text():
-    update = update_agent_message_text("hello world")
-    assert _extract_text(update) == "hello world"
+    assert fmt(update_agent_message_text("hello world")) == "hello world"
 
 
 def test_agent_thought_chunk_gets_thought_prefix():
-    update = update_agent_thought_text("let me think")
-    assert _extract_text(update) == "💭 let me think"
+    assert fmt(update_agent_thought_text("let me think")) == "💭 let me think"
 
 
 def test_tool_call_start_emits_title_line():
-    update = start_tool_call("tc1", "Editing src/foo.py", kind="edit")
-    out = _extract_text(update)
+    out = fmt(start_tool_call("tc1", "Editing src/foo.py", kind="edit"))
     assert "Editing src/foo.py" in out
     assert "🔧" in out
 
 
 def test_tool_call_completed_emits_checkmark():
-    update = update_tool_call("tc1", title="Editing src/foo.py", status="completed")
-    out = _extract_text(update)
+    out = fmt(update_tool_call("tc1", title="Editing src/foo.py", status="completed"))
     assert "✅" in out
     assert "Editing src/foo.py" in out
 
 
 def test_tool_call_failed_emits_cross():
-    update = update_tool_call("tc1", title="Running tests", status="failed")
-    out = _extract_text(update)
+    out = fmt(update_tool_call("tc1", title="Running tests", status="failed"))
     assert "❌" in out
 
 
 def test_tool_call_in_progress_emits_nothing():
-    update = update_tool_call("tc1", title="x", status="in_progress")
-    assert _extract_text(update) == ""
+    assert fmt(update_tool_call("tc1", title="x", status="in_progress")) == ""
 
 
 def test_agent_message_chunk_empty_text():
-    update = update_agent_message_text("")
-    assert _extract_text(update) == ""
+    assert fmt(update_agent_message_text("")) == ""
 
 
 def test_plan_update_renders_entries_with_status_marks():
@@ -63,7 +64,7 @@ def test_plan_update_renders_entries_with_status_marks():
             PlanEntry(content="run tests", priority="high", status="pending"),
         ],
     )
-    out = _extract_text(update)
+    out = fmt(update)
     assert "📋" in out
     assert "☑️ read files" in out
     assert "🔄 write code" in out
@@ -73,5 +74,52 @@ def test_plan_update_renders_entries_with_status_marks():
 def test_plan_update_with_no_entries_emits_nothing():
     from acp.schema import AgentPlanUpdate
 
-    update = AgentPlanUpdate(session_update="plan", entries=[])
-    assert _extract_text(update) == ""
+    assert fmt(AgentPlanUpdate(session_update="plan", entries=[])) == ""
+
+
+# --- 跨 chunk 状态（💭 碎前缀修复的核心）-------------------------------- #
+
+
+def test_consecutive_thought_chunks_prefix_only_once():
+    """逐 token 的连续 thought 只在开头加一次 💭，后续原样追加。"""
+    f = _StreamFormatter()
+    assert f.format(update_agent_thought_text("The")) == "💭 The"
+    assert f.format(update_agent_thought_text(" user")) == " user"
+    assert f.format(update_agent_thought_text(" asks")) == " asks"
+    # 拼接后是干净的一行「💭 The user asks」而非「💭 The💭 user💭 asks」
+
+
+def test_message_after_thought_gets_newline_separator():
+    f = _StreamFormatter()
+    f.format(update_agent_thought_text("thinking…"))
+    assert f.format(update_agent_message_text("answer")) == "\nanswer"
+
+
+def test_consecutive_messages_no_extra_prefix():
+    f = _StreamFormatter()
+    assert f.format(update_agent_message_text("a")) == "a"
+    assert f.format(update_agent_message_text("b")) == "b"
+
+
+def test_thought_after_toolcall_reprefixes():
+    """离散事件（tool_call）后新的 thought 段重新加 💭。"""
+    f = _StreamFormatter()
+    f.format(update_agent_thought_text("t1"))
+    f.format(start_tool_call("tc1", "Editing", kind="edit"))
+    assert f.format(update_agent_thought_text("t2")) == "💭 t2"
+
+
+def test_reset_reprefixes_next_thought():
+    """回合重置后，本轮首个 thought 重新加 💭。"""
+    f = _StreamFormatter()
+    f.format(update_agent_thought_text("a"))
+    f.reset()
+    assert f.format(update_agent_thought_text("b")) == "💭 b"
+
+
+def test_empty_thought_chunk_does_not_change_state():
+    f = _StreamFormatter()
+    assert f.format(update_agent_thought_text("start")) == "💭 start"
+    assert f.format(update_agent_thought_text("")) == ""
+    # 空 chunk 不重置连续态，后续 thought 仍不重复加 💭
+    assert f.format(update_agent_thought_text(" more")) == " more"
