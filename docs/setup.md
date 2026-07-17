@@ -1,6 +1,11 @@
 # 飞书应用配置指南
 
-从零把 feishu-dispatcher 跑起来的完整步骤。前置：本机装好 `uv`、`copilot` CLI（npm 全局，且 `copilot` 已登录过 GitHub 账号）。
+从零把 feishu-dispatcher 跑起来的完整步骤。前置：本机装好 `uv`，以及至少一个 coding agent CLI（npm 全局）——两者均经 ACP 协议控制、本地实测可用：
+
+- **Copilot CLI**：`copilot` 已登录过 GitHub 账号。ACP 冒烟 `uv run python scripts/smoke_acp.py`。
+- **OpenCode**：`opencode` 已配好 provider/凭据（`opencode providers`）。ACP 冒烟 `uv run python scripts/smoke_opencode.py`。
+
+在 `config.toml` 的 `[[projects]]` 里用 `default_agent = "copilot" | "opencode"` 指定每个项目由哪个 agent 处理。
 
 ## 1. 创建飞书应用
 

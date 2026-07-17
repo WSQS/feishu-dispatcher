@@ -30,14 +30,24 @@ throttle_window = 0.5
 #   在 agent 话题内发 /stop     = 结束该 agent
 
 [agents]
-# agent 名 -> ACP 启动命令（argv 数组）
+# agent 名 -> ACP 启动命令（argv 数组），均经 ACP 协议控制、本地实测握手通过。
 # Windows 上必须用 npm 装的 .cmd shim（copilot.cmd / opencode.cmd），
 # daemon 会自动补 .cmd 后缀。
+# - copilot：需先 `copilot` 登录过 GitHub 账号。
+# - opencode：需 opencode 侧配好 provider/凭据（`opencode providers`），
+#   用其默认模型；acp 模式无需额外 model 参数。
 copilot = ["copilot", "--acp"]
 opencode = ["opencode", "acp"]
 
-# P0 阶段项目硬编码在这里（设计文档 P2 才做 LLM 自注册）
+# P0 阶段项目硬编码在这里（设计文档 P2 才做 LLM 自注册）。
+# 每个项目用 default_agent 指定由哪个 agent 处理。
 [[projects]]
 name = "feishu-dispatcher"
 path = "C:/Users/wsqsy/Documents/ai/feishu-dispatcher"
 default_agent = "copilot"
+
+# 用 opencode 处理的项目示例：
+# [[projects]]
+# name = "my-other-project"
+# path = "C:/path/to/project"
+# default_agent = "opencode"
