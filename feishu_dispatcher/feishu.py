@@ -275,6 +275,10 @@ class FeishuBridge:
             text = content.get("text", "") if content else ""
         except json.JSONDecodeError:
             text = ""
+        # 去掉 @bot / @user 前缀（飞书 text 消息里 at 表现为 @_user_N）
+        import re
+
+        text = re.sub(r"@_\w+\s*", "", text).strip()
         message_id = msg.get("message_id", "")
         root_id = msg.get("root_id")
         thread_root = root_id if root_id and root_id != message_id else None
