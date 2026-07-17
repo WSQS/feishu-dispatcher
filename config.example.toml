@@ -20,6 +20,11 @@ chat_id = ""
 # 活跃 agent 并发上限（防止 /run 进程炸弹）。
 max_agents = 3
 
+# 空闲多少秒后自动挂起 agent：关掉子进程、腾出 max_agents 名额，但会话记录保留，
+# 之后在该话题回复即自动 load_session 恢复（无缝续聊）。<=0 = 不自动挂起。
+# 默认 1800（30 分钟），只回收真正被搁置的 agent，不影响短暂离开。
+# idle_timeout = 1800
+
 # agent 输出合并窗口（秒）
 throttle_window = 0.5
 

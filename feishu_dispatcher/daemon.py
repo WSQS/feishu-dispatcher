@@ -207,19 +207,16 @@ class _Daemon:
             logger.info("根消息 %s 已有 agent session，忽略重复 spawn", thread_root)
             return
 
-        # R11：并��上限检查
+        # R11：并发上限检查。check 与 _launch 的登记之间不能有 await，否则两条
+        # 并发 /run 会都通过检查再各自登记，突破上限（TOCTOU）。故先原子地
+        # 检查+登记，再发「🚀」提示。
         if len(self._sessions) >= self.cfg.max_agents:
             await self._safe_reply(
                 msg.message_id,
-                f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，"
-                "请先 `/stop` 或等待完成。",
+                f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，请先 `/stop` 一个。",
             )
             return
 
-        await self._safe_reply(
-            thread_root,
-            f"🚀 启动 {project.default_agent} 处理项目 {project_name}…\n任务: {task}",
-        )
         self._launch(
             thread_root=thread_root,
             project_name=project_name,
@@ -227,6 +224,10 @@ class _Daemon:
             cwd=str(project.path),
             agent_argv=agent_argv,
             first_prompt=task,
+        )
+        await self._safe_reply(
+            thread_root,
+            f"🚀 启动 {project.default_agent} 处理项目 {project_name}…\n任务: {task}",
         )
 
     def _make_agent(
@@ -329,7 +330,18 @@ class _Daemon:
         )
         try:
             while True:
-                prompt = await sess.queue.get()
+                # 空闲挂起（坑 1）：超时无新回复就关掉 agent 腾出 max_agents 名额，
+                # 但**保留** sessions.json 记录（区别于 /stop 的删除）——之后在本
+                # 话题回复即走 load_session 恢复。<=0 表示不自动挂起。
+                timeout = self.cfg.idle_timeout if self.cfg.idle_timeout > 0 else None
+                try:
+                    prompt = await asyncio.wait_for(sess.queue.get(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    await self._safe_reply(
+                        root,
+                        "💤 空闲超时，已挂起该 agent（在本话题回复即自动恢复）。",
+                    )
+                    break
                 if prompt is None:
                     self.store.remove(root)  # 用户显式结束，不再恢复
                     await self._safe_reply(root, "🛑 agent 已停止。")
@@ -428,6 +440,9 @@ class _Daemon:
                 f"⚠️ 无法恢复会话：agent '{rec.agent_label}' 未配置。发送 `/run` 重开。",
             )
             return
+        if not text:
+            return  # 空回复不触发恢复
+        # 与 _spawn_for_root 同理：check 与 _launch 登记之间不能 await（TOCTOU）。
         if len(self._sessions) >= self.cfg.max_agents:
             await self._safe_reply(
                 reply_target,
@@ -435,9 +450,6 @@ class _Daemon:
                 "请先 `/stop` 一个再回复。",
             )
             return
-        if not text:
-            return  # 空回复不触发恢复
-        await self._safe_reply(reply_target, "♻️ 正在恢复会话…")
         self._launch(
             thread_root=thread_root,
             project_name=rec.project_name,
@@ -447,6 +459,7 @@ class _Daemon:
             first_prompt=text,
             resume_session_id=rec.session_id,
         )
+        await self._safe_reply(reply_target, "♻️ 正在恢复会话…")
 
     async def _list_agents(self, msg: IncomingMessage) -> None:
         lines = [

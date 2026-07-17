@@ -184,16 +184,15 @@ ACP SDK 也暴露了 `load_session(cwd, session_id)`（`connection.py`）/ `list
   root 消息会回「用法…」**，若群里有闲聊会打扰。可考虑：非命令 root 消息静默（不回用法），
   或用法提示仅在明确请求（如 `/help`）时给。
 
-### max_agents 名额释放的两个坑（待修）
+### max_agents 名额释放的三个坑（✅ 已修 2026-07-17）
 
-`max_agents`（默认 3）限制 `_sessions` 里同时存活的 session 数，在 `/run`（`daemon.py`
-`_spawn_for_root`）和会话恢复（`_recover_or_notify`）两处检查。两个坑：
+`max_agents`（默认 3）限制 `_sessions` 里同时存活的 session 数，在 `/run`
+（`_spawn_for_root`）和会话恢复（`_recover_or_notify`）两处检查。曾有三个坑，现已修：
 
-- **空闲 agent 也占名额**：agent 跨 turn 存活（R2/R3 设计），一个任务**跑完但没 `/stop`**，
-  其 session 仍留在 `_sessions`、子进程仍活着，继续占用一个名额。名额只在 `/stop`/出错/
-  daemon 退出（`_close_session`）时释放。故三个「跑完但没停」的 agent 会占满槽位，第 4 个
-  `/run` 被拒。
-- **拒绝文案误导**：`_spawn_for_root` 超限回「请先 `/stop` 或**等待完成**」，但「等待完成」
-  不释放名额（只有 `/stop` 会）。应改成「请先 `/stop` 一个」（恢复路径的文案已经是对的）。
-- **关联改进**：可加「空闲超时自动 `/stop`」——既释放名额又清理僵尸 agent（呼应 review R17
-  「`_agents_by_thread` 永不清理」的遗留）。
+- **空闲 agent 占名额** → 加了 **`idle_timeout`（默认 1800s）空闲自动挂起**：一轮跑完后
+  超时无新回复，worker 关掉 agent 子进程、腾出名额，但**保留** `sessions.json` 记录
+  （区别于 `/stop` 的删除）——之后在该话题回复即走 `load_session` 无缝恢复。一并了结
+  review R17「`_agents_by_thread` 永不清理」的僵尸 agent 遗留。`idle_timeout<=0` 可关闭。
+- **拒绝文案误导** → 「请先 `/stop` 或等待完成」改为「请先 `/stop` 一个」。
+- **上限检查 TOCTOU 竞态** → 检查与 `_launch` 登记之间原有 `await`（发「🚀」提示），
+  并发两条 `/run` 可都通过检查再各自登记、突破上限。改为**先原子地检查+登记、再发提示**。

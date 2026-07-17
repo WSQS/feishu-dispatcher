@@ -34,6 +34,9 @@ class Config:
     sender_whitelist: list[str] = field(default_factory=list)
     #: 活跃 agent 并发上限（R11）
     max_agents: int = 3
+    #: 空闲多少秒后自动挂起 agent（关进程腾名额，记录保留、回复即恢复）；
+    #: <=0 = 不自动挂起。默认 30 分钟，只回收真正被搁置的 agent。
+    idle_timeout: float = 1800.0
     #: 流式输出模式：card=原地更新卡片（默认），text=每批发新消息（兜底）
     stream_mode: str = "card"
 
@@ -72,5 +75,6 @@ class Config:
             throttle_window=float(data.get("throttle_window", 0.5)),
             sender_whitelist=list(data.get("sender_whitelist", [])),
             max_agents=int(data.get("max_agents", 3)),
+            idle_timeout=float(data.get("idle_timeout", 1800.0)),
             stream_mode=stream_mode,
         )

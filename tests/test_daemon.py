@@ -82,6 +82,7 @@ def make_daemon(
     *,
     stream_mode: str = "text",
     store: SessionStore | None = None,
+    idle_timeout: float = 1800.0,
 ) -> tuple[_Daemon, FakeBridge, list[FakeAgent]]:
     cfg = Config(
         app_id="a",
@@ -90,6 +91,7 @@ def make_daemon(
         agents={"copilot": ["copilot", "--acp"]},
         projects={"demo": Project(name="demo", path=Path("C:/tmp/demo"))},
         throttle_window=0.01,
+        idle_timeout=idle_timeout,
         stream_mode=stream_mode,
     )
     daemon = _Daemon(cfg, store=store or SessionStore(None))
@@ -477,4 +479,53 @@ async def test_recovery_respects_max_agents():
     await daemon._handle_message(thread_msg("hi", root="om_orphan", mid="om_r2"))
     assert len(created) == 1  # 未恢复
     assert any("上限" in t for t in bridge.texts("om_orphan"))
+    await daemon._shutdown()
+
+
+# ---------------------------------------------------------------------- #
+# 空闲挂起 + max_agents 名额释放（坑 1/2/3）
+# ---------------------------------------------------------------------- #
+
+
+async def test_idle_timeout_suspends_but_keeps_record_recoverable():
+    store = SessionStore(None)
+    daemon, bridge, created = make_daemon(store=store, idle_timeout=0.1)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    saved_sid = created[0].session_id
+    # 空闲超时 → 挂起：关进程、腾名额、但记录保留
+    await wait_until(lambda: any("💤" in t for t in bridge.texts("om_root1")))
+    await wait_until(lambda: "om_root1" not in daemon._sessions)  # 名额已释放
+    assert created[0].closed
+    assert store.get("om_root1") is not None  # 记录保留（区别于 /stop）
+
+    # 在话题里回复 → 自动 load_session 恢复
+    await daemon._handle_message(thread_msg("more", root="om_root1", mid="om_t2"))
+    await wait_until(lambda: len(created) == 2 and created[1].prompts == ["more"])
+    assert created[1].resume_session_id == saved_sid
+    await daemon._shutdown()
+
+
+async def test_idle_timeout_zero_disables_suspend():
+    daemon, bridge, created = make_daemon(idle_timeout=0)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: any("✅" in t for t in bridge.texts("om_root1")))
+    # 关闭自动挂起：跑完后 session 仍存活
+    await asyncio.sleep(0.15)
+    assert "om_root1" in daemon._sessions
+    assert not created[0].closed
+    await daemon._shutdown()
+
+
+async def test_max_agents_cap_atomic_under_concurrent_run():
+    # 坑 3：两条 /run 并发到达、正好在上限边界，不应突破上限。
+    daemon, bridge, created = make_daemon_with_limit(max_agents=1)
+    await asyncio.gather(
+        daemon._handle_message(root_msg("/run demo t1", mid="om_a")),
+        daemon._handle_message(root_msg("/run demo t2", mid="om_b")),
+    )
+    await wait_until(lambda: created and created[0].prompts)
+    assert len(created) == 1  # 只起了一个，没突破上限
+    rejected = bridge.texts("om_a") + bridge.texts("om_b")
+    assert any("上限" in t for t in rejected)
     await daemon._shutdown()
