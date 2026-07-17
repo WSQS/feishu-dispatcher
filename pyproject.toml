@@ -1,0 +1,13 @@
+[project]
+name = "feishu-dispatcher"
+version = "0.0.1"
+description = "Feishu-driven personal coding agent dispatcher"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+feishu-dispatcher = "feishu_dispatcher.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"

@@ -1,0 +1,137 @@
+# feishu-dispatcher — 设计方案
+
+> 2026-07-17 grilling session 产出
+
+## 一句话定义
+
+飞书驱动的个人 coding agent 调度器。你在飞书话题群里跟调度器对话，调度器理解任务、按项目拆解、派发给底层 coding agent（Copilot CLI / OpenCode）执行。每个 agent 在独立的飞书话题里运行，你可以随时跳进话题查看实时输出并直接指挥 agent。
+
+## 架构总览
+
+```
+飞书话题群 ←─WebSocket 长连接─→ 本地 daemon（纯出站）
+                                    │
+                          ┌─────────┼─────────┐
+                          │         │         │
+                     LLM API    内置 Tools   Agent Manager
+                    (规划/理解)  (项目管理)   (ACP 进程)
+                                                    │
+                                          ┌─────────┼─────────┐
+                                          │         │         │
+                                     Copilot   OpenCode    ...
+                                     (ACP)     (ACP)
+```
+
+### 数据流
+
+1. 你在飞书话题群发根消息（任务描述）
+2. daemon 收到消息 → 调用调度器 LLM 理解任务
+3. LLM 识别涉及的项目 → 调用 `spawn_agent` tool
+4. daemon 启动 agent 进程（ACP over stdio）+ 创建飞书话题
+5. agent 的 streaming output → daemon 批量节流 → 发到对应话题
+6. 你在话题内回复 → daemon 将回复作为 ACP `session/prompt` 发给 agent
+7. agent 完成/报错 → daemon 更新话题状态
+
+## 决策清单
+
+| # | 决策点 | 结论 |
+|---|--------|------|
+| 1 | 调度器职责 | 个人助手，按项目（档位 B）拆解任务，派发给 coding agent |
+| 2 | 前端 | 飞书话题形式群（你 + bot），根消息 = 主控，话题 = agent 子 session |
+| 3 | 执行环境 | 本地 daemon，agent 通过 ACP 协议控制 |
+| 4 | 任务���解粒度 | 按项目分派，不做步骤级拆解 |
+| 5 | 项目管理 | 应用内 tool 自管理（LLM 自主注册/查询），落盘本地 |
+| 6 | daemon 形态 | 独立 Python 进程 + LLM API + 内置 tool calling（非 MCP） |
+| 7 | 飞书通信 | WebSocket 长连接（`lark-oapi` Python SDK），纯出站无需公网暴露 |
+| 8 | agent 输出回飞书 | 全量转发 + 批量节流（~500ms 窗口合并） |
+| 9 | 技术栈 | Python（原型验证后最终确认） |
+| 10 | 调度器 LLM 边界 | 轻量 router：理解、拆解、分派、状态查询、并发判断。不碰代码 |
+| 11 | worktree | 仅并发时创建 worktree + 临时分支（`agent/<project>-<task-id>`）隔离 |
+| 12 | daemon 启动 | 手动启动（`feishu-dispatcher start`），后续可包装为系统服务 |
+
+### 决策详情
+
+**档位 B 拆解**：调度器理解任务涉及哪些项目，每个项目派一个 agent。不拆步骤级子任务（那是 agent 的工作），不做原子操作编排（那是重建 Devin）。
+
+**ACP（Agent Client Protocol）**：
+- JSON-RPC 2.0 over stdio，agent 作为子进程运行
+- 流式输出通过 JSON-RPC notification，token 级实时推送
+- Copilot CLI 已支持 ACP（2026-01 public preview），OpenCode 官方支持
+- 官方 Python SDK：`agent-client-protocol` PyPI 包（asyncio + Pydantic）
+- 消除了 PTY hack 的需要，输出结构化（text / tool call / diff / permission request）
+
+**飞书话题群**：
+- 飞书单聊不支持话题，话题是群聊属性（`group_message_type: "thread"`）
+- 创建只有你 + bot 的话题形式群作为控制台
+- 根消息 = 任务派发，`reply_in_thread: true` 创建话题 = agent 子 session
+- `thread_id` 路由消息到正确话题
+
+**调度器 LLM 边界**：
+```
+你是一个任务调度器。你的职责：
+1. 理解用户的任务描述，识别涉及哪些已注册项目
+2. 为每个项目创建 agent 任务
+3. 判断任务是否可以并发（同项目独立修改可并发，有依赖须串行）
+4. 如需并发，为每个任务创建 git worktree 隔离工作区
+5. 回答用户关于 agent 状态的问题
+你不写代码、不改文件、不跑命令。这些是 agent 的工作。
+```
+
+## 内置 Tools（供调度器 LLM 调用）
+
+| Tool | 参数 | 说明 |
+|------|------|------|
+| `list_projects()` | — | 返回已注册项目列表 |
+| `register_project(path, name?, stack?, test_cmd?, default_agent?)` | — | 注册新项目，落盘到本地配置 |
+| `spawn_agent(project, task, worktree?)` | — | 启动 agent 进程（ACP）+ 创建飞书话题。如需并发，自动创建 worktree |
+| `send_to_agent(thread_id, message)` | — | 向指定 agent 发送消息（ACP `session/prompt`） |
+| `get_agent_status(thread_id?)` | — | 查询 agent 状态（running / waiting / done / failed） |
+| `list_agents()` | — | 列出所有活跃 agent |
+
+## 原型验证计划
+
+### 原型范围
+
+只做 P0（核心闭环）+ 硬编码项目配置。不做 LLM 规划，不做多 agent 并发，不做 worktree。
+
+**最小端到端 demo**：
+```
+你在飞书发消息 → daemon 启动 Copilot CLI（ACP）→
+agent 输出实时回到飞书话题 →
+你在话题回复 → 消息传回 agent
+```
+
+### P0 — 不通过则方案不成立
+
+1. **ACP 流式输出 → 飞书实时转发链路**
+   - daemon 作为 ACP client 启动 Copilot CLI
+   - 收到 streaming notification → 批量节流 → 发到飞书话题
+   - 验证：agent 思考过程能否近实时在飞书看到？延迟可接受？
+
+2. **飞书话题双向通信**
+   - 你在话题内回复 → daemon 收到 → 通过 ACP 发给 agent
+   - 验证：agent 能否接收中途插入���指令并响应？
+
+### P1 — 影响体验但不影响可行性（原型后迭代）
+
+3. 多 agent 并发（独立话题 + worktree 隔离）
+4. agent 生命周期管理（完成/报错/取消 → 进程清理 + 状态通知）
+
+### P2 — 体验优化（可跳过）
+
+5. 调度器 LLM 规划（原型阶段硬编码项目匹配）
+6. 项目自注册（原型阶段手动写死项目列表）
+
+## 依赖
+
+| 依赖 | 用途 |
+|------|------|
+| `lark-oapi` | 飞书开放平台 Python SDK（WebSocket 长连接 + 消息 API） |
+| `agent-client-protocol` | ACP 官方 Python SDK（ACP client） |
+| LLM API（openai/anthropic） | 调度器大脑（tool calling） |
+
+## 开放问题
+
+- ACP Python SDK 的 async transport 在 Windows 上的兼容性（原型验证）
+- 飞书消息卡片是否用于 agent 状态展示（当前方案是全量文本转发）
+- 多 agent 并发时飞书通知的噪音问题（原型后评估）
