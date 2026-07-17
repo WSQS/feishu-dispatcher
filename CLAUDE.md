@@ -4,54 +4,41 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目状态
 
-P0 原型核心闭环已实现，并通过飞书端到端实测验证（2026-07-17）。两条 P0 验证均通过：ACP 流式输出实时转发到飞书话题（延迟体验可接受）、话题内双向通信（回复传回 agent 并继续对话）。权威设计来源仍是 `docs/design.md`；若实现与设计冲突，先更新设计文档。所有源码在 `feishu_dispatcher/` 包下，文档统一用中文。
+P0 原型代码完成，并经过深度 review + 三批修复（2026-07-17，缺陷台账见 `docs/reviews/2026-07-17-p0-review.md`，22 项确认缺陷已全部修复或标注）。**ACP 链路已用真实 Copilot CLI 冒烟验证通过**（握手 → session → 流式输出 → 退出）；**飞书端 E2E 尚未用真实凭据验证**——此前文档声称的「P0 验证通过」经审查证实在任何已提交版本上都不可复现，已撤销，配好凭据后需按 `docs/setup.md` 重验。权威设计来源是 `docs/design.md`；若实现与设计冲突，先更新设计文档。文档统一用中文。
 
 ## 项目是什么
 
-飞书驱动的个人 coding agent 调度器：用户在飞书话题群里描述任务，本地 daemon 通过 LLM 理解任务、按项目拆解，派发给底层 coding agent（Copilot CLI / OpenCode，均通过 ACP 协议控制）。每个 agent 对应一个飞书话题，用户可在话题内实时查看输出并中途下指令。
+飞书驱动的个人 coding agent 调度器：用户在飞书群里描述任务，本地 daemon 通过 LLM 理解任务、按项目拆解，派发给底层 coding agent（Copilot CLI / OpenCode，均通过 ACP 协议控制）。每个 agent 对应一个飞书话题，用户可在话题内实时查看输出并中途下指令。P0 阶段无 LLM 规划（`/run` 命令直接匹配项目）。
 
 ## 架构（实现时必须遵守的关键决策）
 
-数据流：飞书话题群 ←WebSocket 长连接→ 本地 daemon → { 调度器 LLM（tool calling）、内置项目管理 tools、Agent Manager（ACP 子进程）}
-
-- **飞书通信**：`lark-oapi` SDK 的 WebSocket 长连接，纯出站，无需公网暴露。飞书单聊不支持话题，用**普通群**（非话题形式群）+ `reply_in_thread: true` 建话题；群主线 = 控制台（发 `/run` 等命令），话题 = agent 子 session，用根 `message_id` 路由消息。
-- **Agent 控制**：ACP（Agent Client Protocol），JSON-RPC 2.0 over stdio，agent 作为子进程运行，用官方 `agent-client-protocol` PyPI SDK（asyncio + Pydantic）。不要用 PTY hack。
-- **输出转发**：agent 流式输出全量转发到飞书话题，批量节流（~500ms 窗口合并）。
-- **调度器 LLM 边界**：轻量 router，只做理解/拆解/分派/状态查询/并发判断。不写代码、不改文件、不跑命令——那是底层 agent 的职责。
-- **拆解粒度**：按项目分派（一个项目一个 agent），不做步骤级子任务拆解。
-- **并发隔离**：仅并发时才创建 git worktree + 临时分支（`agent/<project>-<task-id>`）。
-- **内置 tools**（供调度器 LLM 调用，非 MCP）：`list_projects` / `register_project` / `spawn_agent` / `send_to_agent` / `get_agent_status` / `list_agents`，项目配置落盘本地。
-
-## 原型范围（P0 优先）
-
-原型只验证核心闭环：飞书发消息 → daemon 启动 Copilot CLI（ACP）→ agent 输出实时回话题 → 话题回复传回 agent。原型阶段硬编码项目配置，不做 LLM 规划、多 agent 并发和 worktree（分别是 P1/P2）。P0 两条验证不通过则整个方案不成立，详见 `docs/design.md` 的原型验证计划。
-
-### P0 验证结果（2026-07-17）
-
-1. ✅ **ACP 流式输出 → 飞书实时转发链路**：Copilot 思考过程 + 工具调用 + 最终回复均近实时出现在飞书话题内，延迟体验可接受（~500ms 节流窗口）。
-2. ✅ **飞书话题双向通信**：话题内回复成功传回 agent，agent 接收后继续输出。
-
-### 已知小问题（P1 修）
-
-- 消息偶发重复（同一条收到两次，可能 WS ACK 回环或飞书重发）——导致重复 spawn agent，需去重。
-- `session/close` 不被 Copilot 支持（已 catch 忽略，无害）。
-- 飞书群机器人默认只接收 @bot 消息，需配置才能接收所有群消息（飞书开放平台或群机器人设置）。
+- **飞书通信**：WebSocket 长连接（纯出站），用**普通群** + `reply_in_thread: true` 建话题；群主线 = 控制台（`/run`、`/agents`），话题 = agent 子会话，用根 `message_id` 路由（`root_id == message_id` 为根消息）。消息按 `message_id` 幂等去重（飞书对 ACK 异常事件会重推）。
+- **Agent 控制**：ACP（JSON-RPC 2.0 over stdio），官方 `agent-client-protocol` SDK（**import 名是 `acp`**）。不要用 PTY hack。
+- **agent 生命周期**（review R2/R3 后的设计，改动 daemon.py 前必读）：一个 `/run` = 一个 `_AgentSession`，agent 进程与 ACP session **跨 turn 存活**（上下文在 session 里）；每 session 一个 prompt 队列 + 单消费者 worker 串行执行 turn；话题回复只入队；`/stop`（None 哨兵）、出错或 daemon 退出才关闭。`AcpAgent.start()` 禁止二次调用（会抛 RuntimeError）。
+- **输出转发**：agent 流式输出（message/thought/tool_call/plan）经 ~500ms 节流窗口合并转发到话题，单批超长按 4000 字符切分。
+- **权限**：`request_permission` 自动放行——必须返回 `AllowedOutcome(outcome="selected", option_id=...)` 结构（从 options 挑 allow_once/allow_always），裸字符串过不了 pydantic 校验。fs/terminal 能力未通告也未实现。
+- **环境变量**：agent 子进程只拿 SDK 白名单（PATH/APPDATA/USERPROFILE 等 12 个）+ `AgentSpawn.env` 显式追加项，**不再透传完整 os.environ**。要给 agent 传 token 就写进 `AgentSpawn.env` / 配置。
+- **调度器 LLM 边界**（P2）：轻量 router，只做理解/拆解/分派/状态查询/并发判断，不碰代码。
+- **并发隔离**（P1）：仅并发时创建 git worktree + 临时分支（`agent/<project>-<task-id>`）。
 
 ## 开发命令
 
-用 `uv` 管理（Python 3.12，`.python-version` 已 pin）。
+用 `uv` 管理（Python 3.12 已 pin；本机无系统 Python，一律 `uv run`）。
 
-- 安装依赖：`uv sync`（dev 组：pytest / pytest-asyncio / ruff）
-- 跑测试：`uv run pytest -q`
-- Lint：`uv run ruff check .`（`--fix` 自���修）
-- daemon 启动：`uv run feishu-dispatcher start`（或 `--config <path>` / `-v`）
-- ACP 端到端冒烟（不经过飞书，直接验证 daemon↔Copilot 链路）：`uv run python scripts/smoke_acp.py`
+- 安装依赖：`uv sync`
+- 测试：`uv run pytest -q`（50 个，含 daemon 生命周期集成测试）
+- Lint / 格式：`uv run ruff check .` / `uv run ruff format .`
+- daemon：`uv run feishu-dispatcher start`（`--discover` 发现 chat_id；`-v` 调试日志；`--config <path>`）
+- ACP 冒烟（不经飞书，真实 Copilot）：`uv run python scripts/smoke_acp.py`
+- 飞书应用配置全流程：`docs/setup.md`
 
-包结构：`feishu_dispatcher/`（`cli.py` 入口、`config.py`、`daemon.py` 主循环、`acp_client.py` ACP 封装、`feishu.py` 飞书通信、`throttler.py` 节流、`_lark_compat.py` SDK 兼容 shim）。CLI 入口已在 `pyproject.toml` 声明：`feishu-dispatcher = "feishu_dispatcher.cli:main"`。
+包结构：`feishu_dispatcher/`（`cli.py` 入口、`config.py`、`daemon.py` 调度主循环、`acp_client.py` ACP 封装、`feishu.py` 飞书 WS+HTTP 桥、`throttler.py` 节流、`_lark_compat.py` SDK 兼容 shim）。
 
-## 已知风险（实现时注意）
+## 已知风险与注意事项
 
-- **ACP Windows 兼容性已验证通过**：`agent-client-protocol` 0.11.0（import 名 `acp`）在 Windows + Python 3.12 上工作正常；`copilot.cmd` shim + `spawn_stdio_transport` 可用。注意 import 名是 `acp` 不是 `agent_client_protocol`。
-- **lark-oapi SDK 在 Windows + Defender 下有严重问题**：`import lark_oapi` 会 eager import 全部 57 个 API namespace，Defender 实时扫描数百个小 `.py` 文件导致 access violation（exit 0xC0000005）。已用 `feishu_dispatcher/_lark_compat.py` 绕开（装空壳包跳过 eager import���只按需加载 `im.v1` + protobuf）。修改飞书通信相关代码时务必保持 `__init__.py` 里的 `_lark_compat` 首次 import 顺序。
-- **飞书通信实现不走 `lark.ws.Client`**：因为它依赖 `EventDispatcherHandler`（eager import 25 个 processor）。`feishu.py` 改为直接用 `websockets` + 官方 protobuf Frame + `requests` 自实现 WS 长连接与 HTTP 发消息，绕开 SDK 的重依赖链。
-- **Copilot 权限**：`_ClientImpl.request_permission` 自动返回 allow；Copilot 的写文件类工具可能仍按其内部策略执行（实测部分文件操作未落盘，需后续调权限交互）。
+- **lark-oapi 在 Windows + Defender 下会崩**：`import lark_oapi` eager import 57 个 API namespace 触发 access violation（0xC0000005）。已用 `_lark_compat.py` 空壳 shim 绕开，实际只加载 `ws.pb`（protobuf）+ `ws.const`，事件 JSON 全部手写 dict 解析。**改飞书相关代码务必保持 `__init__.py` 里 `_lark_compat` 最先 import**。
+- **feishu.py 不走 `lark.ws.Client`**（其依赖链会触发上述崩溃），自实现 WS 长连接。frame/ACK/ping/合包语义**必须对照官方参考实现** `.venv/Lib/site-packages/lark_oapi/ws/client.py`：ACK 成功 `{"code": 200}` 失败 500 + `biz_rt` 头；ping 间隔服务端可下发（endpoint 发现响应 / pong payload 的 `PingInterval`）；合包缓存 5s TTL。
+- **飞书限频**：同群全部机器人共享 5 QPS（全应用 50/s）；`max_agents` 默认 3 与之配套；HTTP 层已带 Retry（429/5xx，尊重 Retry-After）。多 agent 高并发需要 per-chat 令牌桶（P1，未做）。
+- **安全默认**：`chat_id` 必填（空则拒绝启动，发现模式用 `--discover`）；`sender_whitelist` 建议配置；`/run` 并发上限 `max_agents`。
+- WS 线程死亡由 daemon 30s 看门狗自动重启；agent 子进程 stderr 有后台 drain（防管道满卡死）。
+- P1/P2 待办：LLM 规划、多 agent worktree 隔离、卡片流式（PATCH interactive card 无编辑次数上限，见 setup.md §8）、per-chat 令牌桶。
