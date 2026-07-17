@@ -37,7 +37,7 @@
 | # | 决策点 | 结论 |
 |---|--------|------|
 | 1 | 调度器职责 | 个人助手，按项目（档位 B）拆解任务，派发给 coding agent |
-| 2 | 前端 | 飞书话题形式群（你 + bot），根消息 = 主控，话题 = agent 子 session |
+| 2 | 前端 | 普通群（主线=控制台）+ `reply_in_thread` 建话题（话题=agent 子 session） |
 | 3 | 执行环境 | 本地 daemon，agent 通过 ACP 协议控制 |
 | 4 | 任务���解粒度 | 按项目分派，不做步骤级拆解 |
 | 5 | 项目管理 | 应用内 tool 自管理（LLM 自主注册/查询），落盘本地 |
@@ -61,10 +61,9 @@
 - 消除了 PTY hack 的需要，输出结构化（text / tool call / diff / permission request）
 
 **飞书话题群**：
-- 飞书单聊不支持话题，话题是群聊属性（`group_message_type: "thread"`）
-- 创建只有你 + bot 的话题形式群作为控制台
-- 根消息 = 任务派发，`reply_in_thread: true` 创建话题 = agent 子 session
-- `thread_id` 路由消息到正确话题
+- 飞书单聊不支持话题；话题形式群（`group_message_type: "thread"`）没有群主线，不适合做控制台
+- 改用**普通群**：群主线 = 控制台（发 `/run` 等命令），`reply_in_thread: true` 在根消息下建话题 = agent 子 session
+- 用根 `message_id` 路由消息到正确话题（`root_id == message_id` 为根消息，`root_id != message_id` 为话题回复）
 
 **调度器 LLM 边界**：
 ```

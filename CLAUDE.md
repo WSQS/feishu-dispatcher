@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目状态
 
-P0 原型核心闭环已实现并通过 ACP 端到端冒烟验证（无飞书侧）。权威设计来源仍是 `docs/design.md`；若实现与设计冲突，先更新设计文档。所有源码在 `feishu_dispatcher/` 包下，文档统一用中文。
+P0 原型核心闭环已实现，并通过飞书端到端实测验证（2026-07-17）。两条 P0 验证均通过：ACP 流式输出实时转发到飞书话题（延迟体验可接受）、话题内双向通信（回复传回 agent 并继续对话）。权威设计来源仍是 `docs/design.md`；若实现与设计冲突，先更新设计文档。所有源码在 `feishu_dispatcher/` 包下，文档统一用中文。
 
 ## 项目是什么
 
@@ -14,7 +14,7 @@ P0 原型核心闭环已实现并通过 ACP 端到端冒烟验证（无飞书侧
 
 数据流：飞书话题群 ←WebSocket 长连接→ 本地 daemon → { 调度器 LLM（tool calling）、内置项目管理 tools、Agent Manager（ACP 子进程）}
 
-- **飞书通信**：`lark-oapi` SDK 的 WebSocket 长连接，纯出站，无需公网暴露。飞书单聊不支持话题，必须用话题形式群（`group_message_type: "thread"`）；根消息 = 任务派发，`reply_in_thread: true` 创建话题 = agent 子 session，用 `thread_id` 路由消息。
+- **飞书通信**：`lark-oapi` SDK 的 WebSocket 长连接，纯出站，无需公网暴露。飞书单聊不支持话题，用**普通群**（非话题形式群）+ `reply_in_thread: true` 建话题；群主线 = 控制台（发 `/run` 等命令），话题 = agent 子 session，用根 `message_id` 路由消息。
 - **Agent 控制**：ACP（Agent Client Protocol），JSON-RPC 2.0 over stdio，agent 作为子进程运行，用官方 `agent-client-protocol` PyPI SDK（asyncio + Pydantic）。不要用 PTY hack。
 - **输出转发**：agent 流式输出全量转发到飞书话题，批量节流（~500ms 窗口合并）。
 - **调度器 LLM 边界**：轻量 router，只做理解/拆解/分派/状态查询/并发判断。不写代码、不改文件、不跑命令——那是底层 agent 的职责。
@@ -25,6 +25,17 @@ P0 原型核心闭环已实现并通过 ACP 端到端冒烟验证（无飞书侧
 ## 原型范围（P0 优先）
 
 原型只验证核心闭环：飞书发消息 → daemon 启动 Copilot CLI（ACP）→ agent 输出实时回话题 → 话题回复传回 agent。原型阶段硬编码项目配置，不做 LLM 规划、多 agent 并发和 worktree（分别是 P1/P2）。P0 两条验证不通过则整个方案不成立，详见 `docs/design.md` 的原型验证计划。
+
+### P0 验证结果（2026-07-17）
+
+1. ✅ **ACP 流式输出 → 飞书实时转发链路**：Copilot 思考过程 + 工具调用 + 最终回复均近实时出现在飞书话题内，延迟体验可接受（~500ms 节流窗口）。
+2. ✅ **飞书话题双向通信**：话题内回复成功传回 agent，agent 接收后继续输出。
+
+### 已知小问题（P1 修）
+
+- 消息偶发重复（同一条收到两次，可能 WS ACK 回环或飞书重发）——导致重复 spawn agent，需去重。
+- `session/close` 不被 Copilot 支持（已 catch 忽略，无害）。
+- 飞书群机器人默认只接收 @bot 消息，需配置才能接收所有群消息（飞书开放平台或群机器人设置）。
 
 ## 开发命令
 
