@@ -14,10 +14,31 @@ class FakeBridge:
     def __init__(self) -> None:
         self.replies: list[tuple[str, str]] = []
         self.stopped = False
+        self.cards: list[dict] = []
+        self.card_replies: list[tuple[str, dict]] = []
+        self.card_patches: list[tuple[str, dict]] = []
+        self.reply_card_errors: int = 0
+        self.patch_card_errors: int = 0
 
     def reply_in_thread(self, root_message_id: str, text: str) -> str:
         self.replies.append((root_message_id, text))
         return f"om_reply_{len(self.replies)}"
+
+    def reply_card(self, root_message_id: str, card: dict) -> str:
+        if self.reply_card_errors > 0:
+            self.reply_card_errors -= 1
+            raise RuntimeError("reply_card boom")
+        self.card_replies.append((root_message_id, card))
+        mid = f"om_card_{len(self.card_replies)}"
+        self.cards.append(card)
+        return mid
+
+    def patch_card(self, message_id: str, card: dict) -> None:
+        if self.patch_card_errors > 0:
+            self.patch_card_errors -= 1
+            raise RuntimeError("patch_card boom")
+        self.card_patches.append((message_id, card))
+        self.cards.append(card)
 
     def stop(self) -> None:
         self.stopped = True
@@ -52,6 +73,8 @@ class FailingAgent(FakeAgent):
 
 def make_daemon(
     agent_cls: type[FakeAgent] = FakeAgent,
+    *,
+    stream_mode: str = "text",
 ) -> tuple[_Daemon, FakeBridge, list[FakeAgent]]:
     cfg = Config(
         app_id="a",
@@ -60,6 +83,7 @@ def make_daemon(
         agents={"copilot": ["copilot", "--acp"]},
         projects={"demo": Project(name="demo", path=Path("C:/tmp/demo"))},
         throttle_window=0.01,
+        stream_mode=stream_mode,
     )
     daemon = _Daemon(cfg)
     bridge = FakeBridge()
@@ -201,6 +225,7 @@ def make_daemon_with_limit(
         projects={"demo": Project(name="demo", path=Path("C:/tmp/demo"))},
         throttle_window=0.01,
         max_agents=max_agents,
+        stream_mode="text",
     )
     daemon = _Daemon(cfg)
     bridge = FakeBridge()
@@ -237,6 +262,8 @@ async def test_max_agents_limit_blocks_excess_spawns():
 
 def make_daemon_with_whitelist(
     sender_whitelist: list[str],
+    *,
+    stream_mode: str = "text",
 ) -> tuple[_Daemon, FakeBridge, list[FakeAgent]]:
     cfg = Config(
         app_id="a",
@@ -246,6 +273,7 @@ def make_daemon_with_whitelist(
         projects={"demo": Project(name="demo", path=Path("C:/tmp/demo"))},
         throttle_window=0.01,
         sender_whitelist=sender_whitelist,
+        stream_mode=stream_mode,
     )
     daemon = _Daemon(cfg)
     bridge = FakeBridge()
@@ -280,6 +308,7 @@ async def test_discover_mode_does_not_execute_commands():
         agents={"copilot": ["copilot", "--acp"]},
         projects={"demo": Project(name="demo", path=Path("C:/tmp/demo"))},
         throttle_window=0.01,
+        stream_mode="text",
     )
     daemon = _Daemon(cfg, discover=True)
     bridge = FakeBridge()
@@ -291,3 +320,60 @@ async def test_discover_mode_does_not_execute_commands():
     await daemon._handle_message(root_msg("/run demo task"))
     assert created == []
     assert bridge.texts() == []
+
+
+# ---------------------------------------------------------------------- #
+# Card 模式测试
+# ---------------------------------------------------------------------- #
+
+
+async def test_card_mode_run_echo_in_card_and_done_status():
+    daemon, bridge, created = make_daemon(stream_mode="card")
+    await daemon._handle_message(root_msg("/run demo do stuff"))
+    await wait_until(
+        lambda: any(
+            "echo:do stuff" in card["elements"][0]["text"]["content"]
+            for _, card in bridge.card_replies
+        )
+    )
+    await wait_until(lambda: any("✅" in t for t in bridge.texts("om_root1")))
+    assert len(created) == 1
+    assert created[0].prompts == ["do stuff"]
+    assert created[0].start_count == 1
+    assert len(bridge.card_replies) >= 1
+    all_cards = bridge.card_replies + bridge.card_patches
+    last_card = all_cards[-1][1]
+    assert last_card["header"]["template"] == "green"
+
+
+async def test_card_mode_thread_reply_reuses_same_agent():
+    daemon, bridge, created = make_daemon(stream_mode="card")
+    await daemon._handle_message(root_msg("/run demo first task"))
+    await wait_until(lambda: created and created[0].prompts == ["first task"])
+
+    await daemon._handle_message(thread_msg("second task"))
+    await wait_until(lambda: created[0].prompts == ["first task", "second task"])
+    assert len(created) == 1
+    assert created[0].start_count == 1
+    assert not created[0].closed
+
+
+async def test_card_mode_agent_error_sets_error_status():
+    from tests.test_daemon import FailingAgent
+
+    daemon, bridge, created = make_daemon(agent_cls=FailingAgent, stream_mode="card")
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: any("❌" in t for t in bridge.texts("om_root1")))
+    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    assert created[0].closed
+
+
+async def test_card_mode_stop_command_closes_agent():
+    daemon, bridge, created = make_daemon(stream_mode="card")
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+
+    await daemon._handle_message(thread_msg("/stop"))
+    await wait_until(lambda: created[0].closed)
+    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    assert any("🛑" in t for t in bridge.texts("om_root1"))

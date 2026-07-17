@@ -20,6 +20,9 @@ max_agents = 3
 # agent 输出合并窗口（秒）
 throttle_window = 0.5
 
+# 流式输出模式：card=原地更新卡片（默认），text=每批发新消息（兜底）
+# stream_mode = "card"
+
 # 用法：在群里发根消息
 #   /run <项目名> <任务描述>    派发任务给 agent（在根消息下建话题）
 #   /agents                     列出活跃 agent

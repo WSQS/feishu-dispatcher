@@ -63,6 +63,10 @@ class StreamThrottler:
             await self._task
         await self._drain()
 
+    async def set_status(self, status: str) -> None:  # noqa: ARG002
+        """no-op：text 模式不需要卡片状态，仅为满足 OutputChannel 接口。"""
+        return None
+
     async def _run(self) -> None:
         while not self._closed:
             await self._pending.wait()

@@ -34,6 +34,8 @@ class Config:
     sender_whitelist: list[str] = field(default_factory=list)
     #: 活跃 agent 并发上限（R11）
     max_agents: int = 3
+    #: 流式输出模式：card=原地更新卡片（默认），text=每批发新消息（兜底）
+    stream_mode: str = "card"
 
     @staticmethod
     def load(path: Path | None = None, *, allow_empty_chat_id: bool = False) -> Config:
@@ -58,6 +60,9 @@ class Config:
                 "配置 chat_id 不能为空。用 `feishu-dispatcher start --discover` "
                 "可在日志里看到收到消息的 chat_id 来发现群 id。"
             )
+        stream_mode = data.get("stream_mode", "card")
+        if stream_mode not in ("card", "text"):
+            raise ValueError(f"stream_mode 必须为 card 或 text，当前为 {stream_mode}")
         return Config(
             app_id=data["app_id"],
             app_secret=data["app_secret"],
@@ -67,4 +72,5 @@ class Config:
             throttle_window=float(data.get("throttle_window", 0.5)),
             sender_whitelist=list(data.get("sender_whitelist", [])),
             max_agents=int(data.get("max_agents", 3)),
+            stream_mode=stream_mode,
         )

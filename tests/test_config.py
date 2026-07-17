@@ -80,3 +80,14 @@ def test_minimal_config(tmp_path: Path):
     assert cfg.max_agents == 3
     assert cfg.projects == {}
     assert cfg.throttle_window == 0.5
+    assert cfg.stream_mode == "card"
+
+
+def test_stream_mode_validation(tmp_path: Path):
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        'app_id = "a"\napp_secret = "b"\nchat_id = "oc_1"\nstream_mode = "invalid"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="stream_mode"):
+        Config.load(cfg_file)

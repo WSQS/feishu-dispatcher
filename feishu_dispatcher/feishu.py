@@ -129,7 +129,7 @@ class FeishuBridge:
             total=3,
             backoff_factor=0.5,
             status_forcelist=[429, 500, 502, 503],
-            allowed_methods=["POST"],
+            allowed_methods=["POST", "PATCH"],
             respect_retry_after_header=True,
         )
         adapter = HTTPAdapter(max_retries=retry)
@@ -457,6 +457,43 @@ class FeishuBridge:
             },
         )
         return result["data"]["message_id"]
+
+    def reply_card(self, root_message_id: str, card: dict) -> str:
+        """在话题内发一张 interactive 卡片，返回新消息 message_id。"""
+        result = self._im_post(
+            f"/open-apis/im/v1/messages/{root_message_id}/reply",
+            {
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False),
+                "reply_in_thread": True,
+            },
+        )
+        return result["data"]["message_id"]
+
+    def patch_card(self, message_id: str, card: dict) -> None:
+        """原地更新一张已发送的卡片。"""
+        self._im_patch(
+            f"/open-apis/im/v1/messages/{message_id}",
+            {"content": json.dumps(card, ensure_ascii=False)},
+        )
+
+    def _im_patch(self, path: str, body: dict) -> dict:
+        """PATCH 飞书 REST API（卡片原地更新）。照抄 _im_post 的 token/错误处理模式。"""
+        token = self._get_tenant_token()
+        resp = self._session.patch(
+            self._domain + path,
+            json=body,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("code") != 0:
+            raise RuntimeError(
+                f"飞书 IM PATCH 失败 path={path} "
+                f"code={result.get('code')} msg={result.get('msg')}"
+            )
+        return result
 
 
 # ---------------------------------------------------------------------- #

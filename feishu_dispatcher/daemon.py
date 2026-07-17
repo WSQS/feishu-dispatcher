@@ -21,7 +21,6 @@ from dataclasses import dataclass, field
 from .acp_client import AcpAgent, AgentSpawn, OnOutput
 from .config import Config
 from .feishu import FeishuBridge, IncomingMessage
-from .throttler import StreamThrottler
 
 logger = logging.getLogger(__name__)
 
@@ -57,12 +56,15 @@ class _AgentSession:
 
     thread_root_id: str
     project_name: str
-    agent: AcpAgent
-    throttler: StreamThrottler
+    agent_label: str
+    #: agent 实例（先建 session、再建 agent，故允许 None）
+    agent: "AcpAgent | None" = None
+    #: 当前回合的输出通道（card 或 text 模式）；回合间为 None
+    current_channel: "object | None" = None
     #: prompt 队列；None 是关闭哨兵（/stop）
-    queue: asyncio.Queue[str | None] = field(default_factory=asyncio.Queue)
+    queue: "asyncio.Queue[str | None]" = field(default_factory=asyncio.Queue)
     #: 单消费者 worker，持有 agent 完整生命周期
-    worker: asyncio.Task[None] | None = None
+    worker: "asyncio.Task[None] | None" = None
 
 
 @dataclass
@@ -200,23 +202,20 @@ class _Daemon:
             )
             return
 
-        throttler = StreamThrottler(
-            sink=lambda piece: self._send_piece(thread_root, piece),
-            window=self.cfg.throttle_window,
+        sess = _AgentSession(
+            thread_root_id=thread_root,
+            project_name=project_name,
+            agent_label=project.default_agent,
         )
 
         async def on_output(text: str) -> None:
-            throttler.feed(text)  # feed 是同步方法（R1）
+            if sess.current_channel is not None:
+                sess.current_channel.feed(text)
 
         agent = self._make_agent(
             AgentSpawn(command=list(agent_argv), cwd=str(project.path)), on_output
         )
-        sess = _AgentSession(
-            thread_root_id=thread_root,
-            project_name=project_name,
-            agent=agent,
-            throttler=throttler,
-        )
+        sess.agent = agent
         sess.queue.put_nowait(task)
         self._sessions[thread_root] = sess
         await self._safe_reply(
@@ -230,6 +229,24 @@ class _Daemon:
     def _make_agent(self, spawn: AgentSpawn, on_output: OnOutput) -> AcpAgent:
         """构造底层 agent（拆出来是测试注入点）。"""
         return AcpAgent(spawn, on_output)
+
+    def _make_channel(self, root: str, title: str):
+        """按 cfg.stream_mode 创建输出通道。
+
+        card 模式返回 LiveCard（原地更新卡片），text 模式返回 StreamThrottler
+        （每批发新消息，兜底）。
+        """
+        if self.cfg.stream_mode == "card":
+            from .livecard import LiveCard
+
+            return LiveCard(self._bridge, root, title)
+        else:
+            from .throttler import StreamThrottler
+
+            return StreamThrottler(
+                sink=lambda piece: self._send_piece(root, piece),
+                window=self.cfg.throttle_window,
+            )
 
     async def _agent_worker(self, sess: _AgentSession) -> None:
         """一个 agent 的完整生命周期：启动 → 串行消费 prompt 队列 → 关闭。"""
@@ -248,9 +265,13 @@ class _Daemon:
                 if prompt is None:
                     await self._safe_reply(root, "🛑 agent 已停止。")
                     break
+                title = f"{sess.project_name} · {sess.agent_label}"
+                channel = self._make_channel(root, title)
+                sess.current_channel = channel
                 try:
                     await sess.agent.prompt(prompt)
-                    await sess.throttler.flush()
+                    await channel.flush()
+                    await channel.set_status("done")
                     await self._safe_reply(
                         root, "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）"
                     )
@@ -258,26 +279,35 @@ class _Daemon:
                     raise
                 except Exception as exc:
                     logger.exception("agent 执行异常")
+                    try:
+                        await channel.set_status("error")
+                    except Exception:
+                        logger.debug("set_status error 失败（忽略）", exc_info=True)
                     await self._safe_reply(
                         root, f"❌ agent 异常，已结束该 agent: {str(exc)[:200]}"
                     )
                     break
+                finally:
+                    await channel.aclose()
+                    sess.current_channel = None
         except asyncio.CancelledError:
             logger.debug("agent worker 被取消 root=%s", root)
         finally:
             await self._close_session(sess)
 
     async def _close_session(self, sess: _AgentSession) -> None:
-        """收尾一个 session：出注册表、清空节流器、关 agent 进程。"""
+        """收尾一个 session：出注册表、清空输出通道、关 agent 进程。"""
         self._sessions.pop(sess.thread_root_id, None)
-        try:
-            await sess.throttler.aclose()
-        except Exception:
-            logger.debug("throttler aclose 异常（忽略）", exc_info=True)
-        try:
-            await sess.agent.aclose()
-        except Exception:
-            logger.debug("agent aclose 异常（忽略）", exc_info=True)
+        if sess.current_channel is not None:
+            try:
+                await sess.current_channel.aclose()
+            except Exception:
+                logger.debug("channel aclose 异常（忽略）", exc_info=True)
+        if sess.agent is not None:
+            try:
+                await sess.agent.aclose()
+            except Exception:
+                logger.debug("agent aclose 异常（忽略）", exc_info=True)
 
     async def _forward_to_agent(self, msg: IncomingMessage) -> None:
         """话题内回复 → 入队给对应 agent（worker 串行消费）。"""
