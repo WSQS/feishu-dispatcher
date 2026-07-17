@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目状态
 
-P0 原型代码完成，并经过深度 review + 三批修复（2026-07-17，缺陷台账见 `docs/reviews/2026-07-17-p0-review.md`，22 项确认缺陷已全部修复或标注）。**ACP 链路已用真实 Copilot CLI 冒烟验证通过**（握手 → session → 流式输出 → 退出）；**飞书端 E2E 尚未用真实凭据验证**——此前文档声称的「P0 验证通过」经审查证实在任何已提交版本上都不可复现，已撤销，配好凭据后需按 `docs/setup.md` 重验。权威设计来源是 `docs/design.md`；若实现与设计冲突，先更新设计文档。文档统一用中文。
+**P0 已完成并真实验证通过**（2026-07-17，master `305fde3` 之后由用户在真实飞书环境实测）：ACP 流式输出实时回话题、话题内回复继续指挥 agent 两条验证均通过。此前经历过一轮深度 review + 三批修复（缺陷台账见 `docs/reviews/2026-07-17-p0-review.md`，22 项确认缺陷全部处理）。下一阶段是 P1（多 agent 并发 + worktree 隔离）与 P2（调度器 LLM 规划）。权威设计来源是 `docs/design.md`；若实现与设计冲突，先更新设计文档。文档统一用中文。
 
 ## 项目是什么
 
@@ -15,7 +15,7 @@ P0 原型代码完成，并经过深度 review + 三批修复（2026-07-17，缺
 - **飞书通信**：WebSocket 长连接（纯出站），用**普通群** + `reply_in_thread: true` 建话题；群主线 = 控制台（`/run`、`/agents`），话题 = agent 子会话，用根 `message_id` 路由（`root_id == message_id` 为根消息）。消息按 `message_id` 幂等去重（飞书对 ACK 异常事件会重推）。
 - **Agent 控制**：ACP（JSON-RPC 2.0 over stdio），官方 `agent-client-protocol` SDK（**import 名是 `acp`**）。不要用 PTY hack。
 - **agent 生命周期**（review R2/R3 后的设计，改动 daemon.py 前必读）：一个 `/run` = 一个 `_AgentSession`，agent 进程与 ACP session **跨 turn 存活**（上下文在 session 里）；每 session 一个 prompt 队列 + 单消费者 worker 串行执行 turn；话题回复只入队；`/stop`（None 哨兵）、出错或 daemon 退出才关闭。`AcpAgent.start()` 禁止二次调用（会抛 RuntimeError）。
-- **输出转发**：agent 流式输出（message/thought/tool_call/plan）经 ~500ms 节流窗口合并转发到话题，单批超长按 4000 字符切分。
+- **输出转发**：`stream_mode` 二选一（config，默认 `card`）。`card`（`livecard.py`）——每回合一张 interactive 卡片,随输出 PATCH 原地更新(5 QPS/条、无编辑次数上限)，顶部状态灯(🔄/✅/❌/🛑)，body 超 25KB 滚动到新卡片；`text`（`throttler.py`）——每 ~500ms 批次发一条新文本消息(兜底)。两模式经 `_AgentSession.current_channel` 间接层做到每回合独立、对 worker 透明。状态类消息(🚀/▶️/✅/❌)始终走纯文本。
 - **权限**：`request_permission` 自动放行——必须返回 `AllowedOutcome(outcome="selected", option_id=...)` 结构（从 options 挑 allow_once/allow_always），裸字符串过不了 pydantic 校验。fs/terminal 能力未通告也未实现。
 - **环境变量**：agent 子进程只拿 SDK 白名单（PATH/APPDATA/USERPROFILE 等 12 个）+ `AgentSpawn.env` 显式追加项，**不再透传完整 os.environ**。要给 agent 传 token 就写进 `AgentSpawn.env` / 配置。
 - **调度器 LLM 边界**（P2）：轻量 router，只做理解/拆解/分派/状态查询/并发判断，不碰代码。
