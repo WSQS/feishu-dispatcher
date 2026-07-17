@@ -1,0 +1,31 @@
+# feishu-dispatcher 配置示例
+# 复制到 ~/.feishu-dispatcher/config.toml 并填写。
+
+# 飞书开发者后台 -> 应用 -> 凭证与基础信息
+app_id = "cli_xxxxxxxxxxxx"
+app_secret = "xxxxxxxxxxxx"
+
+# 控制台话题群的 chat_id。留空则 daemon 接受所有群消息，
+# 并在日志里打印收到消息的 chat_id（首次配置时用它来发现群 id）。
+chat_id = ""
+
+# agent 输出合并窗口（秒）
+throttle_window = 0.5
+
+# 用法：在话题群里发根消息
+#   /run <项目名> <任务描述>    派发任务给 agent（在根消息下建话题）
+#   /agents                     列出活跃 agent
+#   在 agent 话题内直接回复即可与 agent 对话
+
+[agents]
+# agent 名 -> ACP 启动命令（argv 数组）
+# Windows 上必须用 npm 装的 .cmd shim（copilot.cmd / opencode.cmd），
+# daemon 会自动补 .cmd 后缀。
+copilot = ["copilot", "--acp"]
+opencode = ["opencode", "acp"]
+
+# P0 阶段项目硬编码在这里（设计文档 P2 才做 LLM 自注册）
+[[projects]]
+name = "feishu-dispatcher"
+path = "C:/Users/wsqsy/Documents/ai/feishu-dispatcher"
+default_agent = "copilot"
