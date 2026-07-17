@@ -10,6 +10,9 @@ app_secret = "xxxxxxxxxxxx"
 # 来发现群 id。
 chat_id = ""
 
+# 注：daemon 会在本文件同目录自动维护 sessions.json（会话映射），用于重启后
+# 恢复 agent 会话（在旧话题里回复即自动 load_session 重连）。无需手动编辑。
+
 # 发送者 open_id 白名单。留空 = 不限制（机器人所在群任何人可发命令）；
 # 非空时只有名单内的发送者能触发命令。
 # sender_whitelist = ["ou_your_open_id"]

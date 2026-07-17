@@ -137,9 +137,15 @@ agent 输出实时回到飞书话题 →
 
 ## 待办 / 已知限制（post-P0）
 
-### 会话无法跨 daemon 重启恢复
+### 会话跨 daemon 重启恢复（✅ 已实现 2026-07-17）
 
-**现状（2026-07-17 确认）**：daemon 重启后所有 agent 会话丢失。两个原因叠加：
+实现：`store.py` 把 `thread_root_id → {project, agent, session_id, cwd}` 落盘到
+config 同目录 `sessions.json`；话题回复到达而无活跃 agent 时，daemon 用 ACP
+`load_session` 惰性重连（`AcpAgent(resume_session_id=...)`，load 期间抑制历史重放，
+避免旧对话灌进新卡片）；`/stop` 删记录，agent 未配置/加载失败则明确提示重开（不再
+静默忽略）。已用 opencode 实测跨进程恢复通过。
+
+**（历史）问题背景**：重启后所有 agent 会话曾会丢失。两个原因叠加：
 1. `_Daemon._sessions` 是纯内存 dict（`daemon.py`），零持久化 —— 重启即忘记
    thread→session 的全部映射。
 2. `AcpAgent.start()` 永远 `new_session`，从不 `load_session`；且 agent 子进程
@@ -162,3 +168,18 @@ ACP SDK 也暴露了 `load_session(cwd, session_id)`（`connection.py`）/ `list
 
 **范围外**：重启时正好在途的那一轮（未跑完的 prompt + 排队指令）无法可靠恢复；
 只恢复会话上下文，不恢复在途 turn。
+
+### 无需 @ 机器人即可触发（自动触发）
+
+**目标**：群里发消息不用 @ 机器人就触发流程。
+
+**现状**：飞书群里机器人**默认只收到 @ 它的消息**；要收全部消息需授予
+`im:message.group_msg:readonly` 权限（setup.md 已要求）。代码侧 `_parse_event_message`
+已剥离 `@_user_N` 前缀、并不强制 @。**所以授予该权限后，「不用 @ 自动触发」基本已成立**
+（尤其话题内回复无需 @）。
+
+**待办**：
+- 确认并文档化：授予 `group_msg:readonly` 后，root `/run` 与话题回复均无需 @ 即被处理。
+- 噪音取舍：控制台群若只有「你 + bot」，自动处理所有消息没问题；但当前**非命令的
+  root 消息会回「用法…」**，若群里有闲聊会打扰。可考虑：非命令 root 消息静默（不回用法），
+  或用法提示仅在明确请求（如 `/help`）时给。

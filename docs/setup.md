@@ -80,14 +80,17 @@ uv run feishu-dispatcher start        # 前台运行；-v 出调试日志
 | `/run <项目名> <任务描述>` | 启动 agent，在该消息下建话题，流式输出回话题 |
 | 话题内直接回复 | 追加指令（排队串行执行，同一 session 保留上下文） |
 | 话题内发 `/stop` | 结束该 agent |
-| `/agents` | 列出活跃 agent 与排队数 |
+| `/agents` | 列出活跃 + 可恢复的 agent |
+
+**重启恢复**：daemon 重启后（崩溃/升级/重开机），在旧 agent 话题里直接回复即可——daemon 会自动 `load_session` 恢复该会话的上下文继续对话；`sessions.json` 记录随之维护。若会话已在 agent 侧过期或 agent 已从配置移除，会明确提示你 `/run` 重开（不再石沉大海）。
 
 ## 7. 已知约束
 
 - **群内限频 5 QPS**（群里全部机器人共享，全应用 50/s）：单 agent 的 500ms 节流窗口 ≈ 2 msg/s 没问题；多 agent 并发共享此额度，`max_agents` 默认 3 是配套上限。撞限流时 HTTP 层会自动退避重试（尊重 Retry-After）。
 - **文本消息上限 150KB**：节流器单批 4000 字符，远低于上限。
 - **消息重推**：飞书对 ACK 异常/超时的事件会重推，daemon 已按 `message_id` 幂等去重。
-- **ACP 冒烟**（不经过飞书，单测 daemon↔Copilot 链路）：`uv run python scripts/smoke_acp.py`。
+- **在途 turn 不恢复**：重启时正好在跑的那一轮（未完成的 prompt + 排队指令）无法恢复，只恢复会话上下文——重启后重发那条指令即可。
+- **ACP 冒烟**：`uv run python scripts/smoke_acp.py`（copilot）/ `scripts/smoke_opencode.py`（opencode）；`scripts/smoke_resume.py` 验证 load_session 跨进程恢复。
 
 ## 8. 后续可选优化（来自调研，未实现）
 
