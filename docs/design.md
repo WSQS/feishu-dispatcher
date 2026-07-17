@@ -134,3 +134,31 @@ agent 输出实时回到飞书话题 →
 - ACP Python SDK 的 async transport 在 Windows 上的兼容性（原型验证）
 - 飞书消息卡片是否用于 agent 状态展示（当前方案是全量文本转发）
 - 多 agent 并发时飞书通知的噪音问题（原型后评估）
+
+## 待办 / 已知限制（post-P0）
+
+### 会话无法跨 daemon 重启恢复
+
+**现状（2026-07-17 确认）**：daemon 重启后所有 agent 会话丢失。两个原因叠加：
+1. `_Daemon._sessions` 是纯内存 dict（`daemon.py`），零持久化 —— 重启即忘记
+   thread→session 的全部映射。
+2. `AcpAgent.start()` 永远 `new_session`，从不 `load_session`；且 agent 子进程
+   随 daemon 退出被回收。
+
+用户侧症状：老话题变孤儿，回复被 `_forward_to_agent` 静默忽略（无任何提示）。
+
+**恢复是可做的（零件已具备）**：底层 agent 自己把会话存了盘（opencode 有
+`opencode.db` + `session list/resume`；copilot/opencode 均通告 `load_session=True`），
+ACP SDK 也暴露了 `load_session(cwd, session_id)`（`connection.py`）/ `list_sessions` /
+`resume_session`。
+
+**补上大致需要**：
+1. 建会话时把 `thread_root_id → {project, agent, session_id}` 落盘（JSON/sqlite），
+   `/stop` 时删。`session_id` 是 agent 专属，映射必须记住是哪个 agent。
+2. 启动读回映射；**惰性重连** —— 已知但未激活的话题来新回复时，重 spawn 对应
+   agent 并 `load_session` 接回（而非 `new_session`），再把回复入队。
+3. `load_session` 失败（agent 侧会话已过期/不存在）→ 明确提示「会话已失效，请
+   `/run` 重开」，并修掉那个静默忽略。
+
+**范围外**：重启时正好在途的那一轮（未跑完的 prompt + 排队指令）无法可靠恢复；
+只恢复会话上下文，不恢复在途 turn。
