@@ -30,7 +30,9 @@ def main() -> None:
     )
 
     if args.command == "start":
+        import asyncio
+
         from feishu_dispatcher.config import Config
         from feishu_dispatcher.daemon import run
 
-        run(Config.load(args.config))
+        asyncio.run(run(Config.load(args.config)))
