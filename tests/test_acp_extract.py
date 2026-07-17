@@ -50,3 +50,28 @@ def test_tool_call_in_progress_emits_nothing():
 def test_agent_message_chunk_empty_text():
     update = update_agent_message_text("")
     assert _extract_text(update) == ""
+
+
+def test_plan_update_renders_entries_with_status_marks():
+    from acp.schema import AgentPlanUpdate, PlanEntry
+
+    update = AgentPlanUpdate(
+        session_update="plan",
+        entries=[
+            PlanEntry(content="read files", priority="medium", status="completed"),
+            PlanEntry(content="write code", priority="high", status="in_progress"),
+            PlanEntry(content="run tests", priority="high", status="pending"),
+        ],
+    )
+    out = _extract_text(update)
+    assert "📋" in out
+    assert "☑️ read files" in out
+    assert "🔄 write code" in out
+    assert "⬜ run tests" in out
+
+
+def test_plan_update_with_no_entries_emits_nothing():
+    from acp.schema import AgentPlanUpdate
+
+    update = AgentPlanUpdate(session_update="plan", entries=[])
+    assert _extract_text(update) == ""

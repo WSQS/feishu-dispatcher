@@ -44,10 +44,39 @@ def test_missing_file_raises(tmp_path: Path):
         Config.load(tmp_path / "nope.toml")
 
 
-def test_minimal_config(tmp_path: Path):
+def test_empty_chat_id_raises(tmp_path: Path):
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text('app_id = "a"\napp_secret = "b"\n', encoding="utf-8")
-    cfg = Config.load(cfg_file)
+    with pytest.raises(ValueError, match="discover"):
+        Config.load(cfg_file)
+
+
+def test_empty_chat_id_allowed_in_discover_mode(tmp_path: Path):
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text('app_id = "a"\napp_secret = "b"\n', encoding="utf-8")
+    cfg = Config.load(cfg_file, allow_empty_chat_id=True)
     assert cfg.chat_id == ""
+
+
+def test_sender_whitelist_and_max_agents_parsed(tmp_path: Path):
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        'app_id = "a"\napp_secret = "b"\nchat_id = "oc_1"\n'
+        'sender_whitelist = ["ou_a", "ou_b"]\nmax_agents = 5\n',
+        encoding="utf-8",
+    )
+    cfg = Config.load(cfg_file)
+    assert cfg.sender_whitelist == ["ou_a", "ou_b"]
+    assert cfg.max_agents == 5
+
+
+def test_minimal_config(tmp_path: Path):
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        'app_id = "a"\napp_secret = "b"\nchat_id = "oc_1"\n', encoding="utf-8"
+    )
+    cfg = Config.load(cfg_file)
+    assert cfg.sender_whitelist == []
+    assert cfg.max_agents == 3
     assert cfg.projects == {}
     assert cfg.throttle_window == 0.5

@@ -9,9 +9,10 @@
 
 本 shim 在 import lark_oapi 之前，把 ``lark_oapi`` 和 ``lark_oapi.api``
 两个包对象换成「空壳」（只设 ``__path__``，不执行它们的 ``__init__``），
-从而跳过那 57 个 namespace 的 eager import。我们只按需真正 import
-``lark_oapi.api.im.v1``（IM 消息模型）和 ``lark_oapi.ws.pb.pbbp2_pb2``
-（WebSocket frame protobuf）——这两个路径在单 namespace 加载时不会崩。
+从而跳过那 57 个 namespace 的 eager import。实际只会加载
+``lark_oapi.ws.pb``（WebSocket frame protobuf）与 ``lark_oapi.ws.const``
+——事件 JSON 由 :mod:`feishu_dispatcher.feishu` 手写 dict 解析，
+不依赖任何 lark API model。
 
 调用约定：任何要 ``import lark_oapi`` 的模块，必须在最顶部先 ``import
 feishu_dispatcher._lark_compat``（顺序敏感）。重复 import 无副作用。

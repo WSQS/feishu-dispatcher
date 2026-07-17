@@ -30,9 +30,13 @@ class Config:
     agents: dict[str, list[str]] = field(default_factory=dict)
     projects: dict[str, Project] = field(default_factory=dict)
     throttle_window: float = 0.5
+    #: 发送者 open_id 白名单；空 = 不限制（R10）
+    sender_whitelist: list[str] = field(default_factory=list)
+    #: 活跃 agent 并发上限（R11）
+    max_agents: int = 3
 
     @staticmethod
-    def load(path: Path | None = None) -> Config:
+    def load(path: Path | None = None, *, allow_empty_chat_id: bool = False) -> Config:
         cfg_path = path or DEFAULT_CONFIG_PATH
         if not cfg_path.exists():
             raise FileNotFoundError(
@@ -47,11 +51,20 @@ class Config:
             )
             for p in data.get("projects", [])
         }
+        chat_id = data.get("chat_id", "")
+        # R10：chat_id 必填（空则拒绝启动）；只有 discover 模式允许空
+        if not chat_id and not allow_empty_chat_id:
+            raise ValueError(
+                "配置 chat_id 不能为空。用 `feishu-dispatcher start --discover` "
+                "可在日志里看到收到消息的 chat_id 来发现群 id。"
+            )
         return Config(
             app_id=data["app_id"],
             app_secret=data["app_secret"],
-            chat_id=data.get("chat_id", ""),
+            chat_id=chat_id,
             agents={name: list(argv) for name, argv in data.get("agents", {}).items()},
             projects=projects,
             throttle_window=float(data.get("throttle_window", 0.5)),
+            sender_whitelist=list(data.get("sender_whitelist", [])),
+            max_agents=int(data.get("max_agents", 3)),
         )

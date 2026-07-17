@@ -5,17 +5,26 @@
 app_id = "cli_xxxxxxxxxxxx"
 app_secret = "xxxxxxxxxxxx"
 
-# 控制台话题群的 chat_id。留空则 daemon 接受所有群消息，
-# 并在日志里打印收到消息的 chat_id（首次配置时用它来发现群 id）。
+# 控制台话题群的 chat_id。必填（空则 daemon 拒绝启动）。
+# 用 `feishu-dispatcher start --discover` 可在日志里看到收到消息的 chat_id
+# 来发现群 id。
 chat_id = ""
+
+# 发送者 open_id 白名单。留空 = 不限制（机器人所在群任何人可发命令）；
+# 非空时只有名单内的发送者能触发命令。
+# sender_whitelist = ["ou_your_open_id"]
+
+# 活跃 agent 并发上限（防止 /run 进程炸弹）。
+max_agents = 3
 
 # agent 输出合并窗口（秒）
 throttle_window = 0.5
 
-# 用法：在话题群里发根消息
+# 用法：在群里发根消息
 #   /run <项目名> <任务描述>    派发任务给 agent（在根消息下建话题）
 #   /agents                     列出活跃 agent
-#   在 agent 话题内直接回复即可与 agent 对话
+#   在 agent 话题内直接回复 = 追加指令（排队串行执行，session 保留上下文）
+#   在 agent 话题内发 /stop     = 结束该 agent
 
 [agents]
 # agent 名 -> ACP 启动命令（argv 数组）

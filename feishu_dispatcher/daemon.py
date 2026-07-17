@@ -2,59 +2,76 @@
 
 P0 原型范围（设计文档）：
 - 硬编码项目匹配（不做 LLM 规划）
-- 单 agent（不做并发/worktree）
-- 根消息触发 spawn，话题回复转发给 agent
+- 根消息 `/run` 触发 spawn，话题回复排队追加给同一 agent
 
-验证目标（P0）：
-1. ACP 流式输出 → 飞书实时转发链路
-2. 飞书话题双向通信
+生命周期模型（review R2/R3 修复后的设计）：
+- 一个 `/run` = 一个 `_AgentSession`：agent 进程与 ACP session **跨 turn 存活**，
+  上下文保留在 session 里
+- 每个 session 一个 prompt 队列 + 单消费者 worker task，turn 串行执行
+- 话题回复只入队；`/stop`（入队 None 哨兵）、执行出错或 daemon 退出才关闭 agent
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+from collections import OrderedDict
 from dataclasses import dataclass, field
 
-from .acp_client import AcpAgent, AgentSpawn
+from .acp_client import AcpAgent, AgentSpawn, OnOutput
 from .config import Config
 from .feishu import FeishuBridge, IncomingMessage
 from .throttler import StreamThrottler
 
 logger = logging.getLogger(__name__)
 
-#: 触发任务的命令前缀（P0：简单匹配，不做 LLM 规划）
 _DISPATCH_PREFIX = "/run "
-_REPLY_PREFIX = "/say "
-_LIST_PREFIX = "/agents"
+_LIST_CMD = "/agents"
+_STOP_CMD = "/stop"
+
+#: message_id 去重窗口大小（飞书 ACK 异常时服务端会重推事件）
+_DEDUP_CAPACITY = 512
+
+_USAGE = (
+    "用法：\n"
+    "• `/run <项目名> <任务描述>`  派发任务给 agent\n"
+    "• `/agents`  列出活跃 agent\n"
+    "• 在 agent 话题内直接回复 = 追加指令（排队串行执行）\n"
+    "• 在 agent 话题内发 `/stop` = 结束该 agent"
+)
+
+
+async def run(cfg: Config, *, discover: bool = False) -> None:
+    """启动 daemon：飞书 WS 长连接 + agent 调度。阻塞直到收到退出信号。
+
+    ``discover=True`` 时只打印收到消息的 chat_id，不执行任何命令
+    （帮助用户发现群 id 后填进配置）。
+    """
+    daemon = _Daemon(cfg, discover=discover)
+    await daemon.run()
 
 
 @dataclass
-class _AgentTask:
+class _AgentSession:
     """一个活跃 agent 的运行时状态。"""
 
     thread_root_id: str
     project_name: str
     agent: AcpAgent
     throttler: StreamThrottler
-    #: 后台 prompt 任务，用于 cancel
-    task: asyncio.Task[None] | None = None
-
-
-async def run(cfg: Config) -> None:
-    """启动 daemon：飞书 WS 长连接 + agent 调度。
-
-    阻塞调用，直到收到 Ctrl-C。
-    """
-    daemon = _Daemon(cfg)
-    await daemon.run()
+    #: prompt 队列；None 是关闭哨兵（/stop）
+    queue: asyncio.Queue[str | None] = field(default_factory=asyncio.Queue)
+    #: 单消费者 worker，持有 agent 完整生命周期
+    worker: asyncio.Task[None] | None = None
 
 
 @dataclass
 class _Daemon:
     cfg: Config
+    discover: bool = False
     _bridge: FeishuBridge | None = None
-    _agents_by_thread: dict[str, _AgentTask] = field(default_factory=dict)
+    _sessions: dict[str, _AgentSession] = field(default_factory=dict)
+    _seen_message_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -67,58 +84,91 @@ class _Daemon:
         )
         self._bridge.start_background()
         logger.info("feishu-dispatcher daemon 已启动，等待飞书消息…")
-        # 主 loop 只需保活；WS 在后台线程，agent task 按需创建
         try:
-            await asyncio.Event().wait()
+            # R13：看门狗——每 30s 醒一次检查 WS 线程是否存活；
+            # 死了则 error 日志 + bridge.restart() 重启（重启前确认未在退出）
+            while True:
+                try:
+                    await asyncio.wait_for(asyncio.Event().wait(), timeout=30.0)
+                except asyncio.TimeoutError:
+                    pass  # 正常：每 30s 醒来检查一次
+                if not self._bridge.is_alive():
+                    logger.error("飞书 WS 线程已死亡，尝试重启…")
+                    self._bridge.restart()
         except (KeyboardInterrupt, asyncio.CancelledError):
             logger.info("收到退出信号，清理 agent…")
+        finally:
             await self._shutdown()
 
     # ------------------------------------------------------------------ #
     # 消息分发
     # ------------------------------------------------------------------ #
 
+    def _is_duplicate(self, message_id: str) -> bool:
+        """按 message_id 幂等去重（R5：ACK 异常时飞书会重推同一事件）。"""
+        if not message_id:
+            return False
+        if message_id in self._seen_message_ids:
+            return True
+        self._seen_message_ids[message_id] = None
+        while len(self._seen_message_ids) > _DEDUP_CAPACITY:
+            self._seen_message_ids.popitem(last=False)
+        return False
+
     async def _handle_message(self, msg: IncomingMessage) -> None:
         """所有飞书消息的入口（在主 event loop 上）。"""
-        if self._bridge and self.cfg.chat_id and msg.chat_id != self.cfg.chat_id:
+        if self.cfg.chat_id and msg.chat_id != self.cfg.chat_id:
             logger.debug("忽略非目标群消息 chat_id=%s", msg.chat_id)
             return
-        # 忽略 bot 自己发的消息（sender_id 为空通常是系统消息）
+        # 忽略无发送者的系统消息
         if not msg.sender_id:
+            return
+        if self._is_duplicate(msg.message_id):
+            logger.info("忽略重复消息 message_id=%s", msg.message_id)
             return
         logger.info(
             "收到消息 chat=%s msg=%s thread_root=%s text=%r",
-            msg.chat_id, msg.message_id, msg.thread_root_id, msg.text,
+            msg.chat_id,
+            msg.message_id,
+            msg.thread_root_id,
+            msg.text,
         )
 
+        # R10：discover 模式只打印 chat_id 帮助发现，不执行任何命令
+        if self.discover:
+            logger.info(
+                "[discover] chat_id=%r sender_id=%r — 填入 config.toml 的 chat_id 即可",
+                msg.chat_id,
+                msg.sender_id,
+            )
+            return
+
+        # R10：发送者白名单（非空时校验）
+        if self.cfg.sender_whitelist and msg.sender_id not in self.cfg.sender_whitelist:
+            logger.debug(
+                "忽略非白名单发送者 sender_id=%s (msg=%s)",
+                msg.sender_id,
+                msg.message_id,
+            )
+            return
+
         if msg.thread_root_id:
-            # 话题内回复 → 转发给对应 agent
             await self._forward_to_agent(msg)
             return
 
-        # 根消息 → 命令解析
         text = msg.text.strip()
         if text.startswith(_DISPATCH_PREFIX):
-            await self._spawn_for_root(msg, text[len(_DISPATCH_PREFIX):].strip())
-        elif text == _LIST_PREFIX:
+            await self._spawn_for_root(msg, text[len(_DISPATCH_PREFIX) :].strip())
+        elif text == _LIST_CMD:
             await self._list_agents(msg)
         else:
-            await self._safe_reply(
-                msg.message_id,
-                "用法：\n"
-                "• `/run <项目名> <任务描述>`  派发任务给 agent\n"
-                "• `/agents`  列出活跃 agent\n"
-                "• 在 agent 话题内直接回复即可与 agent 对话",
-            )
+            await self._safe_reply(msg.message_id, _USAGE)
 
     async def _spawn_for_root(self, msg: IncomingMessage, body: str) -> None:
-        """解析 ``/run <project> <task>``，spawn agent 并创建话题。"""
-        assert self._bridge is not None
+        """解析 ``/run <project> <task>``，创建 agent session 并启动 worker。"""
         parts = body.split(maxsplit=1)
         if len(parts) < 2:
-            await self._safe_reply(
-                msg.message_id, "格式：`/run <项目名> <任务描述>`"
-            )
+            await self._safe_reply(msg.message_id, "格式：`/run <项目名> <任务描述>`")
             return
         project_name, task = parts[0].strip(), parts[1].strip()
         project = self.cfg.projects.get(project_name)
@@ -136,88 +186,127 @@ class _Daemon:
             )
             return
 
-        # 创建话题：用根消息 message_id 作为 thread root + 路由 key
         thread_root = msg.message_id
-        await self._safe_reply(
-            thread_root,
-            f"🚀 启动 {project.default_agent} 处理项目 {project_name}…\n任务: {task}",
-        )
+        if thread_root in self._sessions:
+            logger.info("根消息 %s 已有 agent session，忽略重复 spawn", thread_root)
+            return
 
-        async def on_output(text: str) -> None:
-            await throttler.feed(text)
+        # R11：并��上限检查
+        if len(self._sessions) >= self.cfg.max_agents:
+            await self._safe_reply(
+                msg.message_id,
+                f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，"
+                "请先 `/stop` 或等待完成。",
+            )
+            return
 
         throttler = StreamThrottler(
             sink=lambda piece: self._send_piece(thread_root, piece),
             window=self.cfg.throttle_window,
         )
-        spawn = AgentSpawn(
-            command=list(agent_argv),
-            cwd=str(project.path),
-        )
-        agent = AcpAgent(spawn, on_output)
 
-        task_obj = _AgentTask(
+        async def on_output(text: str) -> None:
+            throttler.feed(text)  # feed 是同步方法（R1）
+
+        agent = self._make_agent(
+            AgentSpawn(command=list(agent_argv), cwd=str(project.path)), on_output
+        )
+        sess = _AgentSession(
             thread_root_id=thread_root,
             project_name=project_name,
             agent=agent,
             throttler=throttler,
         )
-        self._agents_by_thread[thread_root] = task_obj
-
-        bg = asyncio.create_task(
-            self._run_agent_turn(task_obj, task), name=f"agent-{thread_root}"
+        sess.queue.put_nowait(task)
+        self._sessions[thread_root] = sess
+        await self._safe_reply(
+            thread_root,
+            f"🚀 启动 {project.default_agent} 处理项目 {project_name}…\n任务: {task}",
         )
-        task_obj.task = bg
+        sess.worker = asyncio.create_task(
+            self._agent_worker(sess), name=f"agent-{thread_root}"
+        )
 
-    async def _run_agent_turn(self, task_obj: _AgentTask, prompt: str) -> None:
-        """启动 agent 进程并发送首条 prompt；结束后收尾。"""
-        thread_root = task_obj.thread_root_id
+    def _make_agent(self, spawn: AgentSpawn, on_output: OnOutput) -> AcpAgent:
+        """构造底层 agent（拆出来是测试注入点）。"""
+        return AcpAgent(spawn, on_output)
+
+    async def _agent_worker(self, sess: _AgentSession) -> None:
+        """一个 agent 的完整生命周期：启动 → 串行消费 prompt 队列 → 关闭。"""
+        root = sess.thread_root_id
         try:
-            await task_obj.agent.start()
+            await sess.agent.start()
         except Exception as exc:
             logger.exception("agent 启动失败")
-            await self._safe_reply(thread_root, f"❌ agent 启动失败: {exc}")
-            await task_obj.throttler.aclose()
-            self._agents_by_thread.pop(thread_root, None)
+            await self._safe_reply(root, f"❌ agent 启动失败: {str(exc)[:200]}")
+            await self._close_session(sess)
             return
+        await self._safe_reply(root, "▶️ agent 已就绪，开始执行…")
         try:
-            await self._safe_reply(thread_root, "▶️ agent 已就绪，开始执行…")
-            await task_obj.agent.prompt(prompt)
-            await task_obj.throttler.flush()
-            await self._safe_reply(thread_root, "✅ 本轮结束（可在话题内继续回复 agent）")
-        except Exception as exc:
-            logger.exception("agent 执行异常")
-            await self._safe_reply(thread_root, f"❌ agent 异常: {exc}")
+            while True:
+                prompt = await sess.queue.get()
+                if prompt is None:
+                    await self._safe_reply(root, "🛑 agent 已停止。")
+                    break
+                try:
+                    await sess.agent.prompt(prompt)
+                    await sess.throttler.flush()
+                    await self._safe_reply(
+                        root, "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）"
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    logger.exception("agent 执行异常")
+                    await self._safe_reply(
+                        root, f"❌ agent 异常，已结束该 agent: {str(exc)[:200]}"
+                    )
+                    break
+        except asyncio.CancelledError:
+            logger.debug("agent worker 被取消 root=%s", root)
         finally:
-            await task_obj.throttler.aclose()
-            await task_obj.agent.aclose()
+            await self._close_session(sess)
+
+    async def _close_session(self, sess: _AgentSession) -> None:
+        """收尾一个 session：出注册表、清空节流器、关 agent 进程。"""
+        self._sessions.pop(sess.thread_root_id, None)
+        try:
+            await sess.throttler.aclose()
+        except Exception:
+            logger.debug("throttler aclose 异常（忽略）", exc_info=True)
+        try:
+            await sess.agent.aclose()
+        except Exception:
+            logger.debug("agent aclose 异常（忽略）", exc_info=True)
 
     async def _forward_to_agent(self, msg: IncomingMessage) -> None:
-        """话题内回复 → 作为新 prompt 转发给 agent。"""
-        task_obj = self._agents_by_thread.get(msg.thread_root_id or "")
-        if task_obj is None:
+        """话题内回复 → 入队给对应 agent（worker 串行消费）。"""
+        sess = self._sessions.get(msg.thread_root_id or "")
+        if sess is None:
             logger.debug("话题 %s 无对应 agent，忽略", msg.thread_root_id)
             return
         text = msg.text.strip()
         if not text:
             return
-        if task_obj.task is None or task_obj.task.done():
+        if sess.worker is None or sess.worker.done():
             await self._safe_reply(
                 msg.thread_root_id or msg.message_id,
-                "⚠️ 该 agent 已结束本轮。发送 `/run ...` 新建任务。",
+                "⚠️ 该 agent 已结束。发送 `/run ...` 新建任务。",
             )
             return
-        # 转发：开新 turn，复用同一 session（保留上下文）
-        asyncio.create_task(
-            self._run_agent_turn(task_obj, text),
-            name=f"agent-followup-{msg.message_id}",
-        )
+        if text == _STOP_CMD:
+            sess.queue.put_nowait(None)
+            return
+        sess.queue.put_nowait(text)
 
     async def _list_agents(self, msg: IncomingMessage) -> None:
-        if not self._agents_by_thread:
+        if not self._sessions:
             await self._safe_reply(msg.message_id, "当前无活跃 agent。")
             return
-        lines = [f"• {t.project_name} (thread {t.thread_root_id})" for t in self._agents_by_thread.values()]
+        lines = [
+            f"• {s.project_name} (thread {s.thread_root_id}, 待执行 {s.queue.qsize()})"
+            for s in self._sessions.values()
+        ]
         await self._safe_reply(msg.message_id, "活跃 agent:\n" + "\n".join(lines))
 
     # ------------------------------------------------------------------ #
@@ -228,6 +317,7 @@ class _Daemon:
         """节流器 sink：把一段文本发到话题。HTTP 是阻塞调用，放线程池。"""
         if not piece:
             return
+        assert self._bridge is not None
         await asyncio.to_thread(self._bridge.reply_in_thread, thread_root, piece)
 
     async def _safe_reply(self, root_message_id: str, text: str) -> None:
@@ -239,11 +329,21 @@ class _Daemon:
             logger.exception("飞书发送失败 root=%s", root_message_id)
 
     async def _shutdown(self) -> None:
-        for task_obj in list(self._agents_by_thread.values()):
-            if task_obj.task and not task_obj.task.done():
-                task_obj.task.cancel()
+        """退出清理：停 WS 线程，取消并等待全部 agent worker 收尾。"""
+        if self._bridge is not None:
+            self._bridge.stop()
+        workers = [
+            s.worker
+            for s in list(self._sessions.values())
+            if s.worker is not None and not s.worker.done()
+        ]
+        for w in workers:
+            w.cancel()
+        for w in workers:
             try:
-                await task_obj.agent.aclose()
-            except Exception:
+                await w
+            except asyncio.CancelledError:
                 pass
-        self._agents_by_thread.clear()
+            except Exception:
+                logger.exception("agent worker 退出异常")
+        self._sessions.clear()

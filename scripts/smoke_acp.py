@@ -3,6 +3,7 @@
 不经过飞书，只验证 daemon ↔ ACP 的核心链路（设计文档 P0 第 1 条）。
 用法：uv run python scripts/smoke_acp.py
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -11,7 +12,9 @@ import sys
 
 from feishu_dispatcher.acp_client import AcpAgent, AgentSpawn
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
 
 
 async def main() -> int:
@@ -39,7 +42,10 @@ async def main() -> int:
         await agent.aclose()
 
     joined = "".join(outputs)
-    print(f"\n=== captured {len(outputs)} chunks, total {len(joined)} chars ===", flush=True)
+    print(
+        f"\n=== captured {len(outputs)} chunks, total {len(joined)} chars ===",
+        flush=True,
+    )
     print(f"=== full output:\n{joined}", flush=True)
     return 0
 
