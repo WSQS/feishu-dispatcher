@@ -118,8 +118,10 @@ agent 输出实时回到飞书话题 →
 
 ### P2 — 体验优化（可跳过）
 
-5. 调度器 LLM 规划（原型阶段硬编码项目匹配）
-6. 项目自注册（原型阶段手动写死项目列表）
+5. 调度器 LLM 规划 —— ✅ **核心已接线**（`scheduler.py` 工具循环 + `llm.py`
+   OpenAI 兼容 client + `daemon._dispatch_nl`；配 `[llm]` 后自然语言即派发，真实
+   deepseek 端点已实测）。缓做：并发判断 + worktree（依赖 P1）、更多工具。
+6. 项目自注册（原型阶段手动写死项目列表；`register_project` 工具尚未加）
 
 ## 依赖
 

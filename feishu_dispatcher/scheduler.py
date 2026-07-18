@@ -127,9 +127,7 @@ async def run_tool_loop(
                 except Exception as exc:  # 喂回 LLM，让它决定怎么办
                     logger.exception("调度器工具 %s 执行失败", tc.name)
                     result = f"工具 {tc.name} 执行出错: {exc}"
-            messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": result}
-            )
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
     return "（调度器思考步数超限，请把需求说得更具体，或用 `/run <项目> <任务>` 直接派发。）"
 
 

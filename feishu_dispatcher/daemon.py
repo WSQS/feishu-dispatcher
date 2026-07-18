@@ -23,6 +23,8 @@ from pathlib import Path
 from .acp_client import AcpAgent, AgentSpawn, OnOutput
 from .config import DEFAULT_CONFIG_PATH, Config
 from .feishu import FeishuBridge, IncomingMessage
+from .llm import build_llm_client
+from .scheduler import LLMClient, build_scheduler_tools, run_tool_loop
 from .store import SessionRecord, SessionStore
 
 logger = logging.getLogger(__name__)
@@ -85,12 +87,16 @@ class _Daemon:
     discover: bool = False
     #: 会话持久化（默认纯内存，不写盘）；run() 会注入文件版
     store: SessionStore = field(default_factory=lambda: SessionStore(None))
+    #: 调度器 LLM（P2）；None = 不启用自然语言派发。run() 按 cfg.llm 构造；测试可注入
+    _llm: LLMClient | None = None
     _bridge: FeishuBridge | None = None
     _sessions: dict[str, _AgentSession] = field(default_factory=dict)
     _seen_message_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
+        if self._llm is None:
+            self._llm = build_llm_client(self.cfg.llm)
         self._bridge = FeishuBridge(
             app_id=self.cfg.app_id,
             app_secret=self.cfg.app_secret,
@@ -99,7 +105,10 @@ class _Daemon:
             chat_whitelist=self.cfg.chat_id,
         )
         self._bridge.start_background()
-        logger.info("feishu-dispatcher daemon 已启动，等待飞书消息…")
+        logger.info(
+            "feishu-dispatcher daemon 已启动（调度器 LLM: %s），等待飞书消息…",
+            "on" if self._llm else "off",
+        )
         try:
             # R13：看门狗——每 30s 醒一次检查 WS 线程是否存活；
             # 死了则 error 日志 + bridge.restart() 重启（重启前确认未在退出）
@@ -177,6 +186,11 @@ class _Daemon:
             await self._spawn_for_root(msg, text[len(_DISPATCH_PREFIX) :].strip())
         elif text == _LIST_CMD:
             await self._list_agents(msg)
+        elif text in ("/help", "/?", "/usage"):
+            await self._safe_reply(msg.message_id, _USAGE)
+        elif self._llm is not None and text and not text.startswith("/"):
+            # P2：自然语言交给调度器 LLM 理解并派发（未配置 LLM 则回退到用法）
+            await self._dispatch_nl(msg, text)
         else:
             await self._safe_reply(msg.message_id, _USAGE)
 
@@ -481,6 +495,73 @@ class _Daemon:
         await self._safe_reply(
             msg.message_id, "\n\n".join(parts) if parts else "当前无活跃 agent。"
         )
+
+    # ------------------------------------------------------------------ #
+    # P2：调度器 LLM（自然语言派发）
+    # ------------------------------------------------------------------ #
+
+    async def _dispatch_nl(self, msg: IncomingMessage, text: str) -> None:
+        """自然语言 → 调度器 LLM 理解并调用工具派发（P2）。"""
+        assert self._llm is not None
+        tools = build_scheduler_tools(
+            list_projects=self._sched_list_projects,
+            spawn_agent=self._sched_spawn_agent,
+            list_agents=self._sched_list_agents,
+        )
+        try:
+            reply = await run_tool_loop(self._llm, text, tools)
+        except Exception as exc:
+            logger.exception("调度器 LLM 失败")
+            reply = (
+                f"调度器出错：{str(exc)[:200]}。可用 `/run <项目> <任务>` 直接派发。"
+            )
+        await self._safe_reply(msg.message_id, reply or "（调度器无输出）")
+
+    def _sched_list_projects(self) -> list[dict]:
+        return [
+            {"name": p.name, "default_agent": p.default_agent}
+            for p in self.cfg.projects.values()
+        ]
+
+    def _sched_list_agents(self) -> list[dict]:
+        active = [
+            {"project": s.project_name, "agent": s.agent_label, "state": "active"}
+            for s in self._sessions.values()
+        ]
+        dormant = [
+            {"project": r.project_name, "agent": r.agent_label, "state": "dormant"}
+            for tid, r in self.store.all().items()
+            if tid not in self._sessions
+        ]
+        return active + dormant
+
+    async def _sched_spawn_agent(self, project_name: str, task: str) -> str:
+        """spawn_agent 工具实现：新建话题 + 启动 agent，返回给 LLM 的状态串。"""
+        project = self.cfg.projects.get(project_name)
+        if project is None:
+            known = ", ".join(self.cfg.projects) or "(无)"
+            return f"未知项目 '{project_name}'。已注册项目: {known}"
+        agent_argv = self.cfg.agents.get(project.default_agent)
+        if not agent_argv:
+            return f"项目 '{project_name}' 的 agent '{project.default_agent}' 未配置。"
+        if len(self._sessions) >= self.cfg.max_agents:
+            return f"已达并发上限 {self.cfg.max_agents}，请先 `/stop` 一个再派发。"
+        assert self._bridge is not None
+        # 每个派发新建一个话题根消息，agent 输出流进该话题
+        root = await asyncio.to_thread(
+            self._bridge.send_root_message,
+            self.cfg.chat_id,
+            f"🚀 {project.default_agent} · {project_name}\n任务: {task}",
+        )
+        self._launch(
+            thread_root=root,
+            project_name=project_name,
+            agent_label=project.default_agent,
+            cwd=str(project.path),
+            agent_argv=agent_argv,
+            first_prompt=task,
+        )
+        return f"已在项目 {project_name} 启动 {project.default_agent} 处理：{task}"
 
     # ------------------------------------------------------------------ #
     # 发送辅助

@@ -357,6 +357,10 @@ class FeishuBridge:
     def _parse_event_message(event: dict) -> IncomingMessage | None:
         msg = event.get("message") or {}
         sender = event.get("sender") or {}
+        # 忽略机器人自己发的消息：daemon 会 send_root_message 建话题根，若该消息被
+        # 回投会触发 LLM 派发 → 死循环。多数 scope 本就不下发 bot 消息，此处防御性拦截。
+        if sender.get("sender_type") == "bot":
+            return None
         if msg.get("message_type") != _TEXT_MSG_TYPE:
             return None
         chat_type = msg.get("chat_type", "")

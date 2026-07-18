@@ -31,6 +31,15 @@ throttle_window = 0.5
 # 流式输出模式：card=原地更新卡片（默认），text=每批发新消息（兜底）
 # stream_mode = "card"
 
+# 调度器 LLM（P2）：配了才启用「自然语言派发」——群里直接说需求，LLM 识别项目并
+# 派 agent，不用打 /run。任何 OpenAI 兼容端点（deepseek / GLM回归 / openai 等）。
+# 可直接照抄 opencode 的 provider 配置（~/.config/opencode/opencode.json）。
+# 不配则自然语言消息回退到「用法」提示，/run 等命令照常可用。
+# [llm]
+# base_url = "https://ai.jiachengyun.com/v1"
+# api_key = "sk-..."
+# model = "deepseek-v4-pro"
+
 # 用法：在群里发根消息
 #   /run <项目名> <任务描述>    派发任务给 agent（在根消息下建话题）
 #   /agents                     列出活跃 agent

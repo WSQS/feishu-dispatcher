@@ -102,7 +102,10 @@ async def test_max_iters_cap():
         return "ok"
 
     llm = FakeLLM(
-        [LLMResponse(tool_calls=[ToolCall(str(i), "list_projects", {})]) for i in range(10)]
+        [
+            LLMResponse(tool_calls=[ToolCall(str(i), "list_projects", {})])
+            for i in range(10)
+        ]
     )
     out = await run_tool_loop(llm, "x", _tools(spawn=noop), max_iters=3)
     assert "步数超限" in out

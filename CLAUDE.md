@@ -20,7 +20,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **输出转发**：`stream_mode` 二选一（config，默认 `card`）。`card`（`livecard.py`）——每回合一张 interactive 卡片,随输出 PATCH 原地更新(5 QPS/条、无编辑次数上限)，顶部状态灯(🔄/✅/❌/🛑)，body 超 25KB 滚动到新卡片；`text`（`throttler.py`）——每 ~500ms 批次发一条新文本消息(兜底)。两模式经 `_AgentSession.current_channel` 间接层做到每回合独立、对 worker 透明。状态类消息(🚀/▶️/✅/❌)始终走纯文本。
 - **权限**：`request_permission` 自动放行——必须返回 `AllowedOutcome(outcome="selected", option_id=...)` 结构（从 options 挑 allow_once/allow_always），裸字符串过不了 pydantic 校验。fs/terminal 能力未通告也未实现。
 - **环境变量**：agent 子进程只拿 SDK 白名单（PATH/APPDATA/USERPROFILE 等 12 个）+ `AgentSpawn.env` 显式追加项，**不再透传完整 os.environ**。要给 agent 传 token 就写进 `AgentSpawn.env` / 配置。
-- **调度器 LLM 边界**（P2）：轻量 router，只做理解/拆解/分派/状态查询/并发判断，不碰代码。
+- **调度器 LLM（P2，核心已接线，opt-in）**：配了 `[llm]`（OpenAI 兼容端点 base_url/api_key/model）才启用——群里非 `/命令` 的自然语言 root 消息交给 `scheduler.py` 的工具循环，LLM 调 `list_projects`/`spawn_agent`/`list_agents` 派发（`daemon._dispatch_nl`）。未配则回退到「用法」。`spawn_agent` 用 `send_root_message` 每次新建话题。轻量 router 边界：只理解/识别项目/派发/查状态，**不碰代码**。真实端点已实测（deepseek）。`llm.py` = OpenAI 兼容 client（httpx）；`scheduler.py` = provider 无关引擎。
 - **并发隔离**（P1）：仅并发时创建 git worktree + 临时分支（`agent/<project>-<task-id>`）。
 
 ## 开发命令

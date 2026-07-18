@@ -8,6 +8,7 @@ from pathlib import Path
 from feishu_dispatcher.config import Config, Project
 from feishu_dispatcher.daemon import _Daemon
 from feishu_dispatcher.feishu import IncomingMessage
+from feishu_dispatcher.scheduler import LLMResponse, ToolCall
 from feishu_dispatcher.store import SessionRecord, SessionStore
 
 
@@ -21,9 +22,15 @@ class FakeBridge:
         self.reply_card_errors: int = 0
         self.patch_card_errors: int = 0
 
+        self.roots: list[tuple[str, str]] = []
+
     def reply_in_thread(self, root_message_id: str, text: str) -> str:
         self.replies.append((root_message_id, text))
         return f"om_reply_{len(self.replies)}"
+
+    def send_root_message(self, chat_id: str, text: str) -> str:
+        self.roots.append((chat_id, text))
+        return f"om_newroot_{len(self.roots)}"
 
     def reply_card(self, root_message_id: str, card: dict) -> str:
         if self.reply_card_errors > 0:
@@ -529,3 +536,63 @@ async def test_max_agents_cap_atomic_under_concurrent_run():
     rejected = bridge.texts("om_a") + bridge.texts("om_b")
     assert any("上限" in t for t in rejected)
     await daemon._shutdown()
+
+
+# ---------------------------------------------------------------------- #
+# P2：调度器 LLM 自然语言派发
+# ---------------------------------------------------------------------- #
+
+
+class ScriptedLLM:
+    def __init__(self, script: list[LLMResponse]) -> None:
+        self.script = list(script)
+
+    async def chat(self, messages, tools) -> LLMResponse:
+        return self.script.pop(0)
+
+
+async def test_nl_dispatch_spawns_agent_via_llm():
+    daemon, bridge, created = make_daemon()
+    daemon._llm = ScriptedLLM(
+        [
+            LLMResponse(tool_calls=[ToolCall("1", "list_projects", {})]),
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        "2", "spawn_agent", {"project": "demo", "task": "加 dark mode"}
+                    )
+                ]
+            ),
+            LLMResponse(content="已给 demo 派发：加 dark mode"),
+        ]
+    )
+    await daemon._handle_message(root_msg("帮 demo 加个 dark mode", mid="om_nl"))
+    await wait_until(lambda: created and created[0].prompts == ["加 dark mode"])
+    assert bridge.roots  # 新建了话题根消息
+    assert any("已给 demo 派发" in t for t in bridge.texts("om_nl"))  # LLM 回复回给用户
+    await daemon._shutdown()
+
+
+async def test_nl_dispatch_unknown_project_reported_to_llm():
+    daemon, bridge, created = make_daemon()
+    # LLM 先试图派给不存在的项目，工具返回错误 → LLM 收尾说明
+    daemon._llm = ScriptedLLM(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall("1", "spawn_agent", {"project": "ghost", "task": "x"})
+                ]
+            ),
+            LLMResponse(content="没找到项目 ghost。"),
+        ]
+    )
+    await daemon._handle_message(root_msg("给 ghost 做点事", mid="om_g"))
+    assert created == []  # 未 spawn
+    assert any("没找到项目" in t for t in bridge.texts("om_g"))
+
+
+async def test_nl_without_llm_falls_back_to_usage():
+    daemon, bridge, created = make_daemon()  # _llm is None
+    await daemon._handle_message(root_msg("帮我做点什么", mid="om_x"))
+    assert created == []
+    assert any("用法" in t for t in bridge.texts("om_x"))

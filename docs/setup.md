@@ -84,6 +84,19 @@ uv run feishu-dispatcher start        # 前台运行；-v 出调试日志
 
 **重启恢复**：daemon 重启后（崩溃/升级/重开机），在旧 agent 话题里直接回复即可——daemon 会自动 `load_session` 恢复该会话的上下文继续对话；`sessions.json` 记录随之维护。若会话已在 agent 侧过期或 agent 已从配置移除，会明确提示你 `/run` 重开（不再石沉大海）。
 
+## 6.5 自然语言派发（可选，P2）
+
+配了 `[llm]` 后，群里**不用 `/run`、直接用自然语言说需求**，调度器 LLM 会识别项目并派 agent（如「帮 feishu-dispatcher 加个深色模式」）。任何 OpenAI 兼容端点均可，可直接照抄 `~/.config/opencode/opencode.json` 里的 provider 配置：
+
+```toml
+[llm]
+base_url = "https://ai.jiachengyun.com/v1"
+api_key = "sk-..."
+model = "deepseek-v4-pro"
+```
+
+不配则自然语言消息回退到「用法」提示，`/run`/`/agents`/`/stop` 照常。冒烟：`uv run python scripts/smoke_llm.py "你的需求"`。
+
 ## 7. 已知约束
 
 - **群内限频 5 QPS**（群里全部机器人共享，全应用 50/s）：单 agent 的 500ms 节流窗口 ≈ 2 msg/s 没问题；多 agent 并发共享此额度，`max_agents` 默认 3 是配套上限。撞限流时 HTTP 层会自动退避重试（尊重 Retry-After）。
