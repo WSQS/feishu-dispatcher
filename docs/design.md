@@ -196,3 +196,28 @@ ACP SDK 也暴露了 `load_session(cwd, session_id)`（`connection.py`）/ `list
 - **拒绝文案误导** → 「请先 `/stop` 或等待完成」改为「请先 `/stop` 一个」。
 - **上限检查 TOCTOU 竞态** → 检查与 `_launch` 登记之间原有 `await`（发「🚀」提示），
   并发两条 `/run` 可都通过检查再各自登记、突破上限。改为**先原子地检查+登记、再发提示**。
+
+### CLI ↔ ACP 会话交接（下一步方向）
+
+**探索问题**：一个 coding agent session 能否被 CLI 和 ACP 客户端**同时**控制？
+
+**实测结论（2026-07-18）**：分两种情形。
+- **真·同时（两端都活着、并发发指令）——不行**。我们用 ACP over stdio，每个
+  `opencode acp` / `copilot --acp` 是独占子进程 + 私有 stdin/stdout 管道，CLI 接不进去；
+  ACP 本质 1 client ↔ 1 agent。硬让两个进程开同一 session 会并发读写 opencode.db 冲突。
+  （opencode 的 `serve` + 多客户端 attach 理论上可多客户端连一 session，但那是 opencode
+  私有 HTTP API、非 ACP，用它要放弃 agent 无关性 + copilot，且并发回合语义含糊，不推荐。）
+- **交接（谁都能接手、一次一个）——可以，已验证**。ACP 建的 opencode session 与 CLI
+  **共用同一 opencode.db + id 空间**：实测用 ACP 建 session 植入「5566」、关闭，再用
+  `opencode run -s <同一 session_id>` 从 CLI 问，答「5566」。所以：飞书(daemon/ACP)跑着 →
+  跳终端 `opencode run -s <id>` 接着干 → 交回 daemon（`load_session` 恢复）。与「空闲挂起」
+  天作之合（挂起即释放会话，CLI 正好安全接手）。
+
+**下一步要做的产品化**：一对命令把「一次一个、安全交接」做顺滑，避免手动记 id + 撞车。
+- `/handoff`：daemon 挂起该 agent + 打印 `opencode run -s <id>` 供粘贴到终端；给会话上
+  **交接锁**，期间 daemon 不自动 `load_session` 恢复。
+- `/resume`（或解锁后回复）：解锁，daemon 重新接回。
+
+**注意点**：① 即便交接也**必须一次只有一端活着**（daemon 进程或 CLI 进程），否则撞同一
+会话——故需交接锁，防止用户在 CLI 操作时飞书回复触发 daemon 恢复。② 目前只对 opencode
+验证（CLI `-s <id>` 续会话）；copilot CLI 能否从命令行按 id 续 ACP 建的会话尚未验证。
