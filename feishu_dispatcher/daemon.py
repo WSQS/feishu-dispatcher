@@ -187,30 +187,30 @@ class _Daemon:
         elif text == _LIST_CMD:
             await self._list_agents(msg)
         elif text in ("/help", "/?", "/usage"):
-            await self._safe_reply(msg.message_id, _USAGE)
+            await self._reply_user(msg.message_id, _USAGE)
         elif self._llm is not None and text and not text.startswith("/"):
             # P2：自然语言交给调度器 LLM 理解并派发（未配置 LLM 则回退到用法）
             await self._dispatch_nl(msg, text)
         else:
-            await self._safe_reply(msg.message_id, _USAGE)
+            await self._reply_user(msg.message_id, _USAGE)
 
     async def _spawn_for_root(self, msg: IncomingMessage, body: str) -> None:
         """解析 ``/run <project> <task>``，创建 agent session 并启动 worker。"""
         parts = body.split(maxsplit=1)
         if len(parts) < 2:
-            await self._safe_reply(msg.message_id, "格式：`/run <项目名> <任务描述>`")
+            await self._reply_user(msg.message_id, "格式：`/run <项目名> <任务描述>`")
             return
         project_name, task = parts[0].strip(), parts[1].strip()
         project = self.cfg.projects.get(project_name)
         if project is None:
             known = ", ".join(self.cfg.projects) or "(无)"
-            await self._safe_reply(
+            await self._reply_user(
                 msg.message_id, f"未知项目 '{project_name}'。已知项目: {known}"
             )
             return
         agent_argv = self.cfg.agents.get(project.default_agent)
         if not agent_argv:
-            await self._safe_reply(
+            await self._reply_user(
                 msg.message_id,
                 f"项目 '{project_name}' 的 agent '{project.default_agent}' 未配置",
             )
@@ -225,7 +225,7 @@ class _Daemon:
         # 并发 /run 会都通过检查再各自登记，突破上限（TOCTOU）。故先原子地
         # 检查+登记，再发「🚀」提示。
         if len(self._sessions) >= self.cfg.max_agents:
-            await self._safe_reply(
+            await self._reply_user(
                 msg.message_id,
                 f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，请先 `/stop` 一个。",
             )
@@ -492,7 +492,7 @@ class _Daemon:
                 f"可恢复会话 {len(dormant)} 个（回复对应话题即自动恢复）："
                 + "、".join(f"{r.project_name}" for r in dormant)
             )
-        await self._safe_reply(
+        await self._reply_user(
             msg.message_id, "\n\n".join(parts) if parts else "当前无活跃 agent。"
         )
 
@@ -515,7 +515,7 @@ class _Daemon:
             reply = (
                 f"调度器出错：{str(exc)[:200]}。可用 `/run <项目> <任务>` 直接派发。"
             )
-        await self._safe_reply(msg.message_id, reply or "（调度器无输出）")
+        await self._reply_user(msg.message_id, reply or "（调度器无输出）")
 
     def _sched_list_projects(self) -> list[dict]:
         return [
@@ -574,13 +574,24 @@ class _Daemon:
         assert self._bridge is not None
         await asyncio.to_thread(self._bridge.reply_in_thread, thread_root, piece)
 
-    async def _safe_reply(self, root_message_id: str, text: str) -> None:
-        """发消息但吞掉异常（只记录日志），避免一条失败拖垮 daemon。"""
+    async def _safe_reply(
+        self, message_id: str, text: str, *, in_thread: bool = True
+    ) -> None:
+        """发消息但吞掉异常（只记录日志），避免一条失败拖垮 daemon。
+
+        ``in_thread=True``（默认）用于 agent 话题内的输出/状态；``in_thread=False``
+        用于对用户对话/命令的普通回复——**不创建话题**（只有派发 agent 才建话题）。
+        """
         assert self._bridge is not None
+        fn = self._bridge.reply_in_thread if in_thread else self._bridge.reply
         try:
-            await asyncio.to_thread(self._bridge.reply_in_thread, root_message_id, text)
+            await asyncio.to_thread(fn, message_id, text)
         except Exception:
-            logger.exception("飞书发送失败 root=%s", root_message_id)
+            logger.exception("飞书发送失败 msg=%s", message_id)
+
+    async def _reply_user(self, message_id: str, text: str) -> None:
+        """对用户对话/命令消息的普通回复（不建话题）。"""
+        await self._safe_reply(message_id, text, in_thread=False)
 
     async def _shutdown(self) -> None:
         """退出清理：停 WS 线程，取消并等待全部 agent worker 收尾。"""

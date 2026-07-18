@@ -462,6 +462,22 @@ class FeishuBridge:
         )
         return result["data"]["message_id"]
 
+    def reply(self, message_id: str, text: str) -> str:
+        """普通引用回复（``reply_in_thread=False``），**不创建话题**。
+
+        用于对用户对话/命令消息的回复（如调度器 LLM 应答、用法提示、错误）——
+        只有派发 coding agent 才应创建话题，普通回复不该给用户消息挂话题。
+        """
+        result = self._im_post(
+            f"/open-apis/im/v1/messages/{message_id}/reply",
+            {
+                "msg_type": "text",
+                "content": json.dumps({"text": text}),
+                "reply_in_thread": False,
+            },
+        )
+        return result["data"]["message_id"]
+
     def reply_card(self, root_message_id: str, card: dict) -> str:
         """在话题内发一张 interactive 卡片，返回新消息 message_id。"""
         result = self._im_post(

@@ -23,9 +23,15 @@ class FakeBridge:
         self.patch_card_errors: int = 0
 
         self.roots: list[tuple[str, str]] = []
+        self.plain: list[tuple[str, str]] = []  # reply_in_thread=False（不建话题）
 
     def reply_in_thread(self, root_message_id: str, text: str) -> str:
         self.replies.append((root_message_id, text))
+        return f"om_reply_{len(self.replies)}"
+
+    def reply(self, message_id: str, text: str) -> str:
+        self.replies.append((message_id, text))
+        self.plain.append((message_id, text))
         return f"om_reply_{len(self.replies)}"
 
     def send_root_message(self, chat_id: str, text: str) -> str:
@@ -568,9 +574,22 @@ async def test_nl_dispatch_spawns_agent_via_llm():
     )
     await daemon._handle_message(root_msg("帮 demo 加个 dark mode", mid="om_nl"))
     await wait_until(lambda: created and created[0].prompts == ["加 dark mode"])
-    assert bridge.roots  # 新建了话题根消息
-    assert any("已给 demo 派发" in t for t in bridge.texts("om_nl"))  # LLM 回复回给用户
+    assert bridge.roots  # agent 有自己的话题根消息
+    # LLM 对用户的回复是**普通回复、不建话题**（bug 修复：只有派 agent 才建话题）
+    assert any(m == "om_nl" and "已给 demo 派发" in t for m, t in bridge.plain)
+    # 用户的对话消息 om_nl 不应成为任何 agent 话题的根
+    assert all(root != "om_nl" for root, _ in bridge.roots)
     await daemon._shutdown()
+
+
+async def test_nl_reply_does_not_create_thread():
+    daemon, bridge, created = make_daemon()
+    daemon._llm = ScriptedLLM([LLMResponse(content="你好，需要我做什么？")])
+    await daemon._handle_message(root_msg("在吗", mid="om_chat"))
+    # 纯对话（无 spawn）：回复走普通回复、不建话题、不起 agent
+    assert any(m == "om_chat" and "需要我做什么" in t for m, t in bridge.plain)
+    assert created == []
+    assert bridge.roots == []
 
 
 async def test_nl_dispatch_unknown_project_reported_to_llm():
