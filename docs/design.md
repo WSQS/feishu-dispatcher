@@ -232,3 +232,42 @@ ACP SDK 也暴露了 `load_session(cwd, session_id)`（`connection.py`）/ `list
 **注意点**：① 即便交接也**必须一次只有一端活着**（daemon 进程或 CLI 进程），否则撞同一
 会话——故需交接锁，防止用户在 CLI 操作时飞书回复触发 daemon 恢复。② 目前只对 opencode
 验证（CLI `-s <id>` 续会话）；copilot CLI 能否从命令行按 id 续 ACP 建的会话尚未验证。
+
+### 任务系统（Task system，下一步方向 · 2026-07-18）
+
+**动机**：现在调度器「记得有哪些任务」只能靠主线对话记忆，而记忆是滑动窗口（默认 12 轮），
+多几个任务就把早的挤掉、忘了。**正解不是把记忆调大（贵且仍会丢），而是把「有哪些任务、
+各自状态」做成结构化、持久化的任务系统，调度器用工具去查而非靠记。** 两者分工：对话记忆
+= 记住你怎么说话（指代/追问，小即可）；任务系统 = 记住发生了什么（可查、持久）。
+
+**做法**：把现有 `sessions.json` 的 SessionRecord 升级成完整 **Task**（任务 ≈ session ≈ 话题，1:1）：
+- 字段：`task_id`（稳定 id）、`project`/`agent`/`description`（当初的自然语言需求）、
+  `status`（pending/running/idle/done/stopped/failed/suspended）、`created_at`/`updated_at`、
+  `thread_root_id`、`session_id`、（审计）动作日志/摘要。
+- 调度器工具（取代偏薄的 `list_agents`）：`list_tasks`、`get_task(id)`，可选 `stop_task`、
+  `send_to_task(id, msg)`。
+- **行为改动**：`/stop` 从「删记录」改为「标记 `status=stopped` 保留历史」（否则调度器还是
+  忘了已停的任务）；恢复只对可恢复状态生效。完成/停止任务留最近 N 个（+ 可 `/clear`）。
+- **一举多得**：解决遗忘 + 统一 session 恢复记录 + 是审计（A）的落脚点（动作日志挂 task 上）。
+
+### 调度器审计 A（事后审计，紧随任务系统）
+
+记录每个 task 的**动作日志**——agent 调了哪些工具（编辑哪些文件、跑什么命令），来源是
+ACP 的 `tool_call` 事件流（已流经 `_extract_text`，改成也存一份进 task）。配 `get_task(id)`
+让主线能问「brick-blast 都干了啥」做事后审计，不用翻整个话题。（**B = 事前审批**：破坏性
+操作前飞书卡片按钮确认，替换现在「全自动放行」——更重、涉安全，单开一条线。）
+
+### 其他已考虑方向（roadmap，待排期）
+
+- **`send_to_agent` / `send_to_task`**：主线一句话路由进某个在跑的 agent 话题，不用手动切过去。
+- **`register_project`（项目自注册）**：对话式注册新项目并落盘，免去改 config + 重启。
+- **权限审批 B（安全）**：见上，替换 auto-allow-all，单开线。
+- **P1 多 agent 并发 + worktree 隔离**：同项目并行的文件隔离（跨项目并发已可用）；见上文 P1。
+- **per-turn 取消**：ACP `session/cancel`，agent 跑偏时只停这一轮、不杀整个 agent。
+- **完成通知带摘要**：🔔 通知里附 agent 最后输出的一句摘要（依赖任务系统的 last_output/摘要）。
+- **自动触发降噪**：非命令 root 消息静默/仅 `/help` 给用法（见上文「无需 @」）。
+- **对话记忆可配**：`[llm]` 加 `memory_rounds`（默认 12 轮）。
+
+**优先级读法（我的建议）**：近期最高价值 = **任务系统 → 审计 A**（连着，任务系统是审计地基，
+且直接解决「调度器忘任务」）；中期 = register_project / send_to_task / per-turn 取消 / 通知摘要；
+较大或单开线 = 权限审批 B、CLI↔ACP 交接、P1 并发+worktree。
