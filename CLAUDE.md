@@ -21,6 +21,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **权限**：`request_permission` 自动放行——必须返回 `AllowedOutcome(outcome="selected", option_id=...)` 结构（从 options 挑 allow_once/allow_always），裸字符串过不了 pydantic 校验。fs/terminal 能力未通告也未实现。
 - **环境变量**：agent 子进程只拿 SDK 白名单（PATH/APPDATA/USERPROFILE 等 12 个）+ `AgentSpawn.env` 显式追加项，**不再透传完整 os.environ**。要给 agent 传 token 就写进 `AgentSpawn.env` / 配置。
 - **调度器 LLM（P2，核心已接线，opt-in）**：配了 `[llm]`（OpenAI 兼容端点 base_url/api_key/model）才启用——群里非 `/命令` 的自然语言 root 消息交给 `scheduler.py` 的工具循环，LLM 调 `list_projects`/`spawn_agent`/`list_agents` 派发（`daemon._dispatch_nl`）。未配则回退到「用法」。`spawn_agent` 用 `send_root_message` 每次新建话题。轻量 router 边界：只理解/识别项目/派发/查状态，**不碰代码**。真实端点已实测（deepseek）。`llm.py` = OpenAI 兼容 client（httpx）；`scheduler.py` = provider 无关引擎。
+  - **对话记忆**：`SchedulerMemory`（主线 (user, assistant) 成对，跨重启持久化到 `scheduler_memory.json`，限长）——每次 dispatch 带上历史（`run_tool_loop(history=...)`），支持追问/修正/指代。**注意主线 = 跟调度器聊；话题内回复 = 跟 agent 聊，两层上下文分开**。
+  - **完成/出错/挂起主线通知**：worker 在「完成一轮且已空闲 / 出错 / 空闲挂起」时经 `_notify_main`（`send_root_message`，不建话题）推一条主线消息（🔔/❌/💤）。
+  - **状态**：`_AgentSession.state`（starting/running/idle/error）+ `turns`，`_sched_list_agents` 报给 LLM。（审计动作日志 = 下一步 A。）
+  - **回复分层（勿回退）**：对用户对话/命令用 `_reply_user`（`bridge.reply`，`reply_in_thread=false`，**不建话题**）；只有 agent 输出/状态进它自己的话题才用 `reply_in_thread=true`。
 - **并发隔离**（P1）：仅并发时创建 git worktree + 临时分支（`agent/<project>-<task-id>`）。
 
 ## 开发命令

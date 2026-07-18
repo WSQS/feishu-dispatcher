@@ -592,6 +592,74 @@ async def test_nl_reply_does_not_create_thread():
     assert bridge.roots == []
 
 
+# ---------------------------------------------------------------------- #
+# 调度器：对话记忆 + 完成通知 + 状态
+# ---------------------------------------------------------------------- #
+
+
+async def test_scheduler_records_exchange_in_memory():
+    daemon, bridge, created = make_daemon()
+    daemon._llm = ScriptedLLM([LLMResponse(content="收到")])
+    await daemon._handle_message(root_msg("记住我叫小明", mid="om_m"))
+    assert daemon._sched_memory.history() == [
+        {"role": "user", "content": "记住我叫小明"},
+        {"role": "assistant", "content": "收到"},
+    ]
+
+
+async def test_scheduler_feeds_history_on_next_message():
+    daemon, bridge, created = make_daemon()
+
+    class RecordingLLM:
+        def __init__(self) -> None:
+            self.n = 0
+            self.second_messages: list = []
+
+        async def chat(self, messages, tools) -> LLMResponse:
+            self.n += 1
+            if self.n == 1:
+                return LLMResponse(content="好的，小明")
+            self.second_messages = list(messages)
+            return LLMResponse(content="你叫小明")
+
+    daemon._llm = RecordingLLM()
+    await daemon._handle_message(root_msg("我叫小明", mid="om_1"))
+    await daemon._handle_message(root_msg("我叫什么", mid="om_2"))
+    contents = [m.get("content") for m in daemon._llm.second_messages]
+    assert "我叫小明" in contents and "好的，小明" in contents
+
+
+async def test_agent_completion_notifies_main_line():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: any("🔔" in t for _, t in bridge.roots))
+    assert any("demo 完成" in t for _, t in bridge.roots)
+    await daemon._shutdown()
+
+
+async def test_agent_error_notifies_main_line():
+    daemon, bridge, created = make_daemon(agent_cls=FailingAgent)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: any("❌" in t and "出错" in t for _, t in bridge.roots))
+    await wait_until(lambda: "om_root1" not in daemon._sessions)
+
+
+async def test_list_agents_reports_state_and_turns():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    await wait_until(
+        lambda: (
+            daemon._sched_list_agents()
+            and daemon._sched_list_agents()[0]["state"] == "idle"
+        )
+    )
+    info = daemon._sched_list_agents()[0]
+    assert info["project"] == "demo"
+    assert info["turns"] == 1
+    await daemon._shutdown()
+
+
 async def test_nl_dispatch_unknown_project_reported_to_llm():
     daemon, bridge, created = make_daemon()
     # LLM 先试图派给不存在的项目，工具返回错误 → LLM 收尾说明

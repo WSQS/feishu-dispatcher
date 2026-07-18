@@ -118,9 +118,18 @@ agent 输出实时回到飞书话题 →
 
 ### P2 — 体验优化（可跳过）
 
-5. 调度器 LLM 规划 —— ✅ **核心已接线**（`scheduler.py` 工具循环 + `llm.py`
-   OpenAI 兼容 client + `daemon._dispatch_nl`；配 `[llm]` 后自然语言即派发，真实
-   deepseek 端点已实测）。缓做：并发判断 + worktree（依赖 P1）、更多工具。
+5. 调度器 LLM 规划 —— ✅ **核心 + 记忆/通知/状态已接线**（`scheduler.py` 工具循环 +
+   `llm.py` OpenAI 兼容 client + `daemon._dispatch_nl`；配 `[llm]` 后自然语言即派发，真实
+   deepseek 端点已实测）。已加:主线对话记忆(跨重启持久化 `SchedulerMemory`)、agent
+   完成/出错/挂起的主线通知、加厚的 `list_agents` 状态(state/turns)。
+
+   **调度器职责说明书（2026-07-18 明确）**:定位=控制台主线的「控制塔」。
+   - 该做:记住主线对话、掌握 agent 状态、派发、（下一步）路由消息到 agent、管理项目。
+   - 不该做:写代码/改文件/跑命令（agent 的活）。
+   - **两层上下文**:调度器上下文(主线,daemon 侧,`SchedulerMemory`) vs agent 上下文
+     (每个 agent 自己的会话,agent 侧)。话题内回复=跟 agent 聊;主线=跟调度器聊。
+   - **下一步 A（审计）**:记录每个 agent 的动作日志（ACP `tool_call` 事件）+
+     `get_agent_status` 工具,支持「查看它做了什么」的事后审计。（B=事前审批，另开线。）
 6. 项目自注册（原型阶段手动写死项目列表；`register_project` 工具尚未加）
 
 ## 依赖

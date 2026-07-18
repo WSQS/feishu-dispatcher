@@ -24,7 +24,12 @@ from .acp_client import AcpAgent, AgentSpawn, OnOutput
 from .config import DEFAULT_CONFIG_PATH, Config
 from .feishu import FeishuBridge, IncomingMessage
 from .llm import build_llm_client
-from .scheduler import LLMClient, build_scheduler_tools, run_tool_loop
+from .scheduler import (
+    LLMClient,
+    SchedulerMemory,
+    build_scheduler_tools,
+    run_tool_loop,
+)
 from .store import SessionRecord, SessionStore
 
 logger = logging.getLogger(__name__)
@@ -56,7 +61,12 @@ async def run(
     """
     if store_path is None:
         store_path = DEFAULT_CONFIG_PATH.parent / "sessions.json"
-    daemon = _Daemon(cfg, discover=discover, store=SessionStore(store_path))
+    daemon = _Daemon(
+        cfg,
+        discover=discover,
+        store=SessionStore(store_path),
+        _sched_memory=SchedulerMemory(store_path.parent / "scheduler_memory.json"),
+    )
     await daemon.run()
 
 
@@ -71,6 +81,10 @@ class _AgentSession:
     cwd: str = ""
     #: 是否由 load_session 恢复而来（影响启动失败时的提示文案）
     resumed: bool = False
+    #: 运行态：starting / running（跑一轮中）/ idle（等回复）/ error
+    state: str = "starting"
+    #: 已完成的回合数
+    turns: int = 0
     #: agent 实例（先建 session、再建 agent，故允许 None）
     agent: "AcpAgent | None" = None
     #: 当前回合的输出通道（card 或 text 模式）；回合间为 None
@@ -89,6 +103,10 @@ class _Daemon:
     store: SessionStore = field(default_factory=lambda: SessionStore(None))
     #: 调度器 LLM（P2）；None = 不启用自然语言派发。run() 按 cfg.llm 构造；测试可注入
     _llm: LLMClient | None = None
+    #: 调度器主线对话记忆（跨重启持久化）；默认纯内存，run() 注入文件版
+    _sched_memory: SchedulerMemory = field(
+        default_factory=lambda: SchedulerMemory(None)
+    )
     _bridge: FeishuBridge | None = None
     _sessions: dict[str, _AgentSession] = field(default_factory=dict)
     _seen_message_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
@@ -342,6 +360,7 @@ class _Daemon:
             root,
             "♻️ 已恢复会话，继续执行…" if sess.resumed else "▶️ agent 已就绪，开始执行…",
         )
+        sess.state = "idle"
         try:
             while True:
                 # 空闲挂起（坑 1）：超时无新回复就关掉 agent 腾出 max_agents 名额，
@@ -351,9 +370,13 @@ class _Daemon:
                 try:
                     prompt = await asyncio.wait_for(sess.queue.get(), timeout=timeout)
                 except asyncio.TimeoutError:
+                    sess.state = "suspended"
                     await self._safe_reply(
                         root,
                         "💤 空闲超时，已挂起该 agent（在本话题回复即自动恢复）。",
+                    )
+                    await self._notify_main(
+                        f"💤 {sess.project_name} 已空闲挂起（在其话题回复即自动恢复）。"
                     )
                     break
                 if prompt is None:
@@ -363,23 +386,35 @@ class _Daemon:
                 title = f"{sess.project_name} · {sess.agent_label}"
                 channel = self._make_channel(root, title)
                 sess.current_channel = channel
+                sess.state = "running"
                 try:
                     await sess.agent.prompt(prompt)
                     await channel.flush()
                     await channel.set_status("done")
+                    sess.turns += 1
+                    sess.state = "idle"
                     await self._safe_reply(
                         root, "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）"
                     )
+                    # 完成且已闲下来（无排队）→ 推一条主线通知，免得你挨个点话题
+                    if sess.queue.empty():
+                        await self._notify_main(
+                            f"🔔 {sess.project_name} 完成第 {sess.turns} 轮，在其话题里查看/继续。"
+                        )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     logger.exception("agent 执行异常")
+                    sess.state = "error"
                     try:
                         await channel.set_status("error")
                     except Exception:
                         logger.debug("set_status error 失败（忽略）", exc_info=True)
                     await self._safe_reply(
                         root, f"❌ agent 异常，已结束该 agent: {str(exc)[:200]}"
+                    )
+                    await self._notify_main(
+                        f"❌ {sess.project_name} 出错，已结束该 agent。"
                     )
                     break
                 finally:
@@ -509,13 +544,17 @@ class _Daemon:
             list_agents=self._sched_list_agents,
         )
         try:
-            reply = await run_tool_loop(self._llm, text, tools)
+            reply = await run_tool_loop(
+                self._llm, text, tools, history=self._sched_memory.history()
+            )
         except Exception as exc:
             logger.exception("调度器 LLM 失败")
             reply = (
                 f"调度器出错：{str(exc)[:200]}。可用 `/run <项目> <任务>` 直接派发。"
             )
-        await self._reply_user(msg.message_id, reply or "（调度器无输出）")
+        reply = reply or "（调度器无输出）"
+        self._sched_memory.add_exchange(text, reply)  # 跨重启持久化的主线记忆
+        await self._reply_user(msg.message_id, reply)
 
     def _sched_list_projects(self) -> list[dict]:
         return [
@@ -525,7 +564,13 @@ class _Daemon:
 
     def _sched_list_agents(self) -> list[dict]:
         active = [
-            {"project": s.project_name, "agent": s.agent_label, "state": "active"}
+            {
+                "project": s.project_name,
+                "agent": s.agent_label,
+                "state": s.state,  # starting/running/idle/error
+                "turns": s.turns,
+                "queued": s.queue.qsize(),
+            }
             for s in self._sessions.values()
         ]
         dormant = [
@@ -592,6 +637,17 @@ class _Daemon:
     async def _reply_user(self, message_id: str, text: str) -> None:
         """对用户对话/命令消息的普通回复（不建话题）。"""
         await self._safe_reply(message_id, text, in_thread=False)
+
+    async def _notify_main(self, text: str) -> None:
+        """向控制台主线推一条独立通知（不建话题）——agent 完成/出错/挂起时用。"""
+        if not self.cfg.chat_id or self._bridge is None:
+            return
+        try:
+            await asyncio.to_thread(
+                self._bridge.send_root_message, self.cfg.chat_id, text
+            )
+        except Exception:
+            logger.exception("主线通知发送失败")
 
     async def _shutdown(self) -> None:
         """退出清理：停 WS 线程，取消并等待全部 agent worker 收尾。"""

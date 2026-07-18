@@ -17,9 +17,64 @@ import json
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
+
+
+class SchedulerMemory:
+    """主线（调度器）对话记忆：(user, assistant) 成对，跨重启持久化。
+
+    只存最终问答对（不含中间工具调用），限长保留最近 ``max_messages`` 条。
+    ``path=None`` 为纯内存（测试）。原子写 + 读损坏容错，同 SessionStore。
+    """
+
+    def __init__(self, path: Path | None, *, max_messages: int = 24) -> None:
+        self._path = path
+        self._max = max(2, max_messages)
+        self._messages: list[dict[str, str]] = []
+        if path is not None and path.exists():
+            self._load()
+
+    def _load(self) -> None:
+        assert self._path is not None
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            msgs = [
+                {"role": m["role"], "content": m["content"]}
+                for m in data
+                if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+            ]
+            self._messages = msgs[-self._max :]
+        except Exception:
+            logger.warning("调度器记忆读取失败，忽略: %s", self._path, exc_info=True)
+            self._messages = []
+
+    def _flush(self) -> None:
+        if self._path is None:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_name(self._path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(self._messages, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            tmp.replace(self._path)
+        except Exception:
+            logger.warning("调度器记忆写入失败: %s", self._path, exc_info=True)
+
+    def history(self) -> list[dict[str, str]]:
+        return list(self._messages)
+
+    def add_exchange(self, user_message: str, assistant_reply: str) -> None:
+        self._messages.append({"role": "user", "content": user_message})
+        self._messages.append({"role": "assistant", "content": assistant_reply})
+        if len(self._messages) > self._max:
+            self._messages = self._messages[-self._max :]
+        self._flush()
+
 
 SYSTEM_PROMPT = """你是一个任务调度器。你的职责：
 1. 理解用户的任务描述，识别涉及哪些已注册项目（先用 list_projects 查看有哪些项目）。
@@ -82,9 +137,13 @@ async def run_tool_loop(
     tools: list[ToolSpec],
     *,
     system_prompt: str = SYSTEM_PROMPT,
+    history: list[dict[str, Any]] | None = None,
     max_iters: int = 6,
 ) -> str:
     """驱动 LLM 工具循环，返回给用户的最终文本。
+
+    ``history`` 是主线（调度器）之前的 (user, assistant) 对话，插在 system 之后、
+    本轮 user 之前，给调度器跨消息的上下文（追问/修正/指代）。
 
     每轮：LLM 应答 → 若无工具调用则结束返回其文本；否则执行每个工具、把结果
     作为 ``role=tool`` 消息喂回，继续下一轮。达到 ``max_iters`` 仍未收敛则兜底。
@@ -94,6 +153,7 @@ async def run_tool_loop(
     defs = _tool_defs(tools)
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
+        *(history or []),
         {"role": "user", "content": user_message},
     ]
     for _ in range(max_iters):

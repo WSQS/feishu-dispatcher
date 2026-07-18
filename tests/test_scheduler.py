@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from feishu_dispatcher.scheduler import (
     LLMResponse,
+    SchedulerMemory,
     ToolCall,
     build_scheduler_tools,
     run_tool_loop,
@@ -110,3 +113,48 @@ async def test_max_iters_cap():
     out = await run_tool_loop(llm, "x", _tools(spawn=noop), max_iters=3)
     assert "步数超限" in out
     assert len(llm.calls) == 3
+
+
+async def test_history_is_included_in_messages():
+    hist = [
+        {"role": "user", "content": "上一句"},
+        {"role": "assistant", "content": "上一答"},
+    ]
+    llm = FakeLLM([LLMResponse(content="ok")])
+    await run_tool_loop(llm, "这一句", [], history=hist)
+    msgs = llm.calls[0][0]
+    assert msgs[0]["role"] == "system"
+    assert msgs[1] == {"role": "user", "content": "上一句"}
+    assert msgs[2] == {"role": "assistant", "content": "上一答"}
+    assert msgs[-1] == {"role": "user", "content": "这一句"}
+
+
+def test_memory_in_memory_roundtrip():
+    m = SchedulerMemory(None)
+    m.add_exchange("q", "a")
+    assert m.history() == [
+        {"role": "user", "content": "q"},
+        {"role": "assistant", "content": "a"},
+    ]
+
+
+def test_memory_persists_and_caps(tmp_path: Path):
+    p = tmp_path / "mem.json"
+    m = SchedulerMemory(p, max_messages=4)
+    m.add_exchange("q1", "a1")
+    m.add_exchange("q2", "a2")
+    m.add_exchange("q3", "a3")  # 超过 4 条 → 只留最近两对
+    reloaded = SchedulerMemory(p, max_messages=4)
+    assert reloaded.history() == [
+        {"role": "user", "content": "q2"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "user", "content": "q3"},
+        {"role": "assistant", "content": "a3"},
+    ]
+
+
+def test_memory_corrupt_file_tolerated(tmp_path: Path):
+    p = tmp_path / "mem.json"
+    p.write_text("not json{", encoding="utf-8")
+    m = SchedulerMemory(p)  # 不抛
+    assert m.history() == []
