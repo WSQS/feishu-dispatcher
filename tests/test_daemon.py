@@ -9,7 +9,7 @@ from feishu_dispatcher.config import Config, Project
 from feishu_dispatcher.daemon import _Daemon
 from feishu_dispatcher.feishu import IncomingMessage
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
-from feishu_dispatcher.store import SessionRecord, SessionStore
+from feishu_dispatcher.store import TaskStore
 
 
 class FakeBridge:
@@ -94,7 +94,7 @@ def make_daemon(
     agent_cls: type[FakeAgent] = FakeAgent,
     *,
     stream_mode: str = "text",
-    store: SessionStore | None = None,
+    store: TaskStore | None = None,
     idle_timeout: float = 1800.0,
 ) -> tuple[_Daemon, FakeBridge, list[FakeAgent]]:
     cfg = Config(
@@ -107,7 +107,7 @@ def make_daemon(
         idle_timeout=idle_timeout,
         stream_mode=stream_mode,
     )
-    daemon = _Daemon(cfg, store=store or SessionStore(None))
+    daemon = _Daemon(cfg, store=store or TaskStore(None))
     bridge = FakeBridge()
     daemon._bridge = bridge  # 绕过 run()，直接注入
     created: list[FakeAgent] = []
@@ -240,7 +240,7 @@ def make_daemon_with_limit(
     max_agents: int,
     agent_cls: type[FakeAgent] = FakeAgent,
     *,
-    store: SessionStore | None = None,
+    store: TaskStore | None = None,
 ) -> tuple[_Daemon, FakeBridge, list[FakeAgent]]:
     cfg = Config(
         app_id="a",
@@ -252,7 +252,7 @@ def make_daemon_with_limit(
         max_agents=max_agents,
         stream_mode="text",
     )
-    daemon = _Daemon(cfg, store=store or SessionStore(None))
+    daemon = _Daemon(cfg, store=store or TaskStore(None))
     bridge = FakeBridge()
     daemon._bridge = bridge
     created: list[FakeAgent] = []
@@ -411,33 +411,51 @@ async def test_card_mode_stop_command_closes_agent():
 # ---------------------------------------------------------------------- #
 
 
-async def test_run_persists_session_record():
-    store = SessionStore(None)
+def _seed_task(
+    store, *, thread, agent="copilot", session_id="sid_x", status="suspended"
+):
+    """在台账里塞一个可恢复的历史任务（模拟重启前留下的）。"""
+    t = store.create(
+        project_name="demo",
+        agent_label=agent,
+        description="旧任务",
+        thread_root_id=thread,
+        workspace="C:/tmp/demo",
+    )
+    store.update(t.task_id, session_id=session_id, status=status)
+    return t
+
+
+async def test_run_creates_task():
+    store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo task"))
-    await wait_until(lambda: store.get("om_root1") is not None)
-    rec = store.get("om_root1")
-    assert rec.project_name == "demo"
-    assert rec.agent_label == "copilot"
-    assert rec.session_id == created[0].session_id
+    await wait_until(
+        lambda: store.by_thread("om_root1") and store.by_thread("om_root1").session_id
+    )
+    t = store.by_thread("om_root1")
+    assert t.project_name == "demo"
+    assert t.agent_label == "copilot"
+    assert t.session_id == created[0].session_id
+    assert t.description == "task"
     await daemon._shutdown()
 
 
 async def test_recovery_after_restart_uses_load_session():
-    store = SessionStore(None)  # 内存 store 跨两个 daemon 实例共享 = 模拟重启
+    store = TaskStore(None)  # 内存 store 跨两个 daemon 实例共享 = 模拟重启
     d1, b1, c1 = make_daemon(store=store)
     await d1._handle_message(root_msg("/run demo task1"))
-    await wait_until(lambda: store.get("om_root1") is not None)
-    saved_sid = store.get("om_root1").session_id
-    await d1._shutdown()  # 服务停止；store 记录保留
+    await wait_until(
+        lambda: store.by_thread("om_root1") and store.by_thread("om_root1").session_id
+    )
+    saved_sid = store.by_thread("om_root1").session_id
+    await d1._shutdown()  # 服务停止；任务标记 suspended、记录保留
+    assert store.by_thread("om_root1").status == "suspended"
 
-    # 新 daemon，内存 _sessions 空
     d2, b2, c2 = make_daemon(store=store)
     assert d2._sessions == {}
-    # 在旧话题里回复 → 触发惰性恢复
     await d2._handle_message(thread_msg("follow up", root="om_root1", mid="om_t2"))
     await wait_until(lambda: c2 and c2[0].prompts == ["follow up"])
-    # 用 load_session 恢复：resume_session_id == 之前持久化的 session_id
     assert c2[0].resume_session_id == saved_sid
     assert c2[0].start_count == 1
     assert any("恢复" in t for t in b2.texts("om_root1"))
@@ -448,47 +466,53 @@ async def test_reply_to_unknown_topic_notifies_not_silent():
     daemon, bridge, created = make_daemon()  # 空 store
     await daemon._handle_message(thread_msg("hello", root="om_unknown", mid="om_x"))
     assert created == []
-    assert any("没有活跃 agent" in t for t in bridge.texts("om_unknown"))
+    assert any("没有对应任务" in t for t in bridge.texts("om_unknown"))
 
 
-async def test_stop_removes_persisted_record():
-    store = SessionStore(None)
+async def test_stop_marks_task_stopped():
+    store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo task"))
-    await wait_until(lambda: store.get("om_root1") is not None)
+    await wait_until(lambda: store.by_thread("om_root1") is not None)
     await daemon._handle_message(thread_msg("/stop"))
-    await wait_until(lambda: store.get("om_root1") is None)
+    await wait_until(lambda: store.by_thread("om_root1").status == "stopped")
 
 
 async def test_recovery_fails_when_agent_unconfigured():
-    store = SessionStore(None)
-    # 手工塞一条 agent 已不在配置里的记录
-    store.put(SessionRecord("om_orphan", "demo", "ghost", "sid_x", "C:/tmp/demo"))
+    store = TaskStore(None)
+    _seed_task(store, thread="om_orphan", agent="ghost")  # agent 已不在配置
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(thread_msg("hello", root="om_orphan", mid="om_y"))
     assert created == []
     assert any("未配置" in t for t in bridge.texts("om_orphan"))
-    assert store.get("om_orphan") is None  # 陈旧记录被清掉
+    assert store.by_thread("om_orphan").status == "failed"
 
 
-async def test_orphan_stop_forgets_without_recovering():
-    store = SessionStore(None)
-    store.put(SessionRecord("om_orphan", "demo", "copilot", "sid_x", "C:/tmp/demo"))
+async def test_orphan_stop_marks_stopped_without_recovering():
+    store = TaskStore(None)
+    _seed_task(store, thread="om_orphan")
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(thread_msg("/stop", root="om_orphan", mid="om_z"))
     assert created == []  # 没为了停而恢复
-    assert store.get("om_orphan") is None
+    assert store.by_thread("om_orphan").status == "stopped"
     assert any("已结束" in t for t in bridge.texts("om_orphan"))
 
 
+async def test_terminal_task_reply_not_auto_resumed():
+    store = TaskStore(None)
+    _seed_task(store, thread="om_done", status="done")
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(thread_msg("continue", root="om_done", mid="om_d"))
+    assert created == []
+    assert any("已结束" in t for t in bridge.texts("om_done"))
+
+
 async def test_recovery_respects_max_agents():
-    store = SessionStore(None)
+    store = TaskStore(None)
     daemon, bridge, created = make_daemon_with_limit(max_agents=1, store=store)
-    # 占住唯一槽位
     await daemon._handle_message(root_msg("/run demo task1", mid="om_r1"))
     await wait_until(lambda: created and created[0].prompts == ["task1"])
-    # 另有一条可恢复记录，但已达上限 → 拒绝恢复
-    store.put(SessionRecord("om_orphan", "demo", "copilot", "sid_x", "C:/tmp/demo"))
+    _seed_task(store, thread="om_orphan")  # 可恢复，但已达上限
     await daemon._handle_message(thread_msg("hi", root="om_orphan", mid="om_r2"))
     assert len(created) == 1  # 未恢复
     assert any("上限" in t for t in bridge.texts("om_orphan"))
@@ -501,16 +525,16 @@ async def test_recovery_respects_max_agents():
 
 
 async def test_idle_timeout_suspends_but_keeps_record_recoverable():
-    store = SessionStore(None)
+    store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store, idle_timeout=0.1)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
     saved_sid = created[0].session_id
-    # 空闲超时 → 挂起：关进程、腾名额、但记录保留
+    # 空闲超时 → 挂起：关进程、腾名额、但任务留存为 suspended
     await wait_until(lambda: any("💤" in t for t in bridge.texts("om_root1")))
     await wait_until(lambda: "om_root1" not in daemon._sessions)  # 名额已释放
     assert created[0].closed
-    assert store.get("om_root1") is not None  # 记录保留（区别于 /stop）
+    await wait_until(lambda: store.by_thread("om_root1").status == "suspended")
 
     # 在话题里回复 → 自动 load_session 恢复
     await daemon._handle_message(thread_msg("more", root="om_root1", mid="om_t2"))
@@ -644,19 +668,21 @@ async def test_agent_error_notifies_main_line():
     await wait_until(lambda: "om_root1" not in daemon._sessions)
 
 
-async def test_list_agents_reports_state_and_turns():
+async def test_list_agents_reports_task_status_and_turns():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
     await wait_until(
         lambda: (
             daemon._sched_list_agents()
-            and daemon._sched_list_agents()[0]["state"] == "idle"
+            and daemon._sched_list_agents()[0]["status"] == "idle"
         )
     )
     info = daemon._sched_list_agents()[0]
     assert info["project"] == "demo"
+    assert info["task_id"] == "t1"
     assert info["turns"] == 1
+    assert info["description"] == "task"
     await daemon._shutdown()
 
 

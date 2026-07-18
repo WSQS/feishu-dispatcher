@@ -146,6 +146,40 @@ agent 输出实时回到飞书话题 →
 - 飞书消息卡片是否用于 agent 状态展示（当前方案是全量文本转发）
 - 多 agent 并发时飞书通知的噪音问题（原型后评估）
 
+## 概念模型（2026-07-18，任务系统地基）
+
+**核心四层 + 附属：**
+
+- **Project 项目**（顶层/目标）：要改的代码库。id=`name`；属性 path、default_agent；长期（注册后一直在）。
+- **Task 任务**（**一等公民**，编排单元）：派发在某项目上的一个工作单元。id=`task_id`；属性
+  project、agent、description、status、时间戳；**持有** session_id + thread_root_id + workspace。
+  **daemon 真正拥有并持久化的核心实体（tasks.json）。**
+- **Session 会话**（agent 侧）：agent 的记忆/上下文。id=`session_id`；live/dormant；活在 opencode.db，daemon 只握 id。
+- **Thread 话题**（飞书侧）：展示 + 你回复 agent 的地方。id=`thread_root_id`；活在飞书，daemon 只握 id。
+- **Turn 回合**：Task 的 session 的一次 prompt→响应。Task 1:N Turn；审计（A）的分组单位。
+- **Action 动作**：某回合里 agent 调的工具（编辑/命令），来自 ACP `tool_call`。Turn 1:N Action。
+- **Workspace 工作区**：Task 的工作目录。默认=项目目录；同项目并发（P1）=git worktree+临时分支。Task 1:1 Workspace。
+- **Agent（后端类型+能力）**：copilot/opencode 等，带能力元数据（load_session/session_close/cancel 支持度）；Task 引用它，决定可做哪些操作。
+
+```
+Project ─1:N─► Task（一等公民）
+                 ├─1:1─ Session   (agent 记忆, opencode.db)
+                 ├─1:1─ Thread    (飞书话题)
+                 ├─1:1─ Workspace (项目目录 / P1 worktree)
+                 └─1:N─ Turn ─1:N─ Action   (审计)
+Agent(后端类型+能力) ◄── Task 引用
+```
+
+**daemon 拥有 Project 与 Task；Session/Thread 是外部（agent/飞书）的，只握 id。**
+
+- **task_id 规则**：`t<N>` 短自增，**持久单调计数器，永不复用**；自然指代（「brick-blast 那个」）由调度器 `list_tasks` 查表解析成 id。
+- **status 生命周期**：
+  - 机械态（自动，worker 更新）：`starting`→`running`↔`idle`→`suspended`。
+  - 语义终止态（人/调度器管理）：`done`（手动归档）、`stopped`（中途结束）、`failed`（出错）。
+  - `done` 经 `mark_done` 工具 + `/done` 命令；默认只在明确指示时触发，自主归档走「提议+确认」。
+  - 终止任务默认不自动恢复（可显式 `resume_task`）；`suspended` 才「回复即无缝恢复」。历史留最近 N（+ `/clear`）。
+- **交互落点**：话题回复 → `thread_root_id` → Task → 它的 Session（挂起先 `load_session`）；主线 → 调度器 → 按 `task_id` 操作 Task。
+
 ## 待办 / 已知限制（post-P0）
 
 ### 会话跨 daemon 重启恢复（✅ 已实现 2026-07-17）
@@ -239,6 +273,13 @@ ACP SDK 也暴露了 `load_session(cwd, session_id)`（`connection.py`）/ `list
 多几个任务就把早的挤掉、忘了。**正解不是把记忆调大（贵且仍会丢），而是把「有哪些任务、
 各自状态」做成结构化、持久化的任务系统，调度器用工具去查而非靠记。** 两者分工：对话记忆
 = 记住你怎么说话（指代/追问，小即可）；任务系统 = 记住发生了什么（可查、持久）。
+
+**进展**：✅ **Phase 1 已实现（2026-07-18）**——`store.py` 的 `Task` + `TaskStore`（落盘
+`tasks.json`，task_id 短自增永不复用），status 生命周期（starting/running/idle/suspended +
+done/stopped/failed），`/stop` 改为标记 stopped 保留历史，恢复走 `by_thread → Task`，终止任务
+不自动恢复，`_list_agents` 与调度器状态改读任务台账，历史保留 keep_terminal + clear_terminal。
+**下一步（Phase 2）**：新调度器工具 `list_tasks`/`get_task`/`send_to_task`/`resume_task`/
+`mark_done`（含解决「调度器只能新建」的缺陷）+ `/done`、`/clear` 命令。
 
 **做法**：把现有 `sessions.json` 的 SessionRecord 升级成完整 **Task**（任务 ≈ session ≈ 话题，1:1）：
 - 字段：`task_id`（稳定 id）、`project`/`agent`/`description`（当初的自然语言需求）、

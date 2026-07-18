@@ -30,7 +30,7 @@ from .scheduler import (
     build_scheduler_tools,
     run_tool_loop,
 )
-from .store import SessionRecord, SessionStore
+from .store import Task, TaskStore
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ async def run(
     daemon = _Daemon(
         cfg,
         discover=discover,
-        store=SessionStore(store_path),
+        store=TaskStore(store_path.parent / "tasks.json"),
         _sched_memory=SchedulerMemory(store_path.parent / "scheduler_memory.json"),
     )
     await daemon.run()
@@ -77,14 +77,12 @@ class _AgentSession:
     thread_root_id: str
     project_name: str
     agent_label: str
-    #: agent 工作目录（持久化 + resume 用）
+    #: 关联的 Task id（持久台账的主键）
+    task_id: str = ""
+    #: agent 工作目录（= Task.workspace）
     cwd: str = ""
     #: 是否由 load_session 恢复而来（影响启动失败时的提示文案）
     resumed: bool = False
-    #: 运行态：starting / running（跑一轮中）/ idle（等回复）/ error
-    state: str = "starting"
-    #: 已完成的回合数
-    turns: int = 0
     #: agent 实例（先建 session、再建 agent，故允许 None）
     agent: "AcpAgent | None" = None
     #: 当前回合的输出通道（card 或 text 模式）；回合间为 None
@@ -99,8 +97,8 @@ class _AgentSession:
 class _Daemon:
     cfg: Config
     discover: bool = False
-    #: 会话持久化（默认纯内存，不写盘）；run() 会注入文件版
-    store: SessionStore = field(default_factory=lambda: SessionStore(None))
+    #: 任务台账（默认纯内存，不写盘）；run() 注入文件版（tasks.json）
+    store: TaskStore = field(default_factory=lambda: TaskStore(None))
     #: 调度器 LLM（P2）；None = 不启用自然语言派发。run() 按 cfg.llm 构造；测试可注入
     _llm: LLMClient | None = None
     #: 调度器主线对话记忆（跨重启持久化）；默认纯内存，run() 注入文件版
@@ -249,17 +247,18 @@ class _Daemon:
             )
             return
 
-        self._launch(
-            thread_root=thread_root,
+        new_task = self.store.create(
             project_name=project_name,
             agent_label=project.default_agent,
-            cwd=str(project.path),
-            agent_argv=agent_argv,
-            first_prompt=task,
+            description=task,
+            thread_root_id=thread_root,
+            workspace=str(project.path),
         )
+        self._launch(new_task, agent_argv, first_prompt=task)
         await self._safe_reply(
             thread_root,
-            f"🚀 启动 {project.default_agent} 处理项目 {project_name}…\n任务: {task}",
+            f"🚀 [{new_task.task_id}] 启动 {project.default_agent} 处理项目 "
+            f"{project_name}…\n任务: {task}",
         )
 
     def _make_agent(
@@ -274,24 +273,22 @@ class _Daemon:
 
     def _launch(
         self,
-        *,
-        thread_root: str,
-        project_name: str,
-        agent_label: str,
-        cwd: str,
+        task: Task,
         agent_argv: list[str],
         first_prompt: str,
+        *,
         resume_session_id: str | None = None,
     ) -> _AgentSession:
-        """建 session、接线 on_output、入队首条 prompt、启动 worker。
+        """按 Task 建 session、接线 on_output、入队首条 prompt、启动 worker。
 
         ``resume_session_id`` 非 None 时 agent 用 load_session 恢复（惰性重连）。
         """
         sess = _AgentSession(
-            thread_root_id=thread_root,
-            project_name=project_name,
-            agent_label=agent_label,
-            cwd=cwd,
+            thread_root_id=task.thread_root_id,
+            project_name=task.project_name,
+            agent_label=task.agent_label,
+            task_id=task.task_id,
+            cwd=task.workspace,
             resumed=resume_session_id is not None,
         )
 
@@ -300,14 +297,14 @@ class _Daemon:
                 sess.current_channel.feed(text)
 
         sess.agent = self._make_agent(
-            AgentSpawn(command=list(agent_argv), cwd=cwd),
+            AgentSpawn(command=list(agent_argv), cwd=task.workspace),
             on_output,
             resume_session_id=resume_session_id,
         )
         sess.queue.put_nowait(first_prompt)
-        self._sessions[thread_root] = sess
+        self._sessions[task.thread_root_id] = sess
         sess.worker = asyncio.create_task(
-            self._agent_worker(sess), name=f"agent-{thread_root}"
+            self._agent_worker(sess), name=f"agent-{task.task_id}"
         )
         return sess
 
@@ -336,9 +333,8 @@ class _Daemon:
             await sess.agent.start()
         except Exception as exc:
             logger.exception("agent 启动失败")
+            self.store.update(sess.task_id, status="failed")
             if sess.resumed:
-                # 恢复失败：agent 侧会话多半已过期，丢弃记录并提示重开
-                self.store.remove(root)
                 await self._safe_reply(
                     root, "❌ 会话恢复失败（可能已在 agent 侧过期）。发送 `/run` 重开。"
                 )
@@ -346,21 +342,14 @@ class _Daemon:
                 await self._safe_reply(root, f"❌ agent 启动失败: {str(exc)[:200]}")
             await self._close_session(sess)
             return
-        # 启动成功：落盘会话映射，供 daemon 重启后 load_session 恢复（幂等）
-        self.store.put(
-            SessionRecord(
-                thread_root_id=root,
-                project_name=sess.project_name,
-                agent_label=sess.agent_label,
-                session_id=sess.agent.session_id or "",
-                cwd=sess.cwd,
-            )
+        # 启动成功：把 session_id 落进 Task 并置 idle（供重启后 load_session 恢复）
+        self.store.update(
+            sess.task_id, session_id=sess.agent.session_id or "", status="idle"
         )
         await self._safe_reply(
             root,
             "♻️ 已恢复会话，继续执行…" if sess.resumed else "▶️ agent 已就绪，开始执行…",
         )
-        sess.state = "idle"
         try:
             while True:
                 # 空闲挂起（坑 1）：超时无新回复就关掉 agent 腾出 max_agents 名额，
@@ -370,7 +359,7 @@ class _Daemon:
                 try:
                     prompt = await asyncio.wait_for(sess.queue.get(), timeout=timeout)
                 except asyncio.TimeoutError:
-                    sess.state = "suspended"
+                    self.store.update(sess.task_id, status="suspended")
                     await self._safe_reply(
                         root,
                         "💤 空闲超时，已挂起该 agent（在本话题回复即自动恢复）。",
@@ -380,32 +369,33 @@ class _Daemon:
                     )
                     break
                 if prompt is None:
-                    self.store.remove(root)  # 用户显式结束，不再恢复
+                    self.store.update(sess.task_id, status="stopped")  # 保留历史
                     await self._safe_reply(root, "🛑 agent 已停止。")
                     break
                 title = f"{sess.project_name} · {sess.agent_label}"
                 channel = self._make_channel(root, title)
                 sess.current_channel = channel
-                sess.state = "running"
+                self.store.update(sess.task_id, status="running")
                 try:
                     await sess.agent.prompt(prompt)
                     await channel.flush()
                     await channel.set_status("done")
-                    sess.turns += 1
-                    sess.state = "idle"
+                    cur = self.store.get(sess.task_id)
+                    turns = (cur.turns if cur else 0) + 1
+                    self.store.update(sess.task_id, status="idle", turns=turns)
                     await self._safe_reply(
                         root, "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）"
                     )
                     # 完成且已闲下来（无排队）→ 推一条主线通知，免得你挨个点话题
                     if sess.queue.empty():
                         await self._notify_main(
-                            f"🔔 {sess.project_name} 完成第 {sess.turns} 轮，在其话题里查看/继续。"
+                            f"🔔 {sess.project_name} 完成第 {turns} 轮，在其话题里查看/继续。"
                         )
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     logger.exception("agent 执行异常")
-                    sess.state = "error"
+                    self.store.update(sess.task_id, status="failed")
                     try:
                         await channel.set_status("error")
                     except Exception:
@@ -460,75 +450,79 @@ class _Daemon:
             )
             return
         if text == _STOP_CMD:
-            self.store.remove(thread_root)
-            sess.queue.put_nowait(None)
+            sess.queue.put_nowait(None)  # worker 会把 Task 标记 stopped
             return
         sess.queue.put_nowait(text)
 
     async def _recover_or_notify(
         self, reply_target: str, thread_root: str, text: str
     ) -> None:
-        """话题无活跃 agent：能恢复就用 load_session 惰性重连，否则明确提示用户。"""
-        rec = self.store.get(thread_root)
-        if rec is None:
+        """话题无活跃 agent：能恢复的 Task 就 load_session 惰性重连，否则明确提示。"""
+        task = self.store.by_thread(thread_root)
+        if task is None:
             await self._safe_reply(
                 reply_target,
-                "⚠️ 该话题没有活跃 agent（可能已 `/stop` 或从未启动）。发送 `/run` 新建任务。",
+                "⚠️ 该话题没有对应任务（可能从未启动）。发送 `/run` 新建任务。",
+            )
+            return
+        if task.is_terminal:
+            await self._safe_reply(
+                reply_target,
+                f"⚠️ 任务 [{task.task_id}] 已结束（{task.status}）。发送 `/run` 新开一个。",
             )
             return
         if text == _STOP_CMD:
-            # 对孤儿话题发 /stop：直接忘记记录，不必为了停而先恢复
-            self.store.remove(thread_root)
-            await self._safe_reply(reply_target, "🛑 会话已结束。")
-            return
-        agent_argv = self.cfg.agents.get(rec.agent_label)
-        if not agent_argv:
-            self.store.remove(thread_root)  # agent 已不在配置，无法恢复
-            await self._safe_reply(
-                reply_target,
-                f"⚠️ 无法恢复会话：agent '{rec.agent_label}' 未配置。发送 `/run` 重开。",
-            )
+            self.store.update(task.task_id, status="stopped")
+            await self._safe_reply(reply_target, f"🛑 任务 [{task.task_id}] 已结束。")
             return
         if not text:
             return  # 空回复不触发恢复
+        agent_argv = self.cfg.agents.get(task.agent_label)
+        if not agent_argv or not task.session_id:
+            self.store.update(task.task_id, status="failed")
+            why = "agent 未配置" if not agent_argv else "无可恢复的会话"
+            await self._safe_reply(
+                reply_target,
+                f"⚠️ 无法恢复任务 [{task.task_id}]（{why}）。发送 `/run` 重开。",
+            )
+            return
         # 与 _spawn_for_root 同理：check 与 _launch 登记之间不能 await（TOCTOU）。
         if len(self._sessions) >= self.cfg.max_agents:
             await self._safe_reply(
                 reply_target,
-                f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，无法恢复会话。"
+                f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，无法恢复。"
                 "请先 `/stop` 一个再回复。",
             )
             return
         self._launch(
-            thread_root=thread_root,
-            project_name=rec.project_name,
-            agent_label=rec.agent_label,
-            cwd=rec.cwd,
-            agent_argv=agent_argv,
-            first_prompt=text,
-            resume_session_id=rec.session_id,
+            task, agent_argv, first_prompt=text, resume_session_id=task.session_id
         )
-        await self._safe_reply(reply_target, "♻️ 正在恢复会话…")
+        await self._safe_reply(reply_target, f"♻️ 正在恢复任务 [{task.task_id}]…")
 
     async def _list_agents(self, msg: IncomingMessage) -> None:
-        lines = [
-            f"• {s.project_name} (thread {s.thread_root_id}, 待执行 {s.queue.qsize()})"
-            for s in self._sessions.values()
-        ]
-        # 已持久化但当前未激活的会话（重启后回复对应话题即自动恢复）
-        dormant = [
-            r for tid, r in self.store.all().items() if tid not in self._sessions
-        ]
+        tasks = self.store.all()
+        active = [t for t in tasks if t.is_active]
+        terminal = [t for t in tasks if t.is_terminal]
         parts: list[str] = []
-        if lines:
-            parts.append("活跃 agent:\n" + "\n".join(lines))
-        if dormant:
+        if active:
             parts.append(
-                f"可恢复会话 {len(dormant)} 个（回复对应话题即自动恢复）："
-                + "、".join(f"{r.project_name}" for r in dormant)
+                "活跃任务:\n"
+                + "\n".join(
+                    f"• [{t.task_id}] {t.project_name} · {t.status}"
+                    f"（{t.turns} 轮）：{t.description[:24]}"
+                    for t in active
+                )
+            )
+        if terminal:
+            parts.append(
+                "历史（近 5）:\n"
+                + "\n".join(
+                    f"• [{t.task_id}] {t.project_name} · {t.status}：{t.description[:24]}"
+                    for t in terminal[-5:]
+                )
             )
         await self._reply_user(
-            msg.message_id, "\n\n".join(parts) if parts else "当前无活跃 agent。"
+            msg.message_id, "\n\n".join(parts) if parts else "当前无任务。"
         )
 
     # ------------------------------------------------------------------ #
@@ -563,25 +557,21 @@ class _Daemon:
         ]
 
     def _sched_list_agents(self) -> list[dict]:
-        active = [
+        # 从任务台账读（含历史），而非只看内存里的活跃 session
+        return [
             {
-                "project": s.project_name,
-                "agent": s.agent_label,
-                "state": s.state,  # starting/running/idle/error
-                "turns": s.turns,
-                "queued": s.queue.qsize(),
+                "task_id": t.task_id,
+                "project": t.project_name,
+                "agent": t.agent_label,
+                "description": t.description,
+                "status": t.status,
+                "turns": t.turns,
             }
-            for s in self._sessions.values()
+            for t in self.store.all()
         ]
-        dormant = [
-            {"project": r.project_name, "agent": r.agent_label, "state": "dormant"}
-            for tid, r in self.store.all().items()
-            if tid not in self._sessions
-        ]
-        return active + dormant
 
     async def _sched_spawn_agent(self, project_name: str, task: str) -> str:
-        """spawn_agent 工具实现：新建话题 + 启动 agent，返回给 LLM 的状态串。"""
+        """spawn_agent 工具实现：建 Task + 新话题 + 启动 agent，返回给 LLM 的状态串。"""
         project = self.cfg.projects.get(project_name)
         if project is None:
             known = ", ".join(self.cfg.projects) or "(无)"
@@ -598,15 +588,18 @@ class _Daemon:
             self.cfg.chat_id,
             f"🚀 {project.default_agent} · {project_name}\n任务: {task}",
         )
-        self._launch(
-            thread_root=root,
+        new_task = self.store.create(
             project_name=project_name,
             agent_label=project.default_agent,
-            cwd=str(project.path),
-            agent_argv=agent_argv,
-            first_prompt=task,
+            description=task,
+            thread_root_id=root,
+            workspace=str(project.path),
         )
-        return f"已在项目 {project_name} 启动 {project.default_agent} 处理：{task}"
+        self._launch(new_task, agent_argv, first_prompt=task)
+        return (
+            f"已建任务 [{new_task.task_id}]，在项目 {project_name} 启动 "
+            f"{project.default_agent} 处理：{task}"
+        )
 
     # ------------------------------------------------------------------ #
     # 发送辅助
@@ -653,6 +646,11 @@ class _Daemon:
         """退出清理：停 WS 线程，取消并等待全部 agent worker 收尾。"""
         if self._bridge is not None:
             self._bridge.stop()
+        # 把仍活跃的任务标记为 suspended，让重启后台账状态准确（且可 load_session 恢复）
+        for sess in list(self._sessions.values()):
+            task = self.store.get(sess.task_id)
+            if task is not None and not task.is_terminal:
+                self.store.update(sess.task_id, status="suspended")
         workers = [
             s.worker
             for s in list(self._sessions.values())
