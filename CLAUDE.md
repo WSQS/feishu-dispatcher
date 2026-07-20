@@ -54,4 +54,4 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **飞书限频**：同群全部机器人共享 5 QPS（全应用 50/s）；`max_agents` 默认 3 与之配套；HTTP 层已带 Retry（429/5xx，尊重 Retry-After）。多 agent 高并发需要 per-chat 令牌桶（P1，未做）。
 - **安全默认**：`chat_id` 必填（空则拒绝启动，发现模式用 `--discover`）；`sender_whitelist` 建议配置；`/run` 并发上限 `max_agents`。
 - WS 线程死亡由 daemon 30s 看门狗自动重启；agent 子进程 stderr 有后台 drain（防管道满卡死）。
-- P1/P2 待办：LLM 规划、多 agent worktree 隔离、卡片流式（PATCH interactive card 无编辑次数上限，见 setup.md §8）、per-chat 令牌桶。
+- **待办 / backlog**：可执行任务条目统一走 **GitHub issues**（`gh issue list`，按 `size:` / `area:` label 分类）；设计理由与已评估/暂缓的决策记录留在 `docs/design.md`。**不要**再在本文件或 design.md 里另起任务清单（避免与 issues 漂移）。大块方向：P1 多 agent worktree 隔离（#23）、权限审批 B（#20）。
