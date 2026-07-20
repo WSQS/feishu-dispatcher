@@ -1023,6 +1023,26 @@ async def test_task_command_shows_model():
     await daemon._shutdown()
 
 
+async def test_model_pinned_as_card_footer():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(
+        store=store, agent_cls=ModelAgent, stream_mode="card"
+    )
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    # 卡片最下方固定显示模型（note 元素）
+    all_cards = bridge.card_replies + bridge.card_patches
+    assert any(
+        any(
+            el.get("tag") == "note"
+            and "ns-deepseek/deepseek-v4-pro" in el["elements"][0]["content"]
+            for el in card["elements"]
+        )
+        for _, card in all_cards
+    )
+    await daemon._shutdown()
+
+
 async def test_no_model_agent_leaves_blank():
     # 默认 FakeAgent 不上报模型（似 copilot）→ Task.model 空、就绪消息无模型后缀
     store = TaskStore(None)

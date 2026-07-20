@@ -353,16 +353,16 @@ class _Daemon:
         )
         return sess
 
-    def _make_channel(self, root: str, title: str):
+    def _make_channel(self, root: str, title: str, footer: str = ""):
         """按 cfg.stream_mode 创建输出通道。
 
-        card 模式返回 LiveCard（原地更新卡片），text 模式返回 StreamThrottler
-        （每批发新消息，兜底）。
+        card 模式返回 LiveCard（原地更新卡片，``footer`` 固定显示在卡片最下方，
+        如「模型：X」），text 模式返回 StreamThrottler（每批发新消息，兜底）。
         """
         if self.cfg.stream_mode == "card":
             from .livecard import LiveCard
 
-            return LiveCard(self._bridge, root, title)
+            return LiveCard(self._bridge, root, title, footer=footer)
         else:
             from .throttler import StreamThrottler
 
@@ -430,7 +430,9 @@ class _Daemon:
                     )
                     break
                 title = f"{sess.project_name} · {sess.agent_label}"
-                channel = self._make_channel(root, title)
+                model = getattr(sess.agent, "model", "") or ""
+                footer = f"模型：{model}" if model else ""
+                channel = self._make_channel(root, title, footer=footer)
                 sess.current_channel = channel
                 self.store.update(sess.task_id, status="running")
                 logger.info(
