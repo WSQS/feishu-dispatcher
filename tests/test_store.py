@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from feishu_dispatcher.store import _MAX_ACTIONS, TaskStore
+from feishu_dispatcher.config import Project
+from feishu_dispatcher.store import _MAX_ACTIONS, ProjectStore, TaskStore
 
 
 def make(
@@ -131,3 +132,62 @@ def test_add_action_unknown_task_is_noop():
     s = TaskStore(None)
     s.add_action("t404", {"turn": 1, "kind": "edit", "title": "x"})  # 不抛
     assert s.get("t404") is None
+
+
+# ---------------------------------------------------------------------- #
+# ProjectStore：运行时注册项目（projects.json）
+# ---------------------------------------------------------------------- #
+
+
+def _proj(name: str, agent: str = "opencode") -> Project:
+    return Project(name=name, path=Path(f"C:/work/{name}"), default_agent=agent)
+
+
+def test_project_store_add_get_all():
+    s = ProjectStore(None)
+    assert s.all() == {}
+    s.add(_proj("foo"))
+    assert s.get("foo") == _proj("foo")
+    assert set(s.all()) == {"foo"}
+
+
+def test_project_store_add_is_upsert():
+    s = ProjectStore(None)
+    s.add(_proj("foo", "copilot"))
+    s.add(_proj("foo", "opencode"))  # 同名更新
+    assert s.get("foo").default_agent == "opencode"
+    assert len(s.all()) == 1
+
+
+def test_project_store_remove():
+    s = ProjectStore(None)
+    s.add(_proj("foo"))
+    assert s.remove("foo") is True
+    assert s.get("foo") is None
+    assert s.remove("foo") is False  # 已不存在
+
+
+def test_project_store_persists_and_reloads(tmp_path: Path):
+    path = tmp_path / "projects.json"
+    s1 = ProjectStore(path)
+    s1.add(_proj("foo", "opencode"))
+    s1.add(_proj("bar", "copilot"))
+    s1.remove("bar")
+    # 新实例从盘上读回
+    s2 = ProjectStore(path)
+    assert set(s2.all()) == {"foo"}
+    assert s2.get("foo").path == Path("C:/work/foo")
+    assert s2.get("foo").default_agent == "opencode"
+
+
+def test_project_store_corrupt_file_tolerated(tmp_path: Path):
+    path = tmp_path / "projects.json"
+    path.write_text("{ not json", encoding="utf-8")
+    s = ProjectStore(path)  # 不抛
+    assert s.all() == {}
+
+
+def test_project_store_memory_mode_writes_nothing(tmp_path: Path):
+    s = ProjectStore(None)  # path=None
+    s.add(_proj("foo"))
+    assert list(tmp_path.iterdir()) == []  # 没落盘

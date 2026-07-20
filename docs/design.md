@@ -81,7 +81,7 @@
 | Tool | 参数 | 说明 |
 |------|------|------|
 | `list_projects()` | — | 返回已注册项目列表 |
-| `register_project(path, name?, stack?, test_cmd?, default_agent?)` | — | 注册新项目，落盘到本地配置 |
+| `register_project(name, default_agent, path)` | 三项必填 | 注册新项目，落盘 projects.json（✅ 已实现，agent 必填、path 须为已存在目录） |
 | `spawn_agent(project, task, worktree?)` | — | 启动 agent 进程（ACP）+ 创建飞书话题。如需并发，自动创建 worktree |
 | `send_to_agent(thread_id, message)` | — | 向指定 agent 发送消息（ACP `session/prompt`） |
 | `get_agent_status(thread_id?)` | — | 查询 agent 状态（running / waiting / done / failed） |
@@ -130,7 +130,10 @@ agent 输出实时回到飞书话题 →
      (每个 agent 自己的会话,agent 侧)。话题内回复=跟 agent 聊;主线=跟调度器聊。
    - **下一步 A（审计）**:记录每个 agent 的动作日志（ACP `tool_call` 事件）+
      `get_agent_status` 工具,支持「查看它做了什么」的事后审计。（B=事前审批，另开线。）
-6. 项目自注册（原型阶段手动写死项目列表；`register_project` 工具尚未加）
+6. 项目自注册 —— ✅ **已实现**（2026-07-20）。有效项目 = `config.toml` 种子 + 运行时
+   注册（`ProjectStore`→`projects.json`）合并；root 命令 `/project` / `/project add <名>
+   <agent> <路径>` / `/project remove <名>` + 调度器工具 `register_project`。`default_agent`
+   注册时必填，path 非 git 仓 warning 放行。免去改 config + 重启。
 
 ## 依赖
 
@@ -439,7 +442,8 @@ capabilities 比 copilot/opencode 更全（原生 load_session/fork/resume/close
 ### 其他已考虑方向（roadmap，待排期）
 
 - **`send_to_agent` / `send_to_task`**：主线一句话路由进某个在跑的 agent 话题，不用手动切过去。
-- **`register_project`（项目自注册）**：对话式注册新项目并落盘，免去改 config + 重启。
+- ~~**`register_project`（项目自注册）**~~：✅ 已实现 2026-07-20——`ProjectStore`（`projects.json`）+
+  `/project` 命令族 + `register_project` 工具，种子/注册合并，`default_agent` 必填，非 git 仓 warning 放行。
 - **权限审批 B（安全）**：见上，替换 auto-allow-all，单开线。
 - **P1 多 agent 并发 + worktree 隔离**：同项目并行的文件隔离（跨项目并发已可用）；见上文 P1。
 - **per-turn 取消**：ACP `session/cancel`，agent 跑偏时只停这一轮、不杀整个 agent。

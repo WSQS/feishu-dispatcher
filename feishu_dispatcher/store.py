@@ -20,6 +20,8 @@ import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .config import Project
+
 logger = logging.getLogger(__name__)
 
 #: 仍在活跃视图里的状态
@@ -232,3 +234,78 @@ class TaskStore:
         if gone:
             self._flush()
         return len(gone)
+
+
+class ProjectStore:
+    """运行时注册的项目：name → Project，落盘 projects.json。
+
+    与 config.toml 的 ``[[projects]]`` 种子集**分开**——种子是引导集（只读，
+    改配置文件才能动），这里是用户在飞书里 ``/project add`` / ``register_project``
+    注册的、可增删的项目。daemon 加载时把两者合并成有效项目表（种子 + 注册）。
+
+    ``path=None`` 为纯内存（测试）。原子写 + 读损坏容错，与 TaskStore 一致。
+    只被单个 daemon 实例（单线程 event loop）读写，无需加锁。
+    """
+
+    def __init__(self, path: Path | None) -> None:
+        self._path = path
+        self._projects: dict[str, Project] = {}
+        if path is not None and path.exists():
+            self._load()
+
+    def _load(self) -> None:
+        assert self._path is not None
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            for name, d in (data.get("projects") or {}).items():
+                self._projects[name] = Project(
+                    name=d["name"],
+                    path=Path(d["path"]),
+                    default_agent=d["default_agent"],
+                )
+            logger.info("已加载 %d 个注册项目: %s", len(self._projects), self._path)
+        except Exception:
+            logger.warning("项目台账读取失败，忽略: %s", self._path, exc_info=True)
+            self._projects = {}
+
+    def _flush(self) -> None:
+        if self._path is None:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_name(self._path.name + ".tmp")
+            payload = {
+                "projects": {
+                    name: {
+                        "name": p.name,
+                        "path": str(p.path),
+                        "default_agent": p.default_agent,
+                    }
+                    for name, p in self._projects.items()
+                }
+            }
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            tmp.replace(self._path)
+        except Exception:
+            logger.warning("项目台账写入失败: %s", self._path, exc_info=True)
+
+    def get(self, name: str) -> Project | None:
+        return self._projects.get(name)
+
+    def all(self) -> dict[str, Project]:
+        return dict(self._projects)
+
+    def add(self, project: Project) -> None:
+        """注册或更新一个项目（同名 upsert），落盘。"""
+        self._projects[project.name] = project
+        self._flush()
+
+    def remove(self, name: str) -> bool:
+        """删除一个已注册项目，返回是否存在。"""
+        if name not in self._projects:
+            return False
+        del self._projects[name]
+        self._flush()
+        return True
