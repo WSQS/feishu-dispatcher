@@ -30,17 +30,50 @@ def _short(x: Any, limit: int = 200) -> str:
     return s if len(s) <= limit else s[:limit] + "…"
 
 
-class SchedulerMemory:
-    """主线（调度器）对话记忆：(user, assistant) 成对，跨重启持久化。
+#: 存进记忆的单条 tool 结果内容上限——防止 list_tasks 等大结果把历史撑爆。
+#: 只影响记忆回放；实时工具循环里模型看到的仍是完整结果。
+_MEM_TOOL_RESULT_CLIP = 600
 
-    只存最终问答对（不含中间工具调用），限长保留最近 ``max_messages`` 条。
-    ``path=None`` 为纯内存（测试）。原子写 + 读损坏容错，同 SessionStore。
+
+def _is_valid_turn(turn: Any) -> bool:
+    """一轮 = 非空的消息 dict 列表，首条 user、末条 assistant。
+
+    这个不变量保证：拼接多轮时 role 正常交替，且每个 assistant(tool_calls) 的
+    tool 结果都在同一轮里成对出现、不会被跨轮裁剪切断（否则 OpenAI 兼容端点会 400）。
+    """
+    if not isinstance(turn, list) or not turn:
+        return False
+    if not all(isinstance(m, dict) and "role" in m for m in turn):
+        return False
+    return turn[0].get("role") == "user" and turn[-1].get("role") == "assistant"
+
+
+def _clip_msg(m: dict[str, Any]) -> dict[str, Any]:
+    """存记忆时裁剪 tool 结果内容（assistant/tool_calls 原样保留——那才是关键信号）。"""
+    if m.get("role") == "tool" and isinstance(m.get("content"), str):
+        c = m["content"]
+        if len(c) > _MEM_TOOL_RESULT_CLIP:
+            return {**m, "content": c[:_MEM_TOOL_RESULT_CLIP] + "…"}
+    return dict(m)
+
+
+class SchedulerMemory:
+    """主线（调度器）对话记忆：按「轮」保存完整消息序列，跨重启持久化。
+
+    每一轮是 :func:`run_tool_loop` 产出的完整 OpenAI 形状消息序列——从 user 消息起，
+    含所有 assistant(tool_calls) 与 tool 结果，到最终 assistant 文本。**无损保存工具
+    调用痕迹**是关键：若只存最终文本，模型在历史里只会看到「口头声称做了事」的示范，
+    反过来训练它幻觉工具调用（说了不做）。按整轮保存 / 裁剪，保证 tool_calls 与其
+    tool 结果成对、不被从中间切断。``path=None`` 为纯内存（测试）。原子写 + 读损坏容错。
+
+    落盘格式为「轮的列表」（list[list[msg]]）；读到旧版扁平格式会忽略（等价于清空
+    被污染的历史），自动升级为无损保存。
     """
 
-    def __init__(self, path: Path | None, *, max_messages: int = 24) -> None:
+    def __init__(self, path: Path | None, *, max_turns: int = 12) -> None:
         self._path = path
-        self._max = max(2, max_messages)
-        self._messages: list[dict[str, str]] = []
+        self._max = max(1, max_turns)
+        self._turns: list[list[dict[str, Any]]] = []
         if path is not None and path.exists():
             self._load()
 
@@ -48,15 +81,15 @@ class SchedulerMemory:
         assert self._path is not None
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
-            msgs = [
-                {"role": m["role"], "content": m["content"]}
-                for m in data
-                if isinstance(m, dict) and m.get("role") in ("user", "assistant")
-            ]
-            self._messages = msgs[-self._max :]
+            turns = (
+                [t for t in data if _is_valid_turn(t)] if isinstance(data, list) else []
+            )
+            if data and not turns:
+                logger.info("调度器记忆为旧格式，已忽略（升级为按轮无损保存）")
+            self._turns = turns[-self._max :]
         except Exception:
             logger.warning("调度器记忆读取失败，忽略: %s", self._path, exc_info=True)
-            self._messages = []
+            self._turns = []
 
     def _flush(self) -> None:
         if self._path is None:
@@ -65,22 +98,34 @@ class SchedulerMemory:
             self._path.parent.mkdir(parents=True, exist_ok=True)
             tmp = self._path.with_name(self._path.name + ".tmp")
             tmp.write_text(
-                json.dumps(self._messages, ensure_ascii=False, indent=2),
+                json.dumps(self._turns, ensure_ascii=False, indent=2),
                 encoding="utf-8",
             )
             tmp.replace(self._path)
         except Exception:
             logger.warning("调度器记忆写入失败: %s", self._path, exc_info=True)
 
-    def history(self) -> list[dict[str, str]]:
-        return list(self._messages)
+    def history(self) -> list[dict[str, Any]]:
+        """把所有轮拍平成一串消息，供 :func:`run_tool_loop` 作为 ``history`` 回喂。"""
+        return [m for turn in self._turns for m in turn]
+
+    def add_turn(self, messages: list[dict[str, Any]]) -> None:
+        """存一整轮（run_tool_loop 的返回消息序列）；超限只丢最旧的整轮。"""
+        if not messages:
+            return
+        self._turns.append([_clip_msg(m) for m in messages])
+        if len(self._turns) > self._max:
+            self._turns = self._turns[-self._max :]
+        self._flush()
 
     def add_exchange(self, user_message: str, assistant_reply: str) -> None:
-        self._messages.append({"role": "user", "content": user_message})
-        self._messages.append({"role": "assistant", "content": assistant_reply})
-        if len(self._messages) > self._max:
-            self._messages = self._messages[-self._max :]
-        self._flush()
+        """便捷入口：把一问一答存成一轮（无工具调用场景 / 出错兜底 / 测试）。"""
+        self.add_turn(
+            [
+                {"role": "user", "content": user_message},
+                {"role": "assistant", "content": assistant_reply},
+            ]
+        )
 
 
 SYSTEM_PROMPT = """你是一个任务调度器（控制台主线的「控制塔」）。你的职责：
@@ -160,15 +205,20 @@ async def run_tool_loop(
     system_prompt: str = SYSTEM_PROMPT,
     history: list[dict[str, Any]] | None = None,
     max_iters: int = 6,
-) -> str:
-    """驱动 LLM 工具循环，返回给用户的最终文本。
+) -> tuple[str, list[dict[str, Any]]]:
+    """驱动 LLM 工具循环，返回 ``(给用户的最终文本, 本轮完整消息序列)``。
 
-    ``history`` 是主线（调度器）之前的 (user, assistant) 对话，插在 system 之后、
-    本轮 user 之前，给调度器跨消息的上下文（追问/修正/指代）。
+    第二个返回值是本轮从 user 消息起、含所有 assistant(tool_calls)/tool 结果、到
+    最终 assistant 文本的完整 OpenAI 形状消息序列，供调用方**无损写入记忆**（见
+    :class:`SchedulerMemory`）。下次作为 ``history`` 回喂时，模型能看到自己真实的工具
+    调用史，而非只有「口头说做了」的文本——后者会训练模型幻觉工具调用（说了不做）。
 
-    每轮：LLM 应答 → 若无工具调用则结束返回其文本；否则执行每个工具、把结果
-    作为 ``role=tool`` 消息喂回，继续下一轮。达到 ``max_iters`` 仍未收敛则兜底。
-    工具 handler 抛异常不会中断循环——异常文本作为工具结果喂回，让 LLM 自处理。
+    ``history`` 是主线之前若干轮的消息（拍平），插在 system 之后、本轮 user 之前，
+    给调度器跨消息的上下文（追问/修正/指代）。
+
+    每轮：LLM 应答 → 若无工具调用则收尾；否则执行每个工具、把结果作为 ``role=tool``
+    消息喂回，继续下一轮。达到 ``max_iters`` 仍未收敛则兜底。工具 handler 抛异常不会
+    中断循环——异常文本作为工具结果喂回，让 LLM 自处理。
     """
     by_name = {t.name: t for t in tools}
     defs = _tool_defs(tools)
@@ -177,13 +227,16 @@ async def run_tool_loop(
         *(history or []),
         {"role": "user", "content": user_message},
     ]
+    turn_start = len(messages) - 1  # 本轮从 user 消息起，用于切出「本轮新增消息」
     for _ in range(max_iters):
         resp = await client.chat(messages, defs)
         if not resp.tool_calls:
             # 诊断：LLM 未调任何工具直接收尾——若用户本想「派发/发消息」，这里就能
             # 看出它其实什么都没做（只回了话），是排查「说了没做」的关键信号。
-            logger.info("调度器收尾（无工具调用）: %s", _short(resp.content or ""))
-            return resp.content or ""
+            final = resp.content or ""
+            logger.info("调度器收尾（无工具调用）: %s", _short(final))
+            messages.append({"role": "assistant", "content": final})
+            return final, messages[turn_start:]
         messages.append(
             {
                 "role": "assistant",
@@ -220,7 +273,9 @@ async def run_tool_loop(
                 _short(result),
             )
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-    return "（调度器思考步数超限，请把需求说得更具体，或用 `/run <项目> <任务>` 直接派发。）"
+    final = "（调度器思考步数超限，请把需求说得更具体，或用 `/run <项目> <任务>` 直接派发。）"
+    messages.append({"role": "assistant", "content": final})
+    return final, messages[turn_start:]
 
 
 def build_scheduler_tools(
