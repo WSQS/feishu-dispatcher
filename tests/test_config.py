@@ -70,6 +70,35 @@ def test_sender_whitelist_and_max_agents_parsed(tmp_path: Path):
     assert cfg.max_agents == 5
 
 
+def test_llm_memory_rounds_parsed_and_defaults(tmp_path: Path):
+    base = 'app_id = "a"\napp_secret = "b"\nchat_id = "oc_1"\n'
+    # 显式配置 → 采用
+    f1 = tmp_path / "c1.toml"
+    f1.write_text(
+        base + '[llm]\nbase_url = "u"\napi_key = "k"\nmodel = "m"\nmemory_rounds = 6\n',
+        encoding="utf-8",
+    )
+    cfg = Config.load(f1)
+    assert cfg.llm is not None and cfg.llm.memory_rounds == 6
+    # 省略 → 默认 12
+    f2 = tmp_path / "c2.toml"
+    f2.write_text(
+        base + '[llm]\nbase_url = "u"\napi_key = "k"\nmodel = "m"\n', encoding="utf-8"
+    )
+    assert Config.load(f2).llm.memory_rounds == 12
+
+
+def test_llm_memory_rounds_must_be_positive(tmp_path: Path):
+    f = tmp_path / "c.toml"
+    f.write_text(
+        'app_id = "a"\napp_secret = "b"\nchat_id = "oc_1"\n'
+        '[llm]\nbase_url = "u"\napi_key = "k"\nmodel = "m"\nmemory_rounds = 0\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="memory_rounds"):
+        Config.load(f)
+
+
 def test_minimal_config(tmp_path: Path):
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(
