@@ -38,6 +38,25 @@ async def test_feed_then_flush_reply_card():
     await lc.aclose()
 
 
+async def test_footer_fixed_at_card_bottom():
+    bridge = FakeBridge()
+    lc = LiveCard(bridge, "om_root1", "test", footer="模型：deepseek-v4", window=0.05)
+    lc.feed("hi")
+    await lc.flush()
+    card = bridge.card_replies[0][1]
+    note = card["elements"][-1]  # footer 在最下方
+    assert note["tag"] == "note"
+    assert "模型：deepseek-v4" in note["elements"][0]["content"]
+    # 再 patch 一次，footer 仍在
+    lc.feed(" more")
+    await lc.flush()
+    assert (
+        "模型：deepseek-v4"
+        in bridge.card_patches[-1][1]["elements"][-1]["elements"][0]["content"]
+    )
+    await lc.aclose()
+
+
 async def test_feed_then_flush_then_feed_again_patches():
     bridge = FakeBridge()
     lc = LiveCard(bridge, "om_root1", "test", window=0.05)

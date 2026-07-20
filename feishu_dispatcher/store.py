@@ -46,6 +46,7 @@ _TASK_FIELDS = (
     "updated_at",
     "actions",
     "last_output",
+    "model",
 )
 
 
@@ -66,6 +67,8 @@ class Task:
     actions: list[dict] = field(default_factory=list)
     #: 最近一轮 agent 的收尾回复（截断），供 get_task / 完成通知摘要
     last_output: str = ""
+    #: agent 当前模型（opencode 上报；copilot 不暴露则为空）
+    model: str = ""
 
     @property
     def is_active(self) -> bool:

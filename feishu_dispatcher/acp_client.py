@@ -180,6 +180,21 @@ def _extract_action(update: Any) -> dict | None:
     return {"kind": getattr(update, "kind", "") or "", "title": title}
 
 
+def _extract_model(response: Any) -> str:
+    """从 new_session/load_session 响应里取当前模型名，取不到返回空串。
+
+    opencode 把模型建成 ``config_options`` 里 ``id``/``category`` == "model" 的
+    select，其 ``current_value`` 即当前模型（实测 `ns-deepseek/deepseek-v4-pro`）。
+    copilot 无此项（只有 mode/agent/allow_all），故返回空串——协议本身不暴露模型。
+    """
+    for opt in getattr(response, "config_options", None) or []:
+        oid = getattr(opt, "id", "") or ""
+        cat = getattr(opt, "category", "") or ""
+        if oid == "model" or cat == "model":
+            return getattr(opt, "current_value", "") or ""
+    return ""
+
+
 class _StreamFormatter:
     """把 ACP 流式 session_update 转成可转发文本，跨 chunk 维护状态。
 
@@ -280,6 +295,8 @@ class AcpAgent:
         self._resume_session_id = resume_session_id
         self._conn: acp.ClientSideConnection | None = None
         self._session_id: str | None = None
+        #: 当前模型（opencode 从 new_session config_options 取；copilot 无、留空）
+        self._model: str = ""
         self._transport_ctx: Any = None
         self._proc: Any = None
         self._closed = False
@@ -294,6 +311,11 @@ class AcpAgent:
     def last_message(self) -> str:
         """本轮 agent 的最终 message 文本（收尾回复）；未启动/无输出为空串。"""
         return self._client_impl.last_message() if self._client_impl else ""
+
+    @property
+    def model(self) -> str:
+        """agent 当前使用的模型；agent 未通过 ACP 暴露（如 copilot）时为空串。"""
+        return self._model
 
     async def start(self) -> None:
         """启动 agent 进程、完成 initialize + new_session 握手。
@@ -357,17 +379,27 @@ class AcpAgent:
             # 抑制转发避免旧对话灌进新卡片（历史已在旧飞书话题里）。
             self._client_impl.set_suppress(True)
             try:
-                await self._conn.load_session(
+                resp = await self._conn.load_session(
                     cwd=self._spawn.cwd, session_id=self._resume_session_id
                 )
             finally:
                 self._client_impl.set_suppress(False)
             self._session_id = self._resume_session_id
-            logger.info("已恢复 ACP session: %s", self._session_id)
+            self._model = _extract_model(resp)
+            logger.info(
+                "已恢复 ACP session: %s (模型: %s)",
+                self._session_id,
+                self._model or "?",
+            )
         else:
             session = await self._conn.new_session(cwd=self._spawn.cwd)
             self._session_id = session.session_id
-            logger.info("已创建 ACP session: %s", self._session_id)
+            self._model = _extract_model(session)
+            logger.info(
+                "已创建 ACP session: %s (模型: %s)",
+                self._session_id,
+                self._model or "?",
+            )
 
     async def prompt(self, text: str) -> None:
         """向 agent 发送一条 prompt 并等待其处理完毕。

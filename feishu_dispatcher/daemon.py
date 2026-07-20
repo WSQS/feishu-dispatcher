@@ -353,16 +353,16 @@ class _Daemon:
         )
         return sess
 
-    def _make_channel(self, root: str, title: str):
+    def _make_channel(self, root: str, title: str, footer: str = ""):
         """按 cfg.stream_mode 创建输出通道。
 
-        card 模式返回 LiveCard（原地更新卡片），text 模式返回 StreamThrottler
-        （每批发新消息，兜底）。
+        card 模式返回 LiveCard（原地更新卡片，``footer`` 固定显示在卡片最下方，
+        如「模型：X」），text 模式返回 StreamThrottler（每批发新消息，兜底）。
         """
         if self.cfg.stream_mode == "card":
             from .livecard import LiveCard
 
-            return LiveCard(self._bridge, root, title)
+            return LiveCard(self._bridge, root, title, footer=footer)
         else:
             from .throttler import StreamThrottler
 
@@ -387,14 +387,20 @@ class _Daemon:
                 await self._safe_reply(root, f"❌ agent 启动失败: {str(exc)[:200]}")
             await self._close_session(sess)
             return
-        # 启动成功：把 session_id 落进 Task 并置 idle（供重启后 load_session 恢复）
+        # 启动成功：把 session_id + 模型落进 Task 并置 idle（供重启后 load_session 恢复）
+        model = getattr(sess.agent, "model", "") or ""
         self.store.update(
-            sess.task_id, session_id=sess.agent.session_id or "", status="idle"
+            sess.task_id,
+            session_id=sess.agent.session_id or "",
+            status="idle",
+            model=model,
         )
-        await self._safe_reply(
-            root,
-            "♻️ 已恢复会话，继续执行…" if sess.resumed else "▶️ agent 已就绪，开始执行…",
+        base = (
+            "♻️ 已恢复会话，继续执行…" if sess.resumed else "▶️ agent 已就绪，开始执行…"
         )
+        if model:
+            base += f"（模型：{model}）"
+        await self._safe_reply(root, base)
         try:
             while True:
                 # 空闲挂起（坑 1）：超时无新回复就关掉 agent 腾出 max_agents 名额，
@@ -424,7 +430,9 @@ class _Daemon:
                     )
                     break
                 title = f"{sess.project_name} · {sess.agent_label}"
-                channel = self._make_channel(root, title)
+                model = getattr(sess.agent, "model", "") or ""
+                footer = f"模型：{model}" if model else ""
+                channel = self._make_channel(root, title, footer=footer)
                 sess.current_channel = channel
                 self.store.update(sess.task_id, status="running")
                 logger.info(
@@ -643,11 +651,13 @@ class _Daemon:
                 msg.message_id, f"未找到任务 {task_id}。用 `/agents` 查看有哪些任务。"
             )
             return
-        lines = [
+        head = (
             f"[{t.task_id}] {t.project_name} · {t.agent_label} · {t.status}"
-            f"（{t.turns} 轮）",
-            f"任务: {t.description}",
-        ]
+            f"（{t.turns} 轮）"
+        )
+        if t.model:
+            head += f"\n模型: {t.model}"
+        lines = [head, f"任务: {t.description}"]
         if t.last_output:
             lines.append(f"最近回复: {t.last_output}")
         if t.actions:
@@ -725,6 +735,7 @@ class _Daemon:
             "turns": t.turns,
             "has_session": bool(t.session_id),
             "active": t.thread_root_id in self._sessions,
+            "model": t.model,  # agent 当前模型（copilot 不暴露则为空）
             "created_at": t.created_at,
             "updated_at": t.updated_at,
             "last_output": t.last_output,  # 最近一轮 agent 的收尾回复
