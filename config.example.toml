@@ -56,8 +56,13 @@ throttle_window = 0.5
 # - copilot：需先 `copilot` 登录过 GitHub 账号。
 # - opencode：需 opencode 侧配好 provider/凭据（`opencode providers`），
 #   用其默认模型；acp 模式无需额外 model 参数。
+# - claude：Claude Code 无原生 ACP，经社区适配器接入（bin=claude-agent-acp）。
+#   前置：`npm i -g @agentclientprotocol/claude-agent-acp` + `claude` 已登录
+#   （`claude auth login`，Pro/Max 订阅额度即可；或设 ANTHROPIC_API_KEY 走 API 计费）。
+#   详见 docs/claude-code-backend.md（含实测的握手/流式/load_session 结果）。
 copilot = ["copilot", "--acp"]
 opencode = ["opencode", "acp"]
+claude = ["claude-agent-acp"]
 
 # P0 阶段项目硬编码在这里（设计文档 P2 才做 LLM 自注册）。
 # 每个项目用 default_agent 指定由哪个 agent 处理。

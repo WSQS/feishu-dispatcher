@@ -27,7 +27,11 @@ from feishu_dispatcher.acp_client import (
     _resolve_executable,
 )
 
-_AGENTS = {"opencode": ["opencode", "acp"], "copilot": ["copilot", "--acp"]}
+_AGENTS = {
+    "opencode": ["opencode", "acp"],
+    "copilot": ["copilot", "--acp"],
+    "claude": ["claude-agent-acp"],
+}
 _REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 
 

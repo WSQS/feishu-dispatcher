@@ -3,8 +3,9 @@
   1. 起 agent，new_session，让它记住一个数字，拿 session_id，关闭（模拟 daemon 重启）。
   2. 起全新 agent 进程，load_session(同 id)，问它记住的数字——答对即恢复成功。
 
-用法：uv run python scripts/smoke_resume.py [copilot|opencode]（默认 opencode）
-前置：对应 agent 已可用（opencode 需配好 provider）。
+用法：uv run python scripts/smoke_resume.py [copilot|opencode|claude]（默认 opencode）
+前置：对应 agent 已可用（opencode 需配好 provider；claude 需装 claude-agent-acp
+适配器且已登录，见 docs/claude-code-backend.md）。
 """
 
 from __future__ import annotations
@@ -19,7 +20,11 @@ from feishu_dispatcher.acp_client import AcpAgent, AgentSpawn
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 CWD = str(Path(__file__).resolve().parent.parent)
 SECRET = "4287"
-_AGENTS = {"copilot": ["copilot", "--acp"], "opencode": ["opencode", "acp"]}
+_AGENTS = {
+    "copilot": ["copilot", "--acp"],
+    "opencode": ["opencode", "acp"],
+    "claude": ["claude-agent-acp"],
+}
 
 
 class Collector:
