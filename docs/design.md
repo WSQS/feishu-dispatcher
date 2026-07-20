@@ -392,16 +392,27 @@ send_to_task 会自动恢复。
 - 卡片内容：逐条「🔧 spawn_agent(brick-blast, …) → 已建任务 t3」，末尾附最终文本 + 状态灯。
 - 未配 `[llm]`（无自然语言派发）时不涉及。
 
-### 待记：Claude Code 作为第三种后端（2026-07-20）
+### Claude Code 作为第三种后端（✅ 已验证 2026-07-20，详见 docs/claude-code-backend.md）
 
 **目标**：`[agents]` 里除 copilot/opencode 外，再支持 **Claude Code** 作为 ACP agent（按项目
-`default_agent` 选用）。daemon 本就 agent 无关（按 argv 启动 ACP 子进程），若 Claude Code 说 ACP，
-理论上只是加一条 `[agents]` 配置。
+`default_agent` 选用）。daemon 本就 agent 无关（按 argv 启动 ACP 子进程）。
 
-**开放问题（需先验证）**：`claude` CLI 是否**原生**通过 ACP（stdio JSON-RPC）暴露？还是需要一个
-**ACP 适配器**（社区有 `claude-code-acp` 之类把 Claude Code 包成 ACP agent server）。用
-`scripts/capture_acp_meta.py` 起来 dump 一下握手/`new_session` 就能定性（同当初查 model 的做法）。
-确认后：加配置、跑冒烟（握手/流式/`load_session` 支持度）、补 agent 能力元数据。
+**结论（实测）**：Claude Code **无原生 ACP**（`claude --help` 无 ACP 子命令，
+[claude-code#6686](https://github.com/anthropics/claude-code/issues/6686) 仍 open），走 Zed 官方
+适配器 **`@agentclientprotocol/claude-agent-acp`**（bin `claude-agent-acp`，内含 Claude Agent SDK；
+旧名 `@zed-industries/claude-code-acp` 已改名）。前置：`npm i -g @agentclientprotocol/claude-agent-acp`
++ `claude` 已登录（claude.ai OAuth 或 ANTHROPIC_API_KEY）。配置即 `claude = ["claude-agent-acp"]`。
+
+**daemon 零代码改动**——通用 ACP 路径全部走通，本机实测（`scripts/smoke_claude.py` /
+`smoke_resume.py claude` / `capture_acp_meta.py claude`）：握手 ✅、流式 ✅、`load_session` 跨进程恢复
+✅、`request_permission` 自动放行 + 工具执行（写文件）✅、`on_action` 审计 ✅、`session/close` ✅。
+capabilities 比 copilot/opencode 更全（原生 load_session/fork/resume/close/list/delete + image）；
+`new_session` config_options 暴露 mode/model/effort，`_extract_model`（已并入 main）直接取到当前模型
+（实测 `claude-fable-5[1m]`）。
+
+**剩余打磨（可选，非阻塞）**：new_session 冷启动 ~15–18s（比 copilot/opencode 慢，考虑给握手加超时）；
+默认 `default`（Manual）权限模式够用，如需更顺可切 `acceptEdits`/`bypassPermissions`（daemon 未做切模式，
+与「模型切换」同属 `set_config_option`/`session/set_mode` 一类增强，见下条）。
 
 ### 待修复：调度器「说了没做」幻觉（2026-07-20 用 daemon.log 抓实，暂缓）
 
