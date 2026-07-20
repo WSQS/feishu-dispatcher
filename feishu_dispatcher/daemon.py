@@ -140,6 +140,8 @@ class _AgentSession:
     queue: "asyncio.Queue[str | None]" = field(default_factory=asyncio.Queue)
     #: 收到 None 哨兵时置入的终止态：stopped（/stop，默认）或 done（/done / mark_done）
     terminate_status: str = "stopped"
+    #: 本轮是否正在跑（worker 卡在 agent.prompt() 里）；/stop 据此决定要不要发 cancel
+    turn_in_flight: bool = False
     #: 单消费者 worker，持有 agent 完整生命周期
     worker: "asyncio.Task[None] | None" = None
 
@@ -614,9 +616,17 @@ class _Daemon:
                     sess.agent_label,
                     prompt,
                 )
+                sess.turn_in_flight = True
                 try:
-                    await sess.agent.prompt(prompt)
+                    stop_reason = await sess.agent.prompt(prompt)
                     await channel.flush()
+                    if stop_reason == "cancelled":
+                        # 本轮被 /stop 中途取消：不当作正常完成（不 ✅、不计 turn、
+                        # 不发完成通知）。卡片置停止态；随后循环取到 None 哨兵即终止。
+                        await channel.set_status("stopped")
+                        self.store.update(sess.task_id, status="idle")
+                        logger.info("任务 %s 本轮被取消", sess.task_id)
+                        continue
                     await channel.set_status("done")
                     # 落 last_output：本轮 agent 的收尾回复（截断），供 get_task/通知摘要
                     last_output = _clip(sess.agent.last_message, _LAST_OUTPUT_MAX)
@@ -662,6 +672,7 @@ class _Daemon:
                     )
                     break
                 finally:
+                    sess.turn_in_flight = False
                     await channel.aclose()
                     sess.current_channel = None
         except asyncio.CancelledError:
@@ -682,6 +693,17 @@ class _Daemon:
                 await sess.agent.aclose()
             except Exception:
                 logger.debug("agent aclose 异常（忽略）", exc_info=True)
+
+    async def _cancel_turn(self, sess: _AgentSession) -> None:
+        """协作式取消 session 当前在途的 turn（ACP session/cancel）。失败不致命。"""
+        agent = sess.agent
+        if agent is None:
+            return
+        try:
+            await agent.cancel()
+            logger.info("已请求取消任务 %s 的当前轮", sess.task_id)
+        except Exception:
+            logger.exception("取消当前轮失败 task=%s", sess.task_id)
 
     async def _forward_to_agent(self, msg: IncomingMessage) -> None:
         """话题内回复 → 入队给对应 agent；agent 不在则尝试跨重启恢复。"""
@@ -709,7 +731,11 @@ class _Daemon:
             )
             return
         if text == _STOP_CMD:
-            sess.queue.put_nowait(None)  # worker 会把 Task 标记 stopped
+            sess.queue.put_nowait(None)  # 终止信号：worker 收到即标 stopped 收尾
+            # 有在途 turn 时协作式取消它，否则 None 要等整轮跑完才生效（跑偏时干瞪眼）。
+            # put_nowait 在 cancel 之前：cancel 让在途 prompt() 返回后，队列里已有 None。
+            if sess.turn_in_flight:
+                await self._cancel_turn(sess)
             return
         if text == _DONE_CMD:
             self._finish_task(sess.task_id, "done")  # 优雅收尾，worker 发完成消息
