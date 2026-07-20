@@ -91,3 +91,19 @@ def test_stream_mode_validation(tmp_path: Path):
     )
     with pytest.raises(ValueError, match="stream_mode"):
         Config.load(cfg_file)
+
+
+def test_seed_project_agent_not_configured_warns(tmp_path: Path, caplog):
+    # 种子项目仍允许省略/兜底 default_agent（向后兼容），但兜底的 copilot 不在
+    # [agents] 里时加载应打 warning（否则 /run 才会失败）。
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        'app_id = "a"\napp_secret = "b"\nchat_id = "oc_1"\n'
+        '[agents]\nopencode = ["opencode", "acp"]\n'
+        '[[projects]]\nname = "demo"\npath = "C:/work/demo"\n',  # 无 default_agent → 兜底 copilot
+        encoding="utf-8",
+    )
+    with caplog.at_level("WARNING"):
+        cfg = Config.load(cfg_file)
+    assert cfg.projects["demo"].default_agent == "copilot"  # 兜底仍生效
+    assert "copilot" in caplog.text and "demo" in caplog.text

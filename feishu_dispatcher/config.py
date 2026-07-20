@@ -1,21 +1,27 @@
 """配置加载。
 
-P0 原型范围：项目列表硬编码在 TOML 配置文件里（设计文档 P2 才做自注册），
-飞书凭据与 agent 启动命令同样来自配置。
+TOML 配置文件里的 ``[[projects]]`` 是**种子项目**（引导集）；运行时还可经
+``/project`` 命令 / ``register_project`` 工具动态注册（落盘 projects.json，见
+store.ProjectStore），两者由 daemon 合并成有效项目表。飞书凭据与 agent 启动命令
+同样来自配置。
 """
 
 from __future__ import annotations
 
+import logging
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = Path.home() / ".feishu-dispatcher" / "config.toml"
 
 
 @dataclass(frozen=True)
 class Project:
-    """已注册项目（P0 硬编码于配置文件）。"""
+    """一个项目（config.toml 种子或运行时注册）。default_agent 种子可省略（兜底
+    copilot）；运行时注册强制必填（见 daemon._register_project）。"""
 
     name: str
     path: Path
@@ -85,11 +91,21 @@ class Config:
                 api_key=llm_data["api_key"],
                 model=llm_data["model"],
             )
+        agents = {name: list(argv) for name, argv in data.get("agents", {}).items()}
+        # 种子项目的 default_agent 仍可省略（兜底 copilot，向后兼容）；但若兜底或
+        # 显式指定的 agent 不在 [agents] 里，/run 时才会失败——加载时先提醒。
+        for p in projects.values():
+            if p.default_agent not in agents:
+                logger.warning(
+                    "项目 %s 的 default_agent '%s' 不在 [agents] 配置里，/run 会失败",
+                    p.name,
+                    p.default_agent,
+                )
         return Config(
             app_id=data["app_id"],
             app_secret=data["app_secret"],
             chat_id=chat_id,
-            agents={name: list(argv) for name, argv in data.get("agents", {}).items()},
+            agents=agents,
             projects=projects,
             throttle_window=float(data.get("throttle_window", 0.5)),
             sender_whitelist=list(data.get("sender_whitelist", [])),

@@ -33,6 +33,8 @@ def _tools(
     send=None,
     resume=None,
     done=None,
+    register=None,
+    unregister=None,
 ):
     async def _spawn(p, t):
         return f"已派发 {p}"
@@ -46,6 +48,12 @@ def _tools(
     async def _done(tid):
         return f"已完成 {tid}"
 
+    async def _register(name, agent, path):
+        return f"已注册 {name}"
+
+    async def _unregister(name):
+        return f"已删除 {name}"
+
     return build_scheduler_tools(
         list_projects=lambda: projects or [{"name": "demo"}],
         spawn_agent=spawn or _spawn,
@@ -54,6 +62,8 @@ def _tools(
         send_to_task=send or _send,
         resume_task=resume or _resume,
         mark_done=done or _done,
+        register_project=register or _register,
+        unregister_project=unregister or _unregister,
     )
 
 
@@ -208,6 +218,8 @@ def test_new_tools_are_exposed():
         "send_to_task",
         "resume_task",
         "mark_done",
+        "register_project",
+        "unregister_project",
     }
 
 

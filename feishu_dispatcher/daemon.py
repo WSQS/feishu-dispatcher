@@ -22,7 +22,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .acp_client import AcpAgent, AgentSpawn, OnAction, OnOutput
-from .config import DEFAULT_CONFIG_PATH, Config
+from .config import DEFAULT_CONFIG_PATH, Config, Project
 from .feishu import FeishuBridge, IncomingMessage
 from .llm import build_llm_client
 from .scheduler import (
@@ -31,7 +31,7 @@ from .scheduler import (
     build_scheduler_tools,
     run_tool_loop,
 )
-from .store import Task, TaskStore
+from .store import ProjectStore, Task, TaskStore
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +42,7 @@ _STOP_CMD = "/stop"
 _DONE_CMD = "/done"
 _CLEAR_CMD = "/clear"
 _MODEL_CMD = "/model"  # 话题内：/model 列出可选，/model <名> 切换
+_PROJECT_CMD = "/project"  # root：/project 列出，/project add|remove 增删
 _REBOOT_CMD = "/reboot"  # root：重启整个 daemon 进程（cli.py re-exec）
 
 #: 环境变量：re-exec 重启时置位，新进程据此发「已重启」回执
@@ -55,6 +56,7 @@ _USAGE = (
     "• `/run <项目名> <任务描述>`  派发任务给 agent\n"
     "• `/agents`  列出活跃 + 历史任务\n"
     "• `/task <任务id>`  查看某任务详情与动作日志\n"
+    "• `/project`  列出项目；`/project add <名> <agent> <路径>` 注册，`/project remove <名>` 删除\n"
     "• `/clear`  清理已结束任务的历史\n"
     "• `/reboot`  重启整个 daemon（任务自动恢复）\n"
     "• 在 agent 话题内直接回复 = 追加指令（排队串行执行）\n"
@@ -94,6 +96,7 @@ async def run(
         cfg,
         discover=discover,
         store=TaskStore(store_path.parent / "tasks.json"),
+        project_store=ProjectStore(store_path.parent / "projects.json"),
         _sched_memory=SchedulerMemory(store_path.parent / "scheduler_memory.json"),
     )
     await daemon.run()
@@ -131,6 +134,9 @@ class _Daemon:
     discover: bool = False
     #: 任务台账（默认纯内存，不写盘）；run() 注入文件版（tasks.json）
     store: TaskStore = field(default_factory=lambda: TaskStore(None))
+    #: 运行时注册的项目台账（默认纯内存）；run() 注入文件版（projects.json）。
+    #: 有效项目 = config.toml 种子（cfg.projects）+ 这里注册的，见 _all_projects
+    project_store: ProjectStore = field(default_factory=lambda: ProjectStore(None))
     #: 调度器 LLM（P2）；None = 不启用自然语言派发。run() 按 cfg.llm 构造；测试可注入
     _llm: LLMClient | None = None
     #: 调度器主线对话记忆（跨重启持久化）；默认纯内存，run() 注入文件版
@@ -251,6 +257,8 @@ class _Daemon:
             await self._reply_user(
                 msg.message_id, f"🧹 已清理 {n} 条已结束任务的历史。"
             )
+        elif text == _PROJECT_CMD or text.startswith(_PROJECT_CMD + " "):
+            await self._handle_project_cmd(msg, text[len(_PROJECT_CMD) :].strip())
         elif text == _REBOOT_CMD:
             await self._reboot(msg)
         elif text in ("/help", "/?", "/usage"):
@@ -261,6 +269,108 @@ class _Daemon:
         else:
             await self._reply_user(msg.message_id, _USAGE)
 
+    # ------------------------------------------------------------------ #
+    # 项目：有效项目表（种子 + 注册）解析 + /project 命令 + register_project 工具
+    # ------------------------------------------------------------------ #
+
+    def _all_projects(self) -> dict[str, Project]:
+        """有效项目表：config.toml 种子（cfg.projects）+ 运行时注册（projects.json）。
+
+        同名以注册项优先（正常不会撞——注册时禁止占用种子名）。
+        """
+        merged = dict(self.cfg.projects)
+        merged.update(self.project_store.all())
+        return merged
+
+    def _resolve_project(self, name: str) -> Project | None:
+        return self._all_projects().get(name)
+
+    def _register_project(self, name: str, agent: str, path: str) -> tuple[bool, str]:
+        """注册/更新一个项目（``/project add`` 与 ``register_project`` 共用底层）。
+
+        返回 (是否成功, 给用户/LLM 的消息)。校验：三项都必填；项目名非空且不含
+        空格（否则 ``/run <项目> <任务>`` 会切错）、不占用 config.toml 种子名；
+        agent 必须在 ``[agents]`` 里；path 必须是已存在目录（非 git 仓 warning 放行）。
+        """
+        name, agent, path = name.strip(), agent.strip(), path.strip()
+        if not name or not agent or not path:
+            return False, "参数不足：需要 名称、agent、路径 三项。"
+        if any(c.isspace() for c in name):
+            return False, f"项目名不能含空格：'{name}'。"
+        if name in self.cfg.projects:
+            return (
+                False,
+                f"'{name}' 是 config.toml 里的项目，请改配置文件而非在此注册。",
+            )
+        if agent not in self.cfg.agents:
+            known = ", ".join(self.cfg.agents) or "(无)"
+            return False, f"未知 agent '{agent}'。已配置 agent: {known}"
+        p = Path(path)
+        if not p.is_dir():
+            return False, f"路径不存在或不是目录：{path}"
+        warn = ""
+        if not (p / ".git").exists():
+            warn = "（注意：该目录不是 git 仓库，P1 并发 worktree 隔离将无法启用）"
+        verb = "更新" if self.project_store.get(name) else "注册"
+        self.project_store.add(Project(name=name, path=p, default_agent=agent))
+        logger.info("%s项目 %s（agent=%s, path=%s）", verb, name, agent, p)
+        return True, f"✅ 已{verb}项目 {name}（agent={agent}，路径={p}）{warn}"
+
+    def _format_project_list(self) -> str:
+        merged = self._all_projects()
+        if not merged:
+            return "暂无项目。用 `/project add <名称> <agent> <路径>` 注册。"
+        registered = self.project_store.all()
+        lines = ["项目列表："]
+        for name, p in merged.items():
+            src = "已注册" if name in registered else "种子"
+            lines.append(f"• {name}（{p.default_agent}）— {p.path} [{src}]")
+        lines.append(
+            "`/project add <名称> <agent> <路径>` 增 · `/project remove <名称>` 删"
+        )
+        return "\n".join(lines)
+
+    async def _handle_project_cmd(self, msg: IncomingMessage, arg: str) -> None:
+        """root：``/project`` 列出、``/project add|remove`` 增删（对话/命令层）。"""
+        if not arg:
+            await self._reply_user(msg.message_id, self._format_project_list())
+            return
+        parts = arg.split(maxsplit=1)
+        sub = parts[0].lower()
+        rest = parts[1].strip() if len(parts) > 1 else ""
+        if sub == "add":
+            fields = rest.split(maxsplit=2)
+            if len(fields) < 3:
+                await self._reply_user(
+                    msg.message_id, "格式：`/project add <名称> <agent> <路径>`"
+                )
+                return
+            _, out = self._register_project(fields[0], fields[1], fields[2])
+            await self._reply_user(msg.message_id, out)
+        elif sub == "remove":
+            await self._reply_user(msg.message_id, self._remove_project(rest))
+        else:
+            await self._reply_user(
+                msg.message_id,
+                "用法：`/project`（列出）/ "
+                "`/project add <名称> <agent> <路径>` / "
+                "`/project remove <名称>`",
+            )
+
+    def _remove_project(self, name: str) -> str:
+        """删除一个已注册项目（种子项目改配置文件；引用它的历史任务不受影响）。"""
+        name = name.strip()
+        if not name:
+            return "格式：`/project remove <名称>`"
+        if name in self.cfg.projects:
+            return f"'{name}' 是 config.toml 里的项目，删除请改配置文件。"
+        if not self.project_store.remove(name):
+            return f"未找到已注册项目 '{name}'。"
+        refs = sum(1 for t in self.store.all() if t.project_name == name)
+        tip = f"（有 {refs} 个历史任务引用它，记录仍保留）" if refs else ""
+        logger.info("删除项目 %s（%d 个历史任务引用）", name, refs)
+        return f"🗑️ 已删除项目 {name}。{tip}"
+
     async def _spawn_for_root(self, msg: IncomingMessage, body: str) -> None:
         """解析 ``/run <project> <task>``，创建 agent session 并启动 worker。"""
         parts = body.split(maxsplit=1)
@@ -268,9 +378,9 @@ class _Daemon:
             await self._reply_user(msg.message_id, "格式：`/run <项目名> <任务描述>`")
             return
         project_name, task = parts[0].strip(), parts[1].strip()
-        project = self.cfg.projects.get(project_name)
+        project = self._resolve_project(project_name)
         if project is None:
-            known = ", ".join(self.cfg.projects) or "(无)"
+            known = ", ".join(self._all_projects()) or "(无)"
             await self._reply_user(
                 msg.message_id, f"未知项目 '{project_name}'。已知项目: {known}"
             )
@@ -789,6 +899,8 @@ class _Daemon:
             send_to_task=self._sched_send_to_task,
             resume_task=self._sched_resume_task,
             mark_done=self._sched_mark_done,
+            register_project=self._sched_register_project,
+            unregister_project=self._sched_unregister_project,
         )
         try:
             reply = await run_tool_loop(
@@ -806,8 +918,17 @@ class _Daemon:
     def _sched_list_projects(self) -> list[dict]:
         return [
             {"name": p.name, "default_agent": p.default_agent}
-            for p in self.cfg.projects.values()
+            for p in self._all_projects().values()
         ]
+
+    async def _sched_register_project(self, name: str, agent: str, path: str) -> str:
+        """register_project 工具：对话式注册项目（与 /project add 共用校验）。"""
+        _, msg = self._register_project(name, agent, path)
+        return msg
+
+    async def _sched_unregister_project(self, name: str) -> str:
+        """unregister_project 工具：删除已注册项目（与 /project remove 共用底层）。"""
+        return self._remove_project(name)
 
     def _sched_list_tasks(self) -> list[dict]:
         # 从任务台账读（含历史），而非只看内存里的活跃 session
@@ -902,9 +1023,9 @@ class _Daemon:
 
     async def _sched_spawn_agent(self, project_name: str, task: str) -> str:
         """spawn_agent 工具实现：建 Task + 新话题 + 启动 agent，返回给 LLM 的状态串。"""
-        project = self.cfg.projects.get(project_name)
+        project = self._resolve_project(project_name)
         if project is None:
-            known = ", ".join(self.cfg.projects) or "(无)"
+            known = ", ".join(self._all_projects()) or "(无)"
             return f"未知项目 '{project_name}'。已注册项目: {known}"
         agent_argv = self.cfg.agents.get(project.default_agent)
         if not agent_argv:

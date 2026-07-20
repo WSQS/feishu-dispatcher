@@ -9,7 +9,7 @@ from feishu_dispatcher.config import Config, Project
 from feishu_dispatcher.daemon import _Daemon
 from feishu_dispatcher.feishu import IncomingMessage
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
-from feishu_dispatcher.store import TaskStore
+from feishu_dispatcher.store import ProjectStore, TaskStore
 
 
 class FakeBridge:
@@ -116,6 +116,7 @@ def make_daemon(
     *,
     stream_mode: str = "text",
     store: TaskStore | None = None,
+    project_store: ProjectStore | None = None,
     idle_timeout: float = 1800.0,
 ) -> tuple[_Daemon, FakeBridge, list[FakeAgent]]:
     cfg = Config(
@@ -128,7 +129,11 @@ def make_daemon(
         idle_timeout=idle_timeout,
         stream_mode=stream_mode,
     )
-    daemon = _Daemon(cfg, store=store or TaskStore(None))
+    daemon = _Daemon(
+        cfg,
+        store=store or TaskStore(None),
+        project_store=project_store or ProjectStore(None),
+    )
     bridge = FakeBridge()
     daemon._bridge = bridge  # 绕过 run()，直接注入
     created: list[FakeAgent] = []
@@ -1178,3 +1183,145 @@ async def test_load_session_replay_does_not_log_actions():
     impl.set_suppress(False)
     await impl.session_update("s1", start_tool_call("tc2", "Editing y.py", kind="edit"))
     assert [a["title"] for a in logged] == ["Editing y.py"]
+
+
+# ---------------------------------------------------------------------- #
+# 项目注册：/project（列出）/ add / remove + register_project 工具
+# ---------------------------------------------------------------------- #
+
+
+async def test_project_list_shows_seed():
+    daemon, bridge, _ = make_daemon()  # cfg 里有种子项目 demo
+    await daemon._handle_message(root_msg("/project"))
+    reply = "\n".join(bridge.texts())
+    assert "demo" in reply
+    assert "[种子]" in reply
+
+
+async def test_project_add_registers_and_run_resolves_it(tmp_path):
+    daemon, bridge, created = make_daemon()
+    (tmp_path / ".git").mkdir()  # 是 git 仓 → 无 warning
+    await daemon._handle_message(
+        root_msg(f"/project add newp copilot {tmp_path}", mid="om_p")
+    )
+    assert any("已注册项目 newp" in t for t in bridge.texts())
+    assert daemon.project_store.get("newp") is not None
+    assert "newp" in daemon._all_projects()
+    # /run 现在能解析这个新注册的项目并派发
+    await daemon._handle_message(root_msg("/run newp do it", mid="om_r2"))
+    await wait_until(lambda: created and created[0].prompts == ["do it"])
+    await daemon._shutdown()
+
+
+async def test_project_add_non_git_path_warns_but_registers(tmp_path):
+    daemon, bridge, _ = make_daemon()
+    await daemon._handle_message(
+        root_msg(f"/project add ng copilot {tmp_path}", mid="om_p")
+    )
+    reply = "\n".join(bridge.texts())
+    assert "已注册项目 ng" in reply
+    assert "不是 git 仓库" in reply  # warning 放行
+    assert daemon.project_store.get("ng") is not None
+
+
+async def test_project_add_rejects_unknown_agent(tmp_path):
+    daemon, bridge, _ = make_daemon()
+    await daemon._handle_message(
+        root_msg(f"/project add p ghost {tmp_path}", mid="om_p")
+    )
+    assert any("未知 agent" in t for t in bridge.texts())
+    assert daemon.project_store.get("p") is None
+
+
+async def test_project_add_rejects_nonexistent_path():
+    daemon, bridge, _ = make_daemon()
+    await daemon._handle_message(
+        root_msg("/project add p copilot C:/no/such/dir_xyz", mid="om_p")
+    )
+    assert any("路径不存在" in t for t in bridge.texts())
+    assert daemon.project_store.get("p") is None
+
+
+async def test_project_add_rejects_config_seed_name(tmp_path):
+    daemon, bridge, _ = make_daemon()  # demo 是 config 种子
+    await daemon._handle_message(
+        root_msg(f"/project add demo copilot {tmp_path}", mid="om_p")
+    )
+    assert any("config.toml 里的项目" in t for t in bridge.texts())
+    assert daemon.project_store.get("demo") is None  # 没被写进注册表
+
+
+async def test_project_add_bad_format():
+    daemon, bridge, _ = make_daemon()
+    await daemon._handle_message(root_msg("/project add onlyname", mid="om_p"))
+    assert any("格式" in t for t in bridge.texts())
+
+
+async def test_project_register_rejects_name_with_space(tmp_path):
+    # 命令解析会把空格切成多字段，故直接测底层校验：名字含空格必须拒绝
+    daemon, _, _ = make_daemon()
+    ok, msg = daemon._register_project("a b", "copilot", str(tmp_path))
+    assert ok is False
+    assert "空格" in msg
+
+
+async def test_project_remove(tmp_path):
+    daemon, bridge, _ = make_daemon()
+    daemon.project_store.add(
+        Project(name="tmp", path=Path(tmp_path), default_agent="copilot")
+    )
+    await daemon._handle_message(root_msg("/project remove tmp", mid="om_p"))
+    assert any("已删除项目 tmp" in t for t in bridge.texts())
+    assert daemon.project_store.get("tmp") is None
+
+
+async def test_project_remove_seed_refused():
+    daemon, bridge, _ = make_daemon()
+    await daemon._handle_message(root_msg("/project remove demo", mid="om_p"))
+    assert any("改配置文件" in t for t in bridge.texts())
+
+
+async def test_project_remove_not_found():
+    daemon, bridge, _ = make_daemon()
+    await daemon._handle_message(root_msg("/project remove ghost", mid="om_p"))
+    assert any("未找到已注册项目" in t for t in bridge.texts())
+
+
+async def test_registered_project_survives_restart(tmp_path):
+    # 共享文件版 ProjectStore 模拟重启：注册的项目跨 daemon 实例保留
+    ps_path = tmp_path / "projects.json"
+    proj_dir = tmp_path / "repo"
+    proj_dir.mkdir()
+    d1, b1, _ = make_daemon(project_store=ProjectStore(ps_path))
+    await d1._handle_message(root_msg(f"/project add persistp copilot {proj_dir}"))
+    assert d1.project_store.get("persistp") is not None
+
+    d2, b2, created = make_daemon(project_store=ProjectStore(ps_path))
+    assert d2.project_store.get("persistp") is not None
+    await d2._handle_message(root_msg("/run persistp go", mid="om_r2"))
+    await wait_until(lambda: created and created[0].prompts == ["go"])
+    await d2._shutdown()
+
+
+async def test_scheduler_register_project_tool(tmp_path):
+    daemon, _, _ = make_daemon()
+    (tmp_path / ".git").mkdir()
+    out = await daemon._sched_register_project("schedp", "copilot", str(tmp_path))
+    assert "已注册项目 schedp" in out
+    assert daemon.project_store.get("schedp") is not None
+    # 注册后 list_projects 里能看到
+    names = {p["name"] for p in daemon._sched_list_projects()}
+    assert "schedp" in names
+
+
+async def test_scheduler_unregister_project_tool(tmp_path):
+    daemon, _, _ = make_daemon()
+    daemon.project_store.add(
+        Project(name="delp", path=Path(tmp_path), default_agent="copilot")
+    )
+    out = await daemon._sched_unregister_project("delp")
+    assert "已删除项目 delp" in out
+    assert daemon.project_store.get("delp") is None
+    # 种子项目删不了
+    out2 = await daemon._sched_unregister_project("demo")
+    assert "改配置文件" in out2
