@@ -62,9 +62,12 @@ class FakeBridge:
 
 
 class FakeAgent:
-    def __init__(self, spawn, on_output, *, resume_session_id=None) -> None:
+    def __init__(
+        self, spawn, on_output, on_action=None, *, resume_session_id=None
+    ) -> None:
         self.spawn = spawn
         self.on_output = on_output
+        self.on_action = on_action
         self.resume_session_id = resume_session_id
         self.prompts: list[str] = []
         self.start_count = 0
@@ -112,8 +115,10 @@ def make_daemon(
     daemon._bridge = bridge  # 绕过 run()，直接注入
     created: list[FakeAgent] = []
 
-    def factory(spawn, on_output, *, resume_session_id=None):
-        agent = agent_cls(spawn, on_output, resume_session_id=resume_session_id)
+    def factory(spawn, on_output, on_action=None, *, resume_session_id=None):
+        agent = agent_cls(
+            spawn, on_output, on_action, resume_session_id=resume_session_id
+        )
         created.append(agent)
         return agent
 
@@ -257,8 +262,10 @@ def make_daemon_with_limit(
     daemon._bridge = bridge
     created: list[FakeAgent] = []
 
-    def factory(spawn, on_output, *, resume_session_id=None):
-        agent = agent_cls(spawn, on_output, resume_session_id=resume_session_id)
+    def factory(spawn, on_output, on_action=None, *, resume_session_id=None):
+        agent = agent_cls(
+            spawn, on_output, on_action, resume_session_id=resume_session_id
+        )
         created.append(agent)
         return agent
 
@@ -304,9 +311,15 @@ def make_daemon_with_whitelist(
     bridge = FakeBridge()
     daemon._bridge = bridge
     created: list[FakeAgent] = []
-    daemon._make_agent = lambda spawn, on_output, *, resume_session_id=None: (
-        created.append(FakeAgent(spawn, on_output, resume_session_id=resume_session_id))
-        or created[-1]
+    daemon._make_agent = (
+        lambda spawn, on_output, on_action=None, *, resume_session_id=None: (  # noqa: E731
+            created.append(
+                FakeAgent(
+                    spawn, on_output, on_action, resume_session_id=resume_session_id
+                )
+            )
+            or created[-1]
+        )
     )
     return daemon, bridge, created
 
@@ -340,9 +353,15 @@ async def test_discover_mode_does_not_execute_commands():
     bridge = FakeBridge()
     daemon._bridge = bridge
     created: list[FakeAgent] = []
-    daemon._make_agent = lambda spawn, on_output, *, resume_session_id=None: (
-        created.append(FakeAgent(spawn, on_output, resume_session_id=resume_session_id))
-        or created[-1]
+    daemon._make_agent = (
+        lambda spawn, on_output, on_action=None, *, resume_session_id=None: (  # noqa: E731
+            created.append(
+                FakeAgent(
+                    spawn, on_output, on_action, resume_session_id=resume_session_id
+                )
+            )
+            or created[-1]
+        )
     )
     await daemon._handle_message(root_msg("/run demo task"))
     assert created == []
@@ -850,5 +869,99 @@ async def test_get_task_returns_detail():
     assert info["description"] == "do it"
     assert info["has_session"] is True
     assert info["active"] is True
+    assert info["action_count"] == 0  # FakeAgent 不发 tool_call
     assert daemon._sched_get_task("t404") is None
     await daemon._shutdown()
+
+
+# ---------------------------------------------------------------------- #
+# 审计 A：agent 动作日志（ACP tool_call → Task.actions → get_task / /task）
+# ---------------------------------------------------------------------- #
+
+
+class ActionAgent(FakeAgent):
+    """每个 prompt 回合先发两个 tool_call 审计动作，再 echo。"""
+
+    async def prompt(self, text: str) -> None:
+        self.prompts.append(text)
+        if self.on_action is not None:
+            await self.on_action({"kind": "edit", "title": f"Editing {text}.py"})
+            await self.on_action({"kind": "execute", "title": "pytest"})
+        await self.on_output(f"echo:{text}")
+
+
+async def test_tool_call_actions_logged_to_task_with_turn():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store, agent_cls=ActionAgent)
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and len(store.get("t1").actions) == 2)
+    actions = store.get("t1").actions
+    assert actions[0] == {"turn": 1, "kind": "edit", "title": "Editing build.py"}
+    assert actions[1] == {"turn": 1, "kind": "execute", "title": "pytest"}
+    await daemon._shutdown()
+
+
+async def test_actions_tagged_with_incrementing_turn():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store, agent_cls=ActionAgent)
+    await daemon._handle_message(root_msg("/run demo first"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    await daemon._handle_message(thread_msg("second"))
+    await wait_until(lambda: store.get("t1") and len(store.get("t1").actions) == 4)
+    # 第二轮的动作标 turn=2
+    assert store.get("t1").actions[-1]["turn"] == 2
+    await daemon._shutdown()
+
+
+async def test_get_task_includes_action_log():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store, agent_cls=ActionAgent)
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    info = daemon._sched_get_task("t1")
+    assert info["action_count"] == 2
+    assert [a["title"] for a in info["recent_actions"]] == [
+        "Editing build.py",
+        "pytest",
+    ]
+    await daemon._shutdown()
+
+
+async def test_task_command_shows_detail_and_actions():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store, agent_cls=ActionAgent)
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    await daemon._handle_message(root_msg("/task t1", mid="om_q"))
+    reply = "\n".join(bridge.texts("om_q"))
+    assert "t1" in reply and "Editing build.py" in reply and "pytest" in reply
+    await daemon._shutdown()
+
+
+async def test_task_command_unknown_id_replies_not_found():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/task t404", mid="om_q"))
+    assert any("未找到" in t for t in bridge.texts("om_q"))
+
+
+async def test_load_session_replay_does_not_log_actions():
+    # 恢复时 load_session 会重放历史 session/update；抑制期不应重复记动作。
+    # 这里直接验证：suppress=True 时 session_update 不触发 on_action。
+    from feishu_dispatcher.acp_client import _Callbacks, _ClientImpl
+    from acp import start_tool_call
+
+    logged: list[dict] = []
+
+    async def on_action(a: dict) -> None:
+        logged.append(a)
+
+    async def on_output(_t: str) -> None:
+        pass
+
+    impl = _ClientImpl(_Callbacks(on_output=on_output, on_action=on_action))
+    impl.set_suppress(True)
+    await impl.session_update("s1", start_tool_call("tc1", "Editing x.py", kind="edit"))
+    assert logged == []  # 抑制期不记
+    impl.set_suppress(False)
+    await impl.session_update("s1", start_tool_call("tc2", "Editing y.py", kind="edit"))
+    assert [a["title"] for a in logged] == ["Editing y.py"]

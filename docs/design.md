@@ -285,8 +285,10 @@ done/stopped/failed），`/stop` 改为标记 stopped 保留历史，恢复走 `
 （清终止历史）。`/done` 与 `mark_done` 共用 `_finish_task`（有活跃 worker 走 None 哨兵优雅收尾、
 `terminate_status` 决定 stopped/done；无活跃则直接改台账）；恢复逻辑收敛到 `_try_resume`
 （check→`_launch` 之间无 await 防 TOCTOU），`_launch(first_prompt=None)` 支持「仅拉起在线不跑
-首轮」。system prompt 明确「新建 vs 操作已有」。测试 118→135。**下一步**：审计 A（动作日志 +
-把 `get_task` 扩成含 action log）。
+首轮」。system prompt 明确「新建 vs 操作已有」。测试 118→135。
+
+✅ **审计 A 已实现（2026-07-20）**——ACP `tool_call` → `Task.actions` 动作日志，`get_task` 带
+`recent_actions`，新增 `/task <id>` 人读命令。详见下文「调度器审计 A」。测试 135→148。
 
 **做法**：把现有 `sessions.json` 的 SessionRecord 升级成完整 **Task**（任务 ≈ session ≈ 话题，1:1）：
 - 字段：`task_id`（稳定 id）、`project`/`agent`/`description`（当初的自然语言需求）、
@@ -315,12 +317,20 @@ done/stopped/failed），`/stop` 改为标记 stopped 保留历史，恢复走 `
 - （可选）`resume_task(task_id)`——显式恢复一个挂起任务。
 调度器据此能「认领并操作已有任务」，而不只是不断新建。这是任务系统要一并解决的核心能力之一。
 
-### 调度器审计 A（事后审计，紧随任务系统）
+### 调度器审计 A（事后审计）✅ 已实现 2026-07-20
 
-记录每个 task 的**动作日志**——agent 调了哪些工具（编辑哪些文件、跑什么命令），来源是
-ACP 的 `tool_call` 事件流（已流经 `_extract_text`，改成也存一份进 task）。配 `get_task(id)`
-让主线能问「brick-blast 都干了啥」做事后审计，不用翻整个话题。（**B = 事前审批**：破坏性
-操作前飞书卡片按钮确认，替换现在「全自动放行」——更重、涉安全，单开一条线。）
+记录每个 task 的**动作日志**——agent 调了哪些工具（编辑哪些文件、跑什么命令）。实现：
+`acp_client.py` 的 `session_update` 旁路 `_extract_action`（只认 `tool_call` 首次通告，取
+`kind`+`title`），经新的 `on_action` 回调（与 `on_output` 并列）送到 `daemon._launch` 的闭包，
+`store.add_action(task_id, {turn, kind, title})` 挂到 `Task.actions`（落盘 tasks.json，单 task 上限
+`_MAX_ACTIONS=200` 丢最旧）。turn = 进行中的回合号（已完成 turns + 1）。load_session 重放历史时
+`set_suppress(True)` 期间不记（放在 suppress 之后）。**读取**：`get_task(id)` 加 `action_count` +
+`recent_actions`（末 30）；人读入口 `/task <id>` 命令（无需 LLM）列详情 + 末 15 条动作。
+
+**未做（后续增强）**：① `tool_call_update` 的完成/失败状态（挂 tool_call_id 匹配，标 ✅/❌）；
+② 动作里带文件路径（`tool_call.locations`）；③ 写透式每 tool_call 刷盘，chatty agent 可批量化。
+
+（**B = 事前审批**：破坏性操作前飞书卡片按钮确认，替换现在「全自动放行」——更重、涉安全，单开一条线。）
 
 ### 其他已考虑方向（roadmap，待排期）
 

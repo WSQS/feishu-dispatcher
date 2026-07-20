@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from feishu_dispatcher.store import TaskStore
+from feishu_dispatcher.store import _MAX_ACTIONS, TaskStore
 
 
 def make(
@@ -103,3 +103,31 @@ def test_clear_terminal():
     assert s.clear_terminal() == 1
     assert s.get("t2") is None
     assert s.get("t1") is not None
+
+
+def test_add_action_appends_and_persists(tmp_path: Path):
+    p = tmp_path / "tasks.json"
+    s = TaskStore(p)
+    make(s, thread="om_1")
+    s.add_action("t1", {"turn": 1, "kind": "edit", "title": "Editing a.py"})
+    s.add_action("t1", {"turn": 1, "kind": "execute", "title": "pytest"})
+    assert [a["title"] for a in s.get("t1").actions] == ["Editing a.py", "pytest"]
+    # 持久化：重载后动作还在
+    assert len(TaskStore(p).get("t1").actions) == 2
+
+
+def test_add_action_caps_at_max_dropping_oldest():
+    s = TaskStore(None)
+    make(s, thread="om_1")
+    for i in range(_MAX_ACTIONS + 5):
+        s.add_action("t1", {"turn": 1, "kind": "edit", "title": f"edit {i}"})
+    actions = s.get("t1").actions
+    assert len(actions) == _MAX_ACTIONS
+    assert actions[0]["title"] == "edit 5"  # 最旧 5 条被丢
+    assert actions[-1]["title"] == f"edit {_MAX_ACTIONS + 4}"
+
+
+def test_add_action_unknown_task_is_noop():
+    s = TaskStore(None)
+    s.add_action("t404", {"turn": 1, "kind": "edit", "title": "x"})  # 不抛
+    assert s.get("t404") is None

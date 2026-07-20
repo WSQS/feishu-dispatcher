@@ -9,12 +9,35 @@ from acp import (
     update_tool_call,
 )
 
-from feishu_dispatcher.acp_client import _StreamFormatter
+from feishu_dispatcher.acp_client import _StreamFormatter, _extract_action
 
 
 def fmt(update) -> str:
     """单条 update 用全新格式化器（等价于旧的无状态 _extract_text）。"""
     return _StreamFormatter().format(update)
+
+
+# --- 审计动作抽取 (_extract_action) ------------------------------------- #
+
+
+def test_extract_action_from_tool_call():
+    action = _extract_action(start_tool_call("tc1", "Editing src/foo.py", kind="edit"))
+    assert action == {"kind": "edit", "title": "Editing src/foo.py"}
+
+
+def test_extract_action_ignores_message_and_thought():
+    assert _extract_action(update_agent_message_text("hi")) is None
+    assert _extract_action(update_agent_thought_text("thinking")) is None
+
+
+def test_extract_action_ignores_tool_call_update():
+    # 只认首次通告，完成/失败的状态更新不重复记
+    upd = update_tool_call("tc1", title="Editing src/foo.py", status="completed")
+    assert _extract_action(upd) is None
+
+
+def test_extract_action_skips_titleless_tool_call():
+    assert _extract_action(start_tool_call("tc1", "", kind="edit")) is None
 
 
 # --- 单条 update（无前置状态）------------------------------------------- #
