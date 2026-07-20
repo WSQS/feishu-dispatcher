@@ -220,6 +220,34 @@ async def test_stop_command_closes_agent_and_removes_session():
     assert any("🛑" in t for t in bridge.texts("om_root1"))
 
 
+async def test_help_in_thread_shows_usage_not_forwarded_to_agent():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+
+    await daemon._handle_message(thread_msg("/help", mid="om_help"))
+    # 回了话题内用法，且 /help 没被当 prompt 排给 agent（不入队、不关 agent）
+    assert any("话题内用法" in t for t in bridge.texts("om_root1"))
+    assert created[0].prompts == ["task"]
+    assert not created[0].closed
+    await daemon._shutdown()
+
+
+async def test_help_in_dormant_thread_replies_without_recovery():
+    daemon, bridge, created = make_daemon()
+    # 没有活跃 session 的话题里发 /help：仍回用法，且不为此拉起/恢复任何 agent
+    await daemon._handle_message(thread_msg("/help", root="om_orphan", mid="om_z"))
+    assert any("话题内用法" in t for t in bridge.texts("om_orphan"))
+    assert created == []
+
+
+async def test_help_on_root_shows_console_usage():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/help", mid="om_h"))
+    # root 主线 /help 走普通回复（不建话题），给控制台用法
+    assert any(m == "om_h" and "用法" in t for m, t in bridge.plain)
+
+
 async def test_duplicate_message_id_spawns_only_once():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo task", mid="om_dup"))

@@ -445,7 +445,7 @@ capabilities 比 copilot/opencode 更全（原生 load_session/fork/resume/close
 > **可执行任务条目已迁到 GitHub issues**（`gh issue list`，按 `size:` / `area:` label 分类）——
 > 状态、优先级、PR 闭环都在那边。本段只保留**设计决策**与**已实现记录**；开放任务附对应 issue 号。
 
-**开放任务（详见 issues）**：per-turn 取消（#15，中途控制的低成本首选）、`/help` 话题内生效（#16）、
+**开放任务（详见 issues）**：per-turn 取消（#15，中途控制的低成本首选）、
 审计 A 增强（#17）、对话记忆轮数可配 `memory_rounds`（#18）、卡片流式打磨（#19）、权限审批 B 替换
 auto-allow（#20，安全，单开线）、调度器可靠性根因 / 原生 Anthropic 适配器（#21，观察中）、自动触发
 降噪（#22）、P1 多 agent 并发 + worktree 隔离 + per-chat 令牌桶（#23，大）。`send_to_task` 已实现（调度器工具）。

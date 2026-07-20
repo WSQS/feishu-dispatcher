@@ -44,6 +44,7 @@ _CLEAR_CMD = "/clear"
 _MODEL_CMD = "/model"  # 话题内：/model 列出可选，/model <名> 切换
 _PROJECT_CMD = "/project"  # root：/project 列出，/project add|remove 增删
 _REBOOT_CMD = "/reboot"  # root：重启整个 daemon 进程（cli.py re-exec）
+_HELP_CMDS = ("/help", "/?", "/usage")  # root 与话题内通用
 
 #: 环境变量：re-exec 重启时置位，新进程据此发「已重启」回执
 _REBOOTED_ENV = "FEISHU_DISPATCHER_REBOOTED"
@@ -61,6 +62,17 @@ _USAGE = (
     "• `/reboot`  重启整个 daemon（任务自动恢复）\n"
     "• 在 agent 话题内直接回复 = 追加指令（排队串行执行）\n"
     "• 在 agent 话题内发 `/stop` = 结束，`/done` = 归档，`/model [名]` = 查看/切换模型"
+)
+
+#: 话题内用法（在某个 agent 话题里发 /help 时展示；命令随新增同步维护于此）
+_THREAD_USAGE = (
+    "话题内用法（你正在某个 agent 的话题里）：\n"
+    "• 直接回复 = 追加指令给这个 agent（排队串行执行）\n"
+    "• `/stop`  结束该 agent\n"
+    "• `/done`  归档该任务（标记完成）\n"
+    "• `/model [名]`  查看 / 切换模型\n"
+    "• `/help`  显示本说明\n"
+    "（`/run`、`/agents`、`/task` 等控制台命令请回到群主线发送）"
 )
 
 #: Task.last_output 截断上限（收尾回复只留精华，防 tasks.json 涨）
@@ -261,7 +273,7 @@ class _Daemon:
             await self._handle_project_cmd(msg, text[len(_PROJECT_CMD) :].strip())
         elif text == _REBOOT_CMD:
             await self._reboot(msg)
-        elif text in ("/help", "/?", "/usage"):
+        elif text in _HELP_CMDS:
             await self._reply_user(msg.message_id, _USAGE)
         elif self._llm is not None and text and not text.startswith("/"):
             # P2：自然语言交给调度器 LLM 理解并派发（未配置 LLM 则回退到用法）
@@ -671,6 +683,11 @@ class _Daemon:
         """话题内回复 → 入队给对应 agent；agent 不在则尝试跨重启恢复。"""
         thread_root = msg.thread_root_id or ""
         text = msg.text.strip()
+        # /help 先于 session 检查：不依赖 agent 是否在线（挂起的话题里也能查用法），
+        # 且绝不入队 / 触发恢复。
+        if text in _HELP_CMDS:
+            await self._safe_reply(thread_root or msg.message_id, _THREAD_USAGE)
+            return
         sess = self._sessions.get(thread_root)
         if sess is None:
             # 无活跃 agent：尝试从持久化记录恢复（惰性重连），或明确提示——
