@@ -410,7 +410,32 @@ class _Daemon:
             await self._close_session(sess)
             return
         # 启动成功：把 session_id + 模型落进 Task 并置 idle（供重启后 load_session 恢复）
-        model = getattr(sess.agent, "model", "") or ""
+        reported = getattr(sess.agent, "model", "") or ""
+        model = reported
+        # 模型黏住（恢复后）：agent 后端重载会话（load_session）时可能把模型重置回默认，
+        # 报回的 current_value 即是默认——若直接采信就会把用户此前 /model 切过的模型覆盖掉
+        # （台账 + 实际都还原）。故：Task 若记着用户切过的模型且后端仍支持，就重新下发一次，
+        # 保证「切模型 → 挂起 → 恢复」后仍用用户选的模型。后端已持久化（reported==pinned）时跳过。
+        task = self.store.get(sess.task_id)
+        pinned = (task.model if task else "") or ""
+        available = getattr(sess.agent, "available_models", None) or []
+        if pinned and pinned != reported and pinned in available:
+            try:
+                await sess.agent.set_model(pinned)
+                model = pinned
+                logger.info("恢复后重新应用模型 task=%s → %s", sess.task_id, pinned)
+            except Exception:
+                logger.exception(
+                    "恢复后重新应用模型失败 task=%s → %s", sess.task_id, pinned
+                )
+                model = reported  # 应用失败：如实保留后端报回的模型，不谎报
+        elif pinned and pinned != reported and pinned not in available:
+            logger.warning(
+                "恢复后无法保持模型 task=%s：后端已不提供 %s（回退 %s）",
+                sess.task_id,
+                pinned,
+                reported or "默认",
+            )
         self.store.update(
             sess.task_id,
             session_id=sess.agent.session_id or "",
