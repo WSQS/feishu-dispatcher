@@ -440,28 +440,44 @@ capabilities 比 copilot/opencode 更全（原生 load_session/fork/resume/close
 - **注意**：「工具卡片显示」落地后，幻觉在卡片上已当场可见，B 的价值下降但仍值得（把假话拦在回复里）。
 - （C = 换更强 tool-calling 的模型/端点，是用户配置层面的事，最治本但不在代码内。）
 
-### 其他已考虑方向（roadmap，待排期）
+### 已考虑方向 / 决策记录
 
-- **`send_to_agent` / `send_to_task`**：主线一句话路由进某个在跑的 agent 话题，不用手动切过去。
-- ~~**`register_project`（项目自注册）**~~：✅ 已实现 2026-07-20——`ProjectStore`（`projects.json`）+
-  `/project` 命令族 + `register_project` 工具，种子/注册合并，`default_agent` 必填，非 git 仓 warning 放行。
-- **权限审批 B（安全）**：见上，替换 auto-allow-all，单开线。
-- **P1 多 agent 并发 + worktree 隔离**：同项目并行的文件隔离（跨项目并发已可用）；见上文 P1。
-- **per-turn 取消**：ACP `session/cancel`，agent 跑偏时只停这一轮、不杀整个 agent。
+> **可执行任务条目已迁到 GitHub issues**（`gh issue list`，按 `size:` / `area:` label 分类）——
+> 状态、优先级、PR 闭环都在那边。本段只保留**设计决策**与**已实现记录**；开放任务附对应 issue 号。
+
+**开放任务（详见 issues）**：per-turn 取消（#15，中途控制的低成本首选）、`/help` 话题内生效（#16）、
+审计 A 增强（#17）、对话记忆轮数可配 `memory_rounds`（#18）、卡片流式打磨（#19）、权限审批 B 替换
+auto-allow（#20，安全，单开线）、调度器可靠性根因 / 原生 Anthropic 适配器（#21，观察中）、自动触发
+降噪（#22）、P1 多 agent 并发 + worktree 隔离 + per-chat 令牌桶（#23，大）。`send_to_task` 已实现（调度器工具）。
+
+**决策记录**
+
+- **中途消息处理 / steering（2026-07-21 评估，暂缓）**：现状是「turn 原子 + 每 session 一条
+  FIFO 队列」——agent 跑一轮时来的新消息会**排队，等这一轮整个跑完**才处理（新消息只 `put_nowait`
+  入队，单消费者 worker 卡在 `agent.prompt()` 里，一轮是一次 ACP `session/prompt`）。设计空间(按代价
+  排)：① 纯排队(现状) ② 入队回执(纯 UX) ③ 控制消息(`/stop`/状态查询)插队/不入队 ④ 硬打断(危险，改到
+  一半的文件/命令) ⑤ **协作式取消**(ACP `session/cancel`，见上「per-turn 取消」) ⑥ **steering/注入**
+  (边跑边把新消息喂进当前轮，像 Claude Code)。**关键架构结论**：⑥ steering 要求「**拥有 agent 循环**」
+  才有「步与步之间的缝」可注入；**ACP 的 `session/prompt` 是一次性语义、循环在 agent 子进程里，daemon
+  拿不到缝 → steering 在 ACP 下不现实**。唯一能拿到 steering 的路是换 **Claude Agent SDK**
+  (`claude-agent-sdk` 的 `ClaudeSDKClient` 流式输入 + `interrupt()`，它把循环握在库这边)——但代价是
+  **只对 Claude 生效**(auth=API key/订阅)、**丢掉 daemon 的 agent 无关性**(要在 ACP 之外再加一套非 ACP
+  集成)、且 `_AgentSession`/worker 从「turn 原子」分叉出一套「长连流式」模型。**决策：Agent SDK/steering
+  方向暂缓**——收益(锦上添花的中途 steering) < 代价(破坏后端中立 + Claude 专属 + worker 模型分叉)，当前
+  阶段不划算。若「停不下来 / 中途插不上话」变成实际痛点，**低成本首选是 ⑤ ACP `session/cancel`**
+  (统一、便宜、保持 agent 无关，覆盖「能打断」这一档)；steering 留到「主要就用 Claude 且确需边跑边改」时再议。
+**已实现（历史）**
+
 - ~~**完成通知带摘要**~~：✅ 已实现 2026-07-20——`Task.last_output`（每轮 agent 收尾 message，
-  截断 800）落台账，🔔 通知带一行摘要，`get_task`/`/task` 展示。（后续可选：per-turn 历史输出。）
-- **自动触发降噪**：非命令 root 消息静默/仅 `/help` 给用法（见上文「无需 @」）。
-- **对话记忆可配**：`[llm]` 加 `memory_rounds`（默认 12 轮）。
+  截断 800）落台账，🔔 通知带一行摘要，`get_task`/`/task` 展示。
 - ~~**`/reboot` 重启 daemon**~~：✅ 已实现 2026-07-20——`/reboot`（root）优雅关停（`_stop_event`
   跳出主循环 → `_shutdown` 关 agents、活跃任务标 suspended）后，`run()` 返回 True，`cli._reexec`
   用同 venv python `os.execv` 起 `python -m feishu_dispatcher.cli <原参数>` 替换自己（PID 不变、无需
   外部看护、继承 uv 的 env）。新进程读 `FEISHU_DISPATCHER_REBOOTED` env 发「✅ 已重启」回执；任务由
   `tasks.json` + `load_session` 自动恢复。**注**：Windows `os.execv` 是「新建+退旧」语义，配 uv 需实测；
   若飘可退回「退出码 + wrapper 看护」方案。
-- **`/help` 话题内也生效**：`/help`（+`/?`/`/usage`）目前只在 **root 主线**处理（`_handle_message`），
-  话题内发会被当 prompt 发给 agent。待办：在 `_forward_to_agent` 里加 `/help` 分支，展示话题内可用命令
-  （回复追加 / `/stop` / `/done` / `/model`）。命令清单本身已随新增命令同步维护在 `_USAGE`（root 用法）。
+- ~~**调度器记忆无损保存**~~：✅ 已实现 2026-07-21（#14）——`SchedulerMemory` 按整轮存 tool_calls
+  痕迹（不再只存文本），止住「说了不做」的幻觉工具调用；旧扁平格式读到即忽略（自动清污染历史）。
 
-**优先级读法（我的建议）**：近期最高价值 = **任务系统 → 审计 A**（连着，任务系统是审计地基，
-且直接解决「调度器忘任务」）；中期 = register_project / send_to_task / per-turn 取消 / 通知摘要；
-较大或单开线 = 权限审批 B、CLI↔ACP 交接、P1 并发+worktree。
+**优先级**：见 issues 的 `size:` label（small / medium / large）。近期建议先做 per-turn 取消（#15）；
+大块单开线是 P1 并发 + worktree（#23）与权限审批 B（#20）。
