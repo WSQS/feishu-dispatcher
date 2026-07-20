@@ -22,10 +22,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **输出转发**：`stream_mode` 二选一（config，默认 `card`）。`card`（`livecard.py`）——每回合一张 interactive 卡片,随输出 PATCH 原地更新(5 QPS/条、无编辑次数上限)，顶部状态灯(🔄/✅/❌/🛑)，body 超 25KB 滚动到新卡片；`text`（`throttler.py`）——每 ~500ms 批次发一条新文本消息(兜底)。两模式经 `_AgentSession.current_channel` 间接层做到每回合独立、对 worker 透明。状态类消息(🚀/▶️/✅/❌)始终走纯文本。
 - **权限**：`request_permission` 自动放行——必须返回 `AllowedOutcome(outcome="selected", option_id=...)` 结构（从 options 挑 allow_once/allow_always），裸字符串过不了 pydantic 校验。fs/terminal 能力未通告也未实现。
 - **环境变量**：agent 子进程只拿 SDK 白名单（PATH/APPDATA/USERPROFILE 等 12 个）+ `AgentSpawn.env` 显式追加项，**不再透传完整 os.environ**。要给 agent 传 token 就写进 `AgentSpawn.env` / 配置。
-- **调度器 LLM（P2，核心已接线，opt-in）**：配了 `[llm]`（OpenAI 兼容端点 base_url/api_key/model）才启用——群里非 `/命令` 的自然语言 root 消息交给 `scheduler.py` 的工具循环，LLM 调 `list_projects`/`spawn_agent`/`list_agents` 派发（`daemon._dispatch_nl`）。未配则回退到「用法」。`spawn_agent` 用 `send_root_message` 每次新建话题。轻量 router 边界：只理解/识别项目/派发/查状态，**不碰代码**。真实端点已实测（deepseek）。`llm.py` = OpenAI 兼容 client（httpx）；`scheduler.py` = provider 无关引擎。
+- **调度器 LLM（P2，核心已接线，opt-in）**：配了 `[llm]`（OpenAI 兼容端点 base_url/api_key/model）才启用——群里非 `/命令` 的自然语言 root 消息交给 `scheduler.py` 的工具循环派发（`daemon._dispatch_nl`）。未配则回退到「用法」。工具集（Phase 2 后共 7 个）：`list_projects` / `spawn_agent`（**仅新建**，`send_root_message` 每次开新话题）/ `list_tasks` / `get_task(id)` / `send_to_task(id, msg)`（操作**已有**任务：在跑排队、挂起先 `load_session` 恢复）/ `resume_task(id)`（显式恢复挂起/终止任务，仅拉起不跑首轮）/ `mark_done(id)`（归档）。system prompt 明确「新建 vs 操作已有」，避免对已有任务重复 spawn 丢上下文。轻量 router 边界：只理解/识别项目/派发/查状态，**不碰代码**。真实端点已实测（deepseek）。`llm.py` = OpenAI 兼容 client（httpx）；`scheduler.py` = provider 无关引擎。
   - **对话记忆**：`SchedulerMemory`（主线 (user, assistant) 成对，跨重启持久化到 `scheduler_memory.json`，限长）——每次 dispatch 带上历史（`run_tool_loop(history=...)`），支持追问/修正/指代。**注意主线 = 跟调度器聊；话题内回复 = 跟 agent 聊，两层上下文分开**。
   - **完成/出错/挂起主线通知**：worker 在「完成一轮且已空闲 / 出错 / 空闲挂起」时经 `_notify_main`（`send_root_message`，不建话题）推一条主线消息（🔔/❌/💤）。
-  - **状态**：`_AgentSession.state`（starting/running/idle/error）+ `turns`，`_sched_list_agents` 报给 LLM。（审计动作日志 = 下一步 A。）
+  - **状态**：任务态在 `store.py` 的 `Task.status`（+ `turns`），`_sched_list_tasks`/`_sched_get_task` 读台账报给 LLM（不是内存 session）。（审计动作日志 = 下一步 A。）
+  - **命令（root/话题）**：root = `/run`、`/agents`、`/clear`（清终止历史）；话题内 = 回复追加、`/stop`（标 stopped）、`/done`（标 done 归档）。`/done` 与 `mark_done` 共用 `_finish_task`：有活跃 worker 走 None 哨兵优雅收尾（`_AgentSession.terminate_status` 决定落 stopped/done），无活跃则直接改台账。恢复逻辑收敛到 `_try_resume`（check→`_launch` 无 await 防 TOCTOU），`_launch(first_prompt=None)` = 仅拉起在线。
   - **回复分层（勿回退）**：对用户对话/命令用 `_reply_user`（`bridge.reply`，`reply_in_thread=false`，**不建话题**）；只有 agent 输出/状态进它自己的话题才用 `reply_in_thread=true`。
 - **并发隔离**（P1）：仅并发时创建 git worktree + 临时分支（`agent/<project>-<task-id>`）。
 
@@ -34,7 +35,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 用 `uv` 管理（Python 3.12 已 pin；本机无系统 Python，一律 `uv run`）。
 
 - 安装依赖：`uv sync`
-- 测试：`uv run pytest -q`（50 个，含 daemon 生命周期集成测试）
+- 测试：`uv run pytest -q`（135 个，含 daemon 生命周期 + 任务系统集成测试）
 - Lint / 格式：`uv run ruff check .` / `uv run ruff format .`
 - daemon：`uv run feishu-dispatcher start`（`--discover` 发现 chat_id；`-v` 调试日志；`--config <path>`）
 - ACP 冒烟（不经飞书，真实 Copilot）：`uv run python scripts/smoke_acp.py`

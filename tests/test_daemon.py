@@ -668,17 +668,17 @@ async def test_agent_error_notifies_main_line():
     await wait_until(lambda: "om_root1" not in daemon._sessions)
 
 
-async def test_list_agents_reports_task_status_and_turns():
+async def test_list_tasks_reports_task_status_and_turns():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
     await wait_until(
         lambda: (
-            daemon._sched_list_agents()
-            and daemon._sched_list_agents()[0]["status"] == "idle"
+            daemon._sched_list_tasks()
+            and daemon._sched_list_tasks()[0]["status"] == "idle"
         )
     )
-    info = daemon._sched_list_agents()[0]
+    info = daemon._sched_list_tasks()[0]
     assert info["project"] == "demo"
     assert info["task_id"] == "t1"
     assert info["turns"] == 1
@@ -709,3 +709,146 @@ async def test_nl_without_llm_falls_back_to_usage():
     await daemon._handle_message(root_msg("帮我做点什么", mid="om_x"))
     assert created == []
     assert any("用法" in t for t in bridge.texts("om_x"))
+
+
+# ---------------------------------------------------------------------- #
+# 任务系统 Phase 2：调度器操作已有任务 + /done、/clear
+# ---------------------------------------------------------------------- #
+
+
+async def test_send_to_task_enqueues_to_running_task():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo first"))
+    await wait_until(lambda: created and created[0].prompts == ["first"])
+    out = await daemon._sched_send_to_task("t1", "more work")
+    await wait_until(lambda: created[0].prompts == ["first", "more work"])
+    assert "t1" in out and "转达" in out
+    assert len(created) == 1  # 复用同一 agent，未新建
+    await daemon._shutdown()
+
+
+async def test_send_to_task_resumes_suspended_task():
+    store = TaskStore(None)
+    _seed_task(store, thread="om_s", session_id="sid_s", status="suspended")
+    daemon, bridge, created = make_daemon(store=store)
+    out = await daemon._sched_send_to_task("t1", "继续")
+    await wait_until(lambda: created and created[0].prompts == ["继续"])
+    assert created[0].resume_session_id == "sid_s"
+    assert "恢复" in out
+    await daemon._shutdown()
+
+
+async def test_send_to_task_terminal_points_to_resume():
+    store = TaskStore(None)
+    _seed_task(store, thread="om_d", status="done")
+    daemon, bridge, created = make_daemon(store=store)
+    out = await daemon._sched_send_to_task("t1", "继续")
+    assert created == []  # 终止任务不自动恢复
+    assert "resume_task" in out
+
+
+async def test_send_to_task_unknown_id():
+    daemon, bridge, created = make_daemon()
+    out = await daemon._sched_send_to_task("t99", "x")
+    assert "未找到" in out
+    assert created == []
+
+
+async def test_resume_task_revives_suspended_without_running_a_turn():
+    store = TaskStore(None)
+    _seed_task(store, thread="om_s", session_id="sid_s", status="suspended")
+    daemon, bridge, created = make_daemon(store=store)
+    out = await daemon._sched_resume_task("t1")
+    await wait_until(lambda: created and created[0].start_count == 1)
+    assert created[0].resume_session_id == "sid_s"
+    assert created[0].prompts == []  # 仅拉起在线，不跑首轮
+    await wait_until(lambda: store.get("t1").status == "idle")
+    assert "恢复" in out
+    await daemon._shutdown()
+
+
+async def test_resume_task_already_running_is_noop():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    out = await daemon._sched_resume_task("t1")
+    assert "已在运行" in out
+    assert len(created) == 1
+    await daemon._shutdown()
+
+
+async def test_mark_done_active_archives_and_closes_agent():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    out = await daemon._sched_mark_done("t1")
+    assert "done" in out
+    await wait_until(lambda: store.get("t1").status == "done")
+    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    assert created[0].closed
+    assert any("归档" in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+async def test_mark_done_inactive_task_updates_ledger():
+    store = TaskStore(None)
+    _seed_task(store, thread="om_s", status="suspended")
+    daemon, bridge, created = make_daemon(store=store)
+    out = await daemon._sched_mark_done("t1")
+    assert store.get("t1").status == "done"
+    assert created == []  # 无活跃 session 时不拉起 agent
+    assert "done" in out
+
+
+async def test_mark_done_unknown_id():
+    daemon, bridge, created = make_daemon()
+    out = await daemon._sched_mark_done("t42")
+    assert "未找到" in out
+
+
+async def test_done_command_in_thread_archives_and_closes():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    await daemon._handle_message(thread_msg("/done"))
+    await wait_until(lambda: store.get("t1").status == "done")
+    await wait_until(lambda: created[0].closed)
+    assert any("归档" in t for t in bridge.texts("om_root1"))
+
+
+async def test_done_command_on_suspended_task_without_recovering():
+    store = TaskStore(None)
+    _seed_task(store, thread="om_s", status="suspended")
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(thread_msg("/done", root="om_s", mid="om_dn"))
+    assert created == []  # 不为了归档而恢复
+    assert store.get("t1").status == "done"
+    assert any("归档" in t for t in bridge.texts("om_s"))
+
+
+async def test_clear_command_clears_terminal_history():
+    store = TaskStore(None)
+    _seed_task(store, thread="om_old", status="stopped")  # 终止历史
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/clear", mid="om_c"))
+    assert any("已清理 1" in t for t in bridge.texts("om_c"))
+    assert store.get("t1") is None  # 终止任务被清掉
+
+
+async def test_get_task_returns_detail():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo do it"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").session_id)
+    info = daemon._sched_get_task("t1")
+    assert info["task_id"] == "t1"
+    assert info["project"] == "demo"
+    assert info["description"] == "do it"
+    assert info["has_session"] is True
+    assert info["active"] is True
+    assert daemon._sched_get_task("t404") is None
+    await daemon._shutdown()

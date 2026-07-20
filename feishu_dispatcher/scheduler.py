@@ -76,14 +76,21 @@ class SchedulerMemory:
         self._flush()
 
 
-SYSTEM_PROMPT = """你是一个任务调度器。你的职责：
-1. 理解用户的任务描述，识别涉及哪些已注册项目（先用 list_projects 查看有哪些项目）。
-2. 为每个相关项目调用 spawn_agent 派发任务（task 用清晰的自然语言描述要做什么）。
-3. 回答用户关于 agent 状态的问题（list_agents）。
+SYSTEM_PROMPT = """你是一个任务调度器（控制台主线的「控制塔」）。你的职责：
+1. 理解用户需求，识别涉及哪些已注册项目（先用 list_projects 查看有哪些项目）。
+2. 用 list_tasks 掌握当前有哪些任务及其状态；需要细节时用 get_task(task_id)。
+3. 区分「新任务」与「已有任务」——这是关键：
+   - 全新的工作 → spawn_agent(project, task) 新建任务（会新建一个飞书话题）。
+   - 针对某个**已存在**的任务追加指令/追问/让它继续做某事 → 先 list_tasks 找到它的
+     task_id，再 send_to_task(task_id, message)。**绝不要为已有任务重复 spawn 新
+     agent**——那会丢掉原有上下文、留下重复话题。
+   - 恢复一个挂起或已结束的任务 → resume_task(task_id)（load_session 接回原上下文）。
+   - 用户确认某任务已完成、要归档 → mark_done(task_id)。
+4. 回答用户关于任务状态的问题（list_tasks / get_task）。
 
-你不写代码、不改文件、不跑命令——那些是 agent 的工作，你只负责理解与派发。
-派发后用一两句话简要告诉用户你做了什么。若用户的请求与任何已注册项目都无关，
-或信息不足以确定项目/任务，不要 spawn，直接回复澄清或说明。"""
+你不写代码、不改文件、不跑命令——那些是 agent 的工作，你只负责理解、派发与协调。
+操作已有任务前务必先 list_tasks 确认 task_id；确认没有对应任务再考虑新建。
+做完用一两句话简要告诉用户你做了什么。信息不足以确定项目/任务时，先追问澄清，不要乱建。"""
 
 
 @dataclass
@@ -195,9 +202,13 @@ def build_scheduler_tools(
     *,
     list_projects: Callable[[], list[dict[str, Any]]],
     spawn_agent: Callable[[str, str], Awaitable[str]],
-    list_agents: Callable[[], list[dict[str, Any]]],
+    list_tasks: Callable[[], list[dict[str, Any]]],
+    get_task: Callable[[str], dict[str, Any] | None],
+    send_to_task: Callable[[str, str], Awaitable[str]],
+    resume_task: Callable[[str], Awaitable[str]],
+    mark_done: Callable[[str], Awaitable[str]],
 ) -> list[ToolSpec]:
-    """把 daemon 能力包装成调度器工具。list_* 同步取状态，spawn 异步执行。"""
+    """把 daemon 能力包装成调度器工具。查询类（list/get）同步取状态，操作类异步执行。"""
 
     async def _list_projects(_args: dict[str, Any]) -> str:
         return json.dumps(list_projects(), ensure_ascii=False)
@@ -209,8 +220,47 @@ def build_scheduler_tools(
             return "参数不足：project 和 task 都必填。"
         return await spawn_agent(project, task)
 
-    async def _list_agents(_args: dict[str, Any]) -> str:
-        return json.dumps(list_agents(), ensure_ascii=False)
+    async def _list_tasks(_args: dict[str, Any]) -> str:
+        return json.dumps(list_tasks(), ensure_ascii=False)
+
+    async def _get_task(args: dict[str, Any]) -> str:
+        task_id = str(args.get("task_id", "")).strip()
+        if not task_id:
+            return "参数不足：task_id 必填。"
+        info = get_task(task_id)
+        if info is None:
+            return f"未找到任务 {task_id}。"
+        return json.dumps(info, ensure_ascii=False)
+
+    async def _send_to_task(args: dict[str, Any]) -> str:
+        task_id = str(args.get("task_id", "")).strip()
+        message = str(args.get("message", "")).strip()
+        if not task_id or not message:
+            return "参数不足：task_id 和 message 都必填。"
+        return await send_to_task(task_id, message)
+
+    async def _resume_task(args: dict[str, Any]) -> str:
+        task_id = str(args.get("task_id", "")).strip()
+        if not task_id:
+            return "参数不足：task_id 必填。"
+        return await resume_task(task_id)
+
+    async def _mark_done(args: dict[str, Any]) -> str:
+        task_id = str(args.get("task_id", "")).strip()
+        if not task_id:
+            return "参数不足：task_id 必填。"
+        return await mark_done(task_id)
+
+    _task_id_param = {
+        "type": "object",
+        "properties": {
+            "task_id": {
+                "type": "string",
+                "description": "任务 id（形如 t3，用 list_tasks 查）",
+            }
+        },
+        "required": ["task_id"],
+    }
 
     return [
         ToolSpec(
@@ -221,7 +271,10 @@ def build_scheduler_tools(
         ),
         ToolSpec(
             name="spawn_agent",
-            description="给指定项目派发一个 coding agent 执行任务，会新建一个飞书话题跟踪其输出。",
+            description=(
+                "给指定项目派发一个**新** coding agent 执行任务，会新建一个飞书话题。"
+                "仅用于全新工作；要操作已有任务请改用 send_to_task。"
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -236,9 +289,56 @@ def build_scheduler_tools(
             handler=_spawn_agent,
         ),
         ToolSpec(
-            name="list_agents",
-            description="列出当前活跃与可恢复的 agent 及其项目，用于回答状态类问题。",
+            name="list_tasks",
+            description=(
+                "列出所有任务（活跃 + 历史）及其 task_id/项目/状态/轮数/描述。"
+                "操作已有任务前先用它确认 task_id。"
+            ),
             parameters={"type": "object", "properties": {}},
-            handler=_list_agents,
+            handler=_list_tasks,
+        ),
+        ToolSpec(
+            name="get_task",
+            description="查看单个任务的详情（状态、轮数、是否有可恢复会话、时间戳等）。",
+            parameters=_task_id_param,
+            handler=_get_task,
+        ),
+        ToolSpec(
+            name="send_to_task",
+            description=(
+                "把一条消息/指令转达给**已有**任务的 agent（在跑就排队执行；挂起会先"
+                "自动 load_session 恢复）。用于追加指令、追问、让它继续做某事——"
+                "不要为此新建 agent。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "task_id": {
+                        "type": "string",
+                        "description": "目标任务 id（用 list_tasks 查）",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "要转达给 agent 的内容",
+                    },
+                },
+                "required": ["task_id", "message"],
+            },
+            handler=_send_to_task,
+        ),
+        ToolSpec(
+            name="resume_task",
+            description=(
+                "显式恢复一个挂起或已结束的任务（load_session 接回原上下文），使其重新"
+                "在线。之后可再 send_to_task 或让用户在其话题回复。"
+            ),
+            parameters=_task_id_param,
+            handler=_resume_task,
+        ),
+        ToolSpec(
+            name="mark_done",
+            description="把一个任务标记为完成并归档（done）。用户确认某任务做完时用。",
+            parameters=_task_id_param,
+            handler=_mark_done,
         ),
     ]

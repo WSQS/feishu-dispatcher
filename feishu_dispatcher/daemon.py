@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 _DISPATCH_PREFIX = "/run "
 _LIST_CMD = "/agents"
 _STOP_CMD = "/stop"
+_DONE_CMD = "/done"
+_CLEAR_CMD = "/clear"
 
 #: message_id 去重窗口大小（飞书 ACK 异常时服务端会重推事件）
 _DEDUP_CAPACITY = 512
@@ -44,9 +46,10 @@ _DEDUP_CAPACITY = 512
 _USAGE = (
     "用法：\n"
     "• `/run <项目名> <任务描述>`  派发任务给 agent\n"
-    "• `/agents`  列出活跃 agent\n"
+    "• `/agents`  列出活跃 + 历史任务\n"
+    "• `/clear`  清理已结束任务的历史\n"
     "• 在 agent 话题内直接回复 = 追加指令（排队串行执行）\n"
-    "• 在 agent 话题内发 `/stop` = 结束该 agent"
+    "• 在 agent 话题内发 `/stop` = 结束该 agent，`/done` = 标记完成并归档"
 )
 
 
@@ -87,8 +90,10 @@ class _AgentSession:
     agent: "AcpAgent | None" = None
     #: 当前回合的输出通道（card 或 text 模式）；回合间为 None
     current_channel: "object | None" = None
-    #: prompt 队列；None 是关闭哨兵（/stop）
+    #: prompt 队列；None 是关闭哨兵（/stop / /done / mark_done）
     queue: "asyncio.Queue[str | None]" = field(default_factory=asyncio.Queue)
+    #: 收到 None 哨兵时置入的终止态：stopped（/stop，默认）或 done（/done / mark_done）
+    terminate_status: str = "stopped"
     #: 单消费者 worker，持有 agent 完整生命周期
     worker: "asyncio.Task[None] | None" = None
 
@@ -202,6 +207,11 @@ class _Daemon:
             await self._spawn_for_root(msg, text[len(_DISPATCH_PREFIX) :].strip())
         elif text == _LIST_CMD:
             await self._list_agents(msg)
+        elif text == _CLEAR_CMD:
+            n = self.store.clear_terminal()
+            await self._reply_user(
+                msg.message_id, f"🧹 已清理 {n} 条已结束任务的历史。"
+            )
         elif text in ("/help", "/?", "/usage"):
             await self._reply_user(msg.message_id, _USAGE)
         elif self._llm is not None and text and not text.startswith("/"):
@@ -275,13 +285,14 @@ class _Daemon:
         self,
         task: Task,
         agent_argv: list[str],
-        first_prompt: str,
+        first_prompt: str | None,
         *,
         resume_session_id: str | None = None,
     ) -> _AgentSession:
         """按 Task 建 session、接线 on_output、入队首条 prompt、启动 worker。
 
         ``resume_session_id`` 非 None 时 agent 用 load_session 恢复（惰性重连）。
+        ``first_prompt=None`` 时只把 agent 拉起来在线（不跑首轮），用于 resume_task。
         """
         sess = _AgentSession(
             thread_root_id=task.thread_root_id,
@@ -301,7 +312,8 @@ class _Daemon:
             on_output,
             resume_session_id=resume_session_id,
         )
-        sess.queue.put_nowait(first_prompt)
+        if first_prompt is not None:
+            sess.queue.put_nowait(first_prompt)
         self._sessions[task.thread_root_id] = sess
         sess.worker = asyncio.create_task(
             self._agent_worker(sess), name=f"agent-{task.task_id}"
@@ -369,8 +381,14 @@ class _Daemon:
                     )
                     break
                 if prompt is None:
-                    self.store.update(sess.task_id, status="stopped")  # 保留历史
-                    await self._safe_reply(root, "🛑 agent 已停止。")
+                    status = sess.terminate_status  # stopped(/stop) 或 done(/done)
+                    self.store.update(sess.task_id, status=status)  # 保留历史
+                    await self._safe_reply(
+                        root,
+                        "✅ 任务已完成并归档。"
+                        if status == "done"
+                        else "🛑 agent 已停止。",
+                    )
                     break
                 title = f"{sess.project_name} · {sess.agent_label}"
                 channel = self._make_channel(root, title)
@@ -452,6 +470,9 @@ class _Daemon:
         if text == _STOP_CMD:
             sess.queue.put_nowait(None)  # worker 会把 Task 标记 stopped
             return
+        if text == _DONE_CMD:
+            self._finish_task(sess.task_id, "done")  # 优雅收尾，worker 发完成消息
+            return
         sess.queue.put_nowait(text)
 
     async def _recover_or_notify(
@@ -475,29 +496,63 @@ class _Daemon:
             self.store.update(task.task_id, status="stopped")
             await self._safe_reply(reply_target, f"🛑 任务 [{task.task_id}] 已结束。")
             return
+        if text == _DONE_CMD:
+            self.store.update(task.task_id, status="done")
+            await self._safe_reply(
+                reply_target, f"✅ 任务 [{task.task_id}] 已完成并归档。"
+            )
+            return
         if not text:
             return  # 空回复不触发恢复
+        ok, why = self._try_resume(task, first_prompt=text)
+        if not ok:
+            await self._safe_reply(reply_target, why)
+            return
+        await self._safe_reply(reply_target, f"♻️ 正在恢复任务 [{task.task_id}]…")
+
+    def _try_resume(self, task: Task, *, first_prompt: str | None) -> tuple[bool, str]:
+        """把一个非活跃任务 load_session 惰性重连；返回 (成功, 失败文案)。
+
+        check（agent 配置 / 会话 / max_agents）与 ``_launch`` 登记之间**无 await**，
+        保证并发下不突破 max_agents（TOCTOU，同 _spawn_for_root）。调用点务必也别
+        在 check 与本调用之间插入 await。
+        """
         agent_argv = self.cfg.agents.get(task.agent_label)
         if not agent_argv or not task.session_id:
             self.store.update(task.task_id, status="failed")
             why = "agent 未配置" if not agent_argv else "无可恢复的会话"
-            await self._safe_reply(
-                reply_target,
-                f"⚠️ 无法恢复任务 [{task.task_id}]（{why}）。发送 `/run` 重开。",
+            return False, (
+                f"⚠️ 无法恢复任务 [{task.task_id}]（{why}）。发送 `/run` 重开。"
             )
-            return
-        # 与 _spawn_for_root 同理：check 与 _launch 登记之间不能 await（TOCTOU）。
         if len(self._sessions) >= self.cfg.max_agents:
-            await self._safe_reply(
-                reply_target,
+            return False, (
                 f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，无法恢复。"
-                "请先 `/stop` 一个再回复。",
+                "请先 `/stop` 一个再试。"
             )
-            return
         self._launch(
-            task, agent_argv, first_prompt=text, resume_session_id=task.session_id
+            task,
+            agent_argv,
+            first_prompt=first_prompt,
+            resume_session_id=task.session_id,
         )
-        await self._safe_reply(reply_target, f"♻️ 正在恢复任务 [{task.task_id}]…")
+        return True, ""
+
+    def _finish_task(self, task_id: str, status: str) -> bool:
+        """把任务置为终止态 ``status``；有活跃 worker 则经哨兵优雅收尾，否则直接改台账。
+
+        返回是否找到该任务。活跃时把 ``terminate_status`` 交给 worker、入队 None——
+        worker 跑完当前/排队 turn 后落地状态并发完成消息（与 /stop 同机制）。
+        """
+        task = self.store.get(task_id)
+        if task is None:
+            return False
+        sess = self._sessions.get(task.thread_root_id)
+        if sess is not None and sess.worker is not None and not sess.worker.done():
+            sess.terminate_status = status
+            sess.queue.put_nowait(None)
+        else:
+            self.store.update(task_id, status=status)
+        return True
 
     async def _list_agents(self, msg: IncomingMessage) -> None:
         tasks = self.store.all()
@@ -535,7 +590,11 @@ class _Daemon:
         tools = build_scheduler_tools(
             list_projects=self._sched_list_projects,
             spawn_agent=self._sched_spawn_agent,
-            list_agents=self._sched_list_agents,
+            list_tasks=self._sched_list_tasks,
+            get_task=self._sched_get_task,
+            send_to_task=self._sched_send_to_task,
+            resume_task=self._sched_resume_task,
+            mark_done=self._sched_mark_done,
         )
         try:
             reply = await run_tool_loop(
@@ -556,7 +615,7 @@ class _Daemon:
             for p in self.cfg.projects.values()
         ]
 
-    def _sched_list_agents(self) -> list[dict]:
+    def _sched_list_tasks(self) -> list[dict]:
         # 从任务台账读（含历史），而非只看内存里的活跃 session
         return [
             {
@@ -569,6 +628,64 @@ class _Daemon:
             }
             for t in self.store.all()
         ]
+
+    def _sched_get_task(self, task_id: str) -> dict | None:
+        """get_task 工具：单任务详情（含是否有可恢复会话、是否活跃、时间戳）。"""
+        t = self.store.get(task_id)
+        if t is None:
+            return None
+        return {
+            "task_id": t.task_id,
+            "project": t.project_name,
+            "agent": t.agent_label,
+            "description": t.description,
+            "status": t.status,
+            "turns": t.turns,
+            "has_session": bool(t.session_id),
+            "active": t.thread_root_id in self._sessions,
+            "created_at": t.created_at,
+            "updated_at": t.updated_at,
+        }
+
+    async def _sched_send_to_task(self, task_id: str, message: str) -> str:
+        """send_to_task 工具：把消息路由给已有任务的 agent（在跑排队；挂起先恢复）。"""
+        task = self.store.get(task_id)
+        if task is None:
+            return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
+        sess = self._sessions.get(task.thread_root_id)
+        if sess is not None and sess.worker is not None and not sess.worker.done():
+            sess.queue.put_nowait(message)
+            return f"已把消息转达给任务 [{task_id}]（{task.project_name}），排队执行。"
+        if task.is_terminal:
+            return (
+                f"任务 [{task_id}] 已是终止态（{task.status}），未自动恢复。"
+                f"如需继续，请先 resume_task({task_id})。"
+            )
+        # 非活跃且可恢复：load_session 惰性重连，把消息作为首轮。check→launch 无 await。
+        ok, why = self._try_resume(task, first_prompt=message)
+        return f"已恢复任务 [{task_id}] 并转达消息。" if ok else why
+
+    async def _sched_resume_task(self, task_id: str) -> str:
+        """resume_task 工具：显式恢复挂起/已结束的任务（load_session），仅拉起不跑首轮。"""
+        task = self.store.get(task_id)
+        if task is None:
+            return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
+        sess = self._sessions.get(task.thread_root_id)
+        if sess is not None and sess.worker is not None and not sess.worker.done():
+            return f"任务 [{task_id}] 已在运行，无需恢复。"
+        ok, why = self._try_resume(task, first_prompt=None)
+        if not ok:
+            return why
+        return (
+            f"已恢复任务 [{task_id}]（{task.project_name}），"
+            "可继续 send_to_task 或让用户在其话题回复。"
+        )
+
+    async def _sched_mark_done(self, task_id: str) -> str:
+        """mark_done 工具：把任务标记完成并归档（有活跃 worker 则优雅收尾）。"""
+        if not self._finish_task(task_id, "done"):
+            return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
+        return f"已把任务 [{task_id}] 标记为完成（done）。"
 
     async def _sched_spawn_agent(self, project_name: str, task: str) -> str:
         """spawn_agent 工具实现：建 Task + 新话题 + 启动 agent，返回给 LLM 的状态串。"""
