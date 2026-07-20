@@ -82,6 +82,7 @@
 |------|------|------|
 | `list_projects()` | — | 返回已注册项目列表 |
 | `register_project(name, default_agent, path)` | 三项必填 | 注册新项目，落盘 projects.json（✅ 已实现，agent 必填、path 须为已存在目录） |
+| `unregister_project(name)` | — | 删除已注册项目（✅ 已实现，种子项目删不了；历史 Task 记录不受影响） |
 | `spawn_agent(project, task, worktree?)` | — | 启动 agent 进程（ACP）+ 创建飞书话题。如需并发，自动创建 worktree |
 | `send_to_agent(thread_id, message)` | — | 向指定 agent 发送消息（ACP `session/prompt`） |
 | `get_agent_status(thread_id?)` | — | 查询 agent 状态（running / waiting / done / failed） |

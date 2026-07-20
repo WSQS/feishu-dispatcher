@@ -1312,3 +1312,16 @@ async def test_scheduler_register_project_tool(tmp_path):
     # 注册后 list_projects 里能看到
     names = {p["name"] for p in daemon._sched_list_projects()}
     assert "schedp" in names
+
+
+async def test_scheduler_unregister_project_tool(tmp_path):
+    daemon, _, _ = make_daemon()
+    daemon.project_store.add(
+        Project(name="delp", path=Path(tmp_path), default_agent="copilot")
+    )
+    out = await daemon._sched_unregister_project("delp")
+    assert "已删除项目 delp" in out
+    assert daemon.project_store.get("delp") is None
+    # 种子项目删不了
+    out2 = await daemon._sched_unregister_project("demo")
+    assert "改配置文件" in out2

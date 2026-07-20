@@ -900,6 +900,7 @@ class _Daemon:
             resume_task=self._sched_resume_task,
             mark_done=self._sched_mark_done,
             register_project=self._sched_register_project,
+            unregister_project=self._sched_unregister_project,
         )
         try:
             reply = await run_tool_loop(
@@ -924,6 +925,10 @@ class _Daemon:
         """register_project 工具：对话式注册项目（与 /project add 共用校验）。"""
         _, msg = self._register_project(name, agent, path)
         return msg
+
+    async def _sched_unregister_project(self, name: str) -> str:
+        """unregister_project 工具：删除已注册项目（与 /project remove 共用底层）。"""
+        return self._remove_project(name)
 
     def _sched_list_tasks(self) -> list[dict]:
         # 从任务台账读（含历史），而非只看内存里的活跃 session
