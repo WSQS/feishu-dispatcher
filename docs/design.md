@@ -447,6 +447,12 @@ capabilities 比 copilot/opencode 更全（原生 load_session/fork/resume/close
   截断 800）落台账，🔔 通知带一行摘要，`get_task`/`/task` 展示。（后续可选：per-turn 历史输出。）
 - **自动触发降噪**：非命令 root 消息静默/仅 `/help` 给用法（见上文「无需 @」）。
 - **对话记忆可配**：`[llm]` 加 `memory_rounds`（默认 12 轮）。
+- ~~**`/reboot` 重启 daemon**~~：✅ 已实现 2026-07-20——`/reboot`（root）优雅关停（`_stop_event`
+  跳出主循环 → `_shutdown` 关 agents、活跃任务标 suspended）后，`run()` 返回 True，`cli._reexec`
+  用同 venv python `os.execv` 起 `python -m feishu_dispatcher.cli <原参数>` 替换自己（PID 不变、无需
+  外部看护、继承 uv 的 env）。新进程读 `FEISHU_DISPATCHER_REBOOTED` env 发「✅ 已重启」回执；任务由
+  `tasks.json` + `load_session` 自动恢复。**注**：Windows `os.execv` 是「新建+退旧」语义，配 uv 需实测；
+  若飘可退回「退出码 + wrapper 看护」方案。
 - **`/help` 话题内也生效**：`/help`（+`/?`/`/usage`）目前只在 **root 主线**处理（`_handle_message`），
   话题内发会被当 prompt 发给 agent。待办：在 `_forward_to_agent` 里加 `/help` 分支，展示话题内可用命令
   （回复追加 / `/stop` / `/done` / `/model`）。命令清单本身已随新增命令同步维护在 `_USAGE`（root 用法）。

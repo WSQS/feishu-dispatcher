@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
@@ -41,6 +42,10 @@ _STOP_CMD = "/stop"
 _DONE_CMD = "/done"
 _CLEAR_CMD = "/clear"
 _MODEL_CMD = "/model"  # 话题内：/model 列出可选，/model <名> 切换
+_REBOOT_CMD = "/reboot"  # root：重启整个 daemon 进程（cli.py re-exec）
+
+#: 环境变量：re-exec 重启时置位，新进程据此发「已重启」回执
+_REBOOTED_ENV = "FEISHU_DISPATCHER_REBOOTED"
 
 #: message_id 去重窗口大小（飞书 ACK 异常时服务端会重推事件）
 _DEDUP_CAPACITY = 512
@@ -51,6 +56,7 @@ _USAGE = (
     "• `/agents`  列出活跃 + 历史任务\n"
     "• `/task <任务id>`  查看某任务详情与动作日志\n"
     "• `/clear`  清理已结束任务的历史\n"
+    "• `/reboot`  重启整个 daemon（任务自动恢复）\n"
     "• 在 agent 话题内直接回复 = 追加指令（排队串行执行）\n"
     "• 在 agent 话题内发 `/stop` = 结束，`/done` = 归档，`/model [名]` = 查看/切换模型"
 )
@@ -73,12 +79,14 @@ def _one_line(text: str, limit: int) -> str:
 
 async def run(
     cfg: Config, *, discover: bool = False, store_path: Path | None = None
-) -> None:
+) -> bool:
     """启动 daemon：飞书 WS 长连接 + agent 调度。阻塞直到收到退出信号。
 
     ``discover=True`` 时只打印收到消息的 chat_id，不执行任何命令
     （帮助用户发现群 id 后填进配置）。``store_path`` 是会话持久化文件
     （默认 config 同目录的 sessions.json）。
+
+    返回是否收到 ``/reboot``——cli.py 据此 re-exec 重启进程。
     """
     if store_path is None:
         store_path = DEFAULT_CONFIG_PATH.parent / "sessions.json"
@@ -89,6 +97,7 @@ async def run(
         _sched_memory=SchedulerMemory(store_path.parent / "scheduler_memory.json"),
     )
     await daemon.run()
+    return daemon._reboot_requested
 
 
 @dataclass
@@ -131,6 +140,10 @@ class _Daemon:
     _bridge: FeishuBridge | None = None
     _sessions: dict[str, _AgentSession] = field(default_factory=dict)
     _seen_message_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    #: /reboot 收到后置位；run() 返回它，cli.py re-exec 重启进程
+    _reboot_requested: bool = False
+    #: run() 里创建的退出事件；/reboot 或退出信号 set 它跳出主循环
+    _stop_event: "asyncio.Event | None" = None
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
@@ -143,19 +156,25 @@ class _Daemon:
             on_event=self._handle_message,
             chat_whitelist=self.cfg.chat_id,
         )
+        self._stop_event = asyncio.Event()
         self._bridge.start_background()
         logger.info(
             "feishu-dispatcher daemon 已启动（调度器 LLM: %s），等待飞书消息…",
             "on" if self._llm else "off",
         )
+        # re-exec 重启起来的进程：给控制台发一条「已重启」回执（HTTP，不依赖 WS）
+        if os.environ.pop(_REBOOTED_ENV, None):
+            await self._notify_main("✅ daemon 已重启完成。")
         try:
-            # R13：看门狗——每 30s 醒一次检查 WS 线程是否存活；
-            # 死了则 error 日志 + bridge.restart() 重启（重启前确认未在退出）
-            while True:
+            # R13：看门狗——最多等 30s 或直到 _stop_event 被 set（/reboot / 退出）；
+            # 超时则检查 WS 线程是否存活，死了 bridge.restart()。
+            while not self._stop_event.is_set():
                 try:
-                    await asyncio.wait_for(asyncio.Event().wait(), timeout=30.0)
+                    await asyncio.wait_for(self._stop_event.wait(), timeout=30.0)
                 except asyncio.TimeoutError:
                     pass  # 正常：每 30s 醒来检查一次
+                if self._stop_event.is_set():
+                    break
                 if not self._bridge.is_alive():
                     logger.error("飞书 WS 线程已死亡，尝试重启…")
                     self._bridge.restart()
@@ -232,6 +251,8 @@ class _Daemon:
             await self._reply_user(
                 msg.message_id, f"🧹 已清理 {n} 条已结束任务的历史。"
             )
+        elif text == _REBOOT_CMD:
+            await self._reboot(msg)
         elif text in ("/help", "/?", "/usage"):
             await self._reply_user(msg.message_id, _USAGE)
         elif self._llm is not None and text and not text.startswith("/"):
@@ -714,6 +735,19 @@ class _Daemon:
         else:
             lines.append("（暂无动作记录）")
         await self._reply_user(msg.message_id, "\n".join(lines))
+
+    async def _reboot(self, msg: IncomingMessage) -> None:
+        """`/reboot`：优雅关停后由 cli.py re-exec 重启整个 daemon 进程。
+
+        先发回执再置位（之后 WS 会断）；活跃任务由 `_shutdown` 标 suspended、
+        重启后可 `load_session` 恢复，不丢上下文。"""
+        await self._reply_user(
+            msg.message_id, "🔄 正在重启 daemon…（十几秒后回来，任务会自动恢复）"
+        )
+        logger.info("收到 /reboot，准备重启 daemon")
+        self._reboot_requested = True
+        if self._stop_event is not None:
+            self._stop_event.set()
 
     # ------------------------------------------------------------------ #
     # P2：调度器 LLM（自然语言派发）
