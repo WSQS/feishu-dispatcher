@@ -35,6 +35,8 @@ class LLMSettings:
     base_url: str
     api_key: str
     model: str
+    #: 主线对话记忆保留的轮数（透传给 SchedulerMemory.max_turns）；默认 12
+    memory_rounds: int = 12
 
 
 @dataclass(frozen=True)
@@ -86,10 +88,16 @@ class Config:
         llm_data = data.get("llm")
         llm = None
         if llm_data:
+            memory_rounds = int(llm_data.get("memory_rounds", 12))
+            if memory_rounds < 1:
+                raise ValueError(
+                    f"llm.memory_rounds 必须为正整数，当前为 {memory_rounds}"
+                )
             llm = LLMSettings(
                 base_url=llm_data["base_url"],
                 api_key=llm_data["api_key"],
                 model=llm_data["model"],
+                memory_rounds=memory_rounds,
             )
         agents = {name: list(argv) for name, argv in data.get("agents", {}).items()}
         # 种子项目的 default_agent 仍可省略（兜底 copilot，向后兼容）；但若兜底或

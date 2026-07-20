@@ -109,7 +109,11 @@ async def run(
         discover=discover,
         store=TaskStore(store_path.parent / "tasks.json"),
         project_store=ProjectStore(store_path.parent / "projects.json"),
-        _sched_memory=SchedulerMemory(store_path.parent / "scheduler_memory.json"),
+        _sched_memory=SchedulerMemory(
+            store_path.parent / "scheduler_memory.json",
+            # [llm].memory_rounds 可配；未配 [llm] 时记忆不参与派发，取默认即可
+            max_turns=cfg.llm.memory_rounds if cfg.llm else 12,
+        ),
     )
     await daemon.run()
     return daemon._reboot_requested

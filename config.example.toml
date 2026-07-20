@@ -39,6 +39,7 @@ throttle_window = 0.5
 # base_url = "https://api.deepseek.com/v1"
 # api_key = "sk-..."
 # model = "deepseek-chat"
+# memory_rounds = 12   # 主线对话记忆保留轮数（可选，默认 12；越大上下文越全但越费 token）
 
 # 用法：在群里发根消息
 #   /run <项目名> <任务描述>    派发任务给 agent（在根消息下建话题）
