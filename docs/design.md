@@ -332,21 +332,21 @@ done/stopped/failed），`/stop` 改为标记 stopped 保留历史，恢复走 `
 
 （**B = 事前审批**：破坏性操作前飞书卡片按钮确认，替换现在「全自动放行」——更重、涉安全，单开一条线。）
 
-### 待修复：挂起任务 send_to_task 不自动恢复（2026-07-20 用户实测）
+### 挂起任务 send_to_task 不自动恢复（✅ 已修 2026-07-20）
 
 **现象**：主线让调度器给一个**已挂起**的任务发消息，它不会自动恢复；得先让调度器显式
 `resume_task` 才能把消息加进去。
 
-**诊断**：**代码是对的**——`daemon._sched_send_to_task` 对非活跃且非终止（= 挂起/idle）
-的任务本就会走 `_try_resume`（`load_session` 恢复）再把消息作为首轮。所以根因大概率在
-**调度器 LLM 的工具选择**：`SYSTEM_PROMPT` 里写了「恢复一个挂起或已结束的任务 → resume_task」，
-LLM 看到任务是 suspended 就先调 resume_task，而不知道 send_to_task 会自动恢复。
+**诊断**：**代码本就是对的**——`daemon._sched_send_to_task` 对非活跃且非终止（= 挂起/idle）
+的任务本就会走 `_try_resume`（`load_session` 恢复）再把消息作为首轮（`test_send_to_task_
+resumes_suspended_task` 已证）。根因在**调度器 LLM 的工具选择**：`SYSTEM_PROMPT` 原写「恢复一个
+挂起或已结束的任务 → resume_task」，LLM 看到任务 suspended 就先调 resume_task，不知道
+send_to_task 会自动恢复。
 
-**修复候选**（改 `scheduler.py` 的 `SYSTEM_PROMPT` + send_to_task 工具描述）：明确「给**挂起**
-任务发消息直接用 send_to_task，它会自动 load_session 恢复；resume_task 只用于①不带消息、只
-想把 agent 拉回在线，或②恢复**已终止**（done/stopped）任务」。可能再加一条集成测试：模拟
-LLM 对 suspended 任务调 send_to_task，断言无需先 resume。（也要复核用户当时跑的是不是合入
-send_to_task 之前的旧 daemon。）
+**修复**（`scheduler.py`，纯 prompt/工具描述澄清，无逻辑改动）：`SYSTEM_PROMPT` 与 send_to_task
+/resume_task 工具描述都改为明确——「给**挂起**任务发消息直接用 send_to_task（它自动 load_session
+恢复），resume_task 只用于①不带消息只想让 agent 上线，或②恢复**已终止**（done/stopped/failed）
+任务」。代码路径无需改（既有行为测试已覆盖）。
 
 ### 待实现：显示 code agent 当前使用的模型（2026-07-20，调研结论）
 
