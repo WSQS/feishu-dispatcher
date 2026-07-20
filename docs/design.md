@@ -432,6 +432,9 @@ send_to_task 会自动恢复。
   截断 800）落台账，🔔 通知带一行摘要，`get_task`/`/task` 展示。（后续可选：per-turn 历史输出。）
 - **自动触发降噪**：非命令 root 消息静默/仅 `/help` 给用法（见上文「无需 @」）。
 - **对话记忆可配**：`[llm]` 加 `memory_rounds`（默认 12 轮）。
+- **`/help` 话题内也生效**：`/help`（+`/?`/`/usage`）目前只在 **root 主线**处理（`_handle_message`），
+  话题内发会被当 prompt 发给 agent。待办：在 `_forward_to_agent` 里加 `/help` 分支，展示话题内可用命令
+  （回复追加 / `/stop` / `/done` / `/model`）。命令清单本身已随新增命令同步维护在 `_USAGE`（root 用法）。
 
 **优先级读法（我的建议）**：近期最高价值 = **任务系统 → 审计 A**（连着，任务系统是审计地基，
 且直接解决「调度器忘任务」）；中期 = register_project / send_to_task / per-turn 取消 / 通知摘要；
