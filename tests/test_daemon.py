@@ -77,6 +77,7 @@ class FakeAgent:
         self.model = ""  # 默认无模型（似 copilot）；ModelAgent 覆盖
         self.available_models: list[str] = []
         self.set_model_calls: list[str] = []
+        self.cancel_calls = 0
 
     async def start(self) -> None:
         self.start_count += 1
@@ -84,10 +85,14 @@ class FakeAgent:
         if self.session_id is None:
             self.session_id = f"fake_sid_{id(self)}"
 
-    async def prompt(self, text: str) -> None:
+    async def prompt(self, text: str) -> str:
         self.prompts.append(text)
         self.last_message = f"reply:{text}"
         await self.on_output(f"echo:{text}")
+        return "end_turn"
+
+    async def cancel(self) -> None:
+        self.cancel_calls += 1
 
     async def set_model(self, name: str) -> None:
         self.set_model_calls.append(name)
@@ -98,8 +103,29 @@ class FakeAgent:
 
 
 class FailingAgent(FakeAgent):
-    async def prompt(self, text: str) -> None:
+    async def prompt(self, text: str) -> str:
         raise RuntimeError("boom")
+
+
+class CancelableAgent(FakeAgent):
+    """prompt() 阻塞直到被 cancel()，然后返回 stop_reason='cancelled'（模拟在途取消）。"""
+
+    def __init__(self, *a, **k) -> None:
+        super().__init__(*a, **k)
+        self.in_prompt = asyncio.Event()
+        self._cancelled = asyncio.Event()
+
+    async def prompt(self, text: str) -> str:
+        self.prompts.append(text)
+        self.in_prompt.set()
+        await self._cancelled.wait()
+        self.in_prompt.clear()
+        self._cancelled.clear()
+        return "cancelled"
+
+    async def cancel(self) -> None:
+        self.cancel_calls += 1
+        self._cancelled.set()
 
 
 class ModelAgent(FakeAgent):
@@ -218,6 +244,71 @@ async def test_stop_command_closes_agent_and_removes_session():
     await wait_until(lambda: created[0].closed)
     await wait_until(lambda: "om_root1" not in daemon._sessions)
     assert any("🛑" in t for t in bridge.texts("om_root1"))
+
+
+async def test_stop_cancels_in_flight_turn():
+    daemon, bridge, created = make_daemon(agent_cls=CancelableAgent)
+    await daemon._handle_message(root_msg("/run demo task"))
+    # 等 agent 进入在途 turn（prompt() 阻塞中）
+    await wait_until(lambda: created and created[0].in_prompt.is_set())
+    # 此时 /stop：应触发 cancel 打断在途轮，而非傻等整轮跑完
+    await daemon._handle_message(thread_msg("/stop"))
+    await wait_until(lambda: created[0].cancel_calls == 1)
+    # 取消后 agent 收尾关闭、session 移除、任务标 stopped
+    await wait_until(lambda: created[0].closed)
+    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    assert any("🛑" in t for t in bridge.texts("om_root1"))
+    assert daemon.store.by_thread("om_root1").status == "stopped"
+
+
+async def test_stop_when_idle_does_not_cancel():
+    # 无在途 turn 时 /stop 不应调用 cancel（避免多余的 session/cancel）
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    await wait_until(lambda: not daemon._sessions["om_root1"].turn_in_flight)
+    await daemon._handle_message(thread_msg("/stop"))
+    await wait_until(lambda: created[0].closed)
+    assert created[0].cancel_calls == 0
+
+
+async def test_cancel_stops_turn_but_keeps_agent():
+    daemon, bridge, created = make_daemon(agent_cls=CancelableAgent)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].in_prompt.is_set())
+    await daemon._handle_message(thread_msg("/cancel"))
+    await wait_until(lambda: created[0].cancel_calls == 1)
+    await wait_until(lambda: not daemon._sessions["om_root1"].turn_in_flight)
+    # agent 保留：未关闭、session 还在、任务回 idle（非 stopped）
+    assert not created[0].closed
+    assert "om_root1" in daemon._sessions
+    await wait_until(lambda: daemon.store.by_thread("om_root1").status == "idle")
+    assert any("已取消当前轮" in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+async def test_cancel_with_input_runs_new_turn():
+    daemon, bridge, created = make_daemon(agent_cls=CancelableAgent)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].in_prompt.is_set())
+    await daemon._handle_message(thread_msg("/cancel do this instead"))
+    await wait_until(lambda: created[0].cancel_calls == 1)
+    # 取消后新输入作为下一轮被拾起执行（FIFO），agent 仍存活
+    await wait_until(lambda: created[0].prompts == ["task", "do this instead"])
+    assert not created[0].closed
+    assert "om_root1" in daemon._sessions
+    await daemon._shutdown()
+
+
+async def test_cancel_when_idle_reports_nothing_to_cancel():
+    daemon, bridge, created = make_daemon()  # FakeAgent（回合秒完）
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    await wait_until(lambda: not daemon._sessions["om_root1"].turn_in_flight)
+    await daemon._handle_message(thread_msg("/cancel"))
+    assert created[0].cancel_calls == 0
+    assert any("没有在跑的轮" in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
 
 
 async def test_help_in_thread_shows_usage_not_forwarded_to_agent():

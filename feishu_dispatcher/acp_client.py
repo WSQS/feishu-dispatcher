@@ -439,18 +439,35 @@ class AcpAgent:
                 self._model or "?",
             )
 
-    async def prompt(self, text: str) -> None:
-        """向 agent 发送一条 prompt 并等待其处理完毕。
+    async def prompt(self, text: str) -> str:
+        """向 agent 发送一条 prompt 并等待其处理完毕，返回 ACP ``stop_reason``。
 
-        agent 的流式输出在期间通过 ``on_output`` 回调推送；
-        本方法在 ``prompt()`` 的 response 返回（agent 结束本轮）后返回。
+        agent 的流式输出在期间通过 ``on_output`` 回调推送；本方法在 ``prompt()``
+        的 response 返回（agent 结束本轮）后返回。返回值是 ACP 的 stop_reason
+        （``"end_turn"`` / ``"cancelled"`` / ``"max_tokens"`` …），供上层区分
+        「正常收尾」与被 :meth:`cancel` 「中途取消」。
         """
         if self._conn is None or self._session_id is None:
             raise RuntimeError("agent 尚未启动")
         # 每个回合从头开始：重置流式格式化状态，让本轮首个 thought 重新加 💭
         if self._client_impl is not None:
             self._client_impl.reset_formatter()
-        await self._conn.prompt(session_id=self._session_id, prompt=[text_block(text)])
+        resp = await self._conn.prompt(
+            session_id=self._session_id, prompt=[text_block(text)]
+        )
+        return getattr(resp, "stop_reason", "") or ""
+
+    async def cancel(self) -> None:
+        """请求 agent 取消当前进行中的 turn（ACP ``session/cancel`` 通知）。
+
+        协作式：这是**通知**（无响应），agent 在下一个安全点停下，在途的
+        :meth:`prompt` 会带 ``stop_reason="cancelled"`` 返回——比硬杀进程安全
+        （agent 自己收尾）。agent 若不理会，则 ``prompt`` 照常跑完返回 ``end_turn``
+        （优雅退化）。未启动 / 已关闭时静默忽略。
+        """
+        if self._conn is None or self._session_id is None or self._closed:
+            return
+        await self._conn.cancel(session_id=self._session_id)
 
     async def _drain_stderr(self, proc: Any) -> None:
         """R8：持续读取子进程 stderr 进日志，防止 PIPE 缓冲区满导致 agent 卡死。

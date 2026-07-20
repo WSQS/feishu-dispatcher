@@ -39,6 +39,8 @@ _DISPATCH_PREFIX = "/run "
 _TASK_PREFIX = "/task "
 _LIST_CMD = "/agents"
 _STOP_CMD = "/stop"
+# 话题内：停当前轮但保留 agent；/cancel <新输入> = 停当前轮 + 改做新输入
+_CANCEL_CMD = "/cancel"
 _DONE_CMD = "/done"
 _CLEAR_CMD = "/clear"
 _MODEL_CMD = "/model"  # 话题内：/model 列出可选，/model <名> 切换
@@ -61,14 +63,16 @@ _USAGE = (
     "• `/clear`  清理已结束任务的历史\n"
     "• `/reboot`  重启整个 daemon（任务自动恢复）\n"
     "• 在 agent 话题内直接回复 = 追加指令（排队串行执行）\n"
-    "• 在 agent 话题内发 `/stop` = 结束，`/done` = 归档，`/model [名]` = 查看/切换模型"
+    "• 在 agent 话题内发 `/cancel [新指令]` = 停当前轮（保留 agent），`/stop` = 停并结束，"
+    "`/done` = 归档，`/model [名]` = 查看/切换模型"
 )
 
 #: 话题内用法（在某个 agent 话题里发 /help 时展示；命令随新增同步维护于此）
 _THREAD_USAGE = (
     "话题内用法（你正在某个 agent 的话题里）：\n"
     "• 直接回复 = 追加指令给这个 agent（排队串行执行）\n"
-    "• `/stop`  结束该 agent\n"
+    "• `/cancel [新指令]`  停当前轮但保留 agent；带新指令则停完接着做它\n"
+    "• `/stop`  停当前轮并结束该 agent\n"
     "• `/done`  归档该任务（标记完成）\n"
     "• `/model [名]`  查看 / 切换模型\n"
     "• `/help`  显示本说明\n"
@@ -140,6 +144,8 @@ class _AgentSession:
     queue: "asyncio.Queue[str | None]" = field(default_factory=asyncio.Queue)
     #: 收到 None 哨兵时置入的终止态：stopped（/stop，默认）或 done（/done / mark_done）
     terminate_status: str = "stopped"
+    #: 本轮是否正在跑（worker 卡在 agent.prompt() 里）；/stop 据此决定要不要发 cancel
+    turn_in_flight: bool = False
     #: 单消费者 worker，持有 agent 完整生命周期
     worker: "asyncio.Task[None] | None" = None
 
@@ -614,9 +620,17 @@ class _Daemon:
                     sess.agent_label,
                     prompt,
                 )
+                sess.turn_in_flight = True
                 try:
-                    await sess.agent.prompt(prompt)
+                    stop_reason = await sess.agent.prompt(prompt)
                     await channel.flush()
+                    if stop_reason == "cancelled":
+                        # 本轮被 /stop 中途取消：不当作正常完成（不 ✅、不计 turn、
+                        # 不发完成通知）。卡片置停止态；随后循环取到 None 哨兵即终止。
+                        await channel.set_status("stopped")
+                        self.store.update(sess.task_id, status="idle")
+                        logger.info("任务 %s 本轮被取消", sess.task_id)
+                        continue
                     await channel.set_status("done")
                     # 落 last_output：本轮 agent 的收尾回复（截断），供 get_task/通知摘要
                     last_output = _clip(sess.agent.last_message, _LAST_OUTPUT_MAX)
@@ -662,6 +676,7 @@ class _Daemon:
                     )
                     break
                 finally:
+                    sess.turn_in_flight = False
                     await channel.aclose()
                     sess.current_channel = None
         except asyncio.CancelledError:
@@ -682,6 +697,17 @@ class _Daemon:
                 await sess.agent.aclose()
             except Exception:
                 logger.debug("agent aclose 异常（忽略）", exc_info=True)
+
+    async def _cancel_turn(self, sess: _AgentSession) -> None:
+        """协作式取消 session 当前在途的 turn（ACP session/cancel）。失败不致命。"""
+        agent = sess.agent
+        if agent is None:
+            return
+        try:
+            await agent.cancel()
+            logger.info("已请求取消任务 %s 的当前轮", sess.task_id)
+        except Exception:
+            logger.exception("取消当前轮失败 task=%s", sess.task_id)
 
     async def _forward_to_agent(self, msg: IncomingMessage) -> None:
         """话题内回复 → 入队给对应 agent；agent 不在则尝试跨重启恢复。"""
@@ -709,7 +735,35 @@ class _Daemon:
             )
             return
         if text == _STOP_CMD:
-            sess.queue.put_nowait(None)  # worker 会把 Task 标记 stopped
+            sess.queue.put_nowait(None)  # 终止信号：worker 收到即标 stopped 收尾
+            # 有在途 turn 时协作式取消它，否则 None 要等整轮跑完才生效（跑偏时干瞪眼）。
+            # put_nowait 在 cancel 之前：cancel 让在途 prompt() 返回后，队列里已有 None。
+            if sess.turn_in_flight:
+                await self._cancel_turn(sess)
+            return
+        if text == _CANCEL_CMD or text.startswith(_CANCEL_CMD + " "):
+            # /cancel = 停当前轮但**保留 agent**（区别于 /stop 的结束）；
+            # /cancel <新输入> = 停当前轮 + 把新输入作为下一轮排队（FIFO）。
+            new_input = text[len(_CANCEL_CMD) :].strip()
+            if sess.turn_in_flight:
+                if new_input:
+                    # 排在 cancel 之前：取消让在途 prompt() 返回后，队列里已有新输入 →
+                    # worker 的 cancelled 分支 continue 后即取到它，作为新一轮跑。
+                    sess.queue.put_nowait(new_input)
+                await self._cancel_turn(sess)
+                await self._safe_reply(
+                    thread_root or msg.message_id,
+                    "🛑 已取消当前轮，改执行新指令…"
+                    if new_input
+                    else "🛑 已取消当前轮（agent 保留，可继续发指令）。",
+                )
+            elif new_input:
+                # 无在途轮：没什么可取消，新输入当普通消息执行
+                sess.queue.put_nowait(new_input)
+            else:
+                await self._safe_reply(
+                    thread_root or msg.message_id, "当前没有在跑的轮，无需取消。"
+                )
             return
         if text == _DONE_CMD:
             self._finish_task(sess.task_id, "done")  # 优雅收尾，worker 发完成消息
