@@ -332,6 +332,46 @@ done/stopped/failed），`/stop` 改为标记 stopped 保留历史，恢复走 `
 
 （**B = 事前审批**：破坏性操作前飞书卡片按钮确认，替换现在「全自动放行」——更重、涉安全，单开一条线。）
 
+### 待修复：挂起任务 send_to_task 不自动恢复（2026-07-20 用户实测）
+
+**现象**：主线让调度器给一个**已挂起**的任务发消息，它不会自动恢复；得先让调度器显式
+`resume_task` 才能把消息加进去。
+
+**诊断**：**代码是对的**——`daemon._sched_send_to_task` 对非活跃且非终止（= 挂起/idle）
+的任务本就会走 `_try_resume`（`load_session` 恢复）再把消息作为首轮。所以根因大概率在
+**调度器 LLM 的工具选择**：`SYSTEM_PROMPT` 里写了「恢复一个挂起或已结束的任务 → resume_task」，
+LLM 看到任务是 suspended 就先调 resume_task，而不知道 send_to_task 会自动恢复。
+
+**修复候选**（改 `scheduler.py` 的 `SYSTEM_PROMPT` + send_to_task 工具描述）：明确「给**挂起**
+任务发消息直接用 send_to_task，它会自动 load_session 恢复；resume_task 只用于①不带消息、只
+想把 agent 拉回在线，或②恢复**已终止**（done/stopped）任务」。可能再加一条集成测试：模拟
+LLM 对 suspended 任务调 send_to_task，断言无需先 resume。（也要复核用户当时跑的是不是合入
+send_to_task 之前的旧 daemon。）
+
+### 待实现：显示 code agent 当前使用的模型（2026-07-20，调研结论）
+
+**目标**：在飞书里看到某任务的 agent 当前用的是哪个模型（gpt-4o / claude-sonnet / …）。
+
+**调研结论（ACP SDK 只读排查）**：**ACP 协议 / `acp` SDK 层面没有任何标准的「当前模型」
+字段或方法**——`initialize`（`agent_info`/`agent_capabilities`）、`new_session`/`load_session`
+响应、13 个 `session_update` 变体里都没有 model；也没有 `set_session_model` 之类方法。相近但
+不对口的只有 `providers/*`（是 API 端点/协议路由 base_url，非模型名）。
+
+**间接可行路径（都需运行时验证，agent 自定义、SDK 不保证）**：
+1. **config_options（最靠谱）**：`new_session`/`load_session` 响应带 `config_options`
+   （`SessionConfigOptionSelect`：id/name + `current_value` + options），某些 agent 可能把「模型」
+   建成一个 select 配置项；再订阅 `config_option_update` 通知跟踪切换。**现有 `acp_client.py`
+   拿到 `new_session` 只读了 `session_id`，把 `modes`/`config_options` 全丢了**，`config_option_update`
+   / `current_mode_update` 也在 `_StreamFormatter` 里「有意忽略」——即便 agent 上报了也收不到。
+2. **session modes**：`SessionModeState.current_mode_id`（通常是 ask/code 行为模式，不一定是模型）。
+3. **`_meta` 自由字段**：几乎每个类型都有，agent 可塞模型信息，无约定。
+
+**下一步**：先做**运行时抓包**——分别 spawn `copilot --acp` / `opencode acp`，dump `new_session`
+完整响应（`configOptions`/`modes`/`_meta`）+ 握手后的 `session/update` 流，看哪一方真带模型名
+（抓包挂点：`connection.py` 的 `add_observer` 或 `_ClientImpl.session_update`）。确认有源后，
+再在 `acp_client` 保留 `config_options`/`modes`、暴露 `current_model`，`Task` 存一份、`get_task`/
+`/task` 展示。copilot 与 opencode **协议层无差异**，谁真上报是经验问题。
+
 ### 其他已考虑方向（roadmap，待排期）
 
 - **`send_to_agent` / `send_to_task`**：主线一句话路由进某个在跑的 agent 话题，不用手动切过去。
@@ -339,7 +379,8 @@ done/stopped/failed），`/stop` 改为标记 stopped 保留历史，恢复走 `
 - **权限审批 B（安全）**：见上，替换 auto-allow-all，单开线。
 - **P1 多 agent 并发 + worktree 隔离**：同项目并行的文件隔离（跨项目并发已可用）；见上文 P1。
 - **per-turn 取消**：ACP `session/cancel`，agent 跑偏时只停这一轮、不杀整个 agent。
-- **完成通知带摘要**：🔔 通知里附 agent 最后输出的一句摘要（依赖任务系统的 last_output/摘要）。
+- ~~**完成通知带摘要**~~：✅ 已实现 2026-07-20——`Task.last_output`（每轮 agent 收尾 message，
+  截断 800）落台账，🔔 通知带一行摘要，`get_task`/`/task` 展示。（后续可选：per-turn 历史输出。）
 - **自动触发降噪**：非命令 root 消息静默/仅 `/help` 给用法（见上文「无需 @」）。
 - **对话记忆可配**：`[llm]` 加 `memory_rounds`（默认 12 轮）。
 

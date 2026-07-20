@@ -40,6 +40,25 @@ def test_extract_action_skips_titleless_tool_call():
     assert _extract_action(start_tool_call("tc1", "", kind="edit")) is None
 
 
+# --- 收尾回复累积 (_ClientImpl.last_message) ---------------------------- #
+
+
+async def test_client_accumulates_agent_message_not_thought():
+    from feishu_dispatcher.acp_client import _Callbacks, _ClientImpl
+
+    async def noop(_t: str) -> None:
+        pass
+
+    impl = _ClientImpl(_Callbacks(on_output=noop))
+    await impl.session_update("s", update_agent_message_text("Hello "))
+    await impl.session_update("s", update_agent_thought_text("(思考)"))  # 不计入
+    await impl.session_update("s", update_agent_message_text("world"))
+    assert impl.last_message() == "Hello world"
+    # 回合重置后清空
+    impl.reset_formatter()
+    assert impl.last_message() == ""
+
+
 # --- 单条 update（无前置状态）------------------------------------------- #
 
 

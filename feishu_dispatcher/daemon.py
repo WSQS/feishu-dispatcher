@@ -54,6 +54,21 @@ _USAGE = (
     "• 在 agent 话题内发 `/stop` = 结束该 agent，`/done` = 标记完成并归档"
 )
 
+#: Task.last_output 截断上限（收尾回复只留精华，防 tasks.json 涨）
+_LAST_OUTPUT_MAX = 800
+
+
+def _clip(text: str, limit: int) -> str:
+    """去首尾空白 + 截断到 limit 字符（超出加省略号）。"""
+    text = (text or "").strip()
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _one_line(text: str, limit: int) -> str:
+    """压成一行（合并所有空白）再截断，用于主线通知里的摘要片段。"""
+    s = " ".join((text or "").split())
+    return s if len(s) <= limit else s[:limit] + "…"
+
 
 async def run(
     cfg: Config, *, discover: bool = False, store_path: Path | None = None
@@ -416,17 +431,27 @@ class _Daemon:
                     await sess.agent.prompt(prompt)
                     await channel.flush()
                     await channel.set_status("done")
+                    # 落 last_output：本轮 agent 的收尾回复（截断），供 get_task/通知摘要
+                    last_output = _clip(sess.agent.last_message, _LAST_OUTPUT_MAX)
                     cur = self.store.get(sess.task_id)
                     turns = (cur.turns if cur else 0) + 1
-                    self.store.update(sess.task_id, status="idle", turns=turns)
+                    self.store.update(
+                        sess.task_id,
+                        status="idle",
+                        turns=turns,
+                        last_output=last_output,
+                    )
                     await self._safe_reply(
                         root, "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）"
                     )
-                    # 完成且已闲下来（无排队）→ 推一条主线通知，免得你挨个点话题
+                    # 完成且已闲下来（无排队）→ 推一条主线通知（带收尾摘要），免得挨个点话题
                     if sess.queue.empty():
-                        await self._notify_main(
-                            f"🔔 {sess.project_name} 完成第 {turns} 轮，在其话题里查看/继续。"
-                        )
+                        note = f"🔔 {sess.project_name} 完成第 {turns} 轮"
+                        snippet = _one_line(last_output, 80)
+                        if snippet:
+                            note += f"：{snippet}"
+                        note += "，在其话题里查看/继续。"
+                        await self._notify_main(note)
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -611,6 +636,8 @@ class _Daemon:
             f"（{t.turns} 轮）",
             f"任务: {t.description}",
         ]
+        if t.last_output:
+            lines.append(f"最近回复: {t.last_output}")
         if t.actions:
             recent = t.actions[-15:]
             lines.append(f"最近动作（共 {len(t.actions)} 条，显示末 {len(recent)}）:")
@@ -688,6 +715,7 @@ class _Daemon:
             "active": t.thread_root_id in self._sessions,
             "created_at": t.created_at,
             "updated_at": t.updated_at,
+            "last_output": t.last_output,  # 最近一轮 agent 的收尾回复
             "action_count": len(t.actions),
             "recent_actions": t.actions[-30:],  # 审计 A：agent 调过的工具
         }
