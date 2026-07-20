@@ -160,6 +160,44 @@ async def test_resume_and_mark_done_validate_and_dispatch():
     assert await done.handler({"task_id": "t2"}) == "已完成 t2"
 
 
+async def test_tool_calls_are_logged_for_diagnostics(caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="feishu_dispatcher.scheduler")
+    sent = []
+
+    async def send(tid, m):
+        sent.append((tid, m))
+        return f"已发给 {tid}"
+
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        "1", "send_to_task", {"task_id": "t3", "message": "跑测试"}
+                    )
+                ]
+            ),
+            LLMResponse(content="已让 t3 跑测试"),
+        ]
+    )
+    await run_tool_loop(llm, "让 t3 跑测试", _tools(send=send))
+    # 诊断日志能看出：确实调了 send_to_task、目标 t3、返回什么
+    assert "send_to_task" in caplog.text
+    assert "t3" in caplog.text
+
+
+async def test_finish_without_tool_call_is_logged(caplog):
+    import logging
+
+    caplog.set_level(logging.INFO, logger="feishu_dispatcher.scheduler")
+    llm = FakeLLM([LLMResponse(content="好的，我已经发送了")])  # 只说不做
+    await run_tool_loop(llm, "让 t3 跑测试", _tools())
+    # 关键诊断信号：LLM 没调任何工具就收尾（「说了没做」）
+    assert "无工具调用" in caplog.text
+
+
 def test_new_tools_are_exposed():
     names = {t.name for t in _tools()}
     assert names == {
