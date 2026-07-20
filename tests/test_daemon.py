@@ -75,6 +75,8 @@ class FakeAgent:
         self.session_id = resume_session_id
         self.last_message = ""
         self.model = ""  # 默认无模型（似 copilot）；ModelAgent 覆盖
+        self.available_models: list[str] = []
+        self.set_model_calls: list[str] = []
 
     async def start(self) -> None:
         self.start_count += 1
@@ -87,6 +89,10 @@ class FakeAgent:
         self.last_message = f"reply:{text}"
         await self.on_output(f"echo:{text}")
 
+    async def set_model(self, name: str) -> None:
+        self.set_model_calls.append(name)
+        self.model = name
+
     async def aclose(self) -> None:
         self.closed = True
 
@@ -97,11 +103,12 @@ class FailingAgent(FakeAgent):
 
 
 class ModelAgent(FakeAgent):
-    """启动后上报一个模型（似 opencode），验证模型采集/展示链路。"""
+    """启动后上报一个模型 + 可选列表（似 opencode），验证模型采集/展示/切换链路。"""
 
     async def start(self) -> None:
         await super().start()
         self.model = "ns-deepseek/deepseek-v4-pro"
+        self.available_models = ["ns-deepseek/deepseek-v4-pro", "zhipuai/glm-5"]
 
 
 def make_daemon(
@@ -1052,6 +1059,59 @@ async def test_no_model_agent_leaves_blank():
     assert store.get("t1").model == ""
     assert daemon._sched_get_task("t1")["model"] == ""
     assert not any("模型：" in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+# ---------------------------------------------------------------------- #
+# 话题内 /model：查看 + 切换模型（ACP set_config_option）
+# ---------------------------------------------------------------------- #
+
+
+async def _run_model_agent(store):
+    daemon, bridge, created = make_daemon(store=store, agent_cls=ModelAgent)
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    return daemon, bridge, created
+
+
+async def test_model_command_lists_current_and_available():
+    store = TaskStore(None)
+    daemon, bridge, created = await _run_model_agent(store)
+    await daemon._handle_message(thread_msg("/model", mid="om_m"))
+    reply = "\n".join(bridge.texts("om_root1"))
+    assert "当前模型：ns-deepseek/deepseek-v4-pro" in reply
+    assert "zhipuai/glm-5" in reply
+    await daemon._shutdown()
+
+
+async def test_model_command_switches_and_persists():
+    store = TaskStore(None)
+    daemon, bridge, created = await _run_model_agent(store)
+    await daemon._handle_message(thread_msg("/model zhipuai/glm-5", mid="om_m"))
+    assert created[0].set_model_calls == ["zhipuai/glm-5"]  # 调了 ACP set_config_option
+    assert store.get("t1").model == "zhipuai/glm-5"  # 台账更新
+    assert any("已切换模型为 zhipuai/glm-5" in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+async def test_model_command_rejects_unknown():
+    store = TaskStore(None)
+    daemon, bridge, created = await _run_model_agent(store)
+    await daemon._handle_message(thread_msg("/model no-such-model", mid="om_m"))
+    assert created[0].set_model_calls == []  # 未知模型不下发
+    assert any("未知模型" in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+async def test_model_command_unsupported_agent():
+    # 默认 FakeAgent 无 available_models（似 copilot）→ 提示不支持
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    await daemon._handle_message(thread_msg("/model glm-5", mid="om_m"))
+    assert created[0].set_model_calls == []
+    assert any("不支持切换模型" in t for t in bridge.texts("om_root1"))
     await daemon._shutdown()
 
 

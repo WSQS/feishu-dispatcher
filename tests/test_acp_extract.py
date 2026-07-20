@@ -15,6 +15,7 @@ from feishu_dispatcher.acp_client import (
     _StreamFormatter,
     _extract_action,
     _extract_model,
+    _extract_model_options,
 )
 
 
@@ -82,6 +83,29 @@ def test_extract_model_absent_returns_empty():
 
 def test_extract_model_no_config_options():
     assert _extract_model(NS()) == ""  # 无 config_options 字段也不抛
+
+
+def test_extract_model_options_lists_values():
+    resp = NS(
+        config_options=[
+            NS(id="mode", category="mode", current_value="build", options=[]),
+            NS(
+                id="model",
+                category="model",
+                current_value="deepseek-v4",
+                options=[
+                    NS(value="deepseek-v4", name="DeepSeek V4"),
+                    NS(value="zhipuai/glm-5", name="GLM-5"),
+                ],
+            ),
+        ]
+    )
+    assert _extract_model_options(resp) == ["deepseek-v4", "zhipuai/glm-5"]
+
+
+def test_extract_model_options_absent_returns_empty():
+    resp = NS(config_options=[NS(id="mode", category="mode", current_value="x")])
+    assert _extract_model_options(resp) == []
 
 
 # --- 收尾回复累积 (_ClientImpl.last_message) ---------------------------- #
