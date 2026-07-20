@@ -58,6 +58,9 @@ class _ClientImpl:
         self._cb = cb
         self._fmt = _StreamFormatter()
         self._suppress = False
+        #: 本轮 agent 的最终 message 文本（只攒 agent_message，不含思考/工具行），
+        #: 供上层落 Task.last_output；每轮 reset_formatter 时清空
+        self._message_buf: list[str] = []
 
     def on_connect(self, conn: Any) -> None:  # noqa: D401
         """Agent 侧握手完成时被 SDK 调用。"""
@@ -66,6 +69,11 @@ class _ClientImpl:
     def reset_formatter(self) -> None:
         """每个 prompt 回合开始时重置流式格式化状态（新卡片从头开始）。"""
         self._fmt.reset()
+        self._message_buf.clear()
+
+    def last_message(self) -> str:
+        """本轮 agent 的最终 message 文本（收尾回复），供 Task.last_output。"""
+        return "".join(self._message_buf)
 
     def set_suppress(self, on: bool) -> None:
         """抑制输出转发。恢复会话时 load_session 会重放历史 session/update，
@@ -81,6 +89,9 @@ class _ClientImpl:
             action = _extract_action(update)
             if action is not None:
                 await self._cb.on_action(action)
+        # 攒本轮最终回复（只认 agent_message，不含 💭 思考/🔧 工具噪音）
+        if getattr(update, "session_update", None) == "agent_message_chunk":
+            self._message_buf.append(_content_text(update))
         text = self._fmt.format(update)
         if text:
             await self._cb.on_output(text)
@@ -278,6 +289,11 @@ class AcpAgent:
     @property
     def session_id(self) -> str | None:
         return self._session_id
+
+    @property
+    def last_message(self) -> str:
+        """本轮 agent 的最终 message 文本（收尾回复）；未启动/无输出为空串。"""
+        return self._client_impl.last_message() if self._client_impl else ""
 
     async def start(self) -> None:
         """启动 agent 进程、完成 initialize + new_session 握手。

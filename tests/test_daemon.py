@@ -73,6 +73,7 @@ class FakeAgent:
         self.start_count = 0
         self.closed = False
         self.session_id = resume_session_id
+        self.last_message = ""
 
     async def start(self) -> None:
         self.start_count += 1
@@ -82,6 +83,7 @@ class FakeAgent:
 
     async def prompt(self, text: str) -> None:
         self.prompts.append(text)
+        self.last_message = f"reply:{text}"
         await self.on_output(f"echo:{text}")
 
     async def aclose(self) -> None:
@@ -942,6 +944,44 @@ async def test_task_command_unknown_id_replies_not_found():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/task t404", mid="om_q"))
     assert any("未找到" in t for t in bridge.texts("om_q"))
+
+
+async def test_last_output_captured_from_agent_reply():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    assert store.get("t1").last_output == "reply:build"
+    await daemon._shutdown()
+
+
+async def test_get_task_includes_last_output():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    assert daemon._sched_get_task("t1")["last_output"] == "reply:build"
+    await daemon._shutdown()
+
+
+async def test_completion_notification_includes_reply_snippet():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: any("完成第 1 轮" in t for _, t in bridge.roots))
+    note = next(t for _, t in bridge.roots if "完成第 1 轮" in t)
+    assert "reply:build" in note  # 通知带上了收尾摘要
+    await daemon._shutdown()
+
+
+async def test_task_command_shows_last_output():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    await daemon._handle_message(root_msg("/task t1", mid="om_q"))
+    reply = "\n".join(bridge.texts("om_q"))
+    assert "最近回复: reply:build" in reply
+    await daemon._shutdown()
 
 
 async def test_load_session_replay_does_not_log_actions():

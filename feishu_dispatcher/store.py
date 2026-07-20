@@ -45,6 +45,7 @@ _TASK_FIELDS = (
     "created_at",
     "updated_at",
     "actions",
+    "last_output",
 )
 
 
@@ -63,6 +64,8 @@ class Task:
     updated_at: float = 0.0
     #: 审计动作日志：每条 = {"turn", "kind", "title"}，来自 ACP tool_call 事件
     actions: list[dict] = field(default_factory=list)
+    #: 最近一轮 agent 的收尾回复（截断），供 get_task / 完成通知摘要
+    last_output: str = ""
 
     @property
     def is_active(self) -> bool:
