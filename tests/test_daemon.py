@@ -876,6 +876,16 @@ async def test_clear_command_clears_terminal_history():
     assert store.get("t1") is None  # 终止任务被清掉
 
 
+async def test_reboot_command_requests_restart_and_replies():
+    daemon, bridge, created = make_daemon()
+    daemon._stop_event = asyncio.Event()  # run() 正常会建，测试里手动注入
+    await daemon._handle_message(root_msg("/reboot", mid="om_rb"))
+    # 置位 + 唤醒主循环（run() 返回 True → cli.py re-exec）；先回执再重启
+    assert daemon._reboot_requested is True
+    assert daemon._stop_event.is_set()
+    assert any("重启" in t for t in bridge.texts("om_rb"))
+
+
 async def test_get_task_returns_detail():
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store)
