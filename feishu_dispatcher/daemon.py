@@ -427,6 +427,12 @@ class _Daemon:
                 channel = self._make_channel(root, title)
                 sess.current_channel = channel
                 self.store.update(sess.task_id, status="running")
+                logger.info(
+                    "任务 %s 开始一轮（%s）: %.80s",
+                    sess.task_id,
+                    sess.agent_label,
+                    prompt,
+                )
                 try:
                     await sess.agent.prompt(prompt)
                     await channel.flush()
@@ -435,6 +441,12 @@ class _Daemon:
                     last_output = _clip(sess.agent.last_message, _LAST_OUTPUT_MAX)
                     cur = self.store.get(sess.task_id)
                     turns = (cur.turns if cur else 0) + 1
+                    logger.info(
+                        "任务 %s 完成第 %d 轮，回复 %d 字",
+                        sess.task_id,
+                        turns,
+                        len(last_output),
+                    )
                     self.store.update(
                         sess.task_id,
                         status="idle",
@@ -728,14 +740,29 @@ class _Daemon:
         sess = self._sessions.get(task.thread_root_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             sess.queue.put_nowait(message)
+            logger.info(
+                "send_to_task[%s] 入队（活跃 session，队列深度=%d，task.status=%s）",
+                task_id,
+                sess.queue.qsize(),
+                task.status,
+            )
             return f"已把消息转达给任务 [{task_id}]（{task.project_name}），排队执行。"
         if task.is_terminal:
+            logger.info(
+                "send_to_task[%s] 拒绝：任务已终止 status=%s", task_id, task.status
+            )
             return (
                 f"任务 [{task_id}] 已是终止态（{task.status}），未自动恢复。"
                 f"如需继续，请先 resume_task({task_id})。"
             )
         # 非活跃且可恢复：load_session 惰性重连，把消息作为首轮。check→launch 无 await。
         ok, why = self._try_resume(task, first_prompt=message)
+        logger.info(
+            "send_to_task[%s] 非活跃 status=%s → 恢复%s",
+            task_id,
+            task.status,
+            "成功" if ok else f"失败（{why}）",
+        )
         return f"已恢复任务 [{task_id}] 并转达消息。" if ok else why
 
     async def _sched_resume_task(self, task_id: str) -> str:

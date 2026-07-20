@@ -23,6 +23,13 @@ from typing import Any, Protocol
 logger = logging.getLogger(__name__)
 
 
+def _short(x: Any, limit: int = 200) -> str:
+    """把任意值压成一行短字符串，用于诊断日志（截断，不打全量）。"""
+    s = x if isinstance(x, str) else json.dumps(x, ensure_ascii=False, default=str)
+    s = " ".join(s.split())
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
 class SchedulerMemory:
     """主线（调度器）对话记忆：(user, assistant) 成对，跨重启持久化。
 
@@ -166,6 +173,9 @@ async def run_tool_loop(
     for _ in range(max_iters):
         resp = await client.chat(messages, defs)
         if not resp.tool_calls:
+            # 诊断：LLM 未调任何工具直接收尾——若用户本想「派发/发消息」，这里就能
+            # 看出它其实什么都没做（只回了话），是排查「说了没做」的关键信号。
+            logger.info("调度器收尾（无工具调用）: %s", _short(resp.content or ""))
             return resp.content or ""
         messages.append(
             {
@@ -194,6 +204,14 @@ async def run_tool_loop(
                 except Exception as exc:  # 喂回 LLM，让它决定怎么办
                     logger.exception("调度器工具 %s 执行失败", tc.name)
                     result = f"工具 {tc.name} 执行出错: {exc}"
+            # 诊断：记下 LLM 到底调了哪个工具、参数、返回什么——排查「发消息不生效」
+            # 时能直接看出它有没有真的调 send_to_task、用的哪个 task_id、结果如何。
+            logger.info(
+                "调度器工具 %s(%s) -> %s",
+                tc.name,
+                _short(tc.arguments),
+                _short(result),
+            )
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
     return "（调度器思考步数超限，请把需求说得更具体，或用 `/run <项目> <任务>` 直接派发。）"
 
