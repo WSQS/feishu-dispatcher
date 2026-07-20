@@ -36,9 +36,9 @@ throttle_window = 0.5
 # 可直接照抄 opencode 的 provider 配置（~/.config/opencode/opencode.json）。
 # 不配则自然语言消息回退到「用法」提示，/run 等命令照常可用。
 # [llm]
-# base_url = "https://ai.jiachengyun.com/v1"
+# base_url = "https://api.deepseek.com/v1"
 # api_key = "sk-..."
-# model = "deepseek-v4-pro"
+# model = "deepseek-chat"
 
 # 用法：在群里发根消息
 #   /run <项目名> <任务描述>    派发任务给 agent（在根消息下建话题）
@@ -60,7 +60,7 @@ opencode = ["opencode", "acp"]
 # 每个项目用 default_agent 指定由哪个 agent 处理。
 [[projects]]
 name = "feishu-dispatcher"
-path = "C:/Users/wsqsy/Documents/ai/feishu-dispatcher"
+path = "C:/path/to/feishu-dispatcher"
 default_agent = "copilot"
 
 # 用 opencode 处理的项目示例：

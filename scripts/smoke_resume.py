@@ -12,11 +12,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
 from feishu_dispatcher.acp_client import AcpAgent, AgentSpawn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
-CWD = r"C:\Users\wsqsy\Documents\ai\feishu-dispatcher"
+CWD = str(Path(__file__).resolve().parent.parent)
 SECRET = "4287"
 _AGENTS = {"copilot": ["copilot", "--acp"], "opencode": ["opencode", "acp"]}
 

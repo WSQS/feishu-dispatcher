@@ -3,6 +3,8 @@ name = "feishu-dispatcher"
 version = "0.0.1"
 description = "Feishu-driven personal coding agent dispatcher"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = [
     "agent-client-protocol>=0.11.0",
     "httpx>=0.28.1",

@@ -9,8 +9,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import sys
+from pathlib import Path
 
 from feishu_dispatcher.acp_client import AcpAgent, AgentSpawn
+
+REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
@@ -26,7 +29,7 @@ async def main() -> int:
 
     spawn = AgentSpawn(
         command=["copilot", "--acp"],
-        cwd=r"C:\Users\wsqsy\Documents\ai\feishu-dispatcher",
+        cwd=REPO_ROOT,
     )
     agent = AcpAgent(spawn, on_output)
     try:

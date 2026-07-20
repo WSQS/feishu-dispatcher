@@ -90,9 +90,9 @@ uv run feishu-dispatcher start        # 前台运行；-v 出调试日志
 
 ```toml
 [llm]
-base_url = "https://ai.jiachengyun.com/v1"
+base_url = "https://api.deepseek.com/v1"
 api_key = "sk-..."
-model = "deepseek-v4-pro"
+model = "deepseek-chat"
 ```
 
 不配则自然语言消息回退到「用法」提示，`/run`/`/agents`/`/stop` 照常。冒烟：`uv run python scripts/smoke_llm.py "你的需求"`。
