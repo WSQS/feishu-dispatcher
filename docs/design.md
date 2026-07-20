@@ -372,6 +372,56 @@ send_to_task 会自动恢复。
 再在 `acp_client` 保留 `config_options`/`modes`、暴露 `current_model`，`Task` 存一份、`get_task`/
 `/task` 展示。copilot 与 opencode **协议层无差异**，谁真上报是经验问题。
 
+### 待实现：调度器工具调用实时卡片显示（2026-07-20，最高优先）
+
+**目标**：主线上跟调度器对话时，像 code agent 话题那样，把调度器**正在调用的工具**（`spawn_agent`
+/`send_to_task`/`mark_done`…）用一张**活卡片实时显示**出来（工具名 + 参数 + 返回），而不是像现在
+只在最后甩一句文字。
+
+**动机（双重）**：① 体验——让「控制塔」在干什么可见、有反馈；② **直接缓解「说了没做」幻觉**——
+调度器 LLM 有时只回「已新建 t3」却没真调 `spawn_agent`（已用 `daemon.log` 抓实，见下条）。工具调用
+上卡片后，**没有卡片冒出来 = 它在放空炮**，用户当场可见，不必事后翻日志。
+
+**现状与落点**：现在 `daemon._dispatch_nl` 跑 `run_tool_loop`，只把**最终文本**经 `_reply_user`
+（`bridge.reply`，不建话题）发出；中间工具调用只进 `daemon.log`（诊断日志）。卡片机制已有
+（`livecard.py` 的 `LiveCard` + `card.py` 的 `build_card`），但目前只服务于 agent 话题（`reply_card`
+/`patch_card`）。要做的大致是：
+- `run_tool_loop` 加一个 `on_tool_call(name, args, result)` 回调（现有的诊断 `logger.info` 挂点即
+  同一处），daemon 用它把每步喂进一张主线活卡片。
+- **约束（勿回退）**：调度器回复**不建话题**（`reply_in_thread=false`）。需确认 `reply_card` 回主线
+  消息**不会**建话题（livecard 现在用在 agent 话题；主线卡片的建/patch 路径要走通、且不 thread 化）。
+- 卡片内容：逐条「🔧 spawn_agent(brick-blast, …) → 已建任务 t3」，末尾附最终文本 + 状态灯。
+- 未配 `[llm]`（无自然语言派发）时不涉及。
+
+### 待记：Claude Code 作为第三种后端（2026-07-20）
+
+**目标**：`[agents]` 里除 copilot/opencode 外，再支持 **Claude Code** 作为 ACP agent（按项目
+`default_agent` 选用）。daemon 本就 agent 无关（按 argv 启动 ACP 子进程），若 Claude Code 说 ACP，
+理论上只是加一条 `[agents]` 配置。
+
+**开放问题（需先验证）**：`claude` CLI 是否**原生**通过 ACP（stdio JSON-RPC）暴露？还是需要一个
+**ACP 适配器**（社区有 `claude-code-acp` 之类把 Claude Code 包成 ACP agent server）。用
+`scripts/capture_acp_meta.py` 起来 dump 一下握手/`new_session` 就能定性（同当初查 model 的做法）。
+确认后：加配置、跑冒烟（握手/流式/`load_session` 支持度）、补 agent 能力元数据。
+
+### 待修复：调度器「说了没做」幻觉（2026-07-20 用 daemon.log 抓实，暂缓）
+
+**现象/根因**：调度器 LLM（deepseek-v4-pro 走代理端点）**工具调用不稳定**——有时只回文字
+「已新建 t3 / 已发送」却**根本没调 `spawn_agent`/`send_to_task`**。`daemon.log` 实证：
+`调度器收尾（无工具调用）: 已新建 t3…`，且 `tasks.json` 里 `seq=2`、根本没有 t3（那次是空炮，真正的
+任务是**之后**另一轮才建的）。这就是用户体感「两次生效一次」的根因。**不是代码 bug**——
+`spawn_agent`/`send_to_task` 本身都对，是模型层「narrate 而不 call」。
+
+**修复方案（A+B，暂缓在「工具卡片」之后）**：
+- **A（prompt 硬约束）**：`SYSTEM_PROMPT` 加铁律——凡要执行的动作**必须真的调用对应工具**；
+  工具没调=什么都没发生；**绝不声称做了其实没做的事**。降低发生率。
+- **B（最后一道闸）**：`run_tool_loop` 追踪本轮调过哪些工具；`_dispatch_nl` 检测「本轮没调任何
+  **变更类**工具（spawn/send/resume/mark_done），但最终回复里出现『已新建/已派发/已发送…』完成
+  声明」→ 不把这句假话原样转给用户，改发「⚠️ 我可能只是嘴上说了没真执行，请 /agents 核对或再说
+  一次」。兜住漏网、至少不骗人。keyword 命中宁宽勿漏（误报只是多一句提醒，漏报=退回原 bug）。
+- **注意**：「工具卡片显示」落地后，幻觉在卡片上已当场可见，B 的价值下降但仍值得（把假话拦在回复里）。
+- （C = 换更强 tool-calling 的模型/端点，是用户配置层面的事，最治本但不在代码内。）
+
 ### 其他已考虑方向（roadmap，待排期）
 
 - **`send_to_agent` / `send_to_task`**：主线一句话路由进某个在跑的 agent 话题，不用手动切过去。
