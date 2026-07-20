@@ -180,19 +180,36 @@ def _extract_action(update: Any) -> dict | None:
     return {"kind": getattr(update, "kind", "") or "", "title": title}
 
 
-def _extract_model(response: Any) -> str:
-    """从 new_session/load_session 响应里取当前模型名，取不到返回空串。
+def _find_model_option(response: Any) -> Any:
+    """从 new_session/load_session 响应的 config_options 里找「模型」select，无则 None。
 
-    opencode 把模型建成 ``config_options`` 里 ``id``/``category`` == "model" 的
-    select，其 ``current_value`` 即当前模型（实测 `ns-deepseek/deepseek-v4-pro`）。
-    copilot 无此项（只有 mode/agent/allow_all），故返回空串——协议本身不暴露模型。
+    opencode/claude 把模型建成 ``config_options`` 里 ``id``/``category`` == "model" 的
+    select；copilot 无此项（只有 mode/agent/allow_all）——协议本身不暴露模型。
     """
     for opt in getattr(response, "config_options", None) or []:
         oid = getattr(opt, "id", "") or ""
         cat = getattr(opt, "category", "") or ""
         if oid == "model" or cat == "model":
-            return getattr(opt, "current_value", "") or ""
-    return ""
+            return opt
+    return None
+
+
+def _extract_model(response: Any) -> str:
+    """当前模型名（模型 select 的 ``current_value``），取不到返回空串。"""
+    opt = _find_model_option(response)
+    return (getattr(opt, "current_value", "") or "") if opt is not None else ""
+
+
+def _extract_model_options(response: Any) -> list[str]:
+    """可切换的模型 id 列表（模型 select 的 options 的 value），取不到返回空列表。"""
+    opt = _find_model_option(response)
+    if opt is None:
+        return []
+    return [
+        v
+        for o in (getattr(opt, "options", None) or [])
+        if (v := getattr(o, "value", ""))
+    ]
 
 
 class _StreamFormatter:
@@ -295,8 +312,10 @@ class AcpAgent:
         self._resume_session_id = resume_session_id
         self._conn: acp.ClientSideConnection | None = None
         self._session_id: str | None = None
-        #: 当前模型（opencode 从 new_session config_options 取；copilot 无、留空）
+        #: 当前模型（opencode/claude 从 new_session config_options 取；copilot 无、留空）
         self._model: str = ""
+        #: 可切换的模型 id 列表（模型 select 的 options）；无模型选项则空
+        self._available_models: list[str] = []
         self._transport_ctx: Any = None
         self._proc: Any = None
         self._closed = False
@@ -316,6 +335,23 @@ class AcpAgent:
     def model(self) -> str:
         """agent 当前使用的模型；agent 未通过 ACP 暴露（如 copilot）时为空串。"""
         return self._model
+
+    @property
+    def available_models(self) -> list[str]:
+        """可切换到的模型 id 列表；agent 不暴露模型选项（如 copilot）时为空。"""
+        return list(self._available_models)
+
+    async def set_model(self, name: str) -> None:
+        """切换当前会话的模型（ACP ``session/set_config_option``，config_id="model"）。
+
+        对下一轮 prompt 生效。agent 不支持（无模型选项）时调用会由 agent 侧报错。
+        """
+        if self._conn is None or self._session_id is None:
+            raise RuntimeError("agent 尚未启动")
+        await self._conn.set_config_option(
+            config_id="model", session_id=self._session_id, value=name
+        )
+        self._model = name
 
     async def start(self) -> None:
         """启动 agent 进程、完成 initialize + new_session 握手。
@@ -386,6 +422,7 @@ class AcpAgent:
                 self._client_impl.set_suppress(False)
             self._session_id = self._resume_session_id
             self._model = _extract_model(resp)
+            self._available_models = _extract_model_options(resp)
             logger.info(
                 "已恢复 ACP session: %s (模型: %s)",
                 self._session_id,
@@ -395,6 +432,7 @@ class AcpAgent:
             session = await self._conn.new_session(cwd=self._spawn.cwd)
             self._session_id = session.session_id
             self._model = _extract_model(session)
+            self._available_models = _extract_model_options(session)
             logger.info(
                 "已创建 ACP session: %s (模型: %s)",
                 self._session_id,

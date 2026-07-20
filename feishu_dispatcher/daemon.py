@@ -40,6 +40,7 @@ _LIST_CMD = "/agents"
 _STOP_CMD = "/stop"
 _DONE_CMD = "/done"
 _CLEAR_CMD = "/clear"
+_MODEL_CMD = "/model"  # 话题内：/model 列出可选，/model <名> 切换
 
 #: message_id 去重窗口大小（飞书 ACK 异常时服务端会重推事件）
 _DEDUP_CAPACITY = 512
@@ -51,7 +52,7 @@ _USAGE = (
     "• `/task <任务id>`  查看某任务详情与动作日志\n"
     "• `/clear`  清理已结束任务的历史\n"
     "• 在 agent 话题内直接回复 = 追加指令（排队串行执行）\n"
-    "• 在 agent 话题内发 `/stop` = 结束该 agent，`/done` = 标记完成并归档"
+    "• 在 agent 话题内发 `/stop` = 结束，`/done` = 归档，`/model [名]` = 查看/切换模型"
 )
 
 #: Task.last_output 截断上限（收尾回复只留精华，防 tasks.json 涨）
@@ -536,7 +537,49 @@ class _Daemon:
         if text == _DONE_CMD:
             self._finish_task(sess.task_id, "done")  # 优雅收尾，worker 发完成消息
             return
+        if text == _MODEL_CMD or text.startswith(_MODEL_CMD + " "):
+            await self._handle_model_cmd(sess, thread_root, text)
+            return
         sess.queue.put_nowait(text)
+
+    async def _handle_model_cmd(
+        self, sess: _AgentSession, reply_target: str, text: str
+    ) -> None:
+        """`/model` 列出当前+可选模型；`/model <名>` 切换（ACP set_config_option）。
+
+        对下一轮生效。agent 不暴露模型选项（如 copilot）则提示不支持。
+        """
+        agent = sess.agent
+        models = list(getattr(agent, "available_models", []) or [])
+        current = getattr(agent, "model", "") or ""
+        if not models:
+            await self._safe_reply(
+                reply_target, "⚠️ 该 agent 不支持切换模型（未通过 ACP 暴露模型选项）。"
+            )
+            return
+        arg = text[len(_MODEL_CMD) :].strip()
+        if not arg:  # 裸 /model → 列出
+            lines = [
+                f"当前模型：{current or '未知'}",
+                "可切换（发 `/model <完整名>`）：",
+            ]
+            lines += [f"• {m}" for m in models]
+            await self._safe_reply(reply_target, "\n".join(lines))
+            return
+        if arg not in models:
+            await self._safe_reply(
+                reply_target, f"⚠️ 未知模型 '{arg}'。发 `/model` 查看可选列表。"
+            )
+            return
+        try:
+            await agent.set_model(arg)
+        except Exception as exc:
+            logger.exception("切换模型失败 task=%s model=%s", sess.task_id, arg)
+            await self._safe_reply(reply_target, f"❌ 切换模型失败：{str(exc)[:200]}")
+            return
+        self.store.update(sess.task_id, model=arg)
+        logger.info("任务 %s 切换模型 → %s", sess.task_id, arg)
+        await self._safe_reply(reply_target, f"✅ 已切换模型为 {arg}（下一轮起生效）。")
 
     async def _recover_or_notify(
         self, reply_target: str, thread_root: str, text: str

@@ -368,8 +368,12 @@ send_to_task 会自动恢复。
 暴露。`Task.model` 落台账（worker 启动成功后 `store.update(model=...)`）。展示：agent 就绪消息带
 「（模型：X）」、`get_task` 返回 `model`、`/task` 列「模型: X」。copilot 无则一律留空、不显示。
 
-**后续可选**：切模型（`set_config_option(config_id="model", ...)`）、也展示 effort/mode、
-订阅 `config_option_update` 跟踪运行中切换。
+**切模型（✅ 已实现 2026-07-20）**：`AcpAgent.set_model(name)` 走 ACP
+`session/set_config_option`（config_id="model"），启动时顺带采集 `available_models`
+（模型 select 的 options，`_extract_model_options`）。话题内命令 **`/model`** 列出当前+可选、
+**`/model <完整名>`** 切换（校验在可选列表内、更新 `Task.model`、下一轮生效）。opencode/claude
+可切，copilot 无模型选项→提示不支持。**后续可选**：也展示/切 effort、mode（同 `set_config_option`
+/`set_session_mode`）、订阅 `config_option_update` 跟踪 agent 侧运行中切换、主线调度器工具切模型。
 
 ### 待实现：调度器工具调用实时卡片显示（2026-07-20，最高优先）
 
