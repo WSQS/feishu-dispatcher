@@ -348,29 +348,28 @@ send_to_task 会自动恢复。
 恢复），resume_task 只用于①不带消息只想让 agent 上线，或②恢复**已终止**（done/stopped/failed）
 任务」。代码路径无需改（既有行为测试已覆盖）。
 
-### 待实现：显示 code agent 当前使用的模型（2026-07-20，调研结论）
+### 显示 code agent 当前使用的模型（✅ 已实现 2026-07-20，opencode 可见 / copilot 不暴露）
 
-**目标**：在飞书里看到某任务的 agent 当前用的是哪个模型（gpt-4o / claude-sonnet / …）。
+**目标**：在飞书里看到某任务的 agent 当前用的是哪个模型。
 
-**调研结论（ACP SDK 只读排查）**：**ACP 协议 / `acp` SDK 层面没有任何标准的「当前模型」
-字段或方法**——`initialize`（`agent_info`/`agent_capabilities`）、`new_session`/`load_session`
-响应、13 个 `session_update` 变体里都没有 model；也没有 `set_session_model` 之类方法。相近但
-不对口的只有 `providers/*`（是 API 端点/协议路由 base_url，非模型名）。
+**调研结论**：ACP 协议 / `acp` SDK **没有标准的「当前模型」字段**（`initialize`、`new_session`/
+`load_session` 响应、13 个 `session_update` 变体、所有方法里都没有 model）。但 agent 可自定义塞进
+`config_options`。**运行时抓包实测**（`scripts/capture_acp_meta.py`，起真 agent dump `new_session`）：
+- **opencode**：`new_session` 响应 `config_options` 里有一项 `id=="model"` / `category=="model"`
+  的 select，`current_value` 即当前模型（实测 `ns-deepseek/deepseek-v4-pro`）。另外还暴露 `effort`、
+  `mode` 两项 select。**→ 可拿到。**
+- **copilot**：`config_options` 只有 `mode` / `agent` / `allow_all`（+ `modes` 是 Agent/Plan/
+  Autopilot 行为模式，非模型）。**没有 model 项 → 拿不到，协议层不暴露。**
+- 两者在一次普通 turn 的 `session/update` 流里都**不重发**模型（无 model 相关变体），故只在
+  `new_session`/`load_session` 时读一次。
 
-**间接可行路径（都需运行时验证，agent 自定义、SDK 不保证）**：
-1. **config_options（最靠谱）**：`new_session`/`load_session` 响应带 `config_options`
-   （`SessionConfigOptionSelect`：id/name + `current_value` + options），某些 agent 可能把「模型」
-   建成一个 select 配置项；再订阅 `config_option_update` 通知跟踪切换。**现有 `acp_client.py`
-   拿到 `new_session` 只读了 `session_id`，把 `modes`/`config_options` 全丢了**，`config_option_update`
-   / `current_mode_update` 也在 `_StreamFormatter` 里「有意忽略」——即便 agent 上报了也收不到。
-2. **session modes**：`SessionModeState.current_mode_id`（通常是 ask/code 行为模式，不一定是模型）。
-3. **`_meta` 自由字段**：几乎每个类型都有，agent 可塞模型信息，无约定。
+**实现**：`acp_client._extract_model(resp)` 从 `config_options` 找 `id`/`category=="model"` 取
+`current_value`；`AcpAgent` 在 `start()`（new_session 与 load_session 两条路径）都采集、`.model`
+暴露。`Task.model` 落台账（worker 启动成功后 `store.update(model=...)`）。展示：agent 就绪消息带
+「（模型：X）」、`get_task` 返回 `model`、`/task` 列「模型: X」。copilot 无则一律留空、不显示。
 
-**下一步**：先做**运行时抓包**——分别 spawn `copilot --acp` / `opencode acp`，dump `new_session`
-完整响应（`configOptions`/`modes`/`_meta`）+ 握手后的 `session/update` 流，看哪一方真带模型名
-（抓包挂点：`connection.py` 的 `add_observer` 或 `_ClientImpl.session_update`）。确认有源后，
-再在 `acp_client` 保留 `config_options`/`modes`、暴露 `current_model`，`Task` 存一份、`get_task`/
-`/task` 展示。copilot 与 opencode **协议层无差异**，谁真上报是经验问题。
+**后续可选**：切模型（`set_config_option(config_id="model", ...)`）、也展示 effort/mode、
+订阅 `config_option_update` 跟踪运行中切换。
 
 ### 其他已考虑方向（roadmap，待排期）
 

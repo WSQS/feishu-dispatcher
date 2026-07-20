@@ -9,7 +9,13 @@ from acp import (
     update_tool_call,
 )
 
-from feishu_dispatcher.acp_client import _StreamFormatter, _extract_action
+from types import SimpleNamespace as NS
+
+from feishu_dispatcher.acp_client import (
+    _StreamFormatter,
+    _extract_action,
+    _extract_model,
+)
 
 
 def fmt(update) -> str:
@@ -38,6 +44,44 @@ def test_extract_action_ignores_tool_call_update():
 
 def test_extract_action_skips_titleless_tool_call():
     assert _extract_action(start_tool_call("tc1", "", kind="edit")) is None
+
+
+# --- 当前模型抽取 (_extract_model) ------------------------------------- #
+
+
+def test_extract_model_by_id():
+    # opencode：config_options 里 id=="model" 的 select 的 current_value
+    resp = NS(
+        config_options=[
+            NS(id="mode", category="mode", current_value="build"),
+            NS(
+                id="model",
+                category="model",
+                current_value="ns-deepseek/deepseek-v4-pro",
+            ),
+        ]
+    )
+    assert _extract_model(resp) == "ns-deepseek/deepseek-v4-pro"
+
+
+def test_extract_model_by_category():
+    resp = NS(config_options=[NS(id="x", category="model", current_value="glm-5")])
+    assert _extract_model(resp) == "glm-5"
+
+
+def test_extract_model_absent_returns_empty():
+    # copilot：只有 mode/agent/allow_all，无 model 项
+    resp = NS(
+        config_options=[
+            NS(id="mode", category="mode", current_value="agent"),
+            NS(id="allow_all", category="permissions", current_value="off"),
+        ]
+    )
+    assert _extract_model(resp) == ""
+
+
+def test_extract_model_no_config_options():
+    assert _extract_model(NS()) == ""  # 无 config_options 字段也不抛
 
 
 # --- 收尾回复累积 (_ClientImpl.last_message) ---------------------------- #

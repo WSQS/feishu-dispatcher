@@ -74,6 +74,7 @@ class FakeAgent:
         self.closed = False
         self.session_id = resume_session_id
         self.last_message = ""
+        self.model = ""  # 默认无模型（似 copilot）；ModelAgent 覆盖
 
     async def start(self) -> None:
         self.start_count += 1
@@ -93,6 +94,14 @@ class FakeAgent:
 class FailingAgent(FakeAgent):
     async def prompt(self, text: str) -> None:
         raise RuntimeError("boom")
+
+
+class ModelAgent(FakeAgent):
+    """启动后上报一个模型（似 opencode），验证模型采集/展示链路。"""
+
+    async def start(self) -> None:
+        await super().start()
+        self.model = "ns-deepseek/deepseek-v4-pro"
 
 
 def make_daemon(
@@ -981,6 +990,48 @@ async def test_task_command_shows_last_output():
     await daemon._handle_message(root_msg("/task t1", mid="om_q"))
     reply = "\n".join(bridge.texts("om_q"))
     assert "最近回复: reply:build" in reply
+    await daemon._shutdown()
+
+
+# ---------------------------------------------------------------------- #
+# agent 当前模型（opencode 上报；copilot 不暴露则留空）
+# ---------------------------------------------------------------------- #
+
+
+async def test_model_captured_and_surfaced():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store, agent_cls=ModelAgent)
+    await daemon._handle_message(root_msg("/run demo build"))
+    # 等一轮跑完：此时 start（含采集模型）+ 就绪消息都已落地，避开采集/发消息竞态
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    m = "ns-deepseek/deepseek-v4-pro"
+    assert store.get("t1").model == m
+    assert daemon._sched_get_task("t1")["model"] == m
+    # 就绪消息里带上模型（在话题里直接可见）
+    assert any(m in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+async def test_task_command_shows_model():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store, agent_cls=ModelAgent)
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    await daemon._handle_message(root_msg("/task t1", mid="om_q"))
+    reply = "\n".join(bridge.texts("om_q"))
+    assert "模型: ns-deepseek/deepseek-v4-pro" in reply
+    await daemon._shutdown()
+
+
+async def test_no_model_agent_leaves_blank():
+    # 默认 FakeAgent 不上报模型（似 copilot）→ Task.model 空、就绪消息无模型后缀
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    assert store.get("t1").model == ""
+    assert daemon._sched_get_task("t1")["model"] == ""
+    assert not any("模型：" in t for t in bridge.texts("om_root1"))
     await daemon._shutdown()
 
 
