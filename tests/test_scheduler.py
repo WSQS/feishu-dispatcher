@@ -21,7 +21,9 @@ class FakeLLM:
         self.calls: list[tuple] = []
 
     async def chat(self, messages, tools) -> LLMResponse:
-        self.calls.append((messages, tools))
+        # 快照当次调用的 messages（run_tool_loop 会继续往同一列表追加，
+        # 存引用会让历史断言看到后续追加的消息）
+        self.calls.append((list(messages), tools))
         return self.script.pop(0)
 
 
@@ -69,7 +71,13 @@ def _tools(
 
 async def test_returns_text_when_no_tool_calls():
     llm = FakeLLM([LLMResponse(content="你好")])
-    assert await run_tool_loop(llm, "hi", []) == "你好"
+    text, turn = await run_tool_loop(llm, "hi", [])
+    assert text == "你好"
+    # 本轮消息序列：user + 最终 assistant（无工具调用）
+    assert turn == [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "你好"},
+    ]
 
 
 async def test_executes_tool_then_returns_final():
@@ -90,10 +98,21 @@ async def test_executes_tool_then_returns_final():
             LLMResponse(content="已给 demo 派发：做 X"),
         ]
     )
-    out = await run_tool_loop(llm, "帮 demo 做 X", _tools(spawn=spawn))
+    out, turn = await run_tool_loop(llm, "帮 demo 做 X", _tools(spawn=spawn))
     assert spawned == [("demo", "做 X")]
     assert out == "已给 demo 派发：做 X"
     assert len(llm.calls) == 3  # list_projects → spawn → 收尾
+    # 返回的本轮消息序列无损保留了真实工具调用痕迹（这是修记忆幻觉闭环的关键）
+    assert turn[0] == {"role": "user", "content": "帮 demo 做 X"}
+    tool_call_names = [
+        c["function"]["name"]
+        for m in turn
+        if m.get("role") == "assistant"
+        for c in m.get("tool_calls", [])
+    ]
+    assert tool_call_names == ["list_projects", "spawn_agent"]
+    assert [m["role"] for m in turn if m["role"] == "tool"] == ["tool", "tool"]
+    assert turn[-1] == {"role": "assistant", "content": "已给 demo 派发：做 X"}
 
 
 async def test_unknown_tool_reported_not_crash():
@@ -103,7 +122,7 @@ async def test_unknown_tool_reported_not_crash():
             LLMResponse(content="ok"),
         ]
     )
-    assert await run_tool_loop(llm, "x", []) == "ok"
+    assert (await run_tool_loop(llm, "x", []))[0] == "ok"
 
 
 async def test_tool_error_fed_back_not_raised():
@@ -118,7 +137,7 @@ async def test_tool_error_fed_back_not_raised():
             LLMResponse(content="已处理错误"),
         ]
     )
-    out = await run_tool_loop(llm, "x", _tools(spawn=boom))
+    out, _ = await run_tool_loop(llm, "x", _tools(spawn=boom))
     assert out == "已处理错误"
     # 第二轮 LLM 应看到工具错误结果
     tool_msgs = [m for m in llm.calls[1][0] if m.get("role") == "tool"]
@@ -233,9 +252,11 @@ async def test_max_iters_cap():
             for i in range(10)
         ]
     )
-    out = await run_tool_loop(llm, "x", _tools(spawn=noop), max_iters=3)
+    out, turn = await run_tool_loop(llm, "x", _tools(spawn=noop), max_iters=3)
     assert "步数超限" in out
     assert len(llm.calls) == 3
+    # 兜底路径也补上最终 assistant 消息，保证本轮以 assistant 收尾（可安全回放）
+    assert turn[-1] == {"role": "assistant", "content": out}
 
 
 async def test_history_is_included_in_messages():
@@ -263,11 +284,11 @@ def test_memory_in_memory_roundtrip():
 
 def test_memory_persists_and_caps(tmp_path: Path):
     p = tmp_path / "mem.json"
-    m = SchedulerMemory(p, max_messages=4)
+    m = SchedulerMemory(p, max_turns=2)
     m.add_exchange("q1", "a1")
     m.add_exchange("q2", "a2")
-    m.add_exchange("q3", "a3")  # 超过 4 条 → 只留最近两对
-    reloaded = SchedulerMemory(p, max_messages=4)
+    m.add_exchange("q3", "a3")  # 超过 2 轮 → 只留最近两轮
+    reloaded = SchedulerMemory(p, max_turns=2)
     assert reloaded.history() == [
         {"role": "user", "content": "q2"},
         {"role": "assistant", "content": "a2"},
@@ -281,3 +302,99 @@ def test_memory_corrupt_file_tolerated(tmp_path: Path):
     p.write_text("not json{", encoding="utf-8")
     m = SchedulerMemory(p)  # 不抛
     assert m.history() == []
+
+
+def test_memory_stores_tool_calls_losslessly(tmp_path: Path):
+    """核心回归：整轮（含 tool_calls / tool 结果）无损存盘并原样回放。"""
+    p = tmp_path / "mem.json"
+    turn = [
+        {"role": "user", "content": "帮 demo 做 X"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "spawn_agent", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "1", "content": "已派发 demo"},
+        {"role": "assistant", "content": "已给 demo 派发：做 X"},
+    ]
+    SchedulerMemory(p).add_turn(turn)
+    reloaded = SchedulerMemory(p)
+    # 回放的历史里必须有真实的 tool_calls，而不是只剩最终文本
+    assert reloaded.history() == turn
+
+
+def test_memory_trims_whole_turns_keeping_tool_pairs(tmp_path: Path):
+    """按整轮裁剪：不会把 assistant(tool_calls) 与其 tool 结果从中间切断。"""
+    p = tmp_path / "mem.json"
+    m = SchedulerMemory(p, max_turns=1)
+    m.add_exchange("q1", "a1")
+    m.add_turn(
+        [
+            {"role": "user", "content": "q2"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "9",
+                        "type": "function",
+                        "function": {"name": "list_tasks", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "9", "content": "[]"},
+            {"role": "assistant", "content": "没有任务"},
+        ]
+    )
+    hist = m.history()
+    # 只留最近一轮，且该轮完整（首 user、末 assistant、tool_calls 与结果成对）
+    assert hist[0] == {"role": "user", "content": "q2"}
+    assert hist[-1] == {"role": "assistant", "content": "没有任务"}
+    assert any(msg.get("tool_calls") for msg in hist)
+    tool_ids = {m["tool_call_id"] for m in hist if m["role"] == "tool"}
+    call_ids = {
+        c["id"]
+        for m in hist
+        for c in m.get("tool_calls", [])
+        if m["role"] == "assistant"
+    }
+    assert tool_ids == call_ids  # 每个 tool 结果都能对上一个 tool_call
+
+
+def test_memory_clips_large_tool_results(tmp_path: Path):
+    p = tmp_path / "mem.json"
+    big = "x" * 5000
+    SchedulerMemory(p).add_turn(
+        [
+            {"role": "user", "content": "q"},
+            {"role": "tool", "tool_call_id": "1", "content": big},
+            {"role": "assistant", "content": "done"},
+        ]
+    )
+    stored = SchedulerMemory(p).history()
+    tool_msg = next(m for m in stored if m["role"] == "tool")
+    assert len(tool_msg["content"]) < len(big)
+    assert tool_msg["content"].endswith("…")
+
+
+def test_memory_discards_legacy_flat_format(tmp_path: Path):
+    """旧版扁平格式（被幻觉污染的历史）读到即忽略，等价于自动清空。"""
+    p = tmp_path / "mem.json"
+    import json
+
+    p.write_text(
+        json.dumps(
+            [
+                {"role": "user", "content": "建个任务"},
+                {"role": "assistant", "content": "已创建 t6"},
+            ]
+        ),
+        encoding="utf-8",
+    )
+    assert SchedulerMemory(p).history() == []

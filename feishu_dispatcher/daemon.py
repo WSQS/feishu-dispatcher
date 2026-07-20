@@ -902,8 +902,9 @@ class _Daemon:
             register_project=self._sched_register_project,
             unregister_project=self._sched_unregister_project,
         )
+        turn: list[dict] | None = None
         try:
-            reply = await run_tool_loop(
+            reply, turn = await run_tool_loop(
                 self._llm, text, tools, history=self._sched_memory.history()
             )
         except Exception as exc:
@@ -912,7 +913,11 @@ class _Daemon:
                 f"调度器出错：{str(exc)[:200]}。可用 `/run <项目> <任务>` 直接派发。"
             )
         reply = reply or "（调度器无输出）"
-        self._sched_memory.add_exchange(text, reply)  # 跨重启持久化的主线记忆
+        # 无损记忆：存整轮（含真实 tool_calls/结果），避免只存文本训练出「说了不做」的幻觉
+        if turn:
+            self._sched_memory.add_turn(turn)
+        else:
+            self._sched_memory.add_exchange(text, reply)  # 出错兜底：至少存问答对
         await self._reply_user(msg.message_id, reply)
 
     def _sched_list_projects(self) -> list[dict]:
