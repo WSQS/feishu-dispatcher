@@ -25,14 +25,35 @@ class FakeLLM:
         return self.script.pop(0)
 
 
-def _tools(spawn=None, projects=None, agents=None):
+def _tools(
+    spawn=None,
+    projects=None,
+    tasks=None,
+    get_task=None,
+    send=None,
+    resume=None,
+    done=None,
+):
     async def _spawn(p, t):
         return f"已派发 {p}"
+
+    async def _send(tid, m):
+        return f"已发给 {tid}"
+
+    async def _resume(tid):
+        return f"已恢复 {tid}"
+
+    async def _done(tid):
+        return f"已完成 {tid}"
 
     return build_scheduler_tools(
         list_projects=lambda: projects or [{"name": "demo"}],
         spawn_agent=spawn or _spawn,
-        list_agents=lambda: agents or [],
+        list_tasks=lambda: tasks or [],
+        get_task=get_task or (lambda tid: None),
+        send_to_task=send or _send,
+        resume_task=resume or _resume,
+        mark_done=done or _done,
     )
 
 
@@ -98,6 +119,58 @@ async def test_spawn_agent_validates_missing_args():
     tools = _tools()
     spawn_tool = next(t for t in tools if t.name == "spawn_agent")
     assert "参数不足" in await spawn_tool.handler({"project": "demo"})
+
+
+def _tool(tools, name):
+    return next(t for t in tools if t.name == name)
+
+
+async def test_send_to_task_validates_and_dispatches():
+    sent: list[tuple] = []
+
+    async def send(tid, m):
+        sent.append((tid, m))
+        return f"已发给 {tid}"
+
+    tools = _tools(send=send)
+    st = _tool(tools, "send_to_task")
+    assert "参数不足" in await st.handler({"task_id": "t1"})  # 缺 message
+    assert "参数不足" in await st.handler({"message": "hi"})  # 缺 task_id
+    out = await st.handler({"task_id": "t3", "message": "跑测试"})
+    assert out == "已发给 t3"
+    assert sent == [("t3", "跑测试")]
+
+
+async def test_get_task_not_found_and_found():
+    detail = {"t3": {"task_id": "t3", "status": "idle"}}
+    tools = _tools(get_task=lambda tid: detail.get(tid))
+    gt = _tool(tools, "get_task")
+    assert "参数不足" in await gt.handler({})
+    assert "未找到任务 t9" in await gt.handler({"task_id": "t9"})
+    out = await gt.handler({"task_id": "t3"})
+    assert '"t3"' in out and "idle" in out
+
+
+async def test_resume_and_mark_done_validate_and_dispatch():
+    tools = _tools()
+    resume, done = _tool(tools, "resume_task"), _tool(tools, "mark_done")
+    assert "参数不足" in await resume.handler({})
+    assert "参数不足" in await done.handler({})
+    assert await resume.handler({"task_id": "t2"}) == "已恢复 t2"
+    assert await done.handler({"task_id": "t2"}) == "已完成 t2"
+
+
+def test_new_tools_are_exposed():
+    names = {t.name for t in _tools()}
+    assert names == {
+        "list_projects",
+        "spawn_agent",
+        "list_tasks",
+        "get_task",
+        "send_to_task",
+        "resume_task",
+        "mark_done",
+    }
 
 
 async def test_max_iters_cap():

@@ -79,8 +79,10 @@ uv run feishu-dispatcher start        # 前台运行；-v 出调试日志
 |---|---|
 | `/run <项目名> <任务描述>` | 启动 agent，在该消息下建话题，流式输出回话题 |
 | 话题内直接回复 | 追加指令（排队串行执行，同一 session 保留上下文） |
-| 话题内发 `/stop` | 结束该 agent |
-| `/agents` | 列出活跃 + 可恢复的 agent |
+| 话题内发 `/stop` | 结束该 agent（标记 stopped，保留历史） |
+| 话题内发 `/done` | 标记该任务完成并归档（done） |
+| `/agents` | 列出活跃 + 历史任务 |
+| `/clear` | 清理已结束任务的历史 |
 
 **重启恢复**：daemon 重启后（崩溃/升级/重开机），在旧 agent 话题里直接回复即可——daemon 会自动 `load_session` 恢复该会话的上下文继续对话；`sessions.json` 记录随之维护。若会话已在 agent 侧过期或 agent 已从配置移除，会明确提示你 `/run` 重开（不再石沉大海）。
 

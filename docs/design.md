@@ -278,8 +278,15 @@ ACP SDK 也暴露了 `load_session(cwd, session_id)`（`connection.py`）/ `list
 `tasks.json`，task_id 短自增永不复用），status 生命周期（starting/running/idle/suspended +
 done/stopped/failed），`/stop` 改为标记 stopped 保留历史，恢复走 `by_thread → Task`，终止任务
 不自动恢复，`_list_agents` 与调度器状态改读任务台账，历史保留 keep_terminal + clear_terminal。
-**下一步（Phase 2）**：新调度器工具 `list_tasks`/`get_task`/`send_to_task`/`resume_task`/
-`mark_done`（含解决「调度器只能新建」的缺陷）+ `/done`、`/clear` 命令。
+
+✅ **Phase 2 已实现（2026-07-20）**——调度器工具扩到 7 个，新增 `list_tasks`/`get_task(id)`/
+`send_to_task(id, msg)`/`resume_task(id)`/`mark_done(id)`（`list_agents` 更名 `list_tasks`），
+彻底修掉「调度器只能新建」的缺陷（见下节）；新命令 `/done`（话题内标 done 归档）、`/clear`
+（清终止历史）。`/done` 与 `mark_done` 共用 `_finish_task`（有活跃 worker 走 None 哨兵优雅收尾、
+`terminate_status` 决定 stopped/done；无活跃则直接改台账）；恢复逻辑收敛到 `_try_resume`
+（check→`_launch` 之间无 await 防 TOCTOU），`_launch(first_prompt=None)` 支持「仅拉起在线不跑
+首轮」。system prompt 明确「新建 vs 操作已有」。测试 118→135。**下一步**：审计 A（动作日志 +
+把 `get_task` 扩成含 action log）。
 
 **做法**：把现有 `sessions.json` 的 SessionRecord 升级成完整 **Task**（任务 ≈ session ≈ 话题，1:1）：
 - 字段：`task_id`（稳定 id）、`project`/`agent`/`description`（当初的自然语言需求）、
@@ -291,7 +298,7 @@ done/stopped/failed），`/stop` 改为标记 stopped 保留历史，恢复走 `
   忘了已停的任务）；恢复只对可恢复状态生效。完成/停止任务留最近 N 个（+ 可 `/clear`）。
 - **一举多得**：解决遗忘 + 统一 session 恢复记录 + 是审计（A）的落脚点（动作日志挂 task 上）。
 
-### 调度器只能新建、不能操作已有 agent（问题 · 2026-07-18）
+### 调度器只能新建、不能操作已有 agent（✅ 已修 2026-07-20，任务系统 Phase 2）
 
 **问题**：调度器现在的工具只有 `spawn_agent`（新建），缺两项对**已有** agent 的操作：
 - **恢复已有（挂起/可恢复）的 agent**——主线说「把 brick-blast 那个恢复一下继续做 X」，它只能
