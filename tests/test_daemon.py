@@ -1104,6 +1104,38 @@ async def test_model_command_switches_and_persists():
     await daemon._shutdown()
 
 
+async def test_model_choice_survives_suspend_resume():
+    # 复现 bug：/model 切换后任务挂起，load_session 恢复时模型被还原回默认。
+    # ModelAgent.start() 每次都上报默认模型（模拟 opencode 重载后会话配置回默认）——
+    # 恢复不应把用户切过的 Task.model 覆盖回去，且应把选择重新 apply 回 agent。
+    store = TaskStore(None)  # 跨两个 daemon 实例共享 store = 模拟挂起 + 恢复
+    d1, b1, c1 = make_daemon(store=store, agent_cls=ModelAgent)
+    await d1._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+
+    # 切到 glm-5 → 台账记成 glm-5
+    await d1._handle_message(thread_msg("/model zhipuai/glm-5", mid="om_m"))
+    assert store.get("t1").model == "zhipuai/glm-5"
+    saved_sid = store.by_thread("om_root1").session_id
+
+    # 挂起：任务标 suspended、记录保留，Task.model 应仍是 glm-5
+    await d1._shutdown()
+    assert store.by_thread("om_root1").status == "suspended"
+    assert store.get("t1").model == "zhipuai/glm-5"
+
+    # 新 daemon（共享 store）+ 话题回复 → load_session 恢复（新 agent 上报默认模型）
+    d2, b2, c2 = make_daemon(store=store, agent_cls=ModelAgent)
+    await d2._handle_message(thread_msg("more", root="om_root1", mid="om_t2"))
+    await wait_until(lambda: c2 and c2[0].prompts == ["more"])
+    assert c2[0].resume_session_id == saved_sid
+
+    # 期望：用户切过的模型跨挂起/恢复保持（当前 FAIL → 复现 bug）
+    assert store.get("t1").model == "zhipuai/glm-5"
+    # 期望：恢复后把模型重新 apply 回 agent，实际模型不还原（修复后成立）
+    assert "zhipuai/glm-5" in c2[0].set_model_calls
+    await d2._shutdown()
+
+
 async def test_model_command_rejects_unknown():
     store = TaskStore(None)
     daemon, bridge, created = await _run_model_agent(store)
