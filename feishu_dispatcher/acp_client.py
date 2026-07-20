@@ -28,18 +28,22 @@ logger = logging.getLogger(__name__)
 _PROTOCOL_VERSION = 1
 
 OnOutput = Callable[[str], Awaitable[None]]
+#: 审计动作回调：收到一个 tool_call 时推一条结构化动作（{"kind","title"}）
+OnAction = Callable[[dict], Awaitable[None]]
 
 
 @dataclass
 class _Callbacks:
-    """收集 session_update 里需要转发的文本片段。
+    """收集 session_update 里需要转发的文本片段 + 需要审计的动作。
 
     ACP 把 agent 输出分为 agent_message（给用户的最终文本）和
     agent_thought（思考过程）。P0 原型两者都转发，让飞书话题里能看到
-    agent 的完整思考链路（设计文档决策 #8：全量转发）。
+    agent 的完整思考链路（设计文档决策 #8：全量转发）。``on_action`` 另把
+    tool_call 事件（编辑/命令等）结构化送出做事后审计（审计 A）。
     """
 
     on_output: OnOutput
+    on_action: "OnAction | None" = None
 
 
 class _ClientImpl:
@@ -71,6 +75,12 @@ class _ClientImpl:
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         if self._suppress:
             return
+        # 审计（A）：tool_call 是离散的「做了什么」事件，旁路存一份进 task。
+        # 放在 suppress 之后，load_session 重放的历史动作不会被重复记录。
+        if self._cb.on_action is not None:
+            action = _extract_action(update)
+            if action is not None:
+                await self._cb.on_action(action)
         text = self._fmt.format(update)
         if text:
             await self._cb.on_output(text)
@@ -143,6 +153,20 @@ class _ClientImpl:
 def _content_text(update: Any) -> str:
     content = getattr(update, "content", None)
     return getattr(content, "text", "") or ""
+
+
+def _extract_action(update: Any) -> dict | None:
+    """从 session_update 里抽出一条审计动作，非 tool_call 或无标题则返回 None。
+
+    只认 ``tool_call`` 首次通告（带 title + kind，即「做了什么」）——每个动作稳定
+    记一次；``tool_call_update`` 的完成/失败状态是后续增强（挂 tool_call_id 匹配）。
+    """
+    if getattr(update, "session_update", None) != "tool_call":
+        return None
+    title = getattr(update, "title", "") or ""
+    if not title:
+        return None
+    return {"kind": getattr(update, "kind", "") or "", "title": title}
 
 
 class _StreamFormatter:
@@ -235,10 +259,12 @@ class AcpAgent:
         spawn: AgentSpawn,
         on_output: OnOutput,
         *,
+        on_action: OnAction | None = None,
         resume_session_id: str | None = None,
     ) -> None:
         self._spawn = spawn
         self._on_output = on_output
+        self._on_action = on_action
         #: 非 None 则恢复该 ACP 会话（load_session）而非新建（new_session）
         self._resume_session_id = resume_session_id
         self._conn: acp.ClientSideConnection | None = None
@@ -296,7 +322,7 @@ class AcpAgent:
             self._drain_stderr(proc), name="agent-stderr"
         )
 
-        cb = _Callbacks(on_output=self._on_output)
+        cb = _Callbacks(on_output=self._on_output, on_action=self._on_action)
         self._client_impl = _ClientImpl(cb)
         self._conn = acp.connect_to_agent(self._client_impl, writer, reader)
 

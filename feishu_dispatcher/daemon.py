@@ -20,7 +20,7 @@ from dataclasses import dataclass, field
 
 from pathlib import Path
 
-from .acp_client import AcpAgent, AgentSpawn, OnOutput
+from .acp_client import AcpAgent, AgentSpawn, OnAction, OnOutput
 from .config import DEFAULT_CONFIG_PATH, Config
 from .feishu import FeishuBridge, IncomingMessage
 from .llm import build_llm_client
@@ -35,6 +35,7 @@ from .store import Task, TaskStore
 logger = logging.getLogger(__name__)
 
 _DISPATCH_PREFIX = "/run "
+_TASK_PREFIX = "/task "
 _LIST_CMD = "/agents"
 _STOP_CMD = "/stop"
 _DONE_CMD = "/done"
@@ -47,6 +48,7 @@ _USAGE = (
     "用法：\n"
     "• `/run <项目名> <任务描述>`  派发任务给 agent\n"
     "• `/agents`  列出活跃 + 历史任务\n"
+    "• `/task <任务id>`  查看某任务详情与动作日志\n"
     "• `/clear`  清理已结束任务的历史\n"
     "• 在 agent 话题内直接回复 = 追加指令（排队串行执行）\n"
     "• 在 agent 话题内发 `/stop` = 结束该 agent，`/done` = 标记完成并归档"
@@ -205,6 +207,8 @@ class _Daemon:
         text = msg.text.strip()
         if text.startswith(_DISPATCH_PREFIX):
             await self._spawn_for_root(msg, text[len(_DISPATCH_PREFIX) :].strip())
+        elif text.startswith(_TASK_PREFIX):
+            await self._show_task(msg, text[len(_TASK_PREFIX) :].strip())
         elif text == _LIST_CMD:
             await self._list_agents(msg)
         elif text == _CLEAR_CMD:
@@ -275,11 +279,17 @@ class _Daemon:
         self,
         spawn: AgentSpawn,
         on_output: OnOutput,
+        on_action: "OnAction | None" = None,
         *,
         resume_session_id: str | None = None,
     ) -> AcpAgent:
         """构造底层 agent（拆出来是测试注入点）。"""
-        return AcpAgent(spawn, on_output, resume_session_id=resume_session_id)
+        return AcpAgent(
+            spawn,
+            on_output,
+            on_action=on_action,
+            resume_session_id=resume_session_id,
+        )
 
     def _launch(
         self,
@@ -307,9 +317,17 @@ class _Daemon:
             if sess.current_channel is not None:
                 sess.current_channel.feed(text)
 
+        async def on_action(action: dict) -> None:
+            # 审计（A）：把 agent 的 tool_call 记进 Task，标上「进行中的回合号」
+            # （= 已完成回合数 + 1，回合结束时 worker 才递增 turns）。
+            cur = self.store.get(sess.task_id)
+            turn = (cur.turns if cur else 0) + 1
+            self.store.add_action(sess.task_id, {"turn": turn, **action})
+
         sess.agent = self._make_agent(
             AgentSpawn(command=list(agent_argv), cwd=task.workspace),
             on_output,
+            on_action,
             resume_session_id=resume_session_id,
         )
         if first_prompt is not None:
@@ -580,6 +598,31 @@ class _Daemon:
             msg.message_id, "\n\n".join(parts) if parts else "当前无任务。"
         )
 
+    async def _show_task(self, msg: IncomingMessage, task_id: str) -> None:
+        """`/task <id>`：任务详情 + 最近动作日志（审计 A 的人读入口，无需 LLM）。"""
+        t = self.store.get(task_id)
+        if t is None:
+            await self._reply_user(
+                msg.message_id, f"未找到任务 {task_id}。用 `/agents` 查看有哪些任务。"
+            )
+            return
+        lines = [
+            f"[{t.task_id}] {t.project_name} · {t.agent_label} · {t.status}"
+            f"（{t.turns} 轮）",
+            f"任务: {t.description}",
+        ]
+        if t.actions:
+            recent = t.actions[-15:]
+            lines.append(f"最近动作（共 {len(t.actions)} 条，显示末 {len(recent)}）:")
+            lines += [
+                f"  • 第{a.get('turn', '?')}轮 · {a.get('kind') or '动作'}："
+                f"{a.get('title', '')}"
+                for a in recent
+            ]
+        else:
+            lines.append("（暂无动作记录）")
+        await self._reply_user(msg.message_id, "\n".join(lines))
+
     # ------------------------------------------------------------------ #
     # P2：调度器 LLM（自然语言派发）
     # ------------------------------------------------------------------ #
@@ -630,7 +673,7 @@ class _Daemon:
         ]
 
     def _sched_get_task(self, task_id: str) -> dict | None:
-        """get_task 工具：单任务详情（含是否有可恢复会话、是否活跃、时间戳）。"""
+        """get_task 工具：单任务详情 + 动作审计（回答「这个 agent 都干了啥」）。"""
         t = self.store.get(task_id)
         if t is None:
             return None
@@ -645,6 +688,8 @@ class _Daemon:
             "active": t.thread_root_id in self._sessions,
             "created_at": t.created_at,
             "updated_at": t.updated_at,
+            "action_count": len(t.actions),
+            "recent_actions": t.actions[-30:],  # 审计 A：agent 调过的工具
         }
 
     async def _sched_send_to_task(self, task_id: str, message: str) -> str:

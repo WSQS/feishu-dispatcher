@@ -17,7 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,9 @@ ACTIVE_STATES = frozenset({"starting", "running", "idle", "suspended"})
 RESUMABLE_STATES = frozenset({"idle", "suspended"})
 #: 终止状态（移出活跃，进历史）
 TERMINAL_STATES = frozenset({"done", "stopped", "failed"})
+
+#: 每个 Task 最多保留的动作条数（审计日志，超出丢最旧，防 tasks.json 无限涨）
+_MAX_ACTIONS = 200
 
 _TASK_FIELDS = (
     "task_id",
@@ -41,6 +44,7 @@ _TASK_FIELDS = (
     "turns",
     "created_at",
     "updated_at",
+    "actions",
 )
 
 
@@ -57,6 +61,8 @@ class Task:
     turns: int = 0
     created_at: float = 0.0
     updated_at: float = 0.0
+    #: 审计动作日志：每条 = {"turn", "kind", "title"}，来自 ACP tool_call 事件
+    actions: list[dict] = field(default_factory=list)
 
     @property
     def is_active(self) -> bool:
@@ -187,6 +193,21 @@ class TaskStore:
             self._prune()
         self._flush()
         return task
+
+    def add_action(self, task_id: str, action: dict) -> None:
+        """追加一条动作到任务的审计日志（超 ``_MAX_ACTIONS`` 丢最旧），落盘。
+
+        写透式：每条 tool_call 都刷一次盘，与 store 其余部分一致；chatty agent
+        的写量对个人工具可接受（max_agents 默认 3），需要再批量化。
+        """
+        task = self._tasks.get(task_id)
+        if task is None:
+            return
+        task.actions.append(action)
+        if len(task.actions) > _MAX_ACTIONS:
+            del task.actions[:-_MAX_ACTIONS]
+        task.updated_at = self._now()
+        self._flush()
 
     def _prune(self) -> None:
         """只保留最近 ``keep_terminal`` 个终止任务。"""
