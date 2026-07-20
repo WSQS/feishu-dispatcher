@@ -272,6 +272,45 @@ async def test_stop_when_idle_does_not_cancel():
     assert created[0].cancel_calls == 0
 
 
+async def test_cancel_stops_turn_but_keeps_agent():
+    daemon, bridge, created = make_daemon(agent_cls=CancelableAgent)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].in_prompt.is_set())
+    await daemon._handle_message(thread_msg("/cancel"))
+    await wait_until(lambda: created[0].cancel_calls == 1)
+    await wait_until(lambda: not daemon._sessions["om_root1"].turn_in_flight)
+    # agent 保留：未关闭、session 还在、任务回 idle（非 stopped）
+    assert not created[0].closed
+    assert "om_root1" in daemon._sessions
+    await wait_until(lambda: daemon.store.by_thread("om_root1").status == "idle")
+    assert any("已取消当前轮" in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+async def test_cancel_with_input_runs_new_turn():
+    daemon, bridge, created = make_daemon(agent_cls=CancelableAgent)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].in_prompt.is_set())
+    await daemon._handle_message(thread_msg("/cancel do this instead"))
+    await wait_until(lambda: created[0].cancel_calls == 1)
+    # 取消后新输入作为下一轮被拾起执行（FIFO），agent 仍存活
+    await wait_until(lambda: created[0].prompts == ["task", "do this instead"])
+    assert not created[0].closed
+    assert "om_root1" in daemon._sessions
+    await daemon._shutdown()
+
+
+async def test_cancel_when_idle_reports_nothing_to_cancel():
+    daemon, bridge, created = make_daemon()  # FakeAgent（回合秒完）
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    await wait_until(lambda: not daemon._sessions["om_root1"].turn_in_flight)
+    await daemon._handle_message(thread_msg("/cancel"))
+    assert created[0].cancel_calls == 0
+    assert any("没有在跑的轮" in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
 async def test_help_in_thread_shows_usage_not_forwarded_to_agent():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo task"))

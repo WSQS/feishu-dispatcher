@@ -39,6 +39,8 @@ _DISPATCH_PREFIX = "/run "
 _TASK_PREFIX = "/task "
 _LIST_CMD = "/agents"
 _STOP_CMD = "/stop"
+# 话题内：停当前轮但保留 agent；/cancel <新输入> = 停当前轮 + 改做新输入
+_CANCEL_CMD = "/cancel"
 _DONE_CMD = "/done"
 _CLEAR_CMD = "/clear"
 _MODEL_CMD = "/model"  # 话题内：/model 列出可选，/model <名> 切换
@@ -61,14 +63,16 @@ _USAGE = (
     "• `/clear`  清理已结束任务的历史\n"
     "• `/reboot`  重启整个 daemon（任务自动恢复）\n"
     "• 在 agent 话题内直接回复 = 追加指令（排队串行执行）\n"
-    "• 在 agent 话题内发 `/stop` = 结束，`/done` = 归档，`/model [名]` = 查看/切换模型"
+    "• 在 agent 话题内发 `/cancel [新指令]` = 停当前轮（保留 agent），`/stop` = 停并结束，"
+    "`/done` = 归档，`/model [名]` = 查看/切换模型"
 )
 
 #: 话题内用法（在某个 agent 话题里发 /help 时展示；命令随新增同步维护于此）
 _THREAD_USAGE = (
     "话题内用法（你正在某个 agent 的话题里）：\n"
     "• 直接回复 = 追加指令给这个 agent（排队串行执行）\n"
-    "• `/stop`  结束该 agent\n"
+    "• `/cancel [新指令]`  停当前轮但保留 agent；带新指令则停完接着做它\n"
+    "• `/stop`  停当前轮并结束该 agent\n"
     "• `/done`  归档该任务（标记完成）\n"
     "• `/model [名]`  查看 / 切换模型\n"
     "• `/help`  显示本说明\n"
@@ -736,6 +740,30 @@ class _Daemon:
             # put_nowait 在 cancel 之前：cancel 让在途 prompt() 返回后，队列里已有 None。
             if sess.turn_in_flight:
                 await self._cancel_turn(sess)
+            return
+        if text == _CANCEL_CMD or text.startswith(_CANCEL_CMD + " "):
+            # /cancel = 停当前轮但**保留 agent**（区别于 /stop 的结束）；
+            # /cancel <新输入> = 停当前轮 + 把新输入作为下一轮排队（FIFO）。
+            new_input = text[len(_CANCEL_CMD) :].strip()
+            if sess.turn_in_flight:
+                if new_input:
+                    # 排在 cancel 之前：取消让在途 prompt() 返回后，队列里已有新输入 →
+                    # worker 的 cancelled 分支 continue 后即取到它，作为新一轮跑。
+                    sess.queue.put_nowait(new_input)
+                await self._cancel_turn(sess)
+                await self._safe_reply(
+                    thread_root or msg.message_id,
+                    "🛑 已取消当前轮，改执行新指令…"
+                    if new_input
+                    else "🛑 已取消当前轮（agent 保留，可继续发指令）。",
+                )
+            elif new_input:
+                # 无在途轮：没什么可取消，新输入当普通消息执行
+                sess.queue.put_nowait(new_input)
+            else:
+                await self._safe_reply(
+                    thread_root or msg.message_id, "当前没有在跑的轮，无需取消。"
+                )
             return
         if text == _DONE_CMD:
             self._finish_task(sess.task_id, "done")  # 优雅收尾，worker 发完成消息
