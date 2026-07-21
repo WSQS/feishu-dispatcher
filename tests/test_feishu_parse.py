@@ -127,6 +127,24 @@ def test_parse_post_message_extracts_text():
     assert msg.thread_root_id == "om_root"
 
 
+def test_parse_post_direct_body_received_shape():
+    # 收到的 post 事件多为「直接 body」（无 {"post":{"<locale>":...}} 包裹）
+    content = {
+        "title": "",
+        "content": [[{"tag": "text", "text": "1. 测试一下你可以收到吗？"}]],
+    }
+    msg = FeishuBridge._parse_event_message(
+        _event(
+            message_id="om_direct",
+            root_id="om_root",
+            content=content,
+            message_type="post",
+        )
+    )
+    assert msg is not None
+    assert msg.text == "1. 测试一下你可以收到吗？"
+
+
 def test_parse_post_with_title_and_other_locale():
     content = _post_content(
         [[{"tag": "text", "text": "正文"}]], title="标题", locale="en_us"

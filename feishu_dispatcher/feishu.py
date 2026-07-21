@@ -63,20 +63,30 @@ _TEXT_MSG_TYPE = "text"
 _POST_MSG_TYPE = "post"
 
 
+def _post_body(content: dict) -> dict | None:
+    """定位 post 的 body（带 ``content`` 二维数组的那层），兼容多种形状：
+
+    - 收到的事件多为**直接 body**：``{"title"?, "content": [[run,...], ...]}``
+    - 发送 API 形：``{"post": {"<locale>": body}}`` 或 ``{"<locale>": body}``
+    """
+    if not isinstance(content, dict):
+        return None
+    if isinstance(content.get("content"), list):
+        return content  # 直接 body（收到的事件形）
+    wrapper = content.get("post") if isinstance(content.get("post"), dict) else content
+    for v in (wrapper or {}).values():
+        if isinstance(v, dict) and isinstance(v.get("content"), list):
+            return v
+    return None
+
+
 def _extract_post_text(content: dict) -> str:
     """从飞书富文本 post content 抽纯文本。
 
-    结构：``{"post": {"<locale>": {"title": ..., "content": [[run, run], [run], ...]}}}``
-    ——``content`` 是段落 × run 的二维数组，run（tag=text/a/at…）带 ``text`` 字段。
-    取各 run 的 text 拼接、段落间换行；locale 取第一个带 content 的（zh_cn/en_us…）；
-    有 title 则作首行。@ 前缀清理沿用调用方的正则。
+    body.content 是段落 × run 二维数组，run（tag=text/a/at/link…）带 ``text`` 字段。
+    取各 run 的 text 拼接、段落间换行、title 作首行。@ 前缀清理沿用调用方正则。
     """
-    post = content.get("post") if isinstance(content, dict) else None
-    body = None
-    for loc in (post or {}).values():
-        if isinstance(loc, dict) and loc.get("content") is not None:
-            body = loc
-            break
+    body = _post_body(content)
     if body is None:
         return ""
     lines = [
@@ -473,6 +483,13 @@ class FeishuBridge:
             text = ""
         elif msg_type == _POST_MSG_TYPE:
             text = _extract_post_text(content)  # 富文本：段落×run 抽纯文本
+            if not text:
+                # 抽空：多半是没预料到的 post 结构——打原始 content 便于对着修
+                logger.info(
+                    "post 富文本抽取为空 message_id=%s content=%.300s",
+                    message_id,
+                    str(content),
+                )
         else:
             text = content.get("text", "")
         # 去掉 @bot / @user 前缀（飞书 text 消息里 at 表现为 @_user_N）
