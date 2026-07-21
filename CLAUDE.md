@@ -51,7 +51,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **lark-oapi 在 Windows + Defender 下会崩**：`import lark_oapi` eager import 57 个 API namespace 触发 access violation（0xC0000005）。已用 `_lark_compat.py` 空壳 shim 绕开，实际只加载 `ws.pb`（protobuf）+ `ws.const`，事件 JSON 全部手写 dict 解析。**改飞书相关代码务必保持 `__init__.py` 里 `_lark_compat` 最先 import**。
 - **feishu.py 不走 `lark.ws.Client`**（其依赖链会触发上述崩溃），自实现 WS 长连接。frame/ACK/ping/合包语义**必须对照官方参考实现** `.venv/Lib/site-packages/lark_oapi/ws/client.py`：ACK 成功 `{"code": 200}` 失败 500 + `biz_rt` 头；ping 间隔服务端可下发（endpoint 发现响应 / pong payload 的 `PingInterval`）；合包缓存 5s TTL。
-- **飞书限频**：同群全部机器人共享 5 QPS（全应用 50/s）；`max_agents` 默认 3 与之配套；HTTP 层已带 Retry（429/5xx，尊重 Retry-After）。多 agent 高并发需要 per-chat 令牌桶（P1，未做）。
+- **飞书限频**：同群全部机器人共享 5 QPS（全应用 50/s）。**出站令牌桶**（`feishu.py` 的 `_RateLimiter`，`_im_post`/`_im_patch` 发送前 `acquire`，`[config] feishu_qps` 默认 5、`<=0` 关闭）把多 agent 汇总 QPS 压在限额下——故 `max_agents` 默认已提到 7（#36）。HTTP 层另带 Retry（429/5xx，尊重 Retry-After）当兜底。**当前是全局桶**（不分 chat，个人多为单群够用）；严格 per-chat 桶 + 同项目 worktree 隔离见 #37。
 - **安全默认**：`chat_id` 必填（空则拒绝启动，发现模式用 `--discover`）；`sender_whitelist` 建议配置；`/run` 并发上限 `max_agents`。
 - WS 线程死亡由 daemon 30s 看门狗自动重启；agent 子进程 stderr 有后台 drain（防管道满卡死）。
 - **待办 / backlog**：可执行任务条目统一走 **GitHub issues**（`gh issue list`，按 `size:` / `area:` label 分类）；设计理由与已评估/暂缓的决策记录留在 `docs/design.md`。**不要**再在本文件或 design.md 里另起任务清单（避免与 issues 漂移）。大块方向：P1 多 agent worktree 隔离（#23）、权限审批 B（#20）。

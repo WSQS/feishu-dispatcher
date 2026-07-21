@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 
-from feishu_dispatcher.feishu import FeishuBridge, IncomingMessage
+from feishu_dispatcher.feishu import FeishuBridge, IncomingMessage, _RateLimiter
 
 
 def _event(
@@ -105,6 +105,58 @@ def test_parse_invalid_content_json_still_returns_empty_text():
     )
     assert msg is not None
     assert msg.text == ""
+
+
+# ---------------------------------------------------------------------- #
+# #36：出站令牌桶
+# ---------------------------------------------------------------------- #
+
+
+class _FakeClock:
+    """可控时钟：sleep 直接推进时间，令牌桶测试无需真等。"""
+
+    def __init__(self) -> None:
+        self.t = 0.0
+        self.sleeps: list[float] = []
+
+    def now(self) -> float:
+        return self.t
+
+    def sleep(self, d: float) -> None:
+        self.sleeps.append(d)
+        self.t += d
+
+
+def test_rate_limiter_paces_after_capacity():
+    c = _FakeClock()
+    rl = _RateLimiter(5.0, capacity=1.0, _now=c.now, _sleep=c.sleep)
+    rl.acquire()  # 首个令牌免费（capacity=1）
+    rl.acquire()  # 空了 → 等 1/5 = 0.2s
+    rl.acquire()  # 再等 0.2s
+    assert c.sleeps == [0.2, 0.2]
+
+
+def test_rate_limiter_bursts_up_to_capacity():
+    c = _FakeClock()
+    rl = _RateLimiter(5.0, capacity=3.0, _now=c.now, _sleep=c.sleep)
+    for _ in range(3):
+        rl.acquire()  # 3 个突发令牌，不睡
+    assert c.sleeps == []
+    rl.acquire()  # 第 4 个 → 睡 0.2s
+    assert c.sleeps == [0.2]
+
+
+def test_rate_limiter_disabled_when_zero():
+    c = _FakeClock()
+    rl = _RateLimiter(0, _now=c.now, _sleep=c.sleep)
+    for _ in range(20):
+        rl.acquire()
+    assert c.sleeps == []  # rate<=0 关闭限流，从不 sleep
+
+
+def test_bridge_has_limiter_wired():
+    bridge = make_bridge()
+    assert bridge._limiter._rate == 5.0  # 默认 qps
 
 
 # ---------------------------------------------------------------------- #

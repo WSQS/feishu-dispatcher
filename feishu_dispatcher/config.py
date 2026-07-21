@@ -49,8 +49,11 @@ class Config:
     throttle_window: float = 0.5
     #: 发送者 open_id 白名单；空 = 不限制（R10）
     sender_whitelist: list[str] = field(default_factory=list)
-    #: 活跃 agent 并发上限（R11）
-    max_agents: int = 3
+    #: 活跃 agent 并发上限（R11）。默认 7——配 feishu_qps 令牌桶（#36）后，多 agent
+    #: 高并发的卡片输出会被限流压在飞书同群 QPS 下，故可比早期保守的 3 更高。
+    max_agents: int = 7
+    #: 出站飞书调用的 QPS 上限（令牌桶，#36）；飞书同群共享 ~5 QPS。<=0 关闭限流。
+    feishu_qps: float = 5.0
     #: 空闲多少秒后自动挂起 agent（关进程腾名额，记录保留、回复即恢复）；
     #: <=0 = 不自动挂起。默认 30 分钟，只回收真正被搁置的 agent。
     idle_timeout: float = 1800.0
@@ -117,7 +120,8 @@ class Config:
             projects=projects,
             throttle_window=float(data.get("throttle_window", 0.5)),
             sender_whitelist=list(data.get("sender_whitelist", [])),
-            max_agents=int(data.get("max_agents", 3)),
+            max_agents=int(data.get("max_agents", 7)),
+            feishu_qps=float(data.get("feishu_qps", 5.0)),
             idle_timeout=float(data.get("idle_timeout", 1800.0)),
             stream_mode=stream_mode,
             llm=llm,

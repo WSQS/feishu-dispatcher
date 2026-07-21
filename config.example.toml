@@ -17,8 +17,14 @@ chat_id = ""
 # 非空时只有名单内的发送者能触发命令。
 # sender_whitelist = ["ou_your_open_id"]
 
-# 活跃 agent 并发上限（防止 /run 进程炸弹）。
-max_agents = 3
+# 活跃 agent 并发上限（防止 /run 进程炸弹）。默认 7。
+# 注意：N 个 agent 同群同时流式刷卡片会吃飞书同群 QPS，靠下面的 feishu_qps 令牌桶
+# 限流兜底；调很高时也要留意本机内存/CPU（每个 agent 是一个子进程）。
+max_agents = 7
+
+# 出站飞书调用的 QPS 上限（令牌桶）。飞书同群所有机器人共享 ~5 QPS，多 agent 并发时
+# 汇总的卡片 PATCH/回复会超限触发 429——令牌桶把汇总速率压在此值内。<=0 关闭限流。
+# feishu_qps = 5.0
 
 # 空闲多少秒后自动挂起 agent：关掉子进程、腾出 max_agents 名额，但会话记录保留，
 # 之后在该话题回复即自动 load_session 恢复（无缝续聊）。<=0 = 不自动挂起。

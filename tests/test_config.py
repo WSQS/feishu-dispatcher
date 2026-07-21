@@ -106,10 +106,20 @@ def test_minimal_config(tmp_path: Path):
     )
     cfg = Config.load(cfg_file)
     assert cfg.sender_whitelist == []
-    assert cfg.max_agents == 3
+    assert cfg.max_agents == 7  # #36：令牌桶就位后默认从 3 提到 7
+    assert cfg.feishu_qps == 5.0
     assert cfg.projects == {}
     assert cfg.throttle_window == 0.5
     assert cfg.stream_mode == "card"
+
+
+def test_feishu_qps_parsed(tmp_path: Path):
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        'app_id = "a"\napp_secret = "b"\nchat_id = "oc_1"\nfeishu_qps = 3.5\n',
+        encoding="utf-8",
+    )
+    assert Config.load(cfg_file).feishu_qps == 3.5
 
 
 def test_stream_mode_validation(tmp_path: Path):
