@@ -107,6 +107,24 @@ class FailingAgent(FakeAgent):
         raise RuntimeError("boom")
 
 
+class FailUnlessResumedAgent(FakeAgent):
+    """新建会话的那一轮 prompt 抛错（模拟 turn 异常）；恢复后（resume_session_id
+    有值）的新实例成功——用于验证 failed → load_session 接回。"""
+
+    async def prompt(self, text: str) -> str:
+        self.prompts.append(text)
+        if self.resume_session_id is None:
+            raise RuntimeError("boom")
+        self.last_message = f"reply:{text}"
+        await self.on_output(f"echo:{text}")
+        return "end_turn"
+
+
+class StartupFailAgent(FakeAgent):
+    async def start(self) -> None:
+        raise RuntimeError("startup boom")
+
+
 class CancelableAgent(FakeAgent):
     """prompt() 阻塞直到被 cancel()，然后返回 stop_reason='cancelled'（模拟在途取消）。"""
 
@@ -822,11 +840,51 @@ async def test_agent_completion_notifies_main_line():
     await daemon._shutdown()
 
 
-async def test_agent_error_notifies_main_line():
+async def test_agent_error_pauses_recoverable_notifies_main_line():
     daemon, bridge, created = make_daemon(agent_cls=FailingAgent)
     await daemon._handle_message(root_msg("/run demo task"))
-    await wait_until(lambda: any("❌" in t and "出错" in t for _, t in bridge.roots))
+    # turn 异常 → 主线通知「已暂停」，session 关闭腾名额
+    await wait_until(lambda: any("❌" in t and "暂停" in t for _, t in bridge.roots))
     await wait_until(lambda: "om_root1" not in daemon._sessions)
+    # 关键：failed 是可恢复态（非终止），且记下诊断
+    task = daemon.store.by_thread("om_root1")
+    assert task.status == "failed"
+    assert task.is_resumable and not task.is_terminal
+    assert "RuntimeError" in task.error_message and "boom" in task.error_message
+
+
+async def test_failed_task_resumes_on_thread_reply():
+    daemon, bridge, created = make_daemon(agent_cls=FailUnlessResumedAgent)
+    await daemon._handle_message(root_msg("/run demo task"))
+    # 第一轮异常 → failed（有 session），worker 关闭
+    await wait_until(lambda: daemon.store.by_thread("om_root1").status == "failed")
+    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    assert daemon.store.by_thread("om_root1").session_id  # turn 失败时 session 已建
+    # 话题回复 → load_session 恢复（起第二个 agent，带 resume_session_id）→ 成功
+    await daemon._handle_message(thread_msg("再试一次"))
+    await wait_until(lambda: len(created) == 2)
+    assert created[1].resume_session_id  # 第二个 agent 走 load_session
+    await wait_until(
+        lambda: any("echo:再试一次" in t for t in bridge.texts("om_root1"))
+    )
+    # 恢复成功 → 回 idle，error_message 清空
+    await wait_until(lambda: daemon.store.by_thread("om_root1").status == "idle")
+    assert daemon.store.by_thread("om_root1").error_message == ""
+    await daemon._shutdown()
+
+
+async def test_startup_failure_stays_unresumable_guides_to_run():
+    daemon, bridge, created = make_daemon(agent_cls=StartupFailAgent)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: daemon.store.by_thread("om_root1").status == "failed")
+    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    task = daemon.store.by_thread("om_root1")
+    assert not task.session_id  # startup 失败没建会话
+    # 话题回复 → 尝试恢复但无 session → 挡回 /run（不丢人，只是没得恢复）
+    await daemon._handle_message(thread_msg("再试"))
+    await wait_until(
+        lambda: any("重开" in t or "/run" in t for t in bridge.texts("om_root1"))
+    )
 
 
 async def test_list_tasks_reports_task_status_and_turns():

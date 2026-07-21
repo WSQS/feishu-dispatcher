@@ -71,6 +71,29 @@ def test_prune_keeps_recent_terminal_but_counter_monotonic():
     assert make(s, thread="om_3").task_id == "t3"  # 永不复用 t1
 
 
+def test_failed_is_resumable_not_terminal_and_error_persists(tmp_path: Path):
+    p = tmp_path / "tasks.json"
+    s1 = TaskStore(p)
+    make(s1, thread="om_1")
+    s1.update("t1", status="failed", error_message="RuntimeError: boom")
+    t = s1.get("t1")
+    assert t.is_resumable and not t.is_terminal  # failed 可恢复、非终止
+    # 持久化往返：error_message 落盘并读回
+    s2 = TaskStore(p)
+    assert s2.get("t1").status == "failed"
+    assert s2.get("t1").error_message == "RuntimeError: boom"
+
+
+def test_failed_not_pruned(tmp_path: Path):
+    # failed 不进历史修剪（同 suspended，可恢复态不清）
+    s = TaskStore(None, keep_terminal=1)
+    make(s, thread="om_1")
+    make(s, thread="om_2")
+    s.update("t1", status="failed")
+    s.update("t2", status="done")  # terminal，触发 _prune（只清终止态）
+    assert s.get("t1") is not None  # failed 未被清
+
+
 def test_active_split():
     s = TaskStore(None)
     make(s, thread="om_1")  # starting → active

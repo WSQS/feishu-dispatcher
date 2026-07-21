@@ -5,9 +5,12 @@ thread_root_id（飞书话题）、workspace（工作目录）。落盘到 tasks
 （短自增 `t<N>`，持久单调计数器、**永不复用**）索引；另存 thread→task 便于路由。
 
 status 生命周期：
-- 机械态（worker 自动）：starting → running ↔ idle → suspended
-- 语义终止态（人/调度器）：done（归档）/ stopped（中途结束）/ failed（出错）
-终止任务默认不自动恢复；`suspended`/`idle` 才可 load_session 无缝续。历史留最近 N 个。
+- 机械态（worker 自动）：starting → running ↔ idle → suspended；turn 异常 → failed
+- 语义终止态（人/调度器）：done（归档）/ stopped（中途结束）
+`suspended`/`idle`/`failed` 都可 load_session 惰性恢复——failed = turn 中途异常「卡住等
+恢复」而非「死了」：turn 失败时 session 已建，多半能接回；恢复失败才真停在 failed
+（startup 失败无 session，天然挡回 `/run`）。failed 不自动清理（同 suspended，可恢复态
+不进历史修剪）。历史留最近 N 个终止任务。
 
 ``path=None`` 为纯内存（测试）。原子写 + 读损坏容错。
 """
@@ -24,12 +27,12 @@ from .config import Project
 
 logger = logging.getLogger(__name__)
 
-#: 仍在活跃视图里的状态
-ACTIVE_STATES = frozenset({"starting", "running", "idle", "suspended"})
-#: 话题回复即可 load_session 恢复的状态
-RESUMABLE_STATES = frozenset({"idle", "suspended"})
-#: 终止状态（移出活跃，进历史）
-TERMINAL_STATES = frozenset({"done", "stopped", "failed"})
+#: 仍在活跃视图里的状态（failed = turn 异常卡住、可恢复，不算终止）
+ACTIVE_STATES = frozenset({"starting", "running", "idle", "suspended", "failed"})
+#: 话题回复即可 load_session 恢复的状态（failed 有 session 时可接回）
+RESUMABLE_STATES = frozenset({"idle", "suspended", "failed"})
+#: 终止状态（移出活跃，进历史；只剩人/调度器主动结束的）
+TERMINAL_STATES = frozenset({"done", "stopped"})
 
 #: 每个 Task 最多保留的动作条数（审计日志，超出丢最旧，防 tasks.json 无限涨）
 _MAX_ACTIONS = 200
@@ -49,6 +52,7 @@ _TASK_FIELDS = (
     "actions",
     "last_output",
     "model",
+    "error_message",
 )
 
 
@@ -71,6 +75,8 @@ class Task:
     last_output: str = ""
     #: agent 当前模型（opencode 上报；copilot 不暴露则为空）
     model: str = ""
+    #: turn 异常时的诊断（异常类型 + 片段），供 /task /agents / 恢复判断；正常时空
+    error_message: str = ""
 
     @property
     def is_active(self) -> bool:
