@@ -82,6 +82,9 @@ _THREAD_USAGE = (
 #: Task.last_output 截断上限（收尾回复只留精华，防 tasks.json 涨）
 _LAST_OUTPUT_MAX = 800
 
+#: Task.error_message 截断上限（turn 异常诊断，异常类型 + 片段）
+_ERROR_MSG_MAX = 200
+
 
 def _clip(text: str, limit: int) -> str:
     """去首尾空白 + 截断到 limit 字符（超出加省略号）。"""
@@ -532,7 +535,8 @@ class _Daemon:
             await sess.agent.start()
         except Exception as exc:
             logger.exception("agent 启动失败")
-            self.store.update(sess.task_id, status="failed")
+            err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
+            self.store.update(sess.task_id, status="failed", error_message=err)
             if sess.resumed:
                 await self._safe_reply(
                     root, "❌ 会话恢复失败（可能已在 agent 侧过期）。发送 `/run` 重开。"
@@ -647,6 +651,7 @@ class _Daemon:
                         status="idle",
                         turns=turns,
                         last_output=last_output,
+                        error_message="",  # 一轮成功即清掉上次异常诊断（恢复成功）
                     )
                     await self._safe_reply(
                         root, "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）"
@@ -663,16 +668,21 @@ class _Daemon:
                     raise
                 except Exception as exc:
                     logger.exception("agent 执行异常")
-                    self.store.update(sess.task_id, status="failed")
+                    err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
+                    # failed 不再是终止态：本轮失败但 session 已建，多半能 load_session
+                    # 接回——标 failed（可恢复），话题回复即尝试恢复，而非逼用户重开丢上下文。
+                    self.store.update(sess.task_id, status="failed", error_message=err)
                     try:
                         await channel.set_status("error")
                     except Exception:
                         logger.debug("set_status error 失败（忽略）", exc_info=True)
                     await self._safe_reply(
-                        root, f"❌ agent 异常，已结束该 agent: {str(exc)[:200]}"
+                        root,
+                        f"❌ 本轮异常，已暂停：{err}\n"
+                        "在话题回复即尝试恢复（load_session 接回上下文），或 `/stop` 结束。",
                     )
                     await self._notify_main(
-                        f"❌ {sess.project_name} 出错，已结束该 agent。"
+                        f"❌ {sess.project_name} 本轮异常，已暂停（在其话题回复即尝试恢复）。"
                     )
                     break
                 finally:
@@ -893,7 +903,9 @@ class _Daemon:
 
     async def _list_agents(self, msg: IncomingMessage) -> None:
         tasks = self.store.all()
-        active = [t for t in tasks if t.is_active]
+        # failed 虽算 is_active（可恢复），但单拉一段标注，别和在跑的混
+        paused = [t for t in tasks if t.status == "failed"]
+        active = [t for t in tasks if t.is_active and t.status != "failed"]
         terminal = [t for t in tasks if t.is_terminal]
         parts: list[str] = []
         if active:
@@ -903,6 +915,14 @@ class _Daemon:
                     f"• [{t.task_id}] {t.project_name} · {t.status}"
                     f"（{t.turns} 轮）：{t.description[:24]}"
                     for t in active
+                )
+            )
+        if paused:
+            parts.append(
+                "⚠️ 异常暂停（在话题回复即尝试恢复，或 `/stop` 结束）:\n"
+                + "\n".join(
+                    f"• [{t.task_id}] {t.project_name}：{t.error_message or '本轮异常'}"
+                    for t in paused
                 )
             )
         if terminal:
@@ -932,6 +952,8 @@ class _Daemon:
         if t.model:
             head += f"\n模型: {t.model}"
         lines = [head, f"任务: {t.description}"]
+        if t.status == "failed" and t.error_message:
+            lines.append(f"⚠️ 异常暂停：{t.error_message}（话题回复即尝试恢复）")
         if t.last_output:
             lines.append(f"最近回复: {t.last_output}")
         if t.actions:
@@ -1042,6 +1064,7 @@ class _Daemon:
             "created_at": t.created_at,
             "updated_at": t.updated_at,
             "last_output": t.last_output,  # 最近一轮 agent 的收尾回复
+            "error_message": t.error_message,  # failed 时的诊断（供判断重试/新开）
             "action_count": len(t.actions),
             "recent_actions": t.actions[-30:],  # 审计 A：agent 调过的工具
         }
