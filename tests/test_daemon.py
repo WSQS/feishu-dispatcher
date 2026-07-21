@@ -520,7 +520,7 @@ async def test_card_mode_run_echo_in_card_and_done_status():
     await daemon._handle_message(root_msg("/run demo do stuff"))
     await wait_until(
         lambda: any(
-            "echo:do stuff" in card["elements"][0]["content"]
+            "echo:do stuff" in card["body"]["elements"][0]["content"]
             for _, card in bridge.card_replies
         )
     )
@@ -1171,13 +1171,14 @@ async def test_model_pinned_as_card_footer():
     )
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
-    # 卡片最下方固定显示模型（note 元素）
+    # 卡片最下方固定显示模型（footer：小字号 markdown 元素）
     all_cards = bridge.card_replies + bridge.card_patches
     assert any(
         any(
-            el.get("tag") == "note"
-            and "ns-deepseek/deepseek-v4-pro" in el["elements"][0]["content"]
-            for el in card["elements"]
+            el.get("tag") == "markdown"
+            and el.get("text_size") == "notation"
+            and "ns-deepseek/deepseek-v4-pro" in el.get("content", "")
+            for el in card["body"]["elements"]
         )
         for _, card in all_cards
     )

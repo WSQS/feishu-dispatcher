@@ -1,15 +1,25 @@
-"""build_card 单元测试。"""
+"""build_card 单元测试（卡片 JSON 2.0）。"""
 
 from feishu_dispatcher.card import build_card
+
+
+def _body(card):
+    return card["body"]["elements"]
+
+
+def test_build_card_is_v2_schema():
+    card = build_card("test", "running", "hello")
+    assert card["schema"] == "2.0"
+    assert "elements" in card["body"]  # 2.0：元素在 body 下
 
 
 def test_build_card_running():
     card = build_card("test", "running", "hello")
     assert card["header"]["template"] == "blue"
     assert "🔄" in card["header"]["title"]["content"]
-    # body 走 markdown 组件（渲染代码块/标题等），content 直接挂在元素上
-    assert card["elements"][0]["tag"] == "markdown"
-    assert card["elements"][0]["content"] == "hello"
+    # body 走 markdown 组件（2.0 支持标题/表格/代码块），content 直接挂在元素上
+    assert _body(card)[0]["tag"] == "markdown"
+    assert _body(card)[0]["content"] == "hello"
 
 
 def test_build_card_done():
@@ -38,19 +48,21 @@ def test_build_card_unknown_status_defaults_to_blue():
 
 def test_build_card_empty_body_placeholder():
     card = build_card("test", "running", "")
-    assert card["elements"][0]["content"] == "…"
+    assert _body(card)[0]["content"] == "…"
 
 
 def test_build_card_with_footer():
     card = build_card("test", "running", "body", footer="footer text")
-    assert len(card["elements"]) == 2
-    assert card["elements"][1]["tag"] == "note"
-    assert card["elements"][1]["elements"][0]["content"] == "footer text"
+    assert len(_body(card)) == 2
+    # footer 用小字号 markdown（notation），不再是 note 组件
+    assert _body(card)[1]["tag"] == "markdown"
+    assert _body(card)[1]["text_size"] == "notation"
+    assert _body(card)[1]["content"] == "footer text"
 
 
 def test_build_card_without_footer():
     card = build_card("test", "running", "body")
-    assert len(card["elements"]) == 1
+    assert len(_body(card)) == 1
 
 
 def test_build_card_config():
