@@ -45,6 +45,7 @@ _CANCEL_CMD = "/cancel"
 _DONE_CMD = "/done"
 _CLEAR_CMD = "/clear"
 _MODEL_CMD = "/model"  # 话题内：/model 列出可选，/model <名> 切换
+_RAW_CMD = "/raw"  # 话题内：/raw <文本> 把 <文本> 逐字转发给 agent，绕过话题命令解释
 _PROJECT_CMD = "/project"  # root：/project 列出，/project add|remove 增删
 _REBOOT_CMD = "/reboot"  # root：重启整个 daemon 进程（cli.py re-exec）
 _HELP_CMDS = ("/help", "/?", "/usage")  # root 与话题内通用
@@ -76,6 +77,7 @@ _THREAD_USAGE = (
     "• `/stop`  停当前轮并结束该 agent\n"
     "• `/done`  归档该任务（标记完成）\n"
     "• `/model [名]`  查看 / 切换模型\n"
+    "• `/raw <指令>`  把 <指令> 原样发给 agent（如 `/raw /model` 让 agent 自己执行 /model）\n"
     "• `/help`  显示本说明\n"
     "（`/run`、`/agents`、`/task` 等控制台命令请回到群主线发送）"
 )
@@ -762,12 +764,28 @@ class _Daemon:
         if text in _HELP_CMDS:
             await self._safe_reply(thread_root or msg.message_id, _THREAD_USAGE)
             return
+        # /raw <文本>：把 <文本> 逐字转发给 agent，绕过下面所有话题命令（/stop、/model…）
+        # 的解释——用来给 coding agent 发它自己的、恰好与保留名撞车的 slash 指令。剥掉
+        # 前缀后走与普通消息完全相同的路径（含 session 恢复），只是不再匹配保留命令。
+        forward_raw = False
+        if text == _RAW_CMD or text.startswith(_RAW_CMD + " "):
+            text = text[len(_RAW_CMD) :].strip()
+            if not text:
+                await self._safe_reply(
+                    thread_root or msg.message_id,
+                    "用法：`/raw <指令>` —— 把 <指令> 原样发给 agent（如 `/raw /model`）。",
+                )
+                return
+            forward_raw = True
         sess = self._sessions.get(thread_root)
         if sess is None:
             # 无活跃 agent：尝试从持久化记录恢复（惰性重连），或明确提示——
             # 不再静默忽略（那是重启后老话题回复石沉大海的根源）。
             await self._recover_or_notify(
-                thread_root or msg.message_id, thread_root, text
+                thread_root or msg.message_id,
+                thread_root,
+                text,
+                forward_raw=forward_raw,
             )
             return
         if not text:
@@ -777,6 +795,9 @@ class _Daemon:
                 thread_root or msg.message_id,
                 "⚠️ 该 agent 已结束。发送 `/run ...` 新建任务。",
             )
+            return
+        if forward_raw:
+            sess.queue.put_nowait(text)  # 逐字直传，跳过保留命令解释
             return
         if text == _STOP_CMD:
             sess.queue.put_nowait(None)  # 终止信号：worker 收到即标 stopped 收尾
@@ -857,9 +878,18 @@ class _Daemon:
         await self._safe_reply(reply_target, f"✅ 已切换模型为 {arg}（下一轮起生效）。")
 
     async def _recover_or_notify(
-        self, reply_target: str, thread_root: str, text: str
+        self,
+        reply_target: str,
+        thread_root: str,
+        text: str,
+        *,
+        forward_raw: bool = False,
     ) -> None:
-        """话题无活跃 agent：能恢复的 Task 就 load_session 惰性重连，否则明确提示。"""
+        """话题无活跃 agent：能恢复的 Task 就 load_session 惰性重连，否则明确提示。
+
+        ``forward_raw``（来自 ``/raw <文本>``）时跳过 ``/stop``/``/done`` 解释——恢复
+        agent 后把 <文本> 当普通首轮转发，即使它恰好是 ``/stop`` 也不误当停止命令。
+        """
         task = self.store.by_thread(thread_root)
         if task is None:
             await self._safe_reply(
@@ -873,11 +903,11 @@ class _Daemon:
                 f"⚠️ 任务 [{task.task_id}] 已结束（{task.status}）。发送 `/run` 新开一个。",
             )
             return
-        if text == _STOP_CMD:
+        if not forward_raw and text == _STOP_CMD:
             self.store.update(task.task_id, status="stopped")
             await self._safe_reply(reply_target, f"🛑 任务 [{task.task_id}] 已结束。")
             return
-        if text == _DONE_CMD:
+        if not forward_raw and text == _DONE_CMD:
             self.store.update(task.task_id, status="done")
             await self._safe_reply(
                 reply_target, f"✅ 任务 [{task.task_id}] 已完成并归档。"

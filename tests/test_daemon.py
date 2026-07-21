@@ -381,6 +381,53 @@ async def test_help_on_root_shows_console_usage():
     assert any(m == "om_h" and "用法" in t for m, t in bridge.plain)
 
 
+async def test_raw_forwards_reserved_command_to_agent():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    # /raw /model：/model 逐字转发给 agent，而非被 daemon 当模型命令拦截
+    await daemon._handle_message(thread_msg("/raw /model", mid="om_raw1"))
+    await wait_until(lambda: created[0].prompts == ["task", "/model"])
+    assert not created[0].closed
+    await daemon._shutdown()
+
+
+async def test_raw_bare_shows_usage_hint_not_forwarded():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    # 裸 /raw（无内容）：给用法提示，不入队给 agent
+    await daemon._handle_message(thread_msg("/raw", mid="om_raw0"))
+    assert any(t.startswith("用法：") for t in bridge.texts("om_root1"))
+    assert created[0].prompts == ["task"]
+    await daemon._shutdown()
+
+
+async def test_raw_forwards_stop_literally_keeps_agent():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    # /raw /stop：/stop 逐字转发，绝不把 agent 当 /stop 结束
+    await daemon._handle_message(thread_msg("/raw /stop", mid="om_raw2"))
+    await wait_until(lambda: created[0].prompts == ["task", "/stop"])
+    assert not created[0].closed
+    assert "om_root1" in daemon._sessions
+    await daemon._shutdown()
+
+
+async def test_raw_in_dormant_thread_recovers_not_stops():
+    store = TaskStore(None)
+    _seed_task(store, thread="om_orphan")  # 可恢复的挂起任务
+    daemon, bridge, created = make_daemon(store=store)
+    # 挂起话题里 /raw /stop：恢复 agent 并把 /stop 当首轮转发，不当停止命令
+    await daemon._handle_message(
+        thread_msg("/raw /stop", root="om_orphan", mid="om_rz")
+    )
+    await wait_until(lambda: created and created[0].prompts == ["/stop"])
+    assert store.by_thread("om_orphan").status != "stopped"
+    await daemon._shutdown()
+
+
 async def test_duplicate_message_id_spawns_only_once():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo task", mid="om_dup"))
