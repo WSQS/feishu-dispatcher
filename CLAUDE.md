@@ -55,3 +55,4 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **安全默认**：`chat_id` 必填（空则拒绝启动，发现模式用 `--discover`）；`sender_whitelist` 建议配置；`/run` 并发上限 `max_agents`。
 - WS 线程死亡由 daemon 30s 看门狗自动重启；agent 子进程 stderr 有后台 drain（防管道满卡死）。
 - **待办 / backlog**：可执行任务条目统一走 **GitHub issues**（`gh issue list`，按 `size:` / `area:` label 分类）；设计理由与已评估/暂缓的决策记录留在 `docs/design.md`。**不要**再在本文件或 design.md 里另起任务清单（避免与 issues 漂移）。大块方向：同项目 worktree 隔离（#37）、权限审批 B（#20）。
+- **动手前先开 issue（工作流约束）**：任何要修复/实现的**独立**问题，在开始改动前先 `gh issue create` 记录（打好 `size:`/`area:` label），再开分支写修复，PR 里 `Closes #N` 闭环——不要先写代码、事后再补 issue。同一 PR 范围内顺手带的琐碎修正（如改个错字）不必单独开 issue。
