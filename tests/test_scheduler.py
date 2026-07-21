@@ -38,7 +38,7 @@ def _tools(
     register=None,
     unregister=None,
 ):
-    async def _spawn(p, t):
+    async def _spawn(p, t, a=""):
         return f"已派发 {p}"
 
     async def _send(tid, m):
@@ -83,8 +83,8 @@ async def test_returns_text_when_no_tool_calls():
 async def test_executes_tool_then_returns_final():
     spawned = []
 
-    async def spawn(p, t):
-        spawned.append((p, t))
+    async def spawn(p, t, a=""):
+        spawned.append((p, t, a))
         return f"已派发 {p}"
 
     llm = FakeLLM(
@@ -99,7 +99,7 @@ async def test_executes_tool_then_returns_final():
         ]
     )
     out, turn = await run_tool_loop(llm, "帮 demo 做 X", _tools(spawn=spawn))
-    assert spawned == [("demo", "做 X")]
+    assert spawned == [("demo", "做 X", "")]  # 未指定 agent → 空串（用默认）
     assert out == "已给 demo 派发：做 X"
     assert len(llm.calls) == 3  # list_projects → spawn → 收尾
     # 返回的本轮消息序列无损保留了真实工具调用痕迹（这是修记忆幻觉闭环的关键）
@@ -115,6 +115,31 @@ async def test_executes_tool_then_returns_final():
     assert turn[-1] == {"role": "assistant", "content": "已给 demo 派发：做 X"}
 
 
+async def test_spawn_agent_passes_agent_override():
+    spawned = []
+
+    async def spawn(p, t, a=""):
+        spawned.append((p, t, a))
+        return f"已派发 {p}（{a or '默认'}）"
+
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        "1",
+                        "spawn_agent",
+                        {"project": "demo", "task": "做 X", "agent": "claude"},
+                    )
+                ]
+            ),
+            LLMResponse(content="好"),
+        ]
+    )
+    await run_tool_loop(llm, "用 claude 跑 X", _tools(spawn=spawn))
+    assert spawned == [("demo", "做 X", "claude")]  # agent 覆盖被透传
+
+
 async def test_unknown_tool_reported_not_crash():
     llm = FakeLLM(
         [
@@ -126,7 +151,7 @@ async def test_unknown_tool_reported_not_crash():
 
 
 async def test_tool_error_fed_back_not_raised():
-    async def boom(p, t):
+    async def boom(p, t, a=""):
         raise RuntimeError("kaboom")
 
     llm = FakeLLM(

@@ -167,7 +167,7 @@ def make_daemon(
         app_id="a",
         app_secret="b",
         chat_id="oc_1",
-        agents={"copilot": ["copilot", "--acp"]},
+        agents={"copilot": ["copilot", "--acp"], "opencode": ["opencode", "acp"]},
         projects={"demo": Project(name="demo", path=Path("C:/tmp/demo"))},
         throttle_window=0.01,
         idle_timeout=idle_timeout,
@@ -235,6 +235,30 @@ async def test_run_dispatches_and_streams_output():
     assert len(created) == 1
     assert created[0].prompts == ["do stuff"]
     assert created[0].start_count == 1
+
+
+async def test_run_agent_flag_overrides_default():
+    daemon, bridge, created = make_daemon()
+    # demo 默认 copilot；--agent opencode 覆盖
+    await daemon._handle_message(root_msg("/run demo 做点事 --agent opencode"))
+    await wait_until(lambda: created and created[0].prompts == ["做点事"])
+    assert daemon.store.by_thread("om_root1").agent_label == "opencode"
+    assert any("opencode" in t for t in bridge.texts("om_root1"))
+
+
+async def test_run_without_agent_flag_uses_default():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/run demo 做点事"))
+    await wait_until(lambda: created and created[0].prompts == ["做点事"])
+    assert daemon.store.by_thread("om_root1").agent_label == "copilot"  # 项目默认
+
+
+async def test_run_unknown_agent_errors_no_spawn():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/run demo 做点事 --agent nope"))
+    assert any("未知 agent" in t for m, t in bridge.plain if m == "om_root1")
+    assert created == []  # 未知 agent 直接报错，不启动
+    assert daemon.store.by_thread("om_root1") is None
 
 
 async def test_thread_reply_reuses_same_agent_without_restart():
@@ -411,7 +435,7 @@ def make_daemon_with_limit(
         app_id="a",
         app_secret="b",
         chat_id="oc_1",
-        agents={"copilot": ["copilot", "--acp"]},
+        agents={"copilot": ["copilot", "--acp"], "opencode": ["opencode", "acp"]},
         projects={"demo": Project(name="demo", path=Path("C:/tmp/demo"))},
         throttle_window=0.01,
         max_agents=max_agents,
@@ -461,7 +485,7 @@ def make_daemon_with_whitelist(
         app_id="a",
         app_secret="b",
         chat_id="oc_1",
-        agents={"copilot": ["copilot", "--acp"]},
+        agents={"copilot": ["copilot", "--acp"], "opencode": ["opencode", "acp"]},
         projects={"demo": Project(name="demo", path=Path("C:/tmp/demo"))},
         throttle_window=0.01,
         sender_whitelist=sender_whitelist,
@@ -504,7 +528,7 @@ async def test_discover_mode_does_not_execute_commands():
         app_id="a",
         app_secret="b",
         chat_id="",
-        agents={"copilot": ["copilot", "--acp"]},
+        agents={"copilot": ["copilot", "--acp"], "opencode": ["opencode", "acp"]},
         projects={"demo": Project(name="demo", path=Path("C:/tmp/demo"))},
         throttle_window=0.01,
         stream_mode="text",

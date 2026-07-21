@@ -281,7 +281,7 @@ async def run_tool_loop(
 def build_scheduler_tools(
     *,
     list_projects: Callable[[], list[dict[str, Any]]],
-    spawn_agent: Callable[[str, str], Awaitable[str]],
+    spawn_agent: Callable[[str, str, str], Awaitable[str]],
     list_tasks: Callable[[], list[dict[str, Any]]],
     get_task: Callable[[str], dict[str, Any] | None],
     send_to_task: Callable[[str, str], Awaitable[str]],
@@ -312,9 +312,10 @@ def build_scheduler_tools(
     async def _spawn_agent(args: dict[str, Any]) -> str:
         project = str(args.get("project", "")).strip()
         task = str(args.get("task", "")).strip()
+        agent = str(args.get("agent", "")).strip()  # 可选：覆盖项目 default_agent
         if not project or not task:
             return "参数不足：project 和 task 都必填。"
-        return await spawn_agent(project, task)
+        return await spawn_agent(project, task, agent)
 
     async def _list_tasks(_args: dict[str, Any]) -> str:
         return json.dumps(list_tasks(), ensure_ascii=False)
@@ -370,6 +371,7 @@ def build_scheduler_tools(
             description=(
                 "给指定项目派发一个**新** coding agent 执行任务，会新建一个飞书话题。"
                 "仅用于全新工作；要操作已有任务请改用 send_to_task。"
+                "可选 agent 参数覆盖项目默认 agent（如用户说「用 claude 跑一下」）。"
             ),
             parameters={
                 "type": "object",
@@ -378,6 +380,13 @@ def build_scheduler_tools(
                     "task": {
                         "type": "string",
                         "description": "要 agent 做什么，清晰的自然语言描述",
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": (
+                            "可选：指定用哪个 agent（如 copilot/opencode/claude，须已配置）；"
+                            "不填则用项目的默认 agent"
+                        ),
                     },
                 },
                 "required": ["project", "task"],
