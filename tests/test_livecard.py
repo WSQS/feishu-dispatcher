@@ -44,15 +44,16 @@ async def test_footer_fixed_at_card_bottom():
     lc.feed("hi")
     await lc.flush()
     card = bridge.card_replies[0][1]
-    note = card["elements"][-1]  # footer 在最下方
-    assert note["tag"] == "note"
-    assert "模型：deepseek-v4" in note["elements"][0]["content"]
+    foot = card["body"]["elements"][-1]  # footer 在最下方
+    assert foot["tag"] == "markdown"
+    assert foot["text_size"] == "notation"
+    assert "模型：deepseek-v4" in foot["content"]
     # 再 patch 一次，footer 仍在
     lc.feed(" more")
     await lc.flush()
     assert (
         "模型：deepseek-v4"
-        in bridge.card_patches[-1][1]["elements"][-1]["elements"][0]["content"]
+        in bridge.card_patches[-1][1]["body"]["elements"][-1]["content"]
     )
     await lc.aclose()
 
@@ -143,7 +144,7 @@ async def test_feed_after_close_is_ignored():
     lc.feed("y")
     # Only "x" should have been emitted
     assert len(bridge.card_replies) == 1
-    assert bridge.card_replies[0][1]["elements"][0]["text"]["content"] == "x"
+    assert bridge.card_replies[0][1]["body"]["elements"][0]["content"] == "x"
 
 
 async def test_empty_feed_ignored():
@@ -164,5 +165,5 @@ async def test_debounce_merges_chunks():
     await asyncio.sleep(0.2)
     # Should have 1 reply with merged body
     assert len(bridge.card_replies) == 1
-    assert bridge.card_replies[0][1]["elements"][0]["text"]["content"] == "abc"
+    assert bridge.card_replies[0][1]["body"]["elements"][0]["content"] == "abc"
     await lc.aclose()
