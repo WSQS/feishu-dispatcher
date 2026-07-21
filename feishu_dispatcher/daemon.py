@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
@@ -56,7 +57,7 @@ _DEDUP_CAPACITY = 512
 
 _USAGE = (
     "用法：\n"
-    "• `/run <项目名> <任务描述>`  派发任务给 agent\n"
+    "• `/run <项目名> <任务描述> [--agent <名>]`  派发任务给 agent（可选覆盖默认 agent）\n"
     "• `/agents`  列出活跃 + 历史任务\n"
     "• `/task <任务id>`  查看某任务详情与动作日志\n"
     "• `/project`  列出项目；`/project add <名> <agent> <路径>` 注册，`/project remove <名>` 删除\n"
@@ -96,6 +97,18 @@ def _one_line(text: str, limit: int) -> str:
     """压成一行（合并所有空白）再截断，用于主线通知里的摘要片段。"""
     s = " ".join((text or "").split())
     return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _parse_agent_flag(text: str) -> tuple[str, str]:
+    """从 /run 的任务文本里剥离 ``--agent <name>``，返回 (任务, agent)。
+
+    agent 为空 = 未指定（用项目 default_agent）。``--agent`` 可在任意位置，但推荐末尾。
+    """
+    m = re.search(r"\s*--agent\s+(\S+)", text)
+    if not m:
+        return text.strip(), ""
+    task = (text[: m.start()] + " " + text[m.end() :]).strip()
+    return task, m.group(1)
 
 
 async def run(
@@ -397,13 +410,36 @@ class _Daemon:
         logger.info("删除项目 %s（%d 个历史任务引用）", name, refs)
         return f"🗑️ 已删除项目 {name}。{tip}"
 
+    def _resolve_agent(
+        self, project: Project, override: str
+    ) -> tuple[str, list[str] | None, str]:
+        """定本次实际用的 agent：``override`` 非空则用它（须在 [agents]），否则用项目
+        ``default_agent``。返回 ``(agent_label, argv, 错误串)``；argv=None 表示出错。"""
+        label = (override or project.default_agent or "").strip()
+        argv = self.cfg.agents.get(label)
+        if not argv:
+            known = ", ".join(self.cfg.agents) or "(无)"
+            if override:
+                return label, None, f"未知 agent '{override}'。可选: {known}"
+            return (
+                label,
+                None,
+                f"项目 '{project.name}' 的 agent '{label}' 未配置。可选: {known}",
+            )
+        return label, argv, ""
+
     async def _spawn_for_root(self, msg: IncomingMessage, body: str) -> None:
-        """解析 ``/run <project> <task>``，创建 agent session 并启动 worker。"""
+        """解析 ``/run <project> <task> [--agent <name>]``，建 session 并启动 worker。"""
+        usage = "格式：`/run <项目名> <任务描述> [--agent <agent>]`"
         parts = body.split(maxsplit=1)
         if len(parts) < 2:
-            await self._reply_user(msg.message_id, "格式：`/run <项目名> <任务描述>`")
+            await self._reply_user(msg.message_id, usage)
             return
-        project_name, task = parts[0].strip(), parts[1].strip()
+        project_name = parts[0].strip()
+        task, agent_override = _parse_agent_flag(parts[1].strip())
+        if not task:
+            await self._reply_user(msg.message_id, usage)
+            return
         project = self._resolve_project(project_name)
         if project is None:
             known = ", ".join(self._all_projects()) or "(无)"
@@ -411,12 +447,9 @@ class _Daemon:
                 msg.message_id, f"未知项目 '{project_name}'。已知项目: {known}"
             )
             return
-        agent_argv = self.cfg.agents.get(project.default_agent)
-        if not agent_argv:
-            await self._reply_user(
-                msg.message_id,
-                f"项目 '{project_name}' 的 agent '{project.default_agent}' 未配置",
-            )
+        agent_label, agent_argv, err = self._resolve_agent(project, agent_override)
+        if agent_argv is None:
+            await self._reply_user(msg.message_id, err)
             return
 
         thread_root = msg.message_id
@@ -436,7 +469,7 @@ class _Daemon:
 
         new_task = self.store.create(
             project_name=project_name,
-            agent_label=project.default_agent,
+            agent_label=agent_label,
             description=task,
             thread_root_id=thread_root,
             workspace=str(project.path),
@@ -444,7 +477,7 @@ class _Daemon:
         self._launch(new_task, agent_argv, first_prompt=task)
         await self._safe_reply(
             thread_root,
-            f"🚀 [{new_task.task_id}] 启动 {project.default_agent} 处理项目 "
+            f"🚀 [{new_task.task_id}] 启动 {agent_label} 处理项目 "
             f"{project_name}…\n任务: {task}",
         )
 
@@ -1125,15 +1158,20 @@ class _Daemon:
             return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
         return f"已把任务 [{task_id}] 标记为完成（done）。"
 
-    async def _sched_spawn_agent(self, project_name: str, task: str) -> str:
-        """spawn_agent 工具实现：建 Task + 新话题 + 启动 agent，返回给 LLM 的状态串。"""
+    async def _sched_spawn_agent(
+        self, project_name: str, task: str, agent: str = ""
+    ) -> str:
+        """spawn_agent 工具实现：建 Task + 新话题 + 启动 agent，返回给 LLM 的状态串。
+
+        ``agent`` 可选：非空则覆盖项目 default_agent（须在 [agents]），否则用默认。
+        """
         project = self._resolve_project(project_name)
         if project is None:
             known = ", ".join(self._all_projects()) or "(无)"
             return f"未知项目 '{project_name}'。已注册项目: {known}"
-        agent_argv = self.cfg.agents.get(project.default_agent)
-        if not agent_argv:
-            return f"项目 '{project_name}' 的 agent '{project.default_agent}' 未配置。"
+        agent_label, agent_argv, err = self._resolve_agent(project, agent)
+        if agent_argv is None:
+            return err
         if len(self._sessions) >= self.cfg.max_agents:
             return f"已达并发上限 {self.cfg.max_agents}，请先 `/stop` 一个再派发。"
         assert self._bridge is not None
@@ -1141,11 +1179,11 @@ class _Daemon:
         root = await asyncio.to_thread(
             self._bridge.send_root_message,
             self.cfg.chat_id,
-            f"🚀 {project.default_agent} · {project_name}\n任务: {task}",
+            f"🚀 {agent_label} · {project_name}\n任务: {task}",
         )
         new_task = self.store.create(
             project_name=project_name,
-            agent_label=project.default_agent,
+            agent_label=agent_label,
             description=task,
             thread_root_id=root,
             workspace=str(project.path),
@@ -1153,7 +1191,7 @@ class _Daemon:
         self._launch(new_task, agent_argv, first_prompt=task)
         return (
             f"已建任务 [{new_task.task_id}]，在项目 {project_name} 启动 "
-            f"{project.default_agent} 处理：{task}"
+            f"{agent_label} 处理：{task}"
         )
 
     # ------------------------------------------------------------------ #
