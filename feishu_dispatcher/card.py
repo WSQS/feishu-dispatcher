@@ -11,11 +11,15 @@ _STATUS_MAP = {
 
 
 def build_card(title: str, status: str, body: str, footer: str = "") -> dict:
-    """构造 interactive card dict。status ∈ {running, done, error, stopped}。"""
+    """构造 interactive card dict。status ∈ {running, done, error, stopped}。
+
+    body 用飞书 ``markdown`` 组件渲染（非 ``lark_md`` 那个受限子集）——支持代码块、
+    标题、表格、列表等，coding agent 的输出（大量代码块）才能正常显示。
+    """
     color, emoji = _STATUS_MAP.get(status, ("blue", "🔄"))
 
     elements: list[dict] = [
-        {"tag": "div", "text": {"tag": "lark_md", "content": body or "…"}},
+        {"tag": "markdown", "content": body or "…"},
     ]
     if footer:
         elements.append(

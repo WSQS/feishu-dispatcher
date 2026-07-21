@@ -520,7 +520,7 @@ async def test_card_mode_run_echo_in_card_and_done_status():
     await daemon._handle_message(root_msg("/run demo do stuff"))
     await wait_until(
         lambda: any(
-            "echo:do stuff" in card["elements"][0]["text"]["content"]
+            "echo:do stuff" in card["elements"][0]["content"]
             for _, card in bridge.card_replies
         )
     )

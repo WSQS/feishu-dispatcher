@@ -143,7 +143,7 @@ async def test_feed_after_close_is_ignored():
     lc.feed("y")
     # Only "x" should have been emitted
     assert len(bridge.card_replies) == 1
-    assert bridge.card_replies[0][1]["elements"][0]["text"]["content"] == "x"
+    assert bridge.card_replies[0][1]["elements"][0]["content"] == "x"
 
 
 async def test_empty_feed_ignored():
@@ -164,5 +164,5 @@ async def test_debounce_merges_chunks():
     await asyncio.sleep(0.2)
     # Should have 1 reply with merged body
     assert len(bridge.card_replies) == 1
-    assert bridge.card_replies[0][1]["elements"][0]["text"]["content"] == "abc"
+    assert bridge.card_replies[0][1]["elements"][0]["content"] == "abc"
     await lc.aclose()

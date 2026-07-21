@@ -7,7 +7,9 @@ def test_build_card_running():
     card = build_card("test", "running", "hello")
     assert card["header"]["template"] == "blue"
     assert "🔄" in card["header"]["title"]["content"]
-    assert card["elements"][0]["text"]["content"] == "hello"
+    # body 走 markdown 组件（渲染代码块/标题等），content 直接挂在元素上
+    assert card["elements"][0]["tag"] == "markdown"
+    assert card["elements"][0]["content"] == "hello"
 
 
 def test_build_card_done():
@@ -36,7 +38,7 @@ def test_build_card_unknown_status_defaults_to_blue():
 
 def test_build_card_empty_body_placeholder():
     card = build_card("test", "running", "")
-    assert card["elements"][0]["text"]["content"] == "…"
+    assert card["elements"][0]["content"] == "…"
 
 
 def test_build_card_with_footer():
