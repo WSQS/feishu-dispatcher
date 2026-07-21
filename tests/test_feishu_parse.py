@@ -65,28 +65,38 @@ def test_parse_message_where_root_id_equals_message_id_is_root():
     assert msg.thread_root_id is None
 
 
-def test_parse_non_text_message_returns_none():
-    msg = FeishuBridge._parse_event_message(
-        _event(
-            message_id="om_img",
-            root_id=None,
-            content={"image_key": "k"},
-            message_type="image",
+def test_parse_non_text_message_returns_none_and_logs(caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="feishu_dispatcher.feishu"):
+        msg = FeishuBridge._parse_event_message(
+            _event(
+                message_id="om_img",
+                root_id=None,
+                content={"image_key": "k"},
+                message_type="image",
+            )
         )
-    )
     assert msg is None
+    # 打日志而非静默丢弃：能看出「发了图但没反应」是因为暂不支持非文本
+    assert "非文本" in caplog.text
+    assert "image" in caplog.text and "om_img" in caplog.text
 
 
-def test_parse_p2p_message_returns_none():
-    msg = FeishuBridge._parse_event_message(
-        _event(
-            message_id="om_p2p",
-            root_id=None,
-            content={"text": "hi"},
-            chat_type="p2p",
+def test_parse_p2p_message_returns_none_and_logs(caplog):
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="feishu_dispatcher.feishu"):
+        msg = FeishuBridge._parse_event_message(
+            _event(
+                message_id="om_p2p",
+                root_id=None,
+                content={"text": "hi"},
+                chat_type="p2p",
+            )
         )
-    )
     assert msg is None
+    assert "非群" in caplog.text and "om_p2p" in caplog.text
 
 
 def test_parse_invalid_content_json_still_returns_empty_text():

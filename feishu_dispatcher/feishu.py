@@ -357,15 +357,29 @@ class FeishuBridge:
     def _parse_event_message(event: dict) -> IncomingMessage | None:
         msg = event.get("message") or {}
         sender = event.get("sender") or {}
+        message_id = msg.get("message_id", "")
         # 忽略机器人自己发的消息：daemon 会 send_root_message 建话题根，若该消息被
         # 回投会触发 LLM 派发 → 死循环。多数 scope 本就不下发 bot 消息，此处防御性拦截。
         if sender.get("sender_type") == "bot":
+            logger.debug("忽略机器人自己的消息 message_id=%s", message_id)
             return None
-        if msg.get("message_type") != _TEXT_MSG_TYPE:
+        msg_type = msg.get("message_type", "")
+        if msg_type != _TEXT_MSG_TYPE:
+            # 打日志而非静默丢弃：图片/文件等暂不支持，至少让「消息没反应」可排查。
+            logger.info(
+                "忽略非文本消息（暂不支持）: message_type=%s message_id=%s",
+                msg_type,
+                message_id,
+            )
             return None
         chat_type = msg.get("chat_type", "")
         # P0 只处理群消息（话题形式群）；单聊不支持话题，忽略。
         if chat_type != "group":
+            logger.info(
+                "忽略非群消息（只处理群/话题）: chat_type=%s message_id=%s",
+                chat_type,
+                message_id,
+            )
             return None
         content_raw = msg.get("content", "{}")
         try:
@@ -379,7 +393,6 @@ class FeishuBridge:
         import re
 
         text = re.sub(r"@_\w+\s*", "", text).strip()
-        message_id = msg.get("message_id", "")
         root_id = msg.get("root_id")
         thread_root = root_id if root_id and root_id != message_id else None
         sender_id_obj = (sender.get("sender_id") or {}) if sender else {}
