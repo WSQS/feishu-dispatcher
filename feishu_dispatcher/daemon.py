@@ -186,6 +186,7 @@ class _Daemon:
             main_loop=loop,
             on_event=self._handle_message,
             chat_whitelist=self.cfg.chat_id,
+            qps=self.cfg.feishu_qps,
         )
         self._stop_event = asyncio.Event()
         self._bridge.start_background()

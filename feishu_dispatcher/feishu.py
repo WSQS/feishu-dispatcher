@@ -61,6 +61,51 @@ _MSG_PONG = "pong"
 _TEXT_MSG_TYPE = "text"
 
 
+class _RateLimiter:
+    """线程安全令牌桶：限制出站 QPS。
+
+    飞书同群共享 ~5 QPS——多 agent 并发时各自的卡片 PATCH/回复汇总会超限触发 429。
+    所有出站发送（``_im_post`` / ``_im_patch``）发之前先 :meth:`acquire` 一个令牌，把
+    汇总速率压在 ``rate`` 内。发送跑在 ``asyncio.to_thread`` 的 worker 线程里，故用
+    threading 锁 + 阻塞 sleep（不阻塞 event loop）。``rate<=0`` 关闭限流。
+
+    当前为**全局桶**（不分 chat）——个人工具多为单群，足够；严格 per-chat 是后续细化。
+    ``_now`` / ``_sleep`` 可注入，便于确定性测试。
+    """
+
+    def __init__(
+        self,
+        rate: float,
+        capacity: float | None = None,
+        *,
+        _now: Callable[[], float] = time.monotonic,
+        _sleep: Callable[[float], None] = time.sleep,
+    ) -> None:
+        self._rate = rate
+        self._capacity = capacity if capacity is not None else max(1.0, rate)
+        self._tokens = self._capacity
+        self._now = _now
+        self._sleep = _sleep
+        self._last = _now()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        if self._rate <= 0:
+            return
+        with self._lock:  # 持锁 sleep：把并发发送串行化并按 rate 匀速放行
+            now = self._now()
+            self._tokens = min(
+                self._capacity, self._tokens + (now - self._last) * self._rate
+            )
+            self._last = now
+            if self._tokens < 1.0:
+                self._sleep((1.0 - self._tokens) / self._rate)
+                self._last = self._now()
+                self._tokens = 0.0
+            else:
+                self._tokens -= 1.0
+
+
 @dataclass(frozen=True)
 class IncomingMessage:
     """从飞书收到的、已规整的消息。"""
@@ -90,6 +135,7 @@ class FeishuBridge:
         *,
         chat_whitelist: str = "",
         domain: str = _FEISHU_DOMAIN,
+        qps: float = 5.0,
     ) -> None:
         self._app_id = app_id
         self._app_secret = app_secret
@@ -101,6 +147,8 @@ class FeishuBridge:
         self._tenant_token_expires: float = 0.0
         # R14：共享 Session + 自动重试退避，防止飞书限流时丢消息
         self._session = self._build_session()
+        # #36：出站令牌桶——多 agent 并发时把汇总 QPS 压在飞书同群 ~5 QPS 限额下
+        self._limiter = _RateLimiter(qps)
         self._ws_thread: threading.Thread | None = None
         self._ws_loop: asyncio.AbstractEventLoop | None = None
         self._ws_task: asyncio.Task[None] | None = None
@@ -434,6 +482,7 @@ class FeishuBridge:
         return self._tenant_token
 
     def _im_post(self, path: str, body: dict) -> dict:
+        self._limiter.acquire()  # #36：限流，压在飞书同群 ~5 QPS 下
         token = self._get_tenant_token()
         resp = self._session.post(
             self._domain + path,
@@ -512,6 +561,7 @@ class FeishuBridge:
 
     def _im_patch(self, path: str, body: dict) -> dict:
         """PATCH 飞书 REST API（卡片原地更新）。照抄 _im_post 的 token/错误处理模式。"""
+        self._limiter.acquire()  # #36：限流，压在飞书同群 ~5 QPS 下
         token = self._get_tenant_token()
         resp = self._session.patch(
             self._domain + path,
