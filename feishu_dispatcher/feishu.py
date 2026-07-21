@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import threading
 import time
 from collections.abc import Awaitable, Callable
@@ -57,8 +58,40 @@ _MSG_EVENT = "event"
 _MSG_PING = "ping"
 _MSG_PONG = "pong"
 
-# IM 消息类型白名单（P0 只处理文本）
+# IM 消息类型：text（纯文本）+ post（富文本，多行/格式/@混排时飞书发这个）
 _TEXT_MSG_TYPE = "text"
+_POST_MSG_TYPE = "post"
+
+
+def _extract_post_text(content: dict) -> str:
+    """从飞书富文本 post content 抽纯文本。
+
+    结构：``{"post": {"<locale>": {"title": ..., "content": [[run, run], [run], ...]}}}``
+    ——``content`` 是段落 × run 的二维数组，run（tag=text/a/at…）带 ``text`` 字段。
+    取各 run 的 text 拼接、段落间换行；locale 取第一个带 content 的（zh_cn/en_us…）；
+    有 title 则作首行。@ 前缀清理沿用调用方的正则。
+    """
+    post = content.get("post") if isinstance(content, dict) else None
+    body = None
+    for loc in (post or {}).values():
+        if isinstance(loc, dict) and loc.get("content") is not None:
+            body = loc
+            break
+    if body is None:
+        return ""
+    lines = [
+        "".join(
+            run["text"]
+            for run in (para or [])
+            if isinstance(run, dict) and run.get("text")
+        )
+        for para in (body.get("content") or [])
+    ]
+    text = "\n".join(lines).strip()
+    title = (body.get("title") or "").strip()
+    if title:
+        text = f"{title}\n{text}" if text else title
+    return text
 
 
 class _RateLimiter:
@@ -412,7 +445,7 @@ class FeishuBridge:
             logger.debug("忽略机器人自己的消息 message_id=%s", message_id)
             return None
         msg_type = msg.get("message_type", "")
-        if msg_type != _TEXT_MSG_TYPE:
+        if msg_type not in (_TEXT_MSG_TYPE, _POST_MSG_TYPE):
             # 打日志而非静默丢弃：图片/文件等暂不支持，至少让「消息没反应」可排查。
             logger.info(
                 "忽略非文本消息（暂不支持）: message_type=%s message_id=%s",
@@ -434,12 +467,15 @@ class FeishuBridge:
             content = (
                 json.loads(content_raw) if isinstance(content_raw, str) else content_raw
             )
-            text = content.get("text", "") if content else ""
         except json.JSONDecodeError:
+            content = None
+        if not content:
             text = ""
+        elif msg_type == _POST_MSG_TYPE:
+            text = _extract_post_text(content)  # 富文本：段落×run 抽纯文本
+        else:
+            text = content.get("text", "")
         # 去掉 @bot / @user 前缀（飞书 text 消息里 at 表现为 @_user_N）
-        import re
-
         text = re.sub(r"@_\w+\s*", "", text).strip()
         root_id = msg.get("root_id")
         thread_root = root_id if root_id and root_id != message_id else None

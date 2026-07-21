@@ -99,6 +99,45 @@ def test_parse_p2p_message_returns_none_and_logs(caplog):
     assert "非群" in caplog.text and "om_p2p" in caplog.text
 
 
+def _post_content(paragraphs: list, *, title: str = "", locale: str = "zh_cn") -> dict:
+    return {"post": {locale: {"title": title, "content": paragraphs}}}
+
+
+def test_parse_post_message_extracts_text():
+    # 富文本：两段，含 text / a / at 混排
+    content = _post_content(
+        [
+            [
+                {"tag": "text", "text": "帮我改一下 "},
+                {"tag": "a", "text": "这个文件", "href": "http://x"},
+            ],
+            [{"tag": "at", "user_id": "ou_bot"}, {"tag": "text", "text": "加日志"}],
+        ]
+    )
+    msg = FeishuBridge._parse_event_message(
+        _event(
+            message_id="om_post",
+            root_id="om_root",
+            content=content,
+            message_type="post",
+        )
+    )
+    assert msg is not None
+    assert msg.text == "帮我改一下 这个文件\n加日志"  # 段落间换行、run 文本拼接
+    assert msg.thread_root_id == "om_root"
+
+
+def test_parse_post_with_title_and_other_locale():
+    content = _post_content(
+        [[{"tag": "text", "text": "正文"}]], title="标题", locale="en_us"
+    )
+    msg = FeishuBridge._parse_event_message(
+        _event(message_id="om_p2", root_id=None, content=content, message_type="post")
+    )
+    assert msg is not None
+    assert msg.text == "标题\n正文"  # title 作首行；locale 非 zh_cn 也能取
+
+
 def test_parse_invalid_content_json_still_returns_empty_text():
     msg = FeishuBridge._parse_event_message(
         _event(message_id="om_bad", root_id=None, content="not-json{")
