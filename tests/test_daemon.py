@@ -1326,6 +1326,48 @@ async def test_no_model_agent_leaves_blank():
     await daemon._shutdown()
 
 
+async def test_card_footer_shows_project_and_model():
+    # #44：卡片 footer 与模型同一行显示项目名，滚到任意卡片都可辨这条话题的归属
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(
+        store=store, agent_cls=ModelAgent, stream_mode="card"
+    )
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    all_cards = bridge.card_replies + bridge.card_patches
+    # footer（notation 小字 markdown 元素）里项目名与模型同行
+    assert any(
+        any(
+            el.get("tag") == "markdown"
+            and el.get("text_size") == "notation"
+            and "demo" in el.get("content", "")
+            and "ns-deepseek/deepseek-v4-pro" in el.get("content", "")
+            for el in card["body"]["elements"]
+        )
+        for _, card in all_cards
+    )
+    await daemon._shutdown()
+
+
+async def test_card_footer_project_only_when_no_model():
+    # 无模型（似 copilot）：footer 仍显示项目名（不带「模型：」）
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store, stream_mode="card")
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    all_cards = bridge.card_replies + bridge.card_patches
+    assert any(
+        any(
+            el.get("tag") == "markdown"
+            and el.get("text_size") == "notation"
+            and el.get("content", "") == "demo"
+            for el in card["body"]["elements"]
+        )
+        for _, card in all_cards
+    )
+    await daemon._shutdown()
+
+
 # ---------------------------------------------------------------------- #
 # 话题内 /model：查看 + 切换模型（ACP set_config_option）
 # ---------------------------------------------------------------------- #

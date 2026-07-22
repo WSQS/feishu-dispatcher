@@ -650,7 +650,10 @@ class _Daemon:
                     break
                 title = f"{sess.project_name} · {sess.agent_label}"
                 model = getattr(sess.agent, "model", "") or ""
-                footer = f"模型：{model}" if model else ""
+                # footer 与模型同一行显示项目名（#44）：滚到任意卡片都可辨归属
+                footer = sess.project_name
+                if model:
+                    footer += f" · 模型：{model}"
                 channel = self._make_channel(root, title, footer=footer)
                 sess.current_channel = channel
                 self.store.update(sess.task_id, status="running")
