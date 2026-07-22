@@ -212,6 +212,46 @@ def _extract_model_options(response: Any) -> list[str]:
     ]
 
 
+#: 工具行里命令/路径细节的单行截断上限（卡片一行可读即可）
+_TOOL_DETAIL_MAX = 100
+
+
+def _one_line_detail(value: Any) -> str:
+    """把命令/路径压成单行并截断：数组 join、折叠换行与多余空白、超长加省略号。"""
+    if isinstance(value, (list, tuple)):
+        value = " ".join(str(v) for v in value)
+    s = " ".join(str(value).split())
+    if len(s) > _TOOL_DETAIL_MAX:
+        s = s[: _TOOL_DETAIL_MAX - 1] + "…"
+    return s
+
+
+def _extract_tool_detail(update: Any) -> str:
+    """从 tool_call / tool_call_update 抽「具体做什么」：命令类取 ``raw_input.command``
+    （兼容 ``cmd`` / 数组），文件类取 ``locations[].path``（回退 ``raw_input.path``）。
+    取不到返回 ""，上层退回泛称 title。
+
+    命令类（kind=execute/other）的 ``locations`` 往往是 **cwd** 而非目标文件（实测
+    opencode bash 的 pending 事件 locations 即工作目录），故路径回退只对非命令 kind 生效，
+    避免把 cwd 误当命令/文件显示。opencode 的命令只在 status=in_progress 的更新里才带，
+    所以要对两类事件都抽（初次事件可能只有 cwd）。
+    """
+    ri = getattr(update, "raw_input", None)
+    if isinstance(ri, dict):
+        cmd = ri.get("command") or ri.get("cmd")
+        if cmd:
+            return _one_line_detail(cmd)
+    kind = getattr(update, "kind", "") or ""
+    if kind not in {"execute", "other"}:
+        for loc in getattr(update, "locations", None) or []:
+            path = getattr(loc, "path", None)
+            if path:
+                return _one_line_detail(path)
+        if isinstance(ri, dict) and ri.get("path"):
+            return _one_line_detail(ri["path"])
+    return ""
+
+
 class _StreamFormatter:
     """把 ACP 流式 session_update 转成可转发文本，跨 chunk 维护状态。
 
@@ -224,9 +264,13 @@ class _StreamFormatter:
 
     def __init__(self) -> None:
         self._last: str | None = None  # "thought" | "text" | None
+        #: tool_call_id -> {"label", "detail", "shown"}，跨 tool_call/tool_call_update
+        #: 事件跟踪一次工具调用（opencode 命令在 in_progress 才带，须按 id 合成）
+        self._tools: dict[str, dict] = {}
 
     def reset(self) -> None:
         self._last = None
+        self._tools.clear()
 
     def format(self, update: Any) -> str:
         kind = getattr(update, "session_update", None)
@@ -245,21 +289,9 @@ class _StreamFormatter:
             self._last = "thought"
             return out
         if kind == "tool_call":
-            title = getattr(update, "title", None)
-            if not title:
-                return ""
-            self._last = None
-            return f"\n🔧 {title}\n"
+            return self._format_tool(update, is_start=True)
         if kind == "tool_call_update":
-            status = getattr(update, "status", None)
-            if status in {"completed", "failed"}:
-                title = getattr(update, "title", "") or ""
-                if not title:
-                    return ""
-                self._last = None
-                mark = "✅" if status == "completed" else "❌"
-                return f"{mark} {title}\n"
-            return ""
+            return self._format_tool(update, is_start=False)
         if kind == "plan":
             marks = {"pending": "⬜", "in_progress": "🔄", "completed": "☑️"}
             lines = [
@@ -272,6 +304,56 @@ class _StreamFormatter:
             return "\n📋 计划:\n" + "\n".join(lines) + "\n"
         # 其余变体（plan_update/usage_update/current_mode_update/available_commands_update
         # 等）有意忽略：P0 只转发对用户可读的主输出与进度。
+        return ""
+
+    def _format_tool(self, update: Any, *, is_start: bool) -> str:
+        """跨 tool_call / tool_call_update 事件按 tool_call_id 跟踪一次工具调用。
+
+        命令类工具的具体命令 opencode 只在 status=in_progress 的更新里带（初次 tool_call
+        仅泛称 title + cwd），故按 id 记住泛称 label，命令/路径一出现即合成
+        「🔧 label: 细节」渲染一次（去重多条 in_progress），完成时用记住的 label+detail
+        出 ✅/❌ 行。命令类初次事件暂无命令时延后（避免多一行泛称「🔧 bash」），其余
+        kind 先出泛称起始行让「开跑」可见。
+        """
+        tcid = getattr(update, "tool_call_id", "") or ""
+        st = self._tools.get(tcid)
+        if st is None:
+            st = {"label": "", "detail": "", "shown": False}
+            self._tools[tcid] = st
+        title = getattr(update, "title", "") or ""
+        if title and not st["label"]:
+            st["label"] = title  # 首个泛称 title（如 'bash'），不被后续命令 title 覆盖
+        if not st["detail"]:
+            detail = _extract_tool_detail(update)
+            if detail:
+                st["detail"] = detail
+        kind = getattr(update, "kind", "") or ""
+        label = st["label"] or kind or "工具"
+        status = getattr(update, "status", None)
+
+        if status in {"completed", "failed"}:
+            self._tools.pop(tcid, None)
+            if not st["label"] and not st["detail"]:
+                return ""
+            self._last = None
+            mark = "✅" if status == "completed" else "❌"
+            tail = f": {st['detail']}" if st["detail"] else ""
+            return f"{mark} {label}{tail}\n"
+
+        if st["detail"] and not st["shown"]:
+            st["shown"] = True
+            self._last = None
+            return f"\n🔧 {label}: {st['detail']}\n"
+
+        if (
+            is_start
+            and not st["shown"]
+            and st["label"]
+            and kind not in {"execute", "other"}
+        ):
+            st["shown"] = True
+            self._last = None
+            return f"\n🔧 {st['label']}\n"
         return ""
 
 

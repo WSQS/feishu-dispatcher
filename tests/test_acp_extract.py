@@ -8,6 +8,7 @@ from acp import (
     start_tool_call,
     update_tool_call,
 )
+from acp.schema import ToolCallLocation
 
 from types import SimpleNamespace as NS
 
@@ -16,6 +17,7 @@ from feishu_dispatcher.acp_client import (
     _extract_action,
     _extract_model,
     _extract_model_options,
+    _extract_tool_detail,
 )
 
 
@@ -157,6 +159,128 @@ def test_tool_call_failed_emits_cross():
 
 def test_tool_call_in_progress_emits_nothing():
     assert fmt(update_tool_call("tc1", title="x", status="in_progress")) == ""
+
+
+# --- 工具行显示命令/路径（#46，卡片侧）---------------------------------- #
+
+
+def test_extract_tool_detail_command_from_raw_input():
+    upd = update_tool_call("c1", raw_input={"command": "git status"})
+    assert _extract_tool_detail(upd) == "git status"
+
+
+def test_extract_tool_detail_command_list_joined():
+    upd = update_tool_call("c1", raw_input={"command": ["git", "status"]})
+    assert _extract_tool_detail(upd) == "git status"
+
+
+def test_extract_tool_detail_path_from_locations_for_file_kind():
+    upd = start_tool_call(
+        "e1", "Edit", kind="edit", locations=[ToolCallLocation(path="src/foo.py")]
+    )
+    assert _extract_tool_detail(upd) == "src/foo.py"
+
+
+def test_extract_tool_detail_execute_cwd_locations_ignored():
+    # 命令类的 locations 是 cwd（实测 opencode bash pending），不能当命令/文件显示
+    upd = start_tool_call(
+        "b1", "bash", kind="execute", locations=[ToolCallLocation(path="/work")]
+    )
+    assert _extract_tool_detail(upd) == ""
+
+
+def test_extract_tool_detail_none_when_no_signal():
+    assert _extract_tool_detail(update_agent_message_text("hi")) == ""
+
+
+def test_command_shown_immediately_when_present_at_start():
+    # Pattern A：命令在初次事件的 raw_input 里 → 立刻显示
+    out = fmt(
+        start_tool_call("c1", "bash", kind="execute", raw_input={"command": "ls -la"})
+    )
+    assert "🔧 bash: ls -la" in out
+
+
+def test_command_appears_at_in_progress_like_opencode():
+    # 实测 opencode 序列：pending 只有 cwd → 不出行；命令在 in_progress 才带
+    f = _StreamFormatter()
+    out0 = f.format(
+        start_tool_call(
+            "c1",
+            "bash",
+            kind="execute",
+            raw_input={"cwd": "/tmp"},
+            locations=[ToolCallLocation(path="/tmp")],
+        )
+    )
+    assert out0 == ""  # 命令类初次无命令 → 延后，不显示 cwd
+    out1 = f.format(
+        update_tool_call(
+            "c1",
+            title="git status",
+            status="in_progress",
+            raw_input={"command": "git status", "workdir": "/tmp"},
+        )
+    )
+    assert "🔧" in out1 and "bash: git status" in out1  # 泛称 label + 命令
+    # 多条 in_progress 去重
+    out2 = f.format(
+        update_tool_call(
+            "c1",
+            title="git status",
+            status="in_progress",
+            raw_input={"command": "git status"},
+        )
+    )
+    assert out2 == ""
+    # 完成事件稀疏（raw_input 缺），用记住的 label+detail 合成
+    out3 = f.format(update_tool_call("c1", title="git status", status="completed"))
+    assert "✅" in out3 and "bash: git status" in out3
+
+
+def test_command_kind_other_powershell_from_in_progress():
+    # PowerShell 是 kind=other，同样按「有 command 字段」显示（不看 title/kind）
+    f = _StreamFormatter()
+    f.format(start_tool_call("p1", "PowerShell", kind="other", raw_input={"cwd": "/w"}))
+    out = f.format(
+        update_tool_call(
+            "p1",
+            title="PowerShell",
+            status="in_progress",
+            raw_input={"command": "Get-ChildItem"},
+        )
+    )
+    assert "🔧 PowerShell: Get-ChildItem" in out
+
+
+def test_file_tool_shows_path_at_start():
+    out = fmt(
+        start_tool_call(
+            "e1",
+            "Edit",
+            kind="edit",
+            locations=[ToolCallLocation(path="src/foo.py")],
+            raw_input={"path": "src/foo.py", "content": "x"},
+        )
+    )
+    assert "🔧 Edit: src/foo.py" in out
+
+
+def test_long_command_truncated_to_one_line():
+    long = "echo " + "x" * 300
+    out = fmt(
+        start_tool_call("c1", "bash", kind="execute", raw_input={"command": long})
+    )
+    line = out.strip()
+    assert line.startswith("🔧 bash: ")
+    assert line.endswith("…")
+    assert len(line) < 130
+
+
+def test_completion_without_prior_start_uses_event_title():
+    # 只见完成事件（无先前 pending）：退回事件自带 title
+    out = fmt(update_tool_call("c1", title="Running tests", status="completed"))
+    assert "✅ Running tests" in out
 
 
 def test_agent_message_chunk_empty_text():
