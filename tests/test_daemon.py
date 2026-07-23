@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 from feishu_dispatcher.config import Config, Project
@@ -1655,3 +1656,113 @@ async def test_scheduler_unregister_project_tool(tmp_path):
     # 种子项目删不了
     out2 = await daemon._sched_unregister_project("demo")
     assert "改配置文件" in out2
+
+
+# ------------------------- forge 只读获取工具（#56） ------------------------- #
+
+
+async def test_sched_get_forge_unknown_project():
+    daemon, _, _ = make_daemon()
+    out = await daemon._sched_get_forge("nope", "issue", 1)
+    assert "未找到项目 nope" in out
+
+
+async def test_sched_get_forge_no_binding(monkeypatch):
+    from feishu_dispatcher import forge
+
+    async def no_ref(project):
+        return None
+
+    monkeypatch.setattr(forge, "resolve_forge", no_ref)
+    daemon, _, _ = make_daemon()
+    out = await daemon._sched_get_forge("demo", "issue", 1)
+    assert "没有可用的 forge 绑定" in out
+
+
+async def test_sched_get_forge_happy(monkeypatch):
+    from feishu_dispatcher import forge
+
+    async def fake_ref(project):
+        return forge.ForgeRef("github", "o/r", "github.com", "u")
+
+    async def fake_get(ref, kind, number):
+        return {"number": number, "kind": kind, "title": "hello"}
+
+    monkeypatch.setattr(forge, "resolve_forge", fake_ref)
+    monkeypatch.setattr(forge, "get_item", fake_get)
+    daemon, _, _ = make_daemon()
+    out = await daemon._sched_get_forge("demo", "pr", 55)
+    assert json.loads(out) == {"number": 55, "kind": "pr", "title": "hello"}
+
+
+async def test_sched_get_forge_error_is_readable(monkeypatch):
+    from feishu_dispatcher import forge
+
+    async def fake_ref(project):
+        return forge.ForgeRef("github", "o/r", "github.com", "u")
+
+    async def boom(ref, kind, number):
+        raise forge.ForgeError("Not Found (HTTP 404)")
+
+    monkeypatch.setattr(forge, "resolve_forge", fake_ref)
+    monkeypatch.setattr(forge, "get_item", boom)
+    daemon, _, _ = make_daemon()
+    out = await daemon._sched_get_forge("demo", "issue", 999)
+    assert "失败" in out and "404" in out
+
+
+async def test_sched_list_forge_single_project(monkeypatch):
+    from feishu_dispatcher import forge
+
+    async def fake_ref(project):
+        return forge.ForgeRef("github", "o/r", "github.com", "u")
+
+    async def fake_list(ref, *, state, limit):
+        return {"repo": ref.slug, "count": 1, "items": [{"number": 1, "type": "issue"}]}
+
+    monkeypatch.setattr(forge, "resolve_forge", fake_ref)
+    monkeypatch.setattr(forge, "list_items", fake_list)
+    daemon, _, _ = make_daemon()
+    out = await daemon._sched_list_forge("demo", "open", 20)
+    data = json.loads(out)
+    assert data["results"][0]["project"] == "demo"
+    assert data["results"][0]["count"] == 1
+
+
+async def test_sched_list_forge_fans_out_and_reports_skipped(monkeypatch):
+    from feishu_dispatcher import forge
+
+    # demo 有绑定；extra 无绑定（resolve 返回 None）
+    daemon, _, _ = make_daemon()
+    daemon.project_store.add(
+        Project(name="extra", path=Path("C:/tmp/extra"), default_agent="copilot")
+    )
+
+    async def fake_ref(project):
+        return (
+            forge.ForgeRef("github", "o/r", "github.com", "u")
+            if project.name == "demo"
+            else None
+        )
+
+    async def fake_list(ref, *, state, limit):
+        return {"repo": ref.slug, "count": 0, "items": []}
+
+    monkeypatch.setattr(forge, "resolve_forge", fake_ref)
+    monkeypatch.setattr(forge, "list_items", fake_list)
+    out = await daemon._sched_list_forge("", "open", 20)  # project 空 = 全部
+    data = json.loads(out)
+    assert [r["project"] for r in data["results"]] == ["demo"]
+    assert any("extra" in s for s in data["skipped"])
+
+
+async def test_sched_list_forge_all_skipped_is_explicit(monkeypatch):
+    from feishu_dispatcher import forge
+
+    async def no_ref(project):
+        return None
+
+    monkeypatch.setattr(forge, "resolve_forge", no_ref)
+    daemon, _, _ = make_daemon()
+    out = await daemon._sched_list_forge("demo", "open", 20)
+    assert "未能获取任何仓库" in out

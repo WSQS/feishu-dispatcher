@@ -21,11 +21,17 @@ DEFAULT_CONFIG_PATH = Path.home() / ".feishu-dispatcher" / "config.toml"
 @dataclass(frozen=True)
 class Project:
     """一个项目（config.toml 种子或运行时注册）。default_agent 种子可省略（兜底
-    copilot）；运行时注册强制必填（见 daemon._register_project）。"""
+    copilot）；运行时注册强制必填（见 daemon._register_project）。
+
+    ``repo`` 是**可选**的远端仓库 URL（如 ``https://github.com/owner/name``），供调度器
+    只读拉取 issue/PR（#56）。留空则 forge 层探测该 ``path`` 下 ``git remote origin``；
+    forge 类型按 URL host 推断（github.com → gh，其余 → glab）。见 ``forge.py``。
+    """
 
     name: str
     path: Path
     default_agent: str = "copilot"
+    repo: str = ""
 
 
 @dataclass(frozen=True)
@@ -75,6 +81,7 @@ class Config:
                 name=p["name"],
                 path=Path(p["path"]),
                 default_agent=p.get("default_agent", "copilot"),
+                repo=str(p.get("repo", "")).strip(),
             )
             for p in data.get("projects", [])
         }

@@ -268,6 +268,7 @@ class ProjectStore:
                     name=d["name"],
                     path=Path(d["path"]),
                     default_agent=d["default_agent"],
+                    repo=str(d.get("repo", "")).strip(),
                 )
             logger.info("已加载 %d 个注册项目: %s", len(self._projects), self._path)
         except Exception:
@@ -286,6 +287,7 @@ class ProjectStore:
                         "name": p.name,
                         "path": str(p.path),
                         "default_agent": p.default_agent,
+                        "repo": p.repo,
                     }
                     for name, p in self._projects.items()
                 }
