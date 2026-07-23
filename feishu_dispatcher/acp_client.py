@@ -61,6 +61,9 @@ class _ClientImpl:
         #: 本轮 agent 的最终 message 文本（只攒 agent_message，不含思考/工具行），
         #: 供上层落 Task.last_output；每轮 reset_formatter 时清空
         self._message_buf: list[str] = []
+        #: 本轮流式 usage_update 报的「当前 context 占用 token 数」（used），
+        #: 作为 PromptResponse.usage 缺失时的回退；每轮 reset_formatter 时清空
+        self._usage_used: int | None = None
 
     def on_connect(self, conn: Any) -> None:  # noqa: D401
         """Agent 侧握手完成时被 SDK 调用。"""
@@ -70,10 +73,15 @@ class _ClientImpl:
         """每个 prompt 回合开始时重置流式格式化状态（新卡片从头开始）。"""
         self._fmt.reset()
         self._message_buf.clear()
+        self._usage_used = None
 
     def last_message(self) -> str:
         """本轮 agent 的最终 message 文本（收尾回复），供 Task.last_output。"""
         return "".join(self._message_buf)
+
+    def usage_tokens(self) -> int | None:
+        """本轮流式 usage_update 报的当前 context 占用 token 数；未报则 None。"""
+        return self._usage_used
 
     def set_suppress(self, on: bool) -> None:
         """抑制输出转发。恢复会话时 load_session 会重放历史 session/update，
@@ -83,6 +91,13 @@ class _ClientImpl:
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         if self._suppress:
             return
+        # token 用量（#53）：usage_update 是「当前 context 占用」的流式通告，
+        # _StreamFormatter 有意忽略（无可读文本）。这里旁路攒最新一次的 used，
+        # 作为 PromptResponse.usage 缺失时的 footer 回退来源。
+        if getattr(update, "session_update", None) == "usage_update":
+            used = getattr(update, "used", None)
+            if isinstance(used, int) and used >= 0:
+                self._usage_used = used
         # 审计（A）：tool_call 是离散的「做了什么」事件，旁路存一份进 task。
         # 放在 suppress 之后，load_session 重放的历史动作不会被重复记录。
         if self._cb.on_action is not None:
@@ -178,6 +193,22 @@ def _extract_action(update: Any) -> dict | None:
     if not title:
         return None
     return {"kind": getattr(update, "kind", "") or "", "title": title}
+
+
+def _extract_usage_tokens(response: Any) -> int | None:
+    """本轮 token 用量（headline 数）：取 PromptResponse.usage.total_tokens。
+
+    ``usage`` 是 ACP UNSTABLE 字段（``Usage``：total/input/output token，语义为跨
+    session 累计），随 prompt 响应返回。取不到（后端不上报，如 copilot 未必给）返回
+    None——上层据此不显示、不报错。
+    """
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return None
+    total = getattr(usage, "total_tokens", None)
+    if isinstance(total, int) and total >= 0:
+        return total
+    return None
 
 
 def _find_model_option(response: Any) -> Any:
@@ -398,6 +429,8 @@ class AcpAgent:
         self._model: str = ""
         #: 可切换的模型 id 列表（模型 select 的 options）；无模型选项则空
         self._available_models: list[str] = []
+        #: 最近一轮 prompt 的 token 用量（headline 数）；后端不上报则 None
+        self._last_usage_tokens: int | None = None
         self._transport_ctx: Any = None
         self._proc: Any = None
         self._closed = False
@@ -422,6 +455,15 @@ class AcpAgent:
     def available_models(self) -> list[str]:
         """可切换到的模型 id 列表；agent 不暴露模型选项（如 copilot）时为空。"""
         return list(self._available_models)
+
+    @property
+    def last_usage_tokens(self) -> int | None:
+        """最近一轮 prompt 的 token 用量（headline 数）；后端不上报时为 None。
+
+        优先 PromptResponse.usage.total_tokens（每轮响应，跨 session 累计），回退到
+        流式 usage_update 的 ``used``（当前 context 占用）。都取不到为 None。
+        """
+        return self._last_usage_tokens
 
     async def set_model(self, name: str) -> None:
         """切换当前会话的模型（ACP ``session/set_config_option``，config_id="model"）。
@@ -537,6 +579,12 @@ class AcpAgent:
         resp = await self._conn.prompt(
             session_id=self._session_id, prompt=[text_block(text)]
         )
+        # token 用量（#53）：优先响应里的 usage.total_tokens，回退到流式 usage_update
+        # 的 used（当前 context 占用）——两处都是 ACP UNSTABLE 特性，取不到即 None。
+        tokens = _extract_usage_tokens(resp)
+        if tokens is None and self._client_impl is not None:
+            tokens = self._client_impl.usage_tokens()
+        self._last_usage_tokens = tokens
         return getattr(resp, "stop_reason", "") or ""
 
     async def cancel(self) -> None:

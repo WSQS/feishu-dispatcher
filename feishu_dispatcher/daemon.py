@@ -101,6 +101,21 @@ def _one_line(text: str, limit: int) -> str:
     return s if len(s) <= limit else s[:limit] + "…"
 
 
+def _fmt_tokens(n: int) -> str:
+    """token 数压成人读的小字（`~850 tok` / `~3.2k tok` / `~1.2M tok`）。"""
+    for unit, div in (("M", 1_000_000), ("k", 1000)):
+        if n >= div:
+            s = f"{n / div:.1f}".rstrip("0").rstrip(".")
+            return f"~{s}{unit} tok"
+    return f"~{n} tok"
+
+
+def _with_tokens(footer: str, tokens: int) -> str:
+    """把 token 用量拼到既有 footer 尾部（`项目 · 模型：X · ~3.2k tok`）。"""
+    tok = _fmt_tokens(tokens)
+    return f"{footer} · {tok}" if footer else tok
+
+
 def _parse_agent_flag(text: str) -> tuple[str, str]:
     """从 /run 的任务文本里剥离 ``--agent <name>``，返回 (任务, agent)。
 
@@ -674,6 +689,11 @@ class _Daemon:
                         self.store.update(sess.task_id, status="idle")
                         logger.info("任务 %s 本轮被取消", sess.task_id)
                         continue
+                    # footer 追加本轮 token 用量（#53）：取不到就不显示、不报错。
+                    # 只标脏，紧随的 set_status("done") 会把新 footer 一起 emit。
+                    tokens = getattr(sess.agent, "last_usage_tokens", None)
+                    if tokens is not None and hasattr(channel, "set_footer"):
+                        channel.set_footer(_with_tokens(footer, tokens))
                     await channel.set_status("done")
                     # 落 last_output：本轮 agent 的收尾回复（截断），供 get_task/通知摘要
                     last_output = _clip(sess.agent.last_message, _LAST_OUTPUT_MAX)
