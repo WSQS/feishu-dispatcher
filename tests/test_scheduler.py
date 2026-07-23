@@ -37,6 +37,8 @@ def _tools(
     done=None,
     register=None,
     unregister=None,
+    list_forge=None,
+    get_forge=None,
 ):
     async def _spawn(p, t, a=""):
         return f"已派发 {p}"
@@ -56,6 +58,12 @@ def _tools(
     async def _unregister(name):
         return f"已删除 {name}"
 
+    async def _list_forge(project, state, limit):
+        return f"forge-list {project or '*'} {state} {limit}"
+
+    async def _get_forge(project, kind, number):
+        return f"forge-get {project} {kind} {number}"
+
     return build_scheduler_tools(
         list_projects=lambda: projects or [{"name": "demo"}],
         spawn_agent=spawn or _spawn,
@@ -66,6 +74,8 @@ def _tools(
         mark_done=done or _done,
         register_project=register or _register,
         unregister_project=unregister or _unregister,
+        list_forge=list_forge or _list_forge,
+        get_forge=get_forge or _get_forge,
     )
 
 
@@ -264,7 +274,38 @@ def test_new_tools_are_exposed():
         "mark_done",
         "register_project",
         "unregister_project",
+        "list_forge_items",
+        "get_forge_item",
     }
+
+
+async def test_get_forge_item_validates_args():
+    tools = {t.name: t for t in _tools()}
+    get_forge = tools["get_forge_item"]
+    # kind 非法 → 不落到 handler，直接报参数不足
+    assert "kind" in await get_forge.handler({"project": "p", "number": 5})
+    # number 非整数 → 报错
+    assert "number" in await get_forge.handler(
+        {"project": "p", "kind": "issue", "number": "abc"}
+    )
+    # 合法 → 透传到注入的假实现
+    assert (
+        await get_forge.handler({"project": "p", "kind": "pr", "number": "55"})
+        == "forge-get p pr 55"
+    )
+
+
+async def test_list_forge_items_defaults_and_clamps():
+    tools = {t.name: t for t in _tools()}
+    list_forge = tools["list_forge_items"]
+    # 省略 project/state/limit → project 传空串、state=open、limit=20
+    assert await list_forge.handler({}) == "forge-list * open 20"
+    # limit 超上限被夹到 50；非法 state 被挡
+    assert (
+        await list_forge.handler({"project": "p", "limit": 999})
+        == "forge-list p open 50"
+    )
+    assert "state" in await list_forge.handler({"state": "weird"})
 
 
 async def test_max_iters_cap():

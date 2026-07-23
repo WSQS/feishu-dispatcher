@@ -77,9 +77,13 @@ claude = ["claude-agent-acp"]
 name = "feishu-dispatcher"
 path = "C:/path/to/feishu-dispatcher"
 default_agent = "copilot"
+# repo（可选）：远端仓库 URL，供调度器只读拉取 issue/PR（#56）。留空则自动探测
+# path 下的 git origin 远端。forge 类型按 host 推断：github.com → gh，其余 → glab。
+# repo = "https://github.com/owner/feishu-dispatcher"
 
 # 用 opencode 处理的项目示例：
 # [[projects]]
 # name = "my-other-project"
 # path = "C:/path/to/project"
 # default_agent = "opencode"
+# repo = "https://git.corp.com/group/my-other-project"   # 自建 GitLab 示例

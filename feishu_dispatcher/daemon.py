@@ -14,6 +14,7 @@ P0 原型范围（设计文档）：
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -22,6 +23,7 @@ from dataclasses import dataclass, field
 
 from pathlib import Path
 
+from . import forge
 from .acp_client import AcpAgent, AgentSpawn, OnAction, OnOutput
 from .config import DEFAULT_CONFIG_PATH, Config, Project
 from .feishu import FeishuBridge, IncomingMessage
@@ -1085,6 +1087,8 @@ class _Daemon:
             mark_done=self._sched_mark_done,
             register_project=self._sched_register_project,
             unregister_project=self._sched_unregister_project,
+            list_forge=self._sched_list_forge,
+            get_forge=self._sched_get_forge,
         )
         turn: list[dict] | None = None
         try:
@@ -1118,6 +1122,55 @@ class _Daemon:
     async def _sched_unregister_project(self, name: str) -> str:
         """unregister_project 工具：删除已注册项目（与 /project remove 共用底层）。"""
         return self._remove_project(name)
+
+    async def _sched_list_forge(self, project: str, state: str, limit: int) -> str:
+        """list_forge_items 工具：只读列 issue/PR。project 空 = 扇出所有已注册项目。"""
+        projects = self._all_projects()
+        if project:
+            proj = projects.get(project)
+            if proj is None:
+                return f"未找到项目 {project}。可用 list_projects 查看。"
+            targets = [proj]
+        else:
+            targets = list(projects.values())
+        if not targets:
+            return "没有已注册的项目。"
+        results: list[dict] = []
+        skipped: list[str] = []
+        for p in targets:
+            ref = await forge.resolve_forge(p)
+            if ref is None:
+                skipped.append(f"{p.name}（无 forge 绑定）")
+                continue
+            try:
+                data = await forge.list_items(ref, state=state, limit=limit)
+                results.append({"project": p.name, **data})
+            except forge.ForgeError as exc:
+                skipped.append(f"{p.name}（{exc}）")
+        payload: dict = {"results": results}
+        if skipped:
+            payload["skipped"] = skipped
+        if not results and skipped:
+            # 一个都没查成——把原因直接说清楚，别让 LLM 以为「没有 issue」。
+            return f"未能获取任何仓库的 issue/PR。跳过：{'；'.join(skipped)}"
+        return json.dumps(payload, ensure_ascii=False)
+
+    async def _sched_get_forge(self, project: str, kind: str, number: int) -> str:
+        """get_forge_item 工具：只读取单个 issue/PR 详情。"""
+        proj = self._resolve_project(project)
+        if proj is None:
+            return f"未找到项目 {project}。可用 list_projects 查看。"
+        ref = await forge.resolve_forge(proj)
+        if ref is None:
+            return (
+                f"项目 {project} 没有可用的 forge 绑定"
+                "（未配置 repo，也没探测到 git origin 远端）。"
+            )
+        try:
+            data = await forge.get_item(ref, kind, number)
+        except forge.ForgeError as exc:
+            return f"获取 {kind} #{number} 失败：{exc}"
+        return json.dumps(data, ensure_ascii=False)
 
     def _sched_list_tasks(self) -> list[dict]:
         # 从任务台账读（含历史），而非只看内存里的活跃 session
