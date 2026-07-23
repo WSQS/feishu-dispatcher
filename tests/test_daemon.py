@@ -155,6 +155,15 @@ class ModelAgent(FakeAgent):
         self.available_models = ["ns-deepseek/deepseek-v4-pro", "zhipuai/glm-5"]
 
 
+class UsageAgent(ModelAgent):
+    """启动上报模型（似 opencode）且每轮 prompt 后带 token 用量，验证 footer 拼接。"""
+
+    async def prompt(self, text: str) -> str:
+        reason = await super().prompt(text)
+        self.last_usage_tokens = 3210
+        return reason
+
+
 def make_daemon(
     agent_cls: type[FakeAgent] = FakeAgent,
     *,
@@ -223,6 +232,23 @@ async def wait_until(cond, timeout: float = 2.0) -> None:
             await asyncio.sleep(0.01)
 
     await asyncio.wait_for(_poll(), timeout)
+
+
+def test_fmt_tokens_scales_units():
+    from feishu_dispatcher.daemon import _fmt_tokens
+
+    assert _fmt_tokens(0) == "~0 tok"
+    assert _fmt_tokens(850) == "~850 tok"
+    assert _fmt_tokens(3210) == "~3.2k tok"
+    assert _fmt_tokens(32000) == "~32k tok"  # 整千不留 .0
+    assert _fmt_tokens(1_200_000) == "~1.2M tok"
+
+
+def test_with_tokens_appends_to_footer():
+    from feishu_dispatcher.daemon import _with_tokens
+
+    assert _with_tokens("demo · 模型：X", 3210) == "demo · 模型：X · ~3.2k tok"
+    assert _with_tokens("", 3210) == "~3.2k tok"  # 空 footer 不带前导分隔
 
 
 async def test_run_dispatches_and_streams_output():
@@ -621,6 +647,19 @@ async def test_card_mode_run_echo_in_card_and_done_status():
     all_cards = bridge.card_replies + bridge.card_patches
     last_card = all_cards[-1][1]
     assert last_card["header"]["template"] == "green"
+
+
+async def test_card_mode_footer_shows_token_usage():
+    daemon, bridge, created = make_daemon(agent_cls=UsageAgent, stream_mode="card")
+    await daemon._handle_message(root_msg("/run demo do stuff"))
+    await wait_until(lambda: any("✅" in t for t in bridge.texts("om_root1")))
+    all_cards = bridge.card_replies + bridge.card_patches
+    last_card = all_cards[-1][1]
+    foot = last_card["body"]["elements"][-1]["content"]
+    # footer = 项目 · 模型 · token 用量（#53）
+    assert "demo" in foot
+    assert "ns-deepseek/deepseek-v4-pro" in foot
+    assert "~3.2k tok" in foot
 
 
 async def test_card_mode_thread_reply_reuses_same_agent():

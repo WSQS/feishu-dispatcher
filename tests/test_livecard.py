@@ -58,6 +58,34 @@ async def test_footer_fixed_at_card_bottom():
     await lc.aclose()
 
 
+async def test_set_footer_appends_on_next_emit():
+    bridge = FakeBridge()
+    lc = LiveCard(
+        bridge, "om_root1", "test", footer="SuFei · 模型：deepseek-v4", window=0.05
+    )
+    lc.feed("hi")
+    await lc.flush()
+    # set_footer 只标脏，不主动 flush：无新 patch
+    patches_before = len(bridge.card_patches)
+    lc.set_footer("SuFei · 模型：deepseek-v4 · ~3.2k tok")
+    assert len(bridge.card_patches) == patches_before
+    # 随后的 set_status 把新 footer 一起 emit
+    await lc.set_status("done")
+    foot = bridge.card_patches[-1][1]["body"]["elements"][-1]
+    assert "~3.2k tok" in foot["content"]
+    await lc.aclose()
+
+
+async def test_set_footer_same_value_is_noop():
+    bridge = FakeBridge()
+    lc = LiveCard(bridge, "om_root1", "test", footer="SuFei", window=0.05)
+    lc.feed("hi")
+    await lc.flush()
+    lc.set_footer("SuFei")  # 相同值不标脏
+    assert not lc._dirty
+    await lc.aclose()
+
+
 async def test_feed_then_flush_then_feed_again_patches():
     bridge = FakeBridge()
     lc = LiveCard(bridge, "om_root1", "test", window=0.05)

@@ -76,6 +76,17 @@ class LiveCard:
         self._force.set()
         await self._drain()
 
+    def set_footer(self, footer: str) -> None:
+        """更新固定 footer（如回合结束追加 token 用量）。
+
+        只标脏、不主动 flush——调用方随后的 :meth:`set_status` / :meth:`flush`
+        会把新 footer 一起 emit，避免多发一次 patch。
+        """
+        if footer == self._footer:
+            return
+        self._footer = footer
+        self._dirty = True
+
     async def aclose(self) -> None:
         """停 loop + 最后 flush。之后 feed 忽略。"""
         if self._closed:

@@ -18,6 +18,7 @@ from feishu_dispatcher.acp_client import (
     _extract_model,
     _extract_model_options,
     _extract_tool_detail,
+    _extract_usage_tokens,
 )
 
 
@@ -108,6 +109,60 @@ def test_extract_model_options_lists_values():
 def test_extract_model_options_absent_returns_empty():
     resp = NS(config_options=[NS(id="mode", category="mode", current_value="x")])
     assert _extract_model_options(resp) == []
+
+
+# --- token 用量抽取 (_extract_usage_tokens) --------------------------- #
+
+
+def test_extract_usage_tokens_from_response():
+    resp = NS(usage=NS(total_tokens=3210, input_tokens=3000, output_tokens=210))
+    assert _extract_usage_tokens(resp) == 3210
+
+
+def test_extract_usage_tokens_absent_returns_none():
+    assert _extract_usage_tokens(NS(usage=None)) is None
+    assert _extract_usage_tokens(NS()) is None  # 无 usage 字段也不抛
+
+
+def test_extract_usage_tokens_ignores_non_int_and_negative():
+    assert _extract_usage_tokens(NS(usage=NS(total_tokens=None))) is None
+    assert _extract_usage_tokens(NS(usage=NS(total_tokens=-1))) is None
+
+
+async def test_client_captures_streamed_usage_update():
+    from feishu_dispatcher.acp_client import _Callbacks, _ClientImpl
+
+    async def noop(_t: str) -> None:
+        pass
+
+    impl = _ClientImpl(_Callbacks(on_output=noop))
+    assert impl.usage_tokens() is None
+    await impl.session_update(
+        "s", NS(session_update="usage_update", used=1234, size=200000)
+    )
+    assert impl.usage_tokens() == 1234
+    # 后续更新覆盖为最新值
+    await impl.session_update(
+        "s", NS(session_update="usage_update", used=5678, size=200000)
+    )
+    assert impl.usage_tokens() == 5678
+    # 回合重置后清空
+    impl.reset_formatter()
+    assert impl.usage_tokens() is None
+
+
+async def test_client_usage_update_suppressed_during_load():
+    from feishu_dispatcher.acp_client import _Callbacks, _ClientImpl
+
+    async def noop(_t: str) -> None:
+        pass
+
+    impl = _ClientImpl(_Callbacks(on_output=noop))
+    impl.set_suppress(True)  # load_session 重放历史期间不计
+    await impl.session_update(
+        "s", NS(session_update="usage_update", used=999, size=200000)
+    )
+    assert impl.usage_tokens() is None
 
 
 # --- 收尾回复累积 (_ClientImpl.last_message) ---------------------------- #
