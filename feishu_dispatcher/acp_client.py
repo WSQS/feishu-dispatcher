@@ -198,9 +198,11 @@ def _extract_action(update: Any) -> dict | None:
 def _extract_usage_tokens(response: Any) -> int | None:
     """本轮 token 用量（headline 数）：取 PromptResponse.usage.total_tokens。
 
-    ``usage`` 是 ACP UNSTABLE 字段（``Usage``：total/input/output token，语义为跨
-    session 累计），随 prompt 响应返回。取不到（后端不上报，如 copilot 未必给）返回
-    None——上层据此不显示、不报错。
+    ``usage`` 是 ACP UNSTABLE 字段（``Usage``：total/input/output/cached token），随
+    prompt 响应返回。SDK 注释写「跨 session 累计」，但 opencode/claude 实测都是**本轮**
+    值——且因每轮重发系统提示+历史（多为 cache 读），total_tokens ≈ **当前上下文大小**，
+    随对话增长而缓慢变大，并非所有轮次的累加。copilot 实测不上报（返回 None）。
+    取不到即 None——上层据此不显示、不报错。
     """
     usage = getattr(response, "usage", None)
     if usage is None:
@@ -460,8 +462,9 @@ class AcpAgent:
     def last_usage_tokens(self) -> int | None:
         """最近一轮 prompt 的 token 用量（headline 数）；后端不上报时为 None。
 
-        优先 PromptResponse.usage.total_tokens（每轮响应，跨 session 累计），回退到
-        流式 usage_update 的 ``used``（当前 context 占用）。都取不到为 None。
+        优先 PromptResponse.usage.total_tokens（每轮响应，实测为本轮值、≈当前上下文），
+        回退到流式 usage_update 的 ``used``（当前 context 占用）。实测：opencode 只给
+        前者、claude 两者都给（且 used==total_tokens）、copilot 都不给。都取不到为 None。
         """
         return self._last_usage_tokens
 
