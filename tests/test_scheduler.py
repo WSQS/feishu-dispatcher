@@ -40,7 +40,7 @@ def _tools(
     list_forge=None,
     get_forge=None,
 ):
-    async def _spawn(p, t, a=""):
+    async def _spawn(p, t, a="", issue=0):
         return f"已派发 {p}"
 
     async def _send(tid, m):
@@ -93,7 +93,7 @@ async def test_returns_text_when_no_tool_calls():
 async def test_executes_tool_then_returns_final():
     spawned = []
 
-    async def spawn(p, t, a=""):
+    async def spawn(p, t, a="", issue=0):
         spawned.append((p, t, a))
         return f"已派发 {p}"
 
@@ -128,7 +128,7 @@ async def test_executes_tool_then_returns_final():
 async def test_spawn_agent_passes_agent_override():
     spawned = []
 
-    async def spawn(p, t, a=""):
+    async def spawn(p, t, a="", issue=0):
         spawned.append((p, t, a))
         return f"已派发 {p}（{a or '默认'}）"
 
@@ -150,6 +150,31 @@ async def test_spawn_agent_passes_agent_override():
     assert spawned == [("demo", "做 X", "claude")]  # agent 覆盖被透传
 
 
+async def test_spawn_agent_passes_issue():
+    spawned = []
+
+    async def spawn(p, t, a="", issue=0):
+        spawned.append((p, t, a, issue))
+        return "ok"
+
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        "1",
+                        "spawn_agent",
+                        {"project": "demo", "task": "做 #3", "issue": 3},
+                    )
+                ]
+            ),
+            LLMResponse(content="好"),
+        ]
+    )
+    await run_tool_loop(llm, "开始做 #3", _tools(spawn=spawn))
+    assert spawned == [("demo", "做 #3", "", 3)]  # issue 编号被透传
+
+
 async def test_unknown_tool_reported_not_crash():
     llm = FakeLLM(
         [
@@ -161,7 +186,7 @@ async def test_unknown_tool_reported_not_crash():
 
 
 async def test_tool_error_fed_back_not_raised():
-    async def boom(p, t, a=""):
+    async def boom(p, t, a="", issue=0):
         raise RuntimeError("kaboom")
 
     llm = FakeLLM(
@@ -309,7 +334,7 @@ async def test_list_forge_items_defaults_and_clamps():
 
 
 async def test_max_iters_cap():
-    async def noop(p, t):
+    async def noop(p, t, a="", issue=0):
         return "ok"
 
     llm = FakeLLM(

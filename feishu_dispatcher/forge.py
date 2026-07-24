@@ -187,9 +187,11 @@ async def resolve_forge(project) -> ForgeRef | None:
 # --------------------------------------------------------------------------- #
 
 
-def _clip(s: str, limit: int) -> str:
+def _clip(s: str, limit: int | None) -> str:
     s = (s or "").strip()
-    return s if len(s) <= limit else s[:limit] + "…"
+    if limit is None or len(s) <= limit:  # limit=None → 不裁剪（供 brief 用全文）
+        return s
+    return s[:limit] + "…"
 
 
 def _date(s) -> str:
@@ -244,8 +246,10 @@ def _shape_gh_comment(c: dict) -> dict:
     }
 
 
-def _shape_gh_detail(kind: str, ref: ForgeRef, d: dict) -> dict:
-    """gh issue/pr view --json → 统一详情形状。"""
+def _shape_gh_detail(
+    kind: str, ref: ForgeRef, d: dict, *, body_limit: int | None = _BODY_CLIP
+) -> dict:
+    """gh issue/pr view --json → 统一详情形状。body_limit=None 取全文（供 brief）。"""
     out = {
         "repo": ref.slug,
         "kind": kind,
@@ -257,7 +261,7 @@ def _shape_gh_detail(kind: str, ref: ForgeRef, d: dict) -> dict:
         "url": d.get("url", ""),
         "created": _date(d.get("createdAt")),
         "updated": _date(d.get("updatedAt")),
-        "body": _clip(d.get("body") or "", _BODY_CLIP),
+        "body": _clip(d.get("body") or "", body_limit),
         "comments": [
             _shape_gh_comment(c) for c in (d.get("comments") or [])[-_MAX_COMMENTS:]
         ],
@@ -309,7 +313,9 @@ async def _gh_list(ref: ForgeRef, state: str, limit: int) -> list[dict]:
     return [_shape_gh_list_item(it) for it in raw][:limit]
 
 
-async def _gh_get(ref: ForgeRef, kind: str, number: int) -> dict:
+async def _gh_get(
+    ref: ForgeRef, kind: str, number: int, *, body_limit: int | None = _BODY_CLIP
+) -> dict:
     gh = _resolve_exe("gh")
     if not gh:
         raise ForgeError("未找到 gh 命令（GitHub CLI 未安装或不在 PATH）。")
@@ -330,7 +336,7 @@ async def _gh_get(ref: ForgeRef, kind: str, number: int) -> dict:
         data = json.loads(out)
     except json.JSONDecodeError as exc:
         raise ForgeError("gh view 返回无法解析为 JSON") from exc
-    return _shape_gh_detail(kind, ref, data)
+    return _shape_gh_detail(kind, ref, data, body_limit=body_limit)
 
 
 # --------------------------------------------------------------------------- #
@@ -391,8 +397,10 @@ def _shape_glab_list_item(it: dict, type_: str) -> dict:
     }
 
 
-def _shape_glab_detail(kind: str, ref: ForgeRef, d: dict) -> dict:
-    """glab api 的 issue/MR 详情 → 统一详情形状。
+def _shape_glab_detail(
+    kind: str, ref: ForgeRef, d: dict, *, body_limit: int | None = _BODY_CLIP
+) -> dict:
+    """glab api 的 issue/MR 详情 → 统一详情形状。body_limit=None 取全文（供 brief）。
 
     评论走单独的 notes 端点（且混入系统事件），1b MVP 暂不拉（comments 留空）；
     MR 的 additions/deletions GitLab 基础端点不含（需 /changes 重端点），故只由
@@ -409,7 +417,7 @@ def _shape_glab_detail(kind: str, ref: ForgeRef, d: dict) -> dict:
         "url": d.get("web_url", ""),
         "created": _date(d.get("created_at")),
         "updated": _date(d.get("updated_at")),
-        "body": _clip(d.get("description") or "", _BODY_CLIP),
+        "body": _clip(d.get("description") or "", body_limit),
         "comments": [],
     }
     if kind == "pr":
@@ -457,13 +465,15 @@ async def _glab_list(ref: ForgeRef, state: str, limit: int) -> list[dict]:
     return items[:limit]
 
 
-async def _glab_get(ref: ForgeRef, kind: str, number: int) -> dict:
+async def _glab_get(
+    ref: ForgeRef, kind: str, number: int, *, body_limit: int | None = _BODY_CLIP
+) -> dict:
     enc = quote(ref.slug, safe="")
     endpoint = "merge_requests" if kind == "pr" else "issues"
     data = await _glab_api(ref, f"projects/{enc}/{endpoint}/{number}")
     if not isinstance(data, dict):
         raise ForgeError("glab api 返回非预期结构")
-    return _shape_glab_detail(kind, ref, data)
+    return _shape_glab_detail(kind, ref, data, body_limit=body_limit)
 
 
 # --------------------------------------------------------------------------- #
@@ -490,12 +500,17 @@ async def list_items(ref: ForgeRef, *, state: str = "open", limit: int = 20) -> 
     }
 
 
-async def get_item(ref: ForgeRef, kind: str, number: int) -> dict:
-    """取单个 issue/PR 详情。kind 消歧（GitLab 的 issue/MR 是两套编号）。"""
+async def get_item(
+    ref: ForgeRef, kind: str, number: int, *, body_limit: int | None = _BODY_CLIP
+) -> dict:
+    """取单个 issue/PR 详情。kind 消歧（GitLab 的 issue/MR 是两套编号）。
+
+    ``body_limit=None`` 取完整正文（供派活当 brief）；默认裁到 _BODY_CLIP（供展示预览）。
+    """
     if kind not in ("issue", "pr"):
         raise ForgeError(f"kind 必须为 issue 或 pr，当前为 {kind!r}")
     if ref.kind == "github":
-        return await _gh_get(ref, kind, number)
+        return await _gh_get(ref, kind, number, body_limit=body_limit)
     if ref.kind == "gitlab":
-        return await _glab_get(ref, kind, number)
+        return await _glab_get(ref, kind, number, body_limit=body_limit)
     raise ForgeError(f"未知 forge 类型: {ref.kind}")
