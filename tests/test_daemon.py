@@ -1766,3 +1766,81 @@ async def test_sched_list_forge_all_skipped_is_explicit(monkeypatch):
     daemon, _, _ = make_daemon()
     out = await daemon._sched_list_forge("demo", "open", 20)
     assert "未能获取任何仓库" in out
+
+
+# ------------------------- Task 绑定 issue 作 brief（#63） ------------------------- #
+
+
+def test_issue_tag_extracts_number():
+    from feishu_dispatcher.daemon import _issue_tag
+
+    assert _issue_tag("https://github.com/o/r/issues/3") == "#3"
+    assert _issue_tag("https://gitlab.com/g/p/-/issues/42") == "#42"
+    assert _issue_tag("") == ""
+    assert _issue_tag("https://x/no/number/here") == ""  # 末段非数字 → 不显示
+
+
+async def test_sched_spawn_with_issue_uses_body_as_brief(monkeypatch):
+    from feishu_dispatcher import forge
+
+    async def fake_ref(project):
+        return forge.ForgeRef("github", "o/r", "github.com", "u")
+
+    async def fake_get(ref, kind, number, *, body_limit=forge._BODY_CLIP):
+        assert kind == "issue" and body_limit is None  # brief 取全文
+        return {
+            "number": number,
+            "title": "Fix bug",
+            "body": "详细复现步骤……",
+            "url": "https://github.com/o/r/issues/3",
+        }
+
+    monkeypatch.setattr(forge, "resolve_forge", fake_ref)
+    monkeypatch.setattr(forge, "get_item", fake_get)
+    daemon, bridge, created = make_daemon()
+    out = await daemon._sched_spawn_agent("demo", "照这个改", issue=3)
+    # Task 锚定了 issue_url
+    t = daemon.store.all()[0]
+    assert t.issue_url == "https://github.com/o/r/issues/3"
+    assert "issue" in out and "issues/3" in out
+    # 就绪消息带 issue 链接
+    assert any("issues/3" in text for _, text in bridge.roots)
+    # 首轮 brief = 用户任务 + issue 标题/正文
+    await wait_until(lambda: bool(created and created[0].prompts))
+    brief = created[0].prompts[0]
+    assert "照这个改" in brief and "Fix bug" in brief and "详细复现步骤" in brief
+    await daemon._shutdown()
+
+
+async def test_sched_spawn_with_issue_no_binding_degrades(monkeypatch):
+    from feishu_dispatcher import forge
+
+    async def no_ref(project):
+        return None
+
+    monkeypatch.setattr(forge, "resolve_forge", no_ref)
+    daemon, _, created = make_daemon()
+    out = await daemon._sched_spawn_agent("demo", "照这个改", issue=3)
+    # 取不到 forge → 优雅退化：任务照建但没绑 issue，brief 就是原任务
+    t = daemon.store.all()[0]
+    assert t.issue_url == ""
+    assert "未关联" in out
+    await wait_until(lambda: created and created[0].prompts == ["照这个改"])
+    await daemon._shutdown()
+
+
+async def test_sched_get_task_reports_issue_url():
+    daemon, _, _ = make_daemon()
+    t = daemon.store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="x",
+        thread_root_id="om_x",
+        workspace="C:/tmp/demo",
+        issue_url="https://github.com/o/r/issues/7",
+    )
+    info = daemon._sched_get_task(t.task_id)
+    assert info["issue_url"] == "https://github.com/o/r/issues/7"
+    assert daemon._sched_list_tasks()[0]["issue_url"] == (
+        "https://github.com/o/r/issues/7"
+    )
