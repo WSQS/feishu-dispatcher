@@ -5,7 +5,8 @@
 
 per-project 绑定：项目可选 ``repo``（一个远端 URL）覆盖；不配则探测该项目 ``path``
 下的 ``git remote get-url origin``。forge 类型按 URL host 推断（``github.com`` →
-GitHub/gh，其余 → GitLab/glab）。GitHub 后端在 1a(#56) 实现；GitLab（glab）见 1b(#57)。
+GitHub/gh，其余 → GitLab/glab）。GitHub 后端（gh）在 1a(#56)、GitLab 后端（glab）在
+1b(#57) 实现，两者共用下面的统一入口与返回形状。
 
 对外三个入口：
 
@@ -27,7 +28,7 @@ import logging
 import os
 import shutil
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -75,18 +76,24 @@ def _resolve_exe(name: str) -> str | None:
 
 
 async def _run(
-    argv: list[str], *, cwd: str | None = None, timeout: float = _TIMEOUT
+    argv: list[str],
+    *,
+    cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    timeout: float = _TIMEOUT,
 ) -> tuple[int, str, str]:
     """跑一个子进程，返回 (returncode, stdout, stderr)。不阻塞事件循环、带超时。
 
     继承 daemon 自身环境（gh/glab 需要 PATH + 各自的凭据/配置目录）——这不是被
-    沙箱约束的 agent 子进程。测试里整体 monkeypatch 掉，不打真命令。
+    沙箱约束的 agent 子进程。``env`` 是**叠加**在 os.environ 上的少量覆盖项（如 glab
+    的 GITLAB_HOST 定位自建实例）。测试里整体 monkeypatch 掉，不打真命令。
     """
     proc = await asyncio.create_subprocess_exec(
         *argv,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
+        env={**os.environ, **env} if env else None,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -273,10 +280,10 @@ def _shape_gh_detail(kind: str, ref: ForgeRef, d: dict) -> dict:
 # --------------------------------------------------------------------------- #
 
 
-def _gh_error(err: str, rc: int) -> str:
-    """从 gh stderr 提炼一行可读错误（多在最后一行）。"""
+def _cli_error(name: str, err: str, rc: int) -> str:
+    """从 CLI stderr 提炼一行可读错误（多在最后一行）。"""
     lines = [ln for ln in (err or "").splitlines() if ln.strip()]
-    return _clip(lines[-1], 200) if lines else f"gh 失败（rc={rc}）"
+    return _clip(lines[-1], 200) if lines else f"{name} 失败（rc={rc}）"
 
 
 async def _gh_list(ref: ForgeRef, state: str, limit: int) -> list[dict]:
@@ -292,7 +299,7 @@ async def _gh_list(ref: ForgeRef, state: str, limit: int) -> list[dict]:
     )
     rc, out, err = await _run([gh, "api", query])
     if rc != 0:
-        raise ForgeError(_gh_error(err, rc))
+        raise ForgeError(_cli_error("gh", err, rc))
     try:
         raw = json.loads(out) if out.strip() else []
     except json.JSONDecodeError as exc:
@@ -318,7 +325,7 @@ async def _gh_get(ref: ForgeRef, kind: str, number: int) -> dict:
         [gh, sub, "view", str(number), "--repo", ref.slug, "--json", fields]
     )
     if rc != 0:
-        raise ForgeError(_gh_error(err, rc))
+        raise ForgeError(_cli_error("gh", err, rc))
     try:
         data = json.loads(out)
     except json.JSONDecodeError as exc:
@@ -327,10 +334,141 @@ async def _gh_get(ref: ForgeRef, kind: str, number: int) -> dict:
 
 
 # --------------------------------------------------------------------------- #
+# GitLab 后端（glab，#57）
+# --------------------------------------------------------------------------- #
+#
+# 与 GitHub 的两处模型差异，本节吸收：
+# 1. issue 与 MR 是**两套独立编号** → 列表要分别打 /issues 与 /merge_requests 两个
+#    端点再合并；详情靠 kind 消歧走对应端点。
+# 2. 自建实例 → 经 GITLAB_HOST env 定位（从 ref.host 取）。
+# 走 `glab api`（而非 `glab issue list`）：直接命中文档化的 GitLab REST，响应形状可控，
+# 且与 GitHub 侧 `gh api` 对称。字段名是 GitLab REST 的（iid/description/web_url/…）。
+# 已对真实自建 GitLab（gitlab.ns-iot.com）实测：嵌套 slug 编码 / GITLAB_HOST 定位 /
+# issue+MR 列表合并 / MR 详情（state/mergeable/draft/changes）均通过；仅 pipeline→checks
+# 映射未撞到带 CI 的 MR（逻辑简单、单测覆盖）。评论未拉、MR 增删 GitLab 基础端点不含（见下）。
+
+#: 统一 state（open/closed/all）→ GitLab REST 的 state 值；"all" 省略该参数（默认返回全部）。
+_GITLAB_STATE = {"open": "opened", "closed": "closed"}
+
+
+def _glab_env(ref: ForgeRef) -> dict[str, str]:
+    """glab 子进程的 host 覆盖：自建实例经 GITLAB_HOST 定位（gitlab.com 也无妨带上）。"""
+    return {"GITLAB_HOST": ref.host}
+
+
+def _glab_changes_count(v) -> int:
+    """GitLab 的 changes_count 可能是 int / "3" / "3+" / 缺失 → 取前导整数。"""
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        digits = "".join(c for c in v if c.isdigit())
+        return int(digits) if digits else 0
+    return 0
+
+
+def _summarize_gitlab_pipeline(status) -> dict:
+    """GitLab MR 的流水线状态（单个 status 串）→ 与 gh 对齐的 checks 计数。"""
+    s = str(status or "").lower()
+    if s == "success":
+        return {"passed": 1, "failed": 0, "pending": 0}
+    if s in ("failed", "canceled", "cancelled"):
+        return {"passed": 0, "failed": 1, "pending": 0}
+    if not s:
+        return {"passed": 0, "failed": 0, "pending": 0}
+    return {"passed": 0, "failed": 0, "pending": 1}  # running/pending/created/manual/…
+
+
+def _shape_glab_list_item(it: dict, type_: str) -> dict:
+    """GitLab issue/MR 列表项 → 统一列表项（labels 是纯字符串数组，_labels 已兼容）。"""
+    return {
+        "number": it.get("iid"),
+        "type": type_,
+        "title": it.get("title", ""),
+        "state": it.get("state", ""),
+        "labels": _labels(it.get("labels")),
+        "updated": _date(it.get("updated_at")),
+        "url": it.get("web_url", ""),
+    }
+
+
+def _shape_glab_detail(kind: str, ref: ForgeRef, d: dict) -> dict:
+    """glab api 的 issue/MR 详情 → 统一详情形状。
+
+    评论走单独的 notes 端点（且混入系统事件），1b MVP 暂不拉（comments 留空）；
+    MR 的 additions/deletions GitLab 基础端点不含（需 /changes 重端点），故只由
+    changes_count 给出文件数、增删留 0。
+    """
+    out = {
+        "repo": ref.slug,
+        "kind": kind,
+        "number": d.get("iid"),
+        "title": d.get("title", ""),
+        "state": d.get("state", ""),
+        "author": (d.get("author") or {}).get("username", ""),
+        "labels": _labels(d.get("labels")),
+        "url": d.get("web_url", ""),
+        "created": _date(d.get("created_at")),
+        "updated": _date(d.get("updated_at")),
+        "body": _clip(d.get("description") or "", _BODY_CLIP),
+        "comments": [],
+    }
+    if kind == "pr":
+        pipeline = d.get("head_pipeline") or d.get("pipeline") or {}
+        out["checks"] = _summarize_gitlab_pipeline(pipeline.get("status"))
+        out["review_decision"] = ""  # GitLab 审批模型不同（approvals），MVP 留空
+        out["mergeable"] = d.get("detailed_merge_status") or d.get("merge_status") or ""
+        out["is_draft"] = bool(d.get("draft") or d.get("work_in_progress"))
+        out["changes"] = {
+            "files": _glab_changes_count(d.get("changes_count")),
+            "additions": 0,
+            "deletions": 0,
+        }
+    return out
+
+
+async def _glab_api(ref: ForgeRef, path: str):
+    """打一个 glab api 调用（自建实例经 GITLAB_HOST 定位），返回解析后的 JSON。"""
+    glab = _resolve_exe("glab")
+    if not glab:
+        raise ForgeError("未找到 glab 命令（GitLab CLI 未安装或不在 PATH）。")
+    rc, out, err = await _run([glab, "api", path], env=_glab_env(ref))
+    if rc != 0:
+        raise ForgeError(_cli_error("glab", err, rc))
+    try:
+        return json.loads(out) if out.strip() else []
+    except json.JSONDecodeError as exc:
+        raise ForgeError("glab api 返回无法解析为 JSON") from exc
+
+
+async def _glab_list(ref: ForgeRef, state: str, limit: int) -> list[dict]:
+    enc = quote(ref.slug, safe="")  # group/sub/proj → group%2Fsub%2Fproj
+    per_page = max(1, min(limit, _LIST_HARD_CAP))
+    base = f"per_page={per_page}&order_by=updated_at&sort=desc"
+    st = _GITLAB_STATE.get(state)
+    sq = f"&state={st}" if st else ""  # "all" → 不带 state（默认返回全部）
+    issues = await _glab_api(ref, f"projects/{enc}/issues?{base}{sq}")
+    mrs = await _glab_api(ref, f"projects/{enc}/merge_requests?{base}{sq}")
+    items = [
+        _shape_glab_list_item(it, "issue") for it in issues if isinstance(it, dict)
+    ]
+    items += [_shape_glab_list_item(it, "pr") for it in mrs if isinstance(it, dict)]
+    # 两端点各自有序，合并后按 updated（日期粒度）重排再截断。
+    items.sort(key=lambda x: x.get("updated", ""), reverse=True)
+    return items[:limit]
+
+
+async def _glab_get(ref: ForgeRef, kind: str, number: int) -> dict:
+    enc = quote(ref.slug, safe="")
+    endpoint = "merge_requests" if kind == "pr" else "issues"
+    data = await _glab_api(ref, f"projects/{enc}/{endpoint}/{number}")
+    if not isinstance(data, dict):
+        raise ForgeError("glab api 返回非预期结构")
+    return _shape_glab_detail(kind, ref, data)
+
+
+# --------------------------------------------------------------------------- #
 # 对外分发（按 ref.kind 选后端）
 # --------------------------------------------------------------------------- #
-
-_GITLAB_TODO = "GitLab（glab）后端尚未实现，见 #57。"
 
 
 async def list_items(ref: ForgeRef, *, state: str = "open", limit: int = 20) -> dict:
@@ -340,7 +478,7 @@ async def list_items(ref: ForgeRef, *, state: str = "open", limit: int = 20) -> 
     if ref.kind == "github":
         items = await _gh_list(ref, state, limit)
     elif ref.kind == "gitlab":
-        raise ForgeError(_GITLAB_TODO)
+        items = await _glab_list(ref, state, limit)
     else:
         raise ForgeError(f"未知 forge 类型: {ref.kind}")
     return {
@@ -359,5 +497,5 @@ async def get_item(ref: ForgeRef, kind: str, number: int) -> dict:
     if ref.kind == "github":
         return await _gh_get(ref, kind, number)
     if ref.kind == "gitlab":
-        raise ForgeError(_GITLAB_TODO)
+        return await _glab_get(ref, kind, number)
     raise ForgeError(f"未知 forge 类型: {ref.kind}")
