@@ -196,7 +196,7 @@ def gh_env(monkeypatch):
     calls = []
 
     def set_run(rc, out, err=""):
-        async def fake_run(argv, *, cwd=None, timeout=forge._TIMEOUT):
+        async def fake_run(argv, *, cwd=None, env=None, timeout=forge._TIMEOUT):
             calls.append(argv)
             return rc, out, err
 
@@ -246,12 +246,171 @@ async def test_get_item_rejects_bad_kind():
         await forge.get_item(ref, "mr", 1)
 
 
-# --------------------------- GitLab 未实现（1b） --------------------------- #
+# --------------------------- GitLab 后端（glab，1b/#57） --------------------------- #
+#
+# mock 单测覆盖命令拼装与形状归一；另已对真实自建 GitLab 实测通过（见 PR）。
+# 评论未拉、MR 增删留 0，见 forge._shape_glab_detail 说明。
+
+_GL_REF = forge.ForgeRef("gitlab", "grp/sub/proj", "git.corp.com", "u")
 
 
-async def test_gitlab_not_implemented():
-    ref = forge.ForgeRef("gitlab", "grp/proj", "git.corp.com", "u")
-    with pytest.raises(forge.ForgeError, match="#57"):
-        await forge.list_items(ref)
-    with pytest.raises(forge.ForgeError, match="#57"):
-        await forge.get_item(ref, "issue", 1)
+def test_shape_glab_list_item_uses_iid_and_string_labels():
+    it = {
+        "iid": 5,
+        "title": "iss",
+        "state": "opened",
+        "labels": ["bug", "p1"],  # GitLab 标签是纯字符串数组
+        "updated_at": "2026-07-23T00:00:00Z",
+        "web_url": "w",
+    }
+    shaped = forge._shape_glab_list_item(it, "issue")
+    assert shaped["number"] == 5  # iid，非 id
+    assert shaped["type"] == "issue"
+    assert shaped["labels"] == ["bug", "p1"]
+    assert shaped["url"] == "w"
+
+
+def test_shape_glab_detail_mr_maps_pipeline_draft_merge():
+    d = {
+        "iid": 7,
+        "title": "mr",
+        "state": "opened",
+        "author": {"username": "me"},
+        "description": "b",
+        "labels": ["feat"],
+        "web_url": "w",
+        "created_at": "2026-07-20T00:00:00Z",
+        "updated_at": "2026-07-22T00:00:00Z",
+        "head_pipeline": {"status": "failed"},
+        "merge_status": "can_be_merged",
+        "draft": True,
+        "changes_count": "3",
+    }
+    out = forge._shape_glab_detail("pr", _GL_REF, d)
+    assert out["number"] == 7
+    assert out["author"] == "me"  # username，非 login
+    assert out["body"] == "b"  # description → body
+    assert out["checks"] == {"passed": 0, "failed": 1, "pending": 0}
+    assert out["mergeable"] == "can_be_merged"
+    assert out["is_draft"] is True
+    assert out["changes"]["files"] == 3
+
+
+def test_shape_glab_detail_issue_has_no_pr_fields():
+    out = forge._shape_glab_detail("issue", _GL_REF, {"iid": 5, "title": "t"})
+    assert "checks" not in out
+    assert out["comments"] == []  # glab MVP 不拉评论
+
+
+def test_summarize_gitlab_pipeline_variants():
+    assert forge._summarize_gitlab_pipeline("success")["passed"] == 1
+    assert forge._summarize_gitlab_pipeline("failed")["failed"] == 1
+    assert forge._summarize_gitlab_pipeline("running")["pending"] == 1
+    assert forge._summarize_gitlab_pipeline(None) == {
+        "passed": 0,
+        "failed": 0,
+        "pending": 0,
+    }
+
+
+def test_glab_changes_count_parses():
+    assert forge._glab_changes_count(3) == 3
+    assert forge._glab_changes_count("3") == 3
+    assert forge._glab_changes_count("3+") == 3
+    assert forge._glab_changes_count(None) == 0
+
+
+async def test_glab_api_passes_host_env(monkeypatch):
+    captured = {}
+
+    async def fake_run(argv, *, cwd=None, env=None, timeout=forge._TIMEOUT):
+        captured["argv"] = argv
+        captured["env"] = env
+        return 0, "[]", ""
+
+    monkeypatch.setattr(forge, "_resolve_exe", lambda name: name)
+    monkeypatch.setattr(forge, "_run", fake_run)
+    await forge._glab_api(_GL_REF, "projects/x/issues")
+    assert captured["argv"][:2] == ["glab", "api"]
+    assert captured["env"]["GITLAB_HOST"] == "git.corp.com"  # 自建实例定位
+
+
+async def test_glab_api_missing_glab_raises(monkeypatch):
+    monkeypatch.setattr(forge, "_resolve_exe", lambda name: None)
+    with pytest.raises(forge.ForgeError, match="glab"):
+        await forge._glab_api(_GL_REF, "projects/x/issues")
+
+
+async def test_glab_list_merges_issues_and_mrs_sorted(monkeypatch):
+    async def fake_api(ref, path):
+        if "merge_requests" in path:
+            return [
+                {
+                    "iid": 7,
+                    "title": "mr",
+                    "state": "opened",
+                    "updated_at": "2026-07-22T0",
+                }
+            ]
+        return [
+            {"iid": 5, "title": "iss", "state": "opened", "updated_at": "2026-07-23T0"}
+        ]
+
+    monkeypatch.setattr(forge, "_glab_api", fake_api)
+    result = await forge.list_items(_GL_REF, state="open", limit=10)
+    types = {(i["type"], i["number"]) for i in result["items"]}
+    assert ("issue", 5) in types and ("pr", 7) in types
+    # 合并后按 updated 降序：issue(07-23) 排在 MR(07-22) 前
+    assert result["items"][0]["number"] == 5
+
+
+async def test_glab_list_state_open_maps_to_opened(monkeypatch):
+    seen = []
+
+    async def fake_api(ref, path):
+        seen.append(path)
+        return []
+
+    monkeypatch.setattr(forge, "_glab_api", fake_api)
+    await forge.list_items(_GL_REF, state="open", limit=10)
+    assert all("state=opened" in p for p in seen)
+    # slug 里的斜杠被百分号编码
+    assert all("grp%2Fsub%2Fproj" in p for p in seen)
+
+
+async def test_glab_list_state_all_omits_param(monkeypatch):
+    seen = []
+
+    async def fake_api(ref, path):
+        seen.append(path)
+        return []
+
+    monkeypatch.setattr(forge, "_glab_api", fake_api)
+    await forge.list_items(_GL_REF, state="all", limit=10)
+    assert all("state=" not in p for p in seen)
+
+
+async def test_glab_get_pr_uses_mr_endpoint(monkeypatch):
+    seen = {}
+
+    async def fake_api(ref, path):
+        seen["path"] = path
+        return {"iid": 7, "title": "mr", "state": "merged"}
+
+    monkeypatch.setattr(forge, "_glab_api", fake_api)
+    out = await forge.get_item(_GL_REF, "pr", 7)
+    assert "merge_requests/7" in seen["path"]
+    assert "grp%2Fsub%2Fproj" in seen["path"]
+    assert out["number"] == 7
+
+
+async def test_glab_get_issue_uses_issue_endpoint(monkeypatch):
+    seen = {}
+
+    async def fake_api(ref, path):
+        seen["path"] = path
+        return {"iid": 5, "title": "iss", "state": "opened"}
+
+    monkeypatch.setattr(forge, "_glab_api", fake_api)
+    await forge.get_item(_GL_REF, "issue", 5)
+    assert "issues/5" in seen["path"]
