@@ -53,6 +53,7 @@ _TASK_FIELDS = (
     "last_output",
     "model",
     "error_message",
+    "issue_url",
 )
 
 
@@ -77,6 +78,9 @@ class Task:
     model: str = ""
     #: turn 异常时的诊断（异常类型 + 片段），供 /task /agents / 恢复判断；正常时空
     error_message: str = ""
+    #: 关联的 forge issue URL（派活时锚定的意图/brief，#63）；空 = 未绑定。
+    #: 单字段、控制平面拥有；PR 不存这里（经 forge 的 Closes #N 反查）。
+    issue_url: str = ""
 
     @property
     def is_active(self) -> bool:
@@ -173,6 +177,7 @@ class TaskStore:
         workspace: str,
         session_id: str = "",
         status: str = "starting",
+        issue_url: str = "",
     ) -> Task:
         self._seq += 1
         now = self._now()
@@ -187,6 +192,7 @@ class TaskStore:
             workspace=workspace,
             created_at=now,
             updated_at=now,
+            issue_url=issue_url,
         )
         self._tasks[task.task_id] = task
         self._flush()

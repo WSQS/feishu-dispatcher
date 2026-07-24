@@ -118,6 +118,17 @@ def _with_tokens(footer: str, tokens: int) -> str:
     return f"{footer} · {tok}" if footer else tok
 
 
+def _issue_tag(issue_url: str) -> str:
+    """从 issue URL 提末段编号拼成 `#N`（GitHub `/issues/3`、GitLab `/-/issues/3`）。
+
+    只用于展示。取不到数字则返回空串（不显示，不猜）。
+    """
+    if not issue_url:
+        return ""
+    last = issue_url.rstrip("/").rsplit("/", 1)[-1]
+    return f"#{last}" if last.isdigit() else ""
+
+
 def _parse_agent_flag(text: str) -> tuple[str, str]:
     """从 /run 的任务文本里剥离 ``--agent <name>``，返回 (任务, agent)。
 
@@ -171,6 +182,8 @@ class _AgentSession:
     cwd: str = ""
     #: 是否由 load_session 恢复而来（影响启动失败时的提示文案）
     resumed: bool = False
+    #: 关联的 forge issue URL（= Task.issue_url，#63）；供 footer/展示标归属，空 = 未绑定
+    issue_url: str = ""
     #: agent 实例（先建 session、再建 agent，故允许 None）
     agent: "AcpAgent | None" = None
     #: 当前回合的输出通道（card 或 text 模式）；回合间为 None
@@ -536,6 +549,7 @@ class _Daemon:
             task_id=task.task_id,
             cwd=task.workspace,
             resumed=resume_session_id is not None,
+            issue_url=task.issue_url,
         )
 
         async def on_output(text: str) -> None:
@@ -671,6 +685,9 @@ class _Daemon:
                 footer = sess.project_name
                 if model:
                     footer += f" · 模型：{model}"
+                issue_tag = _issue_tag(sess.issue_url)  # 绑定了 issue 则标 · #N（#63）
+                if issue_tag:
+                    footer += f" · {issue_tag}"
                 channel = self._make_channel(root, title, footer=footer)
                 sess.current_channel = channel
                 self.store.update(sess.task_id, status="running")
@@ -1041,6 +1058,8 @@ class _Daemon:
         if t.model:
             head += f"\n模型: {t.model}"
         lines = [head, f"任务: {t.description}"]
+        if t.issue_url:
+            lines.append(f"issue: {t.issue_url}")
         if t.status == "failed" and t.error_message:
             lines.append(f"⚠️ 异常暂停：{t.error_message}（话题回复即尝试恢复）")
         if t.last_output:
@@ -1182,6 +1201,7 @@ class _Daemon:
                 "description": t.description,
                 "status": t.status,
                 "turns": t.turns,
+                "issue_url": t.issue_url,  # 关联的 issue（#63）；空 = 未绑定
             }
             for t in self.store.all()
         ]
@@ -1201,6 +1221,7 @@ class _Daemon:
             "has_session": bool(t.session_id),
             "active": t.thread_root_id in self._sessions,
             "model": t.model,  # agent 当前模型（copilot 不暴露则为空）
+            "issue_url": t.issue_url,  # 关联的 issue（#63）；空 = 未绑定
             "created_at": t.created_at,
             "updated_at": t.updated_at,
             "last_output": t.last_output,  # 最近一轮 agent 的收尾回复
@@ -1265,11 +1286,13 @@ class _Daemon:
         return f"已把任务 [{task_id}] 标记为完成（done）。"
 
     async def _sched_spawn_agent(
-        self, project_name: str, task: str, agent: str = ""
+        self, project_name: str, task: str, agent: str = "", issue: int = 0
     ) -> str:
         """spawn_agent 工具实现：建 Task + 新话题 + 启动 agent，返回给 LLM 的状态串。
 
         ``agent`` 可选：非空则覆盖项目 default_agent（须在 [agents]），否则用默认。
+        ``issue`` 可选（>0）：把该 issue 的完整正文当 brief 派给 agent，并把 issue_url
+        锚到 Task（#63）；取不到则优雅退化成普通 spawn（见 _compose_issue_brief）。
         """
         project = self._resolve_project(project_name)
         if project is None:
@@ -1278,14 +1301,22 @@ class _Daemon:
         agent_label, agent_argv, err = self._resolve_agent(project, agent)
         if agent_argv is None:
             return err
+        # issue fetch 放在并发上限检查之前：它只读 forge、不碰 _sessions，避免加宽
+        # 「检查 → _launch 登记」之间的 TOCTOU 窗口。
+        brief, issue_url, note = task, "", ""
+        if issue and issue > 0:
+            brief, issue_url, note = await self._compose_issue_brief(
+                project, task, issue
+            )
         if len(self._sessions) >= self.cfg.max_agents:
             return f"已达并发上限 {self.cfg.max_agents}，请先 `/stop` 一个再派发。"
         assert self._bridge is not None
         # 每个派发新建一个话题根消息，agent 输出流进该话题
+        header = f"🚀 {agent_label} · {project_name}\n任务: {task}"
+        if issue_url:
+            header += f"\nissue: {issue_url}"
         root = await asyncio.to_thread(
-            self._bridge.send_root_message,
-            self.cfg.chat_id,
-            f"🚀 {agent_label} · {project_name}\n任务: {task}",
+            self._bridge.send_root_message, self.cfg.chat_id, header
         )
         new_task = self.store.create(
             project_name=project_name,
@@ -1293,12 +1324,36 @@ class _Daemon:
             description=task,
             thread_root_id=root,
             workspace=str(project.path),
+            issue_url=issue_url,
         )
-        self._launch(new_task, agent_argv, first_prompt=task)
+        self._launch(new_task, agent_argv, first_prompt=brief)
+        bound = f"（brief 来自 issue {issue_url}）" if issue_url else note
         return (
             f"已建任务 [{new_task.task_id}]，在项目 {project_name} 启动 "
-            f"{agent_label} 处理：{task}"
+            f"{agent_label} 处理：{task}{bound}"
         )
+
+    async def _compose_issue_brief(
+        self, project: Project, task: str, issue: int
+    ) -> tuple[str, str, str]:
+        """取 issue 完整正文当 brief，返回 (brief, issue_url, note)。
+
+        取不到（无 forge 绑定 / 编号不存在 / 命令失败）优雅退化：返回 (task, "", 提示)，
+        调用方照常派活、只是没绑 issue——不因 forge 出问题挡住派发。
+        """
+        ref = await forge.resolve_forge(project)
+        if ref is None:
+            return task, "", f"（项目无 forge 绑定，未关联 issue #{issue}）"
+        try:
+            item = await forge.get_item(ref, "issue", issue, body_limit=None)
+        except forge.ForgeError as exc:
+            return task, "", f"（取 issue #{issue} 失败：{exc}，未关联）"
+        brief = (
+            f"{task}\n\n---\n以下是关联的 issue #{item.get('number', issue)}"
+            f"（{ref.slug}）作为本次任务的背景/需求：\n"
+            f"标题：{item.get('title', '')}\n\n{item.get('body', '')}"
+        )
+        return brief, item.get("url", ""), ""
 
     # ------------------------------------------------------------------ #
     # 发送辅助

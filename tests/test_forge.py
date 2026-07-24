@@ -186,6 +186,19 @@ def test_shape_detail_clips_body_and_comments():
     assert len(out["comments"]) == forge._MAX_COMMENTS  # 只留最近几条
 
 
+def test_shape_detail_body_limit_none_keeps_full_body():
+    # brief 用途：body_limit=None 不裁剪，取全文（#63）
+    ref = forge.ForgeRef("github", "o/r", "github.com", "u")
+    out = forge._shape_gh_detail(
+        "issue", ref, {"number": 1, "body": "y" * 5000}, body_limit=None
+    )
+    assert out["body"] == "y" * 5000
+
+
+def test_clip_none_limit_no_truncation():
+    assert forge._clip("z" * 9000, None) == "z" * 9000
+
+
 # --------------------------- gh 后端（monkeypatch _run） --------------------------- #
 
 
