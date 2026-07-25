@@ -178,6 +178,7 @@ class TaskStore:
         session_id: str = "",
         status: str = "starting",
         issue_url: str = "",
+        model: str = "",
     ) -> Task:
         self._seq += 1
         now = self._now()
@@ -193,6 +194,7 @@ class TaskStore:
             created_at=now,
             updated_at=now,
             issue_url=issue_url,
+            model=model,
         )
         self._tasks[task.task_id] = task
         self._flush()
@@ -323,3 +325,71 @@ class ProjectStore:
         del self._projects[name]
         self._flush()
         return True
+
+
+class ModelStore:
+    """按 agent backend 缓存其 available_models（ACP 只在活 session 报，故缓存下来
+    让 spawn 前也能列/校验）。落盘 models.json，原子写 + 读损坏容错。
+
+    两条更新路径：worker 启动读到 available_models 时被动刷新（免费）；``/models
+    refresh`` 临时起一次性 agent 主动刷新。copilot 不暴露模型 → 存空列表。
+
+    ``path=None`` 为纯内存（测试）。只被单个 daemon 实例（单线程 event loop）读写。
+    """
+
+    def __init__(self, path: Path | None) -> None:
+        self._path = path
+        #: backend -> {"models": list[str], "refreshed_at": float}
+        self._by_backend: dict[str, dict] = {}
+        if path is not None and path.exists():
+            self._load()
+
+    def _load(self) -> None:
+        assert self._path is not None
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            for backend, d in (data.get("backends") or {}).items():
+                models = [str(m) for m in (d.get("models") or [])]
+                self._by_backend[backend] = {
+                    "models": models,
+                    "refreshed_at": float(d.get("refreshed_at", 0.0)),
+                }
+        except Exception:
+            logger.warning("模型缓存读取失败，忽略: %s", self._path, exc_info=True)
+            self._by_backend = {}
+
+    def _flush(self) -> None:
+        if self._path is None:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_name(self._path.name + ".tmp")
+            tmp.write_text(
+                json.dumps(
+                    {"backends": self._by_backend}, ensure_ascii=False, indent=2
+                ),
+                encoding="utf-8",
+            )
+            tmp.replace(self._path)
+        except Exception:
+            logger.warning("模型缓存写入失败: %s", self._path, exc_info=True)
+
+    def get(self, backend: str) -> list[str]:
+        """某 backend 已知的模型列表（无缓存则空列表）。"""
+        return list((self._by_backend.get(backend) or {}).get("models") or [])
+
+    def all(self) -> dict[str, dict]:
+        """全部缓存：backend -> {models, refreshed_at}（副本）。"""
+        return {k: dict(v) for k, v in self._by_backend.items()}
+
+    def update(self, backend: str, models: list[str]) -> None:
+        """写入/刷新某 backend 的模型清单（含 refreshed_at 时间戳），落盘。
+
+        被动刷新会带着 models 反复调用——值没变（含空列表，如 copilot）时只更新
+        时间戳、仍落盘，让 ``refreshed_at`` 反映「最近一次确认」。
+        """
+        self._by_backend[backend] = {
+            "models": [str(m) for m in models],
+            "refreshed_at": time.time(),
+        }
+        self._flush()

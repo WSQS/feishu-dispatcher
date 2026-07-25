@@ -5,7 +5,12 @@ from __future__ import annotations
 from pathlib import Path
 
 from feishu_dispatcher.config import Project
-from feishu_dispatcher.store import _MAX_ACTIONS, ProjectStore, TaskStore
+from feishu_dispatcher.store import (
+    _MAX_ACTIONS,
+    ModelStore,
+    ProjectStore,
+    TaskStore,
+)
 
 
 def make(
@@ -213,4 +218,56 @@ def test_project_store_corrupt_file_tolerated(tmp_path: Path):
 def test_project_store_memory_mode_writes_nothing(tmp_path: Path):
     s = ProjectStore(None)  # path=None
     s.add(_proj("foo"))
+    assert list(tmp_path.iterdir()) == []  # 没落盘
+
+
+# ModelStore：按 backend 的模型缓存（models.json，#65）
+
+
+def test_task_create_records_model():
+    s = TaskStore(None)
+    t = s.create(
+        project_name="p",
+        agent_label="opencode",
+        description="x",
+        thread_root_id="om_1",
+        workspace="C:/x",
+        model="glm-5",
+    )
+    assert t.model == "glm-5"
+
+
+def test_model_store_update_get():
+    s = ModelStore(None)
+    assert s.get("opencode") == []  # 未知 backend → 空
+    s.update("opencode", ["a", "b"])
+    assert s.get("opencode") == ["a", "b"]
+    assert "refreshed_at" in s.all()["opencode"]
+
+
+def test_model_store_empty_list_ok_for_copilot():
+    s = ModelStore(None)
+    s.update("copilot", [])  # copilot 不暴露模型 → 存空、仍带时间戳
+    assert s.get("copilot") == []
+    assert "copilot" in s.all()
+
+
+def test_model_store_persists_and_reloads(tmp_path: Path):
+    path = tmp_path / "models.json"
+    s1 = ModelStore(path)
+    s1.update("opencode", ["m1", "m2"])
+    s2 = ModelStore(path)
+    assert s2.get("opencode") == ["m1", "m2"]
+
+
+def test_model_store_corrupt_file_tolerated(tmp_path: Path):
+    path = tmp_path / "models.json"
+    path.write_text("{ not json", encoding="utf-8")
+    s = ModelStore(path)  # 不抛
+    assert s.all() == {}
+
+
+def test_model_store_memory_mode_writes_nothing(tmp_path: Path):
+    s = ModelStore(None)
+    s.update("opencode", ["a"])
     assert list(tmp_path.iterdir()) == []  # 没落盘

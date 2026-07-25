@@ -1844,3 +1844,52 @@ async def test_sched_get_task_reports_issue_url():
     assert daemon._sched_list_tasks()[0]["issue_url"] == (
         "https://github.com/o/r/issues/7"
     )
+
+
+# ------------------------- spawn 指定模型 + 模型缓存（#65） ------------------------- #
+
+
+async def test_sched_spawn_with_model_pins_it():
+    # ModelAgent 报 available=[v4-pro, glm-5]；指定 glm-5 → 启动后下发并记台账
+    daemon, _, created = make_daemon(ModelAgent)
+    await daemon._sched_spawn_agent("demo", "X", model="zhipuai/glm-5")
+    await wait_until(lambda: bool(created and created[0].set_model_calls))
+    assert "zhipuai/glm-5" in created[0].set_model_calls
+    await wait_until(lambda: daemon.store.all()[0].model == "zhipuai/glm-5")
+    await daemon._shutdown()
+
+
+async def test_worker_passively_caches_models():
+    # 真实 agent 一启动，worker 就把它报的 available_models 存进缓存（键 = agent_label）
+    daemon, _, _ = make_daemon(ModelAgent)
+    await daemon._sched_spawn_agent("demo", "X")
+    await wait_until(lambda: bool(daemon.model_store.get("copilot")))
+    assert "zhipuai/glm-5" in daemon.model_store.get("copilot")
+    await daemon._shutdown()
+
+
+def test_sched_list_models():
+    daemon, _, _ = make_daemon()
+    daemon.model_store.update("opencode", ["a", "b"])
+    assert daemon._sched_list_models("opencode") == {"opencode": ["a", "b"]}
+    assert daemon._sched_list_models() == {"opencode": ["a", "b"]}
+
+
+async def test_models_cmd_lists_and_empty():
+    daemon, bridge, _ = make_daemon()
+    # 空缓存
+    await daemon._handle_message(root_msg("/models"))
+    assert any("缓存为空" in t for _, t in bridge.plain)
+    # 有缓存
+    daemon.model_store.update("opencode", ["m1", "m2"])
+    await daemon._handle_message(root_msg("/models", mid="om_r2"))
+    assert any("opencode" in t and "m1" in t for _, t in bridge.plain)
+
+
+async def test_models_refresh_command_boots_throwaway_agent():
+    # /models refresh 起一个一次性 ModelAgent 采集后关掉，刷新缓存，不占 max_agents
+    daemon, _, created = make_daemon(ModelAgent)
+    await daemon._handle_message(root_msg("/models refresh copilot"))
+    assert "zhipuai/glm-5" in daemon.model_store.get("copilot")
+    assert created and created[-1].closed  # 一次性 agent 已关闭
+    assert daemon._sessions == {}  # 没占用 session 名额

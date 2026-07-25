@@ -39,8 +39,9 @@ def _tools(
     unregister=None,
     list_forge=None,
     get_forge=None,
+    list_models=None,
 ):
-    async def _spawn(p, t, a="", issue=0):
+    async def _spawn(p, t, a="", issue=0, model=""):
         return f"已派发 {p}"
 
     async def _send(tid, m):
@@ -64,6 +65,9 @@ def _tools(
     async def _get_forge(project, kind, number):
         return f"forge-get {project} {kind} {number}"
 
+    def _list_models(agent):
+        return {"opencode": ["m1", "m2"]} if not agent else {agent: ["m1"]}
+
     return build_scheduler_tools(
         list_projects=lambda: projects or [{"name": "demo"}],
         spawn_agent=spawn or _spawn,
@@ -76,6 +80,7 @@ def _tools(
         unregister_project=unregister or _unregister,
         list_forge=list_forge or _list_forge,
         get_forge=get_forge or _get_forge,
+        list_models=list_models or _list_models,
     )
 
 
@@ -93,7 +98,7 @@ async def test_returns_text_when_no_tool_calls():
 async def test_executes_tool_then_returns_final():
     spawned = []
 
-    async def spawn(p, t, a="", issue=0):
+    async def spawn(p, t, a="", issue=0, model=""):
         spawned.append((p, t, a))
         return f"已派发 {p}"
 
@@ -128,7 +133,7 @@ async def test_executes_tool_then_returns_final():
 async def test_spawn_agent_passes_agent_override():
     spawned = []
 
-    async def spawn(p, t, a="", issue=0):
+    async def spawn(p, t, a="", issue=0, model=""):
         spawned.append((p, t, a))
         return f"已派发 {p}（{a or '默认'}）"
 
@@ -153,7 +158,7 @@ async def test_spawn_agent_passes_agent_override():
 async def test_spawn_agent_passes_issue():
     spawned = []
 
-    async def spawn(p, t, a="", issue=0):
+    async def spawn(p, t, a="", issue=0, model=""):
         spawned.append((p, t, a, issue))
         return "ok"
 
@@ -175,6 +180,46 @@ async def test_spawn_agent_passes_issue():
     assert spawned == [("demo", "做 #3", "", 3)]  # issue 编号被透传
 
 
+async def test_spawn_agent_passes_model():
+    spawned = []
+
+    async def spawn(p, t, a="", issue=0, model=""):
+        spawned.append((p, t, a, issue, model))
+        return "ok"
+
+    llm = FakeLLM(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        "1",
+                        "spawn_agent",
+                        {"project": "demo", "task": "X", "model": "deepseek-v4"},
+                    )
+                ]
+            ),
+            LLMResponse(content="好"),
+        ]
+    )
+    await run_tool_loop(llm, "用 deepseek-v4 跑 X", _tools(spawn=spawn))
+    assert spawned == [("demo", "X", "", 0, "deepseek-v4")]
+
+
+async def test_list_models_tool():
+    # 有缓存 → 原样 JSON
+    tools = {t.name: t for t in _tools()}
+    out = await tools["list_models"].handler({"agent": "opencode"})
+    assert "m1" in out
+
+    # 空缓存 → 带 note 提示 /models refresh
+    def _empty(agent):
+        return {}
+
+    tools2 = {t.name: t for t in _tools(list_models=_empty)}
+    out2 = await tools2["list_models"].handler({})
+    assert "refresh" in out2
+
+
 async def test_unknown_tool_reported_not_crash():
     llm = FakeLLM(
         [
@@ -186,7 +231,7 @@ async def test_unknown_tool_reported_not_crash():
 
 
 async def test_tool_error_fed_back_not_raised():
-    async def boom(p, t, a="", issue=0):
+    async def boom(p, t, a="", issue=0, model=""):
         raise RuntimeError("kaboom")
 
     llm = FakeLLM(
@@ -301,6 +346,7 @@ def test_new_tools_are_exposed():
         "unregister_project",
         "list_forge_items",
         "get_forge_item",
+        "list_models",
     }
 
 
@@ -334,7 +380,7 @@ async def test_list_forge_items_defaults_and_clamps():
 
 
 async def test_max_iters_cap():
-    async def noop(p, t, a="", issue=0):
+    async def noop(p, t, a="", issue=0, model=""):
         return "ok"
 
     llm = FakeLLM(

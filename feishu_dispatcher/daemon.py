@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
 
@@ -34,7 +35,7 @@ from .scheduler import (
     build_scheduler_tools,
     run_tool_loop,
 )
-from .store import ProjectStore, Task, TaskStore
+from .store import ModelStore, ProjectStore, Task, TaskStore
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,7 @@ _CLEAR_CMD = "/clear"
 _MODEL_CMD = "/model"  # 话题内：/model 列出可选，/model <名> 切换
 _RAW_CMD = "/raw"  # 话题内：/raw <文本> 把 <文本> 逐字转发给 agent，绕过话题命令解释
 _PROJECT_CMD = "/project"  # root：/project 列出，/project add|remove 增删
+_MODELS_CMD = "/models"  # root：/models 列缓存，/models refresh [agent] 主动刷新
 _REBOOT_CMD = "/reboot"  # root：重启整个 daemon 进程（cli.py re-exec）
 _HELP_CMDS = ("/help", "/?", "/usage")  # root 与话题内通用
 
@@ -64,6 +66,7 @@ _USAGE = (
     "• `/agents`  列出活跃 + 历史任务\n"
     "• `/task <任务id>`  查看某任务详情与动作日志\n"
     "• `/project`  列出项目；`/project add <名> <agent> <路径>` 注册，`/project remove <名>` 删除\n"
+    "• `/models`  列出各 agent 已知模型；`/models refresh [agent]` 主动刷新缓存\n"
     "• `/clear`  清理已结束任务的历史\n"
     "• `/reboot`  重启整个 daemon（任务自动恢复）\n"
     "• 在 agent 话题内直接回复 = 追加指令（排队串行执行）\n"
@@ -118,6 +121,13 @@ def _with_tokens(footer: str, tokens: int) -> str:
     return f"{footer} · {tok}" if footer else tok
 
 
+def _fmt_ts(ts: float) -> str:
+    """epoch 秒 → 本地 `MM-DD HH:MM`；0/无 → 「未知」。"""
+    if not ts:
+        return "未知"
+    return time.strftime("%m-%d %H:%M", time.localtime(ts))
+
+
 def _issue_tag(issue_url: str) -> str:
     """从 issue URL 提末段编号拼成 `#N`（GitHub `/issues/3`、GitLab `/-/issues/3`）。
 
@@ -159,6 +169,7 @@ async def run(
         discover=discover,
         store=TaskStore(store_path.parent / "tasks.json"),
         project_store=ProjectStore(store_path.parent / "projects.json"),
+        model_store=ModelStore(store_path.parent / "models.json"),
         _sched_memory=SchedulerMemory(
             store_path.parent / "scheduler_memory.json",
             # [llm].memory_rounds 可配；未配 [llm] 时记忆不参与派发，取默认即可
@@ -207,6 +218,8 @@ class _Daemon:
     #: 运行时注册的项目台账（默认纯内存）；run() 注入文件版（projects.json）。
     #: 有效项目 = config.toml 种子（cfg.projects）+ 这里注册的，见 _all_projects
     project_store: ProjectStore = field(default_factory=lambda: ProjectStore(None))
+    #: 按 backend 的 available_models 缓存（默认纯内存）；run() 注入文件版（models.json）
+    model_store: ModelStore = field(default_factory=lambda: ModelStore(None))
     #: 调度器 LLM（P2）；None = 不启用自然语言派发。run() 按 cfg.llm 构造；测试可注入
     _llm: LLMClient | None = None
     #: 调度器主线对话记忆（跨重启持久化）；默认纯内存，run() 注入文件版
@@ -330,6 +343,8 @@ class _Daemon:
             )
         elif text == _PROJECT_CMD or text.startswith(_PROJECT_CMD + " "):
             await self._handle_project_cmd(msg, text[len(_PROJECT_CMD) :].strip())
+        elif text == _MODELS_CMD or text.startswith(_MODELS_CMD + " "):
+            await self._handle_models_cmd(msg, text[len(_MODELS_CMD) :].strip())
         elif text == _REBOOT_CMD:
             await self._reboot(msg)
         elif text in _HELP_CMDS:
@@ -441,6 +456,89 @@ class _Daemon:
         tip = f"（有 {refs} 个历史任务引用它，记录仍保留）" if refs else ""
         logger.info("删除项目 %s（%d 个历史任务引用）", name, refs)
         return f"🗑️ 已删除项目 {name}。{tip}"
+
+    # ------------------------------------------------------------------ #
+    # 模型缓存：/models 列出 / refresh 主动刷新（#65）
+    # ------------------------------------------------------------------ #
+
+    async def _handle_models_cmd(self, msg: IncomingMessage, arg: str) -> None:
+        """root：``/models`` 列缓存、``/models refresh [agent]`` 主动刷新。"""
+        arg = arg.strip()
+        if arg == "refresh" or arg.startswith("refresh "):
+            target = arg[len("refresh") :].strip()
+            backends = [target] if target else list(self.cfg.agents.keys())
+            if not backends:
+                await self._reply_user(msg.message_id, "没有配置任何 [agents]。")
+                return
+            await self._reply_user(
+                msg.message_id,
+                f"🔄 正在刷新模型缓存（{', '.join(backends)}）…冷启动稍慢，请稍候。",
+            )
+            results = await asyncio.gather(*(self._refresh_models(b) for b in backends))
+            lines = [("✅ " if ok else "❌ ") + m for ok, m in results]
+            await self._reply_user(msg.message_id, "刷新完成：\n" + "\n".join(lines))
+            return
+        # 无参 = 列缓存
+        cache = self.model_store.all()
+        if not cache:
+            await self._reply_user(
+                msg.message_id,
+                "模型缓存为空。发 `/models refresh` 采集（会临时起 agent 读取模型清单）。",
+            )
+            return
+        lines = []
+        for backend, d in cache.items():
+            models = d.get("models") or []
+            when = _fmt_ts(d.get("refreshed_at", 0.0))
+            shown = "、".join(models) if models else "（该后端不暴露模型）"
+            lines.append(f"• {backend}（更新于 {when}）：{shown}")
+        lines.append("`/models refresh [agent]` 主动刷新。")
+        await self._reply_user(msg.message_id, "模型缓存：\n" + "\n".join(lines))
+
+    async def _refresh_models(self, backend: str) -> tuple[bool, str]:
+        """临时起一个该 backend 的一次性 agent、读 available_models 后关掉，刷新缓存。
+
+        不进 ``_sessions``——不占 max_agents。返回 (是否成功, 人读结果串)。
+        """
+        argv = self.cfg.agents.get(backend)
+        if not argv:
+            return False, f"{backend}：不在 [agents] 配置里"
+        projs = self._all_projects()
+        cwd = next(
+            (str(p.path) for p in projs.values() if p.default_agent == backend),
+            next((str(p.path) for p in projs.values()), "."),
+        )
+
+        async def _noop_out(_t: str) -> None:
+            pass
+
+        async def _noop_act(_a: dict) -> None:
+            pass
+
+        agent = self._make_agent(
+            AgentSpawn(command=list(argv), cwd=cwd), _noop_out, _noop_act
+        )
+        try:
+            await asyncio.wait_for(agent.start(), timeout=60)
+            models = list(getattr(agent, "available_models", []) or [])
+            self.model_store.update(backend, models)
+            detail = f" {models}" if models else "（该后端不暴露模型）"
+            return True, f"{backend}：{len(models)} 个模型{detail}"
+        except Exception as exc:
+            logger.exception("刷新模型缓存失败 backend=%s", backend)
+            return False, f"{backend}：刷新失败 {type(exc).__name__}: {str(exc)[:100]}"
+        finally:
+            try:
+                await agent.aclose()
+            except Exception:
+                pass
+
+    def _sched_list_models(self, agent: str = "") -> dict:
+        """list_models 工具：读模型缓存（backend -> 模型列表）。agent 空 = 所有后端。"""
+        cache = self.model_store.all()
+        if agent:
+            return {agent: self.model_store.get(agent)}
+        return {k: (v.get("models") or []) for k, v in cache.items()}
 
     def _resolve_agent(
         self, project: Project, override: str
@@ -622,6 +720,9 @@ class _Daemon:
         task = self.store.get(sess.task_id)
         pinned = (task.model if task else "") or ""
         available = getattr(sess.agent, "available_models", None) or []
+        # 被动刷新模型缓存：真实 agent 一启动就把它报的 available_models 存下来，
+        # 供 spawn 前 /models、list_models 列出/校验（copilot 报空也如实存）。
+        self.model_store.update(sess.agent_label, list(available))
         if pinned and pinned != reported and pinned in available:
             try:
                 await sess.agent.set_model(pinned)
@@ -1108,6 +1209,7 @@ class _Daemon:
             unregister_project=self._sched_unregister_project,
             list_forge=self._sched_list_forge,
             get_forge=self._sched_get_forge,
+            list_models=self._sched_list_models,
         )
         turn: list[dict] | None = None
         try:
@@ -1286,13 +1388,20 @@ class _Daemon:
         return f"已把任务 [{task_id}] 标记为完成（done）。"
 
     async def _sched_spawn_agent(
-        self, project_name: str, task: str, agent: str = "", issue: int = 0
+        self,
+        project_name: str,
+        task: str,
+        agent: str = "",
+        issue: int = 0,
+        model: str = "",
     ) -> str:
         """spawn_agent 工具实现：建 Task + 新话题 + 启动 agent，返回给 LLM 的状态串。
 
         ``agent`` 可选：非空则覆盖项目 default_agent（须在 [agents]），否则用默认。
         ``issue`` 可选（>0）：把该 issue 的完整正文当 brief 派给 agent，并把 issue_url
         锚到 Task（#63）；取不到则优雅退化成普通 spawn（见 _compose_issue_brief）。
+        ``model`` 可选：指定初始模型；启动后由「模型黏住」逻辑下发（#65）。ACP 只在活
+        session 报模型，故 spawn 前无法硬校验——不支持/打错会 warning 回退默认。
         """
         project = self._resolve_project(project_name)
         if project is None:
@@ -1301,6 +1410,13 @@ class _Daemon:
         agent_label, agent_argv, err = self._resolve_agent(project, agent)
         if agent_argv is None:
             return err
+        # 模型软校验：拿缓存比一比，不在已知列表就提示（仍透传，启动时再硬校验/回退）。
+        model = model.strip()
+        model_note = ""
+        if model:
+            cached = self.model_store.get(agent_label)
+            if cached and model not in cached:
+                model_note = f"（注意：{model} 不在 {agent_label} 已知模型 {cached} 里，将尝试下发）"
         # issue fetch 放在并发上限检查之前：它只读 forge、不碰 _sessions，避免加宽
         # 「检查 → _launch 登记」之间的 TOCTOU 窗口。
         brief, issue_url, note = task, "", ""
@@ -1325,12 +1441,13 @@ class _Daemon:
             thread_root_id=root,
             workspace=str(project.path),
             issue_url=issue_url,
+            model=model,
         )
         self._launch(new_task, agent_argv, first_prompt=brief)
         bound = f"（brief 来自 issue {issue_url}）" if issue_url else note
         return (
             f"已建任务 [{new_task.task_id}]，在项目 {project_name} 启动 "
-            f"{agent_label} 处理：{task}{bound}"
+            f"{agent_label} 处理：{task}{bound}{model_note}"
         )
 
     async def _compose_issue_brief(
