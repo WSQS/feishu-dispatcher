@@ -153,6 +153,8 @@ SYSTEM_PROMPT = """你是一个任务调度器（控制台主线的「控制塔�
 7. 用户要**基于某 issue 派活**（如「开始做 #3」「让 agent 处理 issue 5」）→ 直接
    spawn_agent(project, task, issue=<编号>)，daemon 会自动取该 issue 正文当 brief——
    **不要**先 get_forge_item 读出来再粘进 task 里，交给 issue 参数更可靠、还会锚定关联。
+8. 用户要**指定模型**派活（如「用 X 模型跑」）→ spawn_agent(..., model="X")。想知道某后端
+   有哪些模型可选用 list_models(agent)；缓存为空时提示用户发 `/models refresh` 采集。
 
 你不写代码、不改文件、不跑命令——那些是 agent 的工作，你只负责理解、派发与协调。
 操作已有任务前务必先 list_tasks 确认 task_id；确认没有对应任务再考虑新建。
@@ -298,6 +300,7 @@ def build_scheduler_tools(
     unregister_project: Callable[[str], Awaitable[str]],
     list_forge: Callable[[str, str, int], Awaitable[str]],
     get_forge: Callable[[str, str, int], Awaitable[str]],
+    list_models: Callable[[str], dict[str, Any]],
 ) -> list[ToolSpec]:
     """把 daemon 能力包装成调度器工具。查询类（list/get）同步取状态，操作类异步执行。"""
 
@@ -328,7 +331,8 @@ def build_scheduler_tools(
             issue = int(args.get("issue", 0) or 0)  # 可选：把该 issue 正文当 brief
         except (TypeError, ValueError):
             issue = 0
-        return await spawn_agent(project, task, agent, issue)
+        model = str(args.get("model", "")).strip()  # 可选：指定初始模型
+        return await spawn_agent(project, task, agent, issue, model)
 
     async def _list_tasks(_args: dict[str, Any]) -> str:
         return json.dumps(list_tasks(), ensure_ascii=False)
@@ -385,6 +389,20 @@ def build_scheduler_tools(
         except (TypeError, ValueError):
             return "参数不足：number 必须为整数。"
         return await get_forge(project, kind, number)
+
+    async def _list_models(args: dict[str, Any]) -> str:
+        agent = str(args.get("agent", "")).strip()
+        data = list_models(agent)
+        if not data or all(not v for v in data.values()):
+            return json.dumps(
+                {
+                    "models": data,
+                    "note": "缓存为空或该后端不暴露模型（如 copilot）；可让用户发 "
+                    "`/models refresh` 采集。",
+                },
+                ensure_ascii=False,
+            )
+        return json.dumps(data, ensure_ascii=False)
 
     _task_id_param = {
         "type": "object",
@@ -587,5 +605,24 @@ def build_scheduler_tools(
                 "required": ["project", "kind", "number"],
             },
             handler=_get_forge,
+        ),
+        ToolSpec(
+            name="list_models",
+            description=(
+                "列出某 agent 后端已知的可选模型（缓存，来自实际跑过/刷新过的 agent）。"
+                "省略 agent 则列所有后端。用户问「有哪些模型」、或你要在 spawn_agent 里"
+                "给 model 选值前用。缓存可能为空（该后端没跑过或不暴露模型如 copilot）——"
+                "空时可让用户发 `/models refresh` 刷新。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": "agent 后端名（如 opencode/claude）；省略 = 所有后端",
+                    }
+                },
+            },
+            handler=_list_models,
         ),
     ]
