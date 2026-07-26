@@ -31,6 +31,11 @@ max_agents = 7
 # 默认 1800（30 分钟），只回收真正被搁置的 agent，不影响短暂离开。
 # idle_timeout = 1800
 
+# 后台任务（agent 用 `fdx bg run` 起的长任务）默认超时秒数。<=0 = 不超时（默认）——
+# 长训练/build 本就该跑几小时，不该被砍；这只是兜底防卡死进程堆积。agent 也可用
+# `fdx bg run --timeout N -- <命令>` 单次覆盖。
+# bg_job_timeout = 0
+
 # agent 输出合并窗口（秒）
 throttle_window = 0.5
 

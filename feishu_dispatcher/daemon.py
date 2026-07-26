@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -25,8 +26,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import forge
-from .acp_client import AcpAgent, AgentSpawn, OnAction, OnOutput
+from .acp_client import AcpAgent, AgentSpawn, OnAction, OnOutput, _resolve_executable
 from .config import DEFAULT_CONFIG_PATH, Config, Project
+from .control import ControlServer
 from .feishu import FeishuBridge, IncomingMessage
 from .llm import build_llm_client
 from .scheduler import (
@@ -35,7 +37,7 @@ from .scheduler import (
     build_scheduler_tools,
     run_tool_loop,
 )
-from .store import ModelStore, ProjectStore, Task, TaskStore
+from .store import Job, JobStore, ModelStore, ProjectStore, Task, TaskStore
 
 logger = logging.getLogger(__name__)
 
@@ -128,6 +130,29 @@ def _fmt_ts(ts: float) -> str:
     return time.strftime("%m-%d %H:%M", time.localtime(ts))
 
 
+def _fmt_duration(seconds: float) -> str:
+    """时长秒 → 人读 `42s` / `12m03s` / `3h12m`（后台任务耗时展示）。"""
+    s = max(0, int(seconds))
+    if s < 60:
+        return f"{s}s"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+def _read_tail(path: str, nbytes: int = 2000) -> str:
+    """读一个文件的末尾 ``nbytes`` 字节并解码（后台任务输出尾部）；读不到返回空串。"""
+    try:
+        if path and Path(path).exists():
+            raw = Path(path).read_bytes()[-nbytes:]
+            return raw.decode("utf-8", errors="replace").strip()
+    except Exception:
+        logger.debug("读后台任务输出失败 %s", path, exc_info=True)
+    return ""
+
+
 def _issue_tag(issue_url: str) -> str:
     """从 issue URL 提末段编号拼成 `#N`（GitHub `/issues/3`、GitLab `/-/issues/3`）。
 
@@ -170,6 +195,8 @@ async def run(
         store=TaskStore(store_path.parent / "tasks.json"),
         project_store=ProjectStore(store_path.parent / "projects.json"),
         model_store=ModelStore(store_path.parent / "models.json"),
+        job_store=JobStore(store_path.parent / "jobs.json"),
+        _bg_logs_dir=store_path.parent / "bg-logs",
         _sched_memory=SchedulerMemory(
             store_path.parent / "scheduler_memory.json",
             # [llm].memory_rounds 可配；未配 [llm] 时记忆不参与派发，取默认即可
@@ -205,6 +232,8 @@ class _AgentSession:
     terminate_status: str = "stopped"
     #: 本轮是否正在跑（worker 卡在 agent.prompt() 里）；/stop 据此决定要不要发 cancel
     turn_in_flight: bool = False
+    #: 后台任务身份 token（本次启动一次性下发，注入 agent env，映射到 task_id）；#68
+    bg_token: str = ""
     #: 单消费者 worker，持有 agent 完整生命周期
     worker: "asyncio.Task[None] | None" = None
 
@@ -220,6 +249,8 @@ class _Daemon:
     project_store: ProjectStore = field(default_factory=lambda: ProjectStore(None))
     #: 按 backend 的 available_models 缓存（默认纯内存）；run() 注入文件版（models.json）
     model_store: ModelStore = field(default_factory=lambda: ModelStore(None))
+    #: 后台任务台账（默认纯内存）；run() 注入文件版（jobs.json）。#68
+    job_store: JobStore = field(default_factory=lambda: JobStore(None))
     #: 调度器 LLM（P2）；None = 不启用自然语言派发。run() 按 cfg.llm 构造；测试可注入
     _llm: LLMClient | None = None
     #: 调度器主线对话记忆（跨重启持久化）；默认纯内存，run() 注入文件版
@@ -229,6 +260,14 @@ class _Daemon:
     _bridge: FeishuBridge | None = None
     _sessions: dict[str, _AgentSession] = field(default_factory=dict)
     _seen_message_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    #: 本地控制面（agent CLI 入口）；run() 里启动，测试构造 _Daemon 时为 None（不起 HTTP）
+    _control: "ControlServer | None" = None
+    #: 后台任务身份表：token → task_id（启 agent 时登记，关 session 时清）。#68
+    _bg_tokens: dict[str, str] = field(default_factory=dict)
+    #: 后台任务 watcher 的强引用（asyncio 只持弱引用，不存会被 GC）。#68
+    _bg_watchers: set = field(default_factory=set)
+    #: 后台任务输出日志目录；run() 注入（默认 config 同目录 bg-logs/）
+    _bg_logs_dir: "Path | None" = None
     #: /reboot 收到后置位；run() 返回它，cli.py re-exec 重启进程
     _reboot_requested: bool = False
     #: run() 里创建的退出事件；/reboot 或退出信号 set 它跳出主循环
@@ -247,6 +286,14 @@ class _Daemon:
             qps=self.cfg.feishu_qps,
         )
         self._stop_event = asyncio.Event()
+        # 本地控制面（agent CLI → daemon）：127.0.0.1 + 一次性 token 鉴权（#68）。
+        # 路由表可扩展，首个 endpoint 是后台任务 run。
+        self._control = ControlServer(
+            loop,
+            resolve_token=self._bg_tokens.get,
+            routes={("POST", "/v1/bg/run"): self._ctl_bg_run},
+        )
+        self._control.start()
         self._bridge.start_background()
         logger.info(
             "feishu-dispatcher daemon 已启动（调度器 LLM: %s），等待飞书消息…",
@@ -661,8 +708,20 @@ class _Daemon:
             turn = (cur.turns if cur else 0) + 1
             self.store.add_action(sess.task_id, {"turn": turn, **action})
 
+        # 身份注入（#68）：给 agent 子进程一份一次性 token + 控制面 URL（经 env 逐层
+        # 透传到 agent 跑的 shell → fdx）。有控制面才注入（测试无控制面时为空 env）。
+        env: dict[str, str] = {}
+        if self._control is not None:
+            token = secrets.token_urlsafe(16)
+            self._bg_tokens[token] = task.task_id
+            sess.bg_token = token
+            env = {
+                "FEISHU_DISPATCHER_URL": self._control.base_url,
+                "FEISHU_DISPATCHER_TOKEN": token,
+                "FEISHU_DISPATCHER_TASK_ID": task.task_id,
+            }
         sess.agent = self._make_agent(
-            AgentSpawn(command=list(agent_argv), cwd=task.workspace),
+            AgentSpawn(command=list(agent_argv), cwd=task.workspace, env=env),
             on_output,
             on_action,
             resume_session_id=resume_session_id,
@@ -876,6 +935,8 @@ class _Daemon:
     async def _close_session(self, sess: _AgentSession) -> None:
         """收尾一个 session：出注册表、清空输出通道、关 agent 进程。"""
         self._sessions.pop(sess.thread_root_id, None)
+        if sess.bg_token:  # 作废该 session 的后台任务 token（#68）
+            self._bg_tokens.pop(sess.bg_token, None)
         if sess.current_channel is not None:
             try:
                 await sess.current_channel.aclose()
@@ -1473,6 +1534,215 @@ class _Daemon:
         return brief, item.get("url", ""), ""
 
     # ------------------------------------------------------------------ #
+    # 后台任务（#68）：agent 经 fdx bg run → 控制面 → daemon 拥有进程 → 完成唤回
+    # ------------------------------------------------------------------ #
+
+    async def _ctl_bg_run(self, task_id: str, body: dict) -> tuple[int, dict]:
+        """控制面 ``POST /v1/bg/run`` 处理器：起一个 daemon 托管的后台进程。
+
+        在主 loop 上执行（由 ControlServer marshal 而来）。task_id 已由 token 解出。
+        """
+        command = body.get("command")
+        if (
+            not isinstance(command, list)
+            or not command
+            or not all(isinstance(c, str) and c for c in command)
+        ):
+            return 400, {"error": "command 必须是非空字符串数组"}
+        task = self.store.get(task_id)
+        if task is None:
+            return 404, {"error": f"未知任务 {task_id}"}
+        cwd = str(body.get("cwd") or task.workspace or ".")
+        # 超时：请求显式指定优先（fdx --timeout），否则用 config 默认（<=0 = 不超时）
+        try:
+            req_timeout = float(body.get("timeout") or 0)
+        except (TypeError, ValueError):
+            req_timeout = 0.0
+        timeout = req_timeout if req_timeout > 0 else self.cfg.bg_job_timeout
+        try:
+            job = await self._launch_bg_job(
+                task_id, list(command), cwd, timeout=timeout
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("启动后台任务失败 task=%s", task_id)
+            return 500, {"error": f"{type(exc).__name__}: {exc}"}
+        return 200, {"job_id": job.job_id, "status": job.status}
+
+    async def _launch_bg_job(
+        self, task_id: str, command: list[str], cwd: str, *, timeout: float = 0.0
+    ) -> Job:
+        """spawn 一个 daemon 拥有的后台进程（argv exec，不经 shell），输出重定向到文件，
+        登记 Job 并起 watcher。返回 Job（进程仍在跑）。
+
+        进程是 **daemon 的子进程**（非 agent 的），故 agent 挂起/恢复不影响它。用户自己的
+        build/训练命令——继承 daemon(=用户) 的完整环境（PATH/CUDA/conda 等），与用户在终端
+        直接跑一致。shell 特性（管道/&&）需 agent 显式 `bash -c "..."`。
+
+        ``stdin=DEVNULL``：给子进程一个立即 EOF 的 stdin——否则它会继承 daemon 的（控制台）
+        stdin，交互式 shell profile 里读 stdin 的步骤（实测 `opam env`）会阻塞、卡死整个
+        进程（#68 真机踩坑：一条 `Start-Sleep 4` 卡了 26 分钟在 opam env）。
+        ``timeout>0`` 时超时杀进程当兜底（长训练默认不超时）。
+        """
+        logs_dir = self._bg_logs_dir or (DEFAULT_CONFIG_PATH.parent / "bg-logs")
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        job = self.job_store.create(task_id=task_id, command=command, cwd=cwd)
+        out_path = logs_dir / f"{job.job_id}.log"
+        self.job_store.update(job.job_id, output_file=str(out_path))
+        out_file = open(out_path, "wb")  # noqa: SIM115 —— 交给 watcher 在进程退出后关
+        try:
+            argv = [_resolve_executable(command[0]), *command[1:]]
+            proc = await asyncio.create_subprocess_exec(
+                *argv,
+                cwd=cwd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=out_file,
+                stderr=asyncio.subprocess.STDOUT,
+                env=os.environ.copy(),
+            )
+        except Exception:
+            out_file.close()
+            self.job_store.update(job.job_id, status="killed", exit_code=None)
+            raise
+        logger.info(
+            "后台任务 %s 启动: task=%s pid=%s timeout=%s cmd=%.80s",
+            job.job_id,
+            task_id,
+            proc.pid,
+            timeout or "无",
+            " ".join(command),
+        )
+        # 存强引用：asyncio 只对 task 持弱引用，不存会被 GC 掉、watcher 中途消失（#68）
+        watcher = asyncio.create_task(
+            self._watch_bg_job(job.job_id, proc, out_file, timeout),
+            name=f"bgjob-{job.job_id}",
+        )
+        self._bg_watchers.add(watcher)
+        watcher.add_done_callback(self._bg_watchers.discard)
+        return job
+
+    async def _watch_bg_job(self, job_id: str, proc, out_file, timeout: float) -> None:
+        """等后台进程退出 → 落 Job 状态 → 把「完成 + 输出尾部」入队回它的 task。
+
+        ``timeout>0`` 时超时就 kill 进程、标 timed_out，但**照样唤回 agent**（带超时说明）——
+        兜底防卡死进程无声堆积。
+        """
+        timed_out = False
+        try:
+            if timeout and timeout > 0:
+                try:
+                    rc = await asyncio.wait_for(proc.wait(), timeout)
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    logger.warning("后台任务 %s 超时（%.0fs），杀掉", job_id, timeout)
+                    try:
+                        proc.kill()
+                    except Exception:
+                        logger.debug("kill 超时进程失败 %s", job_id, exc_info=True)
+                    rc = await proc.wait()
+            else:
+                rc = await proc.wait()
+        finally:
+            try:
+                out_file.close()
+            except Exception:
+                pass
+        self.job_store.update(
+            job_id,
+            status="killed" if timed_out else "exited",
+            exit_code=rc,
+            finished_at=time.time(),
+            timed_out=timed_out,
+        )
+        job = self.job_store.get(job_id)
+        if job is None:
+            return
+        logger.info(
+            "后台任务 %s %s: exit=%s task=%s",
+            job_id,
+            "超时被杀" if timed_out else "退出",
+            rc,
+            job.task_id,
+        )
+        await self._deliver_bg_result(job, rc, self._build_bg_prompt(job, rc))
+
+    def _build_bg_prompt(self, job: Job, rc: int) -> str:
+        """构造唤回 agent 的 prompt：`<bg_job_done>` 块（id/命令/exit/耗时/输出尾部）+ 引导。"""
+        tail = _read_tail(job.output_file)
+        dur = (
+            _fmt_duration(job.finished_at - job.created_at) if job.finished_at else "?"
+        )
+        return "\n".join(
+            [
+                "<bg_job_done>",
+                f"Job: {job.job_id}",
+                f"Command: {' '.join(job.command)}",
+                f"Exit Code: {rc}",
+                f"Duration: {dur}",
+                f"Timed Out: {'yes（已超时被杀）' if job.timed_out else 'no'}",
+                "Output (tail):",
+                tail,
+                "</bg_job_done>",
+                "",
+                "你之前用 `fdx bg run` 起的后台任务已完成。请根据退出码与输出继续："
+                "成功就推进下一步，失败/超时就用输出诊断并修复。",
+            ]
+        )
+
+    def _bg_result_message(self, job: Job, rc: int) -> str:
+        """后台任务完成的**可见**话题消息：状态 + exit + 耗时 + 输出尾部（用户直接看结果）。
+
+        与注入给 agent 的 `<bg_job_done>` prompt 分开——prompt 是给 agent 读的、不回显到
+        话题；这条是发给用户看的，补上「结果没进对话」的显示缺口（#68）。
+        """
+        mark = "⏱️" if job.timed_out else ("✅" if rc == 0 else "❌")
+        dur = (
+            _fmt_duration(job.finished_at - job.created_at) if job.finished_at else "?"
+        )
+        state = "超时被杀" if job.timed_out else "完成"
+        head = f"{mark} 后台任务 {job.job_id} {state}（exit {rc} · 用时 {dur}）"
+        tail = _clip(_read_tail(job.output_file), 600)
+        return f"{head}\n输出（尾部）:\n{tail}" if tail else head
+
+    async def _deliver_bg_result(self, job: Job, rc: int, prompt: str) -> None:
+        """把后台任务完成的 prompt 送回对应 task：活跃则入队，挂起则恢复，终止则只通知。
+
+        无论哪种去向，只要 task 还在，都先往它的话题发一条**可见**完成消息（带输出尾部），
+        让用户直接看到结果，再驱动 agent 接续（主线 🔔 保留作「快去看」提醒）。
+        """
+        verb = "成功" if rc == 0 else f"失败(exit {rc})"
+        tag = f"[{job.task_id}]"
+        task = self.store.get(job.task_id)
+        if task is None:
+            await self._notify_main(
+                f"🔔 后台任务 {job.job_id} {verb}，但任务 {tag} 已不存在。"
+            )
+            return
+        # 先把「结果」发到话题（可见），再驱动 agent 接续
+        await self._safe_reply(task.thread_root_id, self._bg_result_message(job, rc))
+        sess = self._sessions.get(task.thread_root_id)
+        if sess is not None and sess.worker is not None and not sess.worker.done():
+            sess.queue.put_nowait(prompt)
+            await self._notify_main(
+                f"🔔 {tag} 后台任务 {job.job_id} {verb}，已让 agent 继续。"
+            )
+            return
+        if task.is_terminal:
+            await self._notify_main(
+                f"🔔 {tag} 后台任务 {job.job_id} {verb}，但任务已{task.status}，未自动继续。"
+            )
+            return
+        # 挂起/idle 但无活跃 session：load_session 恢复，把完成 prompt 作为首轮
+        ok, why = self._try_resume(task, first_prompt=prompt)
+        if ok:
+            await self._notify_main(
+                f"🔔 {tag} 后台任务 {job.job_id} {verb}，已恢复 agent 继续。"
+            )
+        else:
+            await self._notify_main(
+                f"🔔 {tag} 后台任务 {job.job_id} {verb}，但恢复 agent 失败：{why}"
+            )
+
+    # ------------------------------------------------------------------ #
     # 发送辅助
     # ------------------------------------------------------------------ #
 
@@ -1515,6 +1785,8 @@ class _Daemon:
 
     async def _shutdown(self) -> None:
         """退出清理：停 WS 线程，取消并等待全部 agent worker 收尾。"""
+        if self._control is not None:
+            self._control.stop()
         if self._bridge is not None:
             self._bridge.stop()
         # 把仍活跃的任务标记为 suspended，让重启后台账状态准确（且可 load_session 恢复）
