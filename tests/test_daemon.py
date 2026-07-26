@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+import time
 from pathlib import Path
 
 from feishu_dispatcher.config import Config, Project
@@ -1893,3 +1895,147 @@ async def test_models_refresh_command_boots_throwaway_agent():
     assert "zhipuai/glm-5" in daemon.model_store.get("copilot")
     assert created and created[-1].closed  # 一次性 agent 已关闭
     assert daemon._sessions == {}  # 没占用 session 名额
+
+
+# ---------------------------------------------------------------------- #
+# 后台任务（#68）：fdx bg run → 控制面 → daemon 拥有进程 → 完成唤回
+# ---------------------------------------------------------------------- #
+
+
+class _StubControl:
+    """假控制面：只提供 base_url，用于验证身份 env 注入（不起真 HTTP）。"""
+
+    base_url = "http://127.0.0.1:65000"
+
+    def stop(self) -> None:
+        pass
+
+
+class _FakeProc:
+    """假子进程：wait() 立刻返回给定退出码，供 _watch_bg_job 单测（不起真进程）。"""
+
+    def __init__(self, rc: int) -> None:
+        self._rc = rc
+        self.pid = 4242
+
+    async def wait(self) -> int:
+        return self._rc
+
+
+async def test_ctl_bg_run_rejects_bad_command():
+    daemon, _, _ = make_daemon()
+    status, payload = await daemon._ctl_bg_run("t1", {"command": []})
+    assert status == 400
+    status2, _ = await daemon._ctl_bg_run("t1", {"command": "not a list"})
+    assert status2 == 400
+
+
+async def test_ctl_bg_run_unknown_task():
+    daemon, _, _ = make_daemon()
+    status, payload = await daemon._ctl_bg_run("t404", {"command": ["python", "x.py"]})
+    assert status == 404
+
+
+async def test_launch_injects_bg_identity_env_and_revokes_on_close():
+    daemon, bridge, created = make_daemon()
+    daemon._control = _StubControl()  # type: ignore[assignment]
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    env = created[0].spawn.env
+    assert env["FEISHU_DISPATCHER_URL"] == "http://127.0.0.1:65000"
+    assert env["FEISHU_DISPATCHER_TASK_ID"] == "t1"
+    token = env["FEISHU_DISPATCHER_TOKEN"]
+    assert daemon._bg_tokens.get(token) == "t1"  # token → task 已登记
+    await daemon._shutdown()
+    assert token not in daemon._bg_tokens  # 关 session 后 token 作废
+
+
+async def test_bg_job_completion_enqueues_resume_to_active_agent():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    job = daemon.job_store.create(task_id="t1", command=["x"], cwd="C:/tmp/demo")
+    daemon.job_store.update(job.job_id, exit_code=0, finished_at=time.time())
+    prompt = "<bg_job_done>\nJob: j1\nExit Code: 0\n</bg_job_done>\n继续"
+    await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 0, prompt)
+    await wait_until(
+        lambda: any(p.startswith("<bg_job_done>") for p in created[0].prompts)
+    )
+    assert any("🔔" in t and "j1" in t and "成功" in t for _, t in bridge.roots)
+    await daemon._shutdown()
+
+
+async def test_bg_job_completion_resumes_suspended_task():
+    store = TaskStore(None)
+    _seed_task(store, thread="om_s", session_id="sid_s", status="suspended")
+    daemon, bridge, created = make_daemon(store=store)
+    job = daemon.job_store.create(task_id="t1", command=["x"], cwd="c")
+    await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 0, "PROMPT")
+    await wait_until(lambda: created and created[0].prompts == ["PROMPT"])
+    assert created[0].resume_session_id == "sid_s"  # 走 load_session
+    await daemon._shutdown()
+
+
+async def test_bg_job_completion_terminal_task_notifies_only():
+    store = TaskStore(None)
+    _seed_task(store, thread="om_x", status="done")
+    daemon, bridge, created = make_daemon(store=store)
+    job = daemon.job_store.create(task_id="t1", command=["x"], cwd="c")
+    await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 1, "P")
+    assert created == []  # 终止任务不恢复
+    assert any("未自动继续" in t and "失败" in t for _, t in bridge.roots)
+
+
+async def test_watch_bg_job_updates_status_and_delivers(tmp_path: Path):
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    out = tmp_path / "j1.log"
+    out.write_bytes(b"training done\nfinal loss 0.1\n")
+    job = daemon.job_store.create(task_id="t1", command=["python", "train.py"], cwd="c")
+    daemon.job_store.update(job.job_id, output_file=str(out))
+    await daemon._watch_bg_job(job.job_id, _FakeProc(0), open(out, "rb"))
+    updated = daemon.job_store.get(job.job_id)
+    assert updated.status == "exited" and updated.exit_code == 0
+    assert updated.finished_at > 0
+    await wait_until(lambda: any("final loss 0.1" in p for p in created[0].prompts))
+    await daemon._shutdown()
+
+
+def test_build_bg_prompt_formats_block(tmp_path: Path):
+    daemon, _, _ = make_daemon()
+    out = tmp_path / "j1.log"
+    out.write_bytes(b"epoch 1\nepoch 2\nDONE\n")
+    job = daemon.job_store.create(task_id="t1", command=["python", "train.py"], cwd="c")
+    daemon.job_store.update(
+        job.job_id, output_file=str(out), finished_at=job.created_at + 65.0
+    )
+    prompt = daemon._build_bg_prompt(daemon.job_store.get(job.job_id), 0)
+    assert "<bg_job_done>" in prompt and "</bg_job_done>" in prompt
+    assert "Job: j1" in prompt
+    assert "Exit Code: 0" in prompt
+    assert "python train.py" in prompt
+    assert "1m05s" in prompt  # 65s → 1m05s
+    assert "DONE" in prompt  # 输出尾部
+
+
+async def test_launch_bg_job_real_subprocess_roundtrip(tmp_path: Path):
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    daemon._bg_logs_dir = tmp_path / "bg-logs"
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    job = await daemon._launch_bg_job(
+        "t1", [sys.executable, "-c", "print('HELLO_BG_MARKER')"], str(tmp_path)
+    )
+    await wait_until(
+        lambda: daemon.job_store.get(job.job_id).status == "exited", timeout=15
+    )
+    assert daemon.job_store.get(job.job_id).exit_code == 0
+    # 真进程输出经 <bg_job_done> 入队回 agent
+    await wait_until(
+        lambda: any("HELLO_BG_MARKER" in p for p in created[0].prompts), timeout=15
+    )
+    await daemon._shutdown()

@@ -20,6 +20,7 @@ dev = [
 
 [project.scripts]
 feishu-dispatcher = "feishu_dispatcher.cli:main"
+fdx = "feishu_dispatcher.agent_cli:main"
 
 [build-system]
 requires = ["hatchling"]

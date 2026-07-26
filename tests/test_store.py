@@ -7,6 +7,7 @@ from pathlib import Path
 from feishu_dispatcher.config import Project
 from feishu_dispatcher.store import (
     _MAX_ACTIONS,
+    JobStore,
     ModelStore,
     ProjectStore,
     TaskStore,
@@ -271,3 +272,61 @@ def test_model_store_memory_mode_writes_nothing(tmp_path: Path):
     s = ModelStore(None)
     s.update("opencode", ["a"])
     assert list(tmp_path.iterdir()) == []  # 没落盘
+
+
+# JobStore：daemon 拥有的后台任务台账（jobs.json，#68）
+
+
+def test_job_store_create_assigns_incrementing_ids():
+    s = JobStore(None)
+    j1 = s.create(task_id="t1", command=["python", "train.py"], cwd="C:/x")
+    j2 = s.create(task_id="t1", command=["gradlew", "build"], cwd="C:/x")
+    assert j1.job_id == "j1"
+    assert j2.job_id == "j2"
+    assert j1.status == "running"
+    assert j1.exit_code is None
+    assert not j1.is_terminal
+
+
+def test_job_store_update_and_terminal():
+    s = JobStore(None)
+    j = s.create(task_id="t1", command=["x"], cwd="c")
+    s.update(j.job_id, status="exited", exit_code=0, finished_at=123.0)
+    got = s.get(j.job_id)
+    assert got.status == "exited" and got.exit_code == 0 and got.finished_at == 123.0
+    assert got.is_terminal
+
+
+def test_job_store_by_task():
+    s = JobStore(None)
+    s.create(task_id="t1", command=["a"], cwd="c")
+    s.create(task_id="t2", command=["b"], cwd="c")
+    s.create(task_id="t1", command=["c"], cwd="c")
+    assert [j.job_id for j in s.by_task("t1")] == ["j1", "j3"]
+    assert [j.job_id for j in s.by_task("t2")] == ["j2"]
+
+
+def test_job_store_persists_and_counter_monotonic(tmp_path: Path):
+    p = tmp_path / "jobs.json"
+    s1 = JobStore(p)
+    s1.create(task_id="t1", command=["python", "train.py"], cwd="C:/x")
+    s1.update("j1", status="exited", exit_code=0)
+    s2 = JobStore(p)  # reload
+    assert s2.get("j1").status == "exited"
+    assert s2.get("j1").command == ["python", "train.py"]
+    # 计数器随之持久化 → 下一个是 j2，不复用
+    assert s2.create(task_id="t2", command=["x"], cwd="c").job_id == "j2"
+
+
+def test_job_store_corrupt_file_tolerated(tmp_path: Path):
+    p = tmp_path / "jobs.json"
+    p.write_text("{ not json", encoding="utf-8")
+    s = JobStore(p)
+    assert s.all() == []
+    assert s.create(task_id="t1", command=["x"], cwd="c").job_id == "j1"
+
+
+def test_job_store_memory_mode_writes_nothing(tmp_path: Path):
+    s = JobStore(None)
+    s.create(task_id="t1", command=["x"], cwd="c")
+    assert list(tmp_path.iterdir()) == []

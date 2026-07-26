@@ -327,6 +327,132 @@ class ProjectStore:
         return True
 
 
+#: Job 落盘/加载的字段白名单（向后兼容：只读认识的键，忽略未知/缺失）
+_JOB_FIELDS = (
+    "job_id",
+    "task_id",
+    "command",
+    "cwd",
+    "status",
+    "exit_code",
+    "output_file",
+    "created_at",
+    "finished_at",
+)
+
+#: 后台任务的机械态：running（跑着）→ exited（正常退出）/ killed（被杀/异常）
+JOB_RUNNING = "running"
+JOB_TERMINAL = frozenset({"exited", "killed"})
+
+
+@dataclass
+class Job:
+    """一个 daemon 拥有的后台进程（#68）。
+
+    与 Task 的关系：Job 绑定一个 ``task_id``——agent 经 CLI 请求 daemon 起的长任务
+    （训练/build/测试）。daemon 拥有该进程（不是 agent 的子进程），故 agent 挂起不影响
+    它；进程退出时 daemon 把「完成 + 输出尾部」入队该 task，agent 自动接续。
+
+    ``command`` 是 argv 列表（exec，不经 shell）；``output_file`` 是重定向的输出文件。
+    """
+
+    job_id: str
+    task_id: str
+    command: list[str]
+    cwd: str
+    status: str = JOB_RUNNING
+    exit_code: int | None = None
+    output_file: str = ""
+    created_at: float = 0.0
+    finished_at: float = 0.0
+
+    @property
+    def is_terminal(self) -> bool:
+        return self.status in JOB_TERMINAL
+
+
+class JobStore:
+    """job_id → Job 台账（落盘 jobs.json），供后台任务追踪、``bg list/logs`` 与
+    完成后路由回 Task。按 ``j<N>`` 短自增、持久单调计数器、**永不复用**。
+
+    ``path=None`` 为纯内存（测试）。原子写 + 读损坏容错，与 TaskStore 一套。
+    只被单个 daemon 实例（单线程 event loop）读写，无需加锁。
+    v1 不做重启穿越——daemon 重启会丢在飞的 Job 的 await（记录仍在盘上，标记为
+    running 的历史 Job 视为「结果未知」，不自动恢复，见 #68）。
+    """
+
+    def __init__(self, path: Path | None) -> None:
+        self._path = path
+        self._jobs: dict[str, Job] = {}
+        self._seq = 0
+        if path is not None and path.exists():
+            self._load()
+
+    def _load(self) -> None:
+        assert self._path is not None
+        try:
+            data = json.loads(self._path.read_text(encoding="utf-8"))
+            self._seq = int(data.get("seq", 0))
+            for jid, d in (data.get("jobs") or {}).items():
+                self._jobs[jid] = Job(**{k: d[k] for k in _JOB_FIELDS if k in d})
+        except Exception:
+            logger.warning("后台任务台账读取失败，忽略: %s", self._path, exc_info=True)
+            self._jobs = {}
+            self._seq = 0
+
+    def _flush(self) -> None:
+        if self._path is None:
+            return
+        try:
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self._path.with_name(self._path.name + ".tmp")
+            payload = {
+                "seq": self._seq,
+                "jobs": {jid: asdict(j) for jid, j in self._jobs.items()},
+            }
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+            tmp.replace(self._path)
+        except Exception:
+            logger.warning("后台任务台账写入失败: %s", self._path, exc_info=True)
+
+    def get(self, job_id: str) -> Job | None:
+        return self._jobs.get(job_id)
+
+    def all(self) -> list[Job]:
+        return list(self._jobs.values())
+
+    def by_task(self, task_id: str) -> list[Job]:
+        return [j for j in self._jobs.values() if j.task_id == task_id]
+
+    def create(
+        self, *, task_id: str, command: list[str], cwd: str, output_file: str = ""
+    ) -> Job:
+        self._seq += 1
+        job = Job(
+            job_id=f"j{self._seq}",
+            task_id=task_id,
+            command=list(command),
+            cwd=cwd,
+            status=JOB_RUNNING,
+            output_file=output_file,
+            created_at=time.time(),
+        )
+        self._jobs[job.job_id] = job
+        self._flush()
+        return job
+
+    def update(self, job_id: str, **changes) -> Job | None:
+        job = self._jobs.get(job_id)
+        if job is None:
+            return None
+        for k, v in changes.items():
+            setattr(job, k, v)
+        self._flush()
+        return job
+
+
 class ModelStore:
     """按 agent backend 缓存其 available_models（ACP 只在活 session 报，故缓存下来
     让 spawn 前也能列/校验）。落盘 models.json，原子写 + 读损坏容错。
