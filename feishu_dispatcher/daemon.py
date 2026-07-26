@@ -142,6 +142,17 @@ def _fmt_duration(seconds: float) -> str:
     return f"{h}h{m:02d}m"
 
 
+def _read_tail(path: str, nbytes: int = 2000) -> str:
+    """读一个文件的末尾 ``nbytes`` 字节并解码（后台任务输出尾部）；读不到返回空串。"""
+    try:
+        if path and Path(path).exists():
+            raw = Path(path).read_bytes()[-nbytes:]
+            return raw.decode("utf-8", errors="replace").strip()
+    except Exception:
+        logger.debug("读后台任务输出失败 %s", path, exc_info=True)
+    return ""
+
+
 def _issue_tag(issue_url: str) -> str:
     """从 issue URL 提末段编号拼成 `#N`（GitHub `/issues/3`、GitLab `/-/issues/3`）。
 
@@ -1606,13 +1617,7 @@ class _Daemon:
 
     def _build_bg_prompt(self, job: Job, rc: int) -> str:
         """构造唤回 agent 的 prompt：`<bg_job_done>` 块（id/命令/exit/耗时/输出尾部）+ 引导。"""
-        tail = ""
-        try:
-            if job.output_file and Path(job.output_file).exists():
-                raw = Path(job.output_file).read_bytes()[-2000:]
-                tail = raw.decode("utf-8", errors="replace").strip()
-        except Exception:
-            logger.debug("读后台任务输出失败 %s", job.job_id, exc_info=True)
+        tail = _read_tail(job.output_file)
         dur = (
             _fmt_duration(job.finished_at - job.created_at) if job.finished_at else "?"
         )
@@ -1632,8 +1637,26 @@ class _Daemon:
             ]
         )
 
+    def _bg_result_message(self, job: Job, rc: int) -> str:
+        """后台任务完成的**可见**话题消息：状态 + exit + 耗时 + 输出尾部（用户直接看结果）。
+
+        与注入给 agent 的 `<bg_job_done>` prompt 分开——prompt 是给 agent 读的、不回显到
+        话题；这条是发给用户看的，补上「结果没进对话」的显示缺口（#68）。
+        """
+        mark = "✅" if rc == 0 else "❌"
+        dur = (
+            _fmt_duration(job.finished_at - job.created_at) if job.finished_at else "?"
+        )
+        head = f"{mark} 后台任务 {job.job_id} 完成（exit {rc} · 用时 {dur}）"
+        tail = _clip(_read_tail(job.output_file), 600)
+        return f"{head}\n输出（尾部）:\n{tail}" if tail else head
+
     async def _deliver_bg_result(self, job: Job, rc: int, prompt: str) -> None:
-        """把后台任务完成的 prompt 送回对应 task：活跃则入队，挂起则恢复，终止则只通知。"""
+        """把后台任务完成的 prompt 送回对应 task：活跃则入队，挂起则恢复，终止则只通知。
+
+        无论哪种去向，只要 task 还在，都先往它的话题发一条**可见**完成消息（带输出尾部），
+        让用户直接看到结果，再驱动 agent 接续（主线 🔔 保留作「快去看」提醒）。
+        """
         verb = "成功" if rc == 0 else f"失败(exit {rc})"
         tag = f"[{job.task_id}]"
         task = self.store.get(job.task_id)
@@ -1642,6 +1665,8 @@ class _Daemon:
                 f"🔔 后台任务 {job.job_id} {verb}，但任务 {tag} 已不存在。"
             )
             return
+        # 先把「结果」发到话题（可见），再驱动 agent 接续
+        await self._safe_reply(task.thread_root_id, self._bg_result_message(job, rc))
         sess = self._sessions.get(task.thread_root_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             sess.queue.put_nowait(prompt)

@@ -1966,6 +1966,25 @@ async def test_bg_job_completion_enqueues_resume_to_active_agent():
     await daemon._shutdown()
 
 
+async def test_bg_job_completion_posts_visible_result_to_thread(tmp_path: Path):
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    out = tmp_path / "j1.log"
+    out.write_bytes(b"line1\nfdx test done\n")
+    job = daemon.job_store.create(task_id="t1", command=["pwsh", "-c", "x"], cwd="c")
+    daemon.job_store.update(
+        job.job_id, output_file=str(out), exit_code=0, finished_at=time.time()
+    )
+    await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 0, "PROMPT")
+    # 话题里出现**可见**的完成消息 + 输出尾部（不只是主线 🔔）
+    thread_texts = bridge.texts("om_root1")
+    assert any("后台任务 j1 完成" in t and "exit 0" in t for t in thread_texts)
+    assert any("fdx test done" in t for t in thread_texts)
+    await daemon._shutdown()
+
+
 async def test_bg_job_completion_resumes_suspended_task():
     store = TaskStore(None)
     _seed_task(store, thread="om_s", session_id="sid_s", status="suspended")
