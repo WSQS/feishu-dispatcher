@@ -338,6 +338,7 @@ _JOB_FIELDS = (
     "output_file",
     "created_at",
     "finished_at",
+    "timed_out",
 )
 
 #: 后台任务的机械态：running（跑着）→ exited（正常退出）/ killed（被杀/异常）
@@ -365,6 +366,8 @@ class Job:
     output_file: str = ""
     created_at: float = 0.0
     finished_at: float = 0.0
+    #: 是否因超时被 daemon 杀掉（区别于进程自己退出）；#68
+    timed_out: bool = False
 
     @property
     def is_terminal(self) -> bool:

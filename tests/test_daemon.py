@@ -1922,6 +1922,22 @@ class _FakeProc:
         return self._rc
 
 
+class _HangingProc:
+    """假子进程：wait() 一直阻塞直到被 kill()——供超时路径单测。"""
+
+    def __init__(self) -> None:
+        self.pid = 999
+        self.killed = False
+
+    async def wait(self) -> int:
+        if self.killed:
+            return -9
+        await asyncio.Event().wait()  # 永久阻塞，等 wait_for 超时取消
+
+    def kill(self) -> None:
+        self.killed = True
+
+
 async def test_ctl_bg_run_rejects_bad_command():
     daemon, _, _ = make_daemon()
     status, payload = await daemon._ctl_bg_run("t1", {"command": []})
@@ -2015,11 +2031,80 @@ async def test_watch_bg_job_updates_status_and_delivers(tmp_path: Path):
     out.write_bytes(b"training done\nfinal loss 0.1\n")
     job = daemon.job_store.create(task_id="t1", command=["python", "train.py"], cwd="c")
     daemon.job_store.update(job.job_id, output_file=str(out))
-    await daemon._watch_bg_job(job.job_id, _FakeProc(0), open(out, "rb"))
+    await daemon._watch_bg_job(job.job_id, _FakeProc(0), open(out, "rb"), 0)
     updated = daemon.job_store.get(job.job_id)
     assert updated.status == "exited" and updated.exit_code == 0
     assert updated.finished_at > 0
+    assert updated.timed_out is False
     await wait_until(lambda: any("final loss 0.1" in p for p in created[0].prompts))
+    await daemon._shutdown()
+
+
+async def test_watch_bg_job_timeout_kills_marks_and_still_resumes(tmp_path: Path):
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    out = tmp_path / "j1.log"
+    out.write_bytes(b"stuck loading profile...\n")
+    job = daemon.job_store.create(task_id="t1", command=["hang"], cwd="c")
+    daemon.job_store.update(job.job_id, output_file=str(out))
+    proc = _HangingProc()
+    await daemon._watch_bg_job(job.job_id, proc, open(out, "rb"), 0.2)
+    assert proc.killed  # 超时后被杀
+    updated = daemon.job_store.get(job.job_id)
+    assert updated.timed_out is True and updated.status == "killed"
+    # 仍唤回 agent（prompt 标 Timed Out: yes），话题可见消息标「超时被杀」
+    await wait_until(
+        lambda: any(
+            "<bg_job_done>" in p and "Timed Out: yes" in p for p in created[0].prompts
+        )
+    )
+    assert any("超时被杀" in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+async def test_launch_bg_job_uses_devnull_stdin(monkeypatch, tmp_path: Path):
+    # 回归 #68 真机坑：不给 DEVNULL 的话，子进程继承 daemon 控制台 stdin，
+    # 交互式 shell profile（opam env）会卡死。断言 spawn 一定用 DEVNULL。
+    daemon, bridge, created = make_daemon()
+    daemon._bg_logs_dir = tmp_path / "bg"
+    captured: dict = {}
+
+    class _DummyProc:
+        pid = 1
+
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_exec(*args, **kwargs):
+        captured["kwargs"] = kwargs
+        return _DummyProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    await daemon._launch_bg_job("t1", ["python", "x.py"], str(tmp_path))
+    assert captured["kwargs"]["stdin"] is asyncio.subprocess.DEVNULL
+    await asyncio.sleep(0.05)  # 让 watcher 收尾
+    await daemon._shutdown()
+
+
+async def test_launch_bg_job_keeps_watcher_reference(tmp_path: Path):
+    # 回归 #68：asyncio 只对 task 持弱引用，必须自存强引用否则 watcher 会被 GC
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    daemon._bg_logs_dir = tmp_path / "bg"
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    job = await daemon._launch_bg_job(
+        "t1", [sys.executable, "-c", "import time; time.sleep(0.3)"], str(tmp_path)
+    )
+    name = f"bgjob-{job.job_id}"
+    assert any(t.get_name() == name for t in daemon._bg_watchers)  # 未完成时被强引用
+    await wait_until(
+        lambda: daemon.job_store.get(job.job_id).status == "exited", timeout=10
+    )
+    # 完成后从集合移除（done_callback）
+    await wait_until(lambda: not any(t.get_name() == name for t in daemon._bg_watchers))
     await daemon._shutdown()
 
 

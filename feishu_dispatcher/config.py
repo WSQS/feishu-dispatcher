@@ -63,6 +63,9 @@ class Config:
     #: 空闲多少秒后自动挂起 agent（关进程腾名额，记录保留、回复即恢复）；
     #: <=0 = 不自动挂起。默认 30 分钟，只回收真正被搁置的 agent。
     idle_timeout: float = 1800.0
+    #: 后台任务（fdx bg run）默认超时秒数；<=0 = 不超时（默认，长训练/build 不该被砍）。
+    #: 兜底防卡死进程堆积；agent 也可用 `fdx bg run --timeout N` 单次覆盖。#68
+    bg_job_timeout: float = 0.0
     #: 流式输出模式：card=原地更新卡片（默认），text=每批发新消息（兜底）
     stream_mode: str = "card"
     #: 调度器 LLM（P2）；None = 不启用（自然语言消息回退到「用法」提示）
@@ -130,6 +133,7 @@ class Config:
             max_agents=int(data.get("max_agents", 7)),
             feishu_qps=float(data.get("feishu_qps", 5.0)),
             idle_timeout=float(data.get("idle_timeout", 1800.0)),
+            bg_job_timeout=float(data.get("bg_job_timeout", 0.0)),
             stream_mode=stream_mode,
             llm=llm,
         )

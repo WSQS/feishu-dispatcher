@@ -45,10 +45,13 @@ def _cmd_bg_run(args: argparse.Namespace) -> int:
     if command and command[0] == "--":
         command = command[1:]  # argparse 有时把分隔符 -- 一起塞进 REMAINDER
     if not command:
-        print("用法：fdx bg run -- <命令> [参数...]", file=sys.stderr)
+        print("用法：fdx bg run [--timeout 秒] -- <命令> [参数...]", file=sys.stderr)
         return 2
+    payload: dict = {"command": command}
+    if args.timeout and args.timeout > 0:
+        payload["timeout"] = args.timeout
     try:
-        resp = _post("/v1/bg/run", {"command": command})
+        resp = _post("/v1/bg/run", payload)
     except Exception as exc:  # noqa: BLE001
         print(f"提交后台任务失败：{exc}", file=sys.stderr)
         return 1
@@ -74,6 +77,12 @@ def _build_parser() -> argparse.ArgumentParser:
     run = bg_cmds.add_parser(
         "run",
         help="起一个后台任务（dispatcher 托管进程，完成时自动唤回你）",
+    )
+    run.add_argument(
+        "--timeout",
+        type=float,
+        default=0.0,
+        help="超时秒数（>0 时超时杀掉并汇报）；默认用 daemon 配置（通常不超时）",
     )
     run.add_argument(
         "command",

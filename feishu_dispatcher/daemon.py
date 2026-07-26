@@ -264,6 +264,8 @@ class _Daemon:
     _control: "ControlServer | None" = None
     #: 后台任务身份表：token → task_id（启 agent 时登记，关 session 时清）。#68
     _bg_tokens: dict[str, str] = field(default_factory=dict)
+    #: 后台任务 watcher 的强引用（asyncio 只持弱引用，不存会被 GC）。#68
+    _bg_watchers: set = field(default_factory=set)
     #: 后台任务输出日志目录；run() 注入（默认 config 同目录 bg-logs/）
     _bg_logs_dir: "Path | None" = None
     #: /reboot 收到后置位；run() 返回它，cli.py re-exec 重启进程
@@ -1551,20 +1553,35 @@ class _Daemon:
         if task is None:
             return 404, {"error": f"未知任务 {task_id}"}
         cwd = str(body.get("cwd") or task.workspace or ".")
+        # 超时：请求显式指定优先（fdx --timeout），否则用 config 默认（<=0 = 不超时）
         try:
-            job = await self._launch_bg_job(task_id, list(command), cwd)
+            req_timeout = float(body.get("timeout") or 0)
+        except (TypeError, ValueError):
+            req_timeout = 0.0
+        timeout = req_timeout if req_timeout > 0 else self.cfg.bg_job_timeout
+        try:
+            job = await self._launch_bg_job(
+                task_id, list(command), cwd, timeout=timeout
+            )
         except Exception as exc:  # noqa: BLE001
             logger.exception("启动后台任务失败 task=%s", task_id)
             return 500, {"error": f"{type(exc).__name__}: {exc}"}
         return 200, {"job_id": job.job_id, "status": job.status}
 
-    async def _launch_bg_job(self, task_id: str, command: list[str], cwd: str) -> Job:
+    async def _launch_bg_job(
+        self, task_id: str, command: list[str], cwd: str, *, timeout: float = 0.0
+    ) -> Job:
         """spawn 一个 daemon 拥有的后台进程（argv exec，不经 shell），输出重定向到文件，
         登记 Job 并起 watcher。返回 Job（进程仍在跑）。
 
         进程是 **daemon 的子进程**（非 agent 的），故 agent 挂起/恢复不影响它。用户自己的
         build/训练命令——继承 daemon(=用户) 的完整环境（PATH/CUDA/conda 等），与用户在终端
         直接跑一致。shell 特性（管道/&&）需 agent 显式 `bash -c "..."`。
+
+        ``stdin=DEVNULL``：给子进程一个立即 EOF 的 stdin——否则它会继承 daemon 的（控制台）
+        stdin，交互式 shell profile 里读 stdin 的步骤（实测 `opam env`）会阻塞、卡死整个
+        进程（#68 真机踩坑：一条 `Start-Sleep 4` 卡了 26 分钟在 opam env）。
+        ``timeout>0`` 时超时杀进程当兜底（长训练默认不超时）。
         """
         logs_dir = self._bg_logs_dir or (DEFAULT_CONFIG_PATH.parent / "bg-logs")
         logs_dir.mkdir(parents=True, exist_ok=True)
@@ -1577,6 +1594,7 @@ class _Daemon:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=cwd,
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=out_file,
                 stderr=asyncio.subprocess.STDOUT,
                 env=os.environ.copy(),
@@ -1586,33 +1604,65 @@ class _Daemon:
             self.job_store.update(job.job_id, status="killed", exit_code=None)
             raise
         logger.info(
-            "后台任务 %s 启动: task=%s pid=%s cmd=%.80s",
+            "后台任务 %s 启动: task=%s pid=%s timeout=%s cmd=%.80s",
             job.job_id,
             task_id,
             proc.pid,
+            timeout or "无",
             " ".join(command),
         )
-        asyncio.create_task(
-            self._watch_bg_job(job.job_id, proc, out_file), name=f"bgjob-{job.job_id}"
+        # 存强引用：asyncio 只对 task 持弱引用，不存会被 GC 掉、watcher 中途消失（#68）
+        watcher = asyncio.create_task(
+            self._watch_bg_job(job.job_id, proc, out_file, timeout),
+            name=f"bgjob-{job.job_id}",
         )
+        self._bg_watchers.add(watcher)
+        watcher.add_done_callback(self._bg_watchers.discard)
         return job
 
-    async def _watch_bg_job(self, job_id: str, proc, out_file) -> None:
-        """等后台进程退出 → 落 Job 状态 → 把「完成 + 输出尾部」入队回它的 task。"""
+    async def _watch_bg_job(self, job_id: str, proc, out_file, timeout: float) -> None:
+        """等后台进程退出 → 落 Job 状态 → 把「完成 + 输出尾部」入队回它的 task。
+
+        ``timeout>0`` 时超时就 kill 进程、标 timed_out，但**照样唤回 agent**（带超时说明）——
+        兜底防卡死进程无声堆积。
+        """
+        timed_out = False
         try:
-            rc = await proc.wait()
+            if timeout and timeout > 0:
+                try:
+                    rc = await asyncio.wait_for(proc.wait(), timeout)
+                except asyncio.TimeoutError:
+                    timed_out = True
+                    logger.warning("后台任务 %s 超时（%.0fs），杀掉", job_id, timeout)
+                    try:
+                        proc.kill()
+                    except Exception:
+                        logger.debug("kill 超时进程失败 %s", job_id, exc_info=True)
+                    rc = await proc.wait()
+            else:
+                rc = await proc.wait()
         finally:
             try:
                 out_file.close()
             except Exception:
                 pass
         self.job_store.update(
-            job_id, status="exited", exit_code=rc, finished_at=time.time()
+            job_id,
+            status="killed" if timed_out else "exited",
+            exit_code=rc,
+            finished_at=time.time(),
+            timed_out=timed_out,
         )
         job = self.job_store.get(job_id)
         if job is None:
             return
-        logger.info("后台任务 %s 退出: exit=%s task=%s", job_id, rc, job.task_id)
+        logger.info(
+            "后台任务 %s %s: exit=%s task=%s",
+            job_id,
+            "超时被杀" if timed_out else "退出",
+            rc,
+            job.task_id,
+        )
         await self._deliver_bg_result(job, rc, self._build_bg_prompt(job, rc))
 
     def _build_bg_prompt(self, job: Job, rc: int) -> str:
@@ -1628,12 +1678,13 @@ class _Daemon:
                 f"Command: {' '.join(job.command)}",
                 f"Exit Code: {rc}",
                 f"Duration: {dur}",
+                f"Timed Out: {'yes（已超时被杀）' if job.timed_out else 'no'}",
                 "Output (tail):",
                 tail,
                 "</bg_job_done>",
                 "",
                 "你之前用 `fdx bg run` 起的后台任务已完成。请根据退出码与输出继续："
-                "成功就推进下一步，失败就用输出诊断并修复。",
+                "成功就推进下一步，失败/超时就用输出诊断并修复。",
             ]
         )
 
@@ -1643,11 +1694,12 @@ class _Daemon:
         与注入给 agent 的 `<bg_job_done>` prompt 分开——prompt 是给 agent 读的、不回显到
         话题；这条是发给用户看的，补上「结果没进对话」的显示缺口（#68）。
         """
-        mark = "✅" if rc == 0 else "❌"
+        mark = "⏱️" if job.timed_out else ("✅" if rc == 0 else "❌")
         dur = (
             _fmt_duration(job.finished_at - job.created_at) if job.finished_at else "?"
         )
-        head = f"{mark} 后台任务 {job.job_id} 完成（exit {rc} · 用时 {dur}）"
+        state = "超时被杀" if job.timed_out else "完成"
+        head = f"{mark} 后台任务 {job.job_id} {state}（exit {rc} · 用时 {dur}）"
         tail = _clip(_read_tail(job.output_file), 600)
         return f"{head}\n输出（尾部）:\n{tail}" if tail else head
 
