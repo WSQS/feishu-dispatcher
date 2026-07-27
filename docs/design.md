@@ -164,13 +164,15 @@ agent 输出实时回到飞书话题 →
 - **Action 动作**：某回合里 agent 调的工具（编辑/命令），来自 ACP `tool_call`。Turn 1:N Action。
 - **Workspace 工作区**：Task 的工作目录。默认=项目目录；同项目并发（P1）=git worktree+临时分支。Task 1:1 Workspace。
 - **Agent（后端类型+能力）**：copilot/opencode 等，带能力元数据（load_session/session_close/cancel 支持度）；Task 引用它，决定可做哪些操作。
+- **Job 后台任务**（daemon 拥有，#68）：agent 经 `fdx bg run` 请 daemon 托管的一个长后台进程（训练/build）。id=`job_id`（`j<N>` 短自增、永不复用）；属性 task_id、command、status（running/exited/killed）、exit_code、timed_out、output_file；落盘 `jobs.json`。**进程是 daemon 的子进程（非 agent 的）**，故 agent 挂起/恢复不影响它；完成时 daemon 把结果 enqueue 回 Task（当作一轮正常 Turn）。Task 1:N Job。
 
 ```
 Project ─1:N─► Task（一等公民）
                  ├─1:1─ Session   (agent 记忆, opencode.db)
                  ├─1:1─ Thread    (飞书话题)
                  ├─1:1─ Workspace (项目目录 / P1 worktree)
-                 └─1:N─ Turn ─1:N─ Action   (审计)
+                 ├─1:N─ Turn ─1:N─ Action   (审计)
+                 └─1:N─ Job       (daemon 托管的后台进程, jobs.json)
 Agent(后端类型+能力) ◄── Task 引用
 ```
 
@@ -439,6 +441,17 @@ capabilities 比 copilot/opencode 更全（原生 load_session/fork/resume/close
   一次」。兜住漏网、至少不骗人。keyword 命中宁宽勿漏（误报只是多一句提醒，漏报=退回原 bug）。
 - **注意**：「工具卡片显示」落地后，幻觉在卡片上已当场可见，B 的价值下降但仍值得（把假话拦在回复里）。
 - （C = 换更强 tool-calling 的模型/端点，是用户配置层面的事，最治本但不在代码内。）
+
+### 后台任务：长任务异步 + 完成自动接续（✅ P1+查看管理已实现 2026-07-26，#67/#68/#70）
+
+**需求（#67）**：agent 发起长任务（训练/build/测试）后**当轮立刻释放**、不阻塞不轮询，任务跑完时 daemon **自动把 agent 唤回同一 Task 继续**。真实痛点：agent 用 opencode-pty 跑训练、自己「等退出通知」后卡住，用户被迫手动戳（= 人替 agent 轮询）。
+
+**方向决策：CLI 控制面 + daemon 拥有进程（否掉 opencode-pty 带外回合）**。评估过三条（详见 #67）：
+- **D1 收编 opencode-pty 的 `notifyOnExit` 带外回合**——探针证实带外回合会经 ACP `session/update` 冒出来，但它有两个硬伤：ACP 流里**没有回合结束标记**（普通回合靠 `prompt()` 响应的 `stop_reason`，带外回合无对应请求 → 只能靠静默 debounce 判收尾），且进程是 opencode 子进程 → **空闲挂起会杀掉它**（实测长任务活不过 idle_timeout）。且仅 opencode。
+- **选定方案**：把进程从「agent 子进程」挪成「**daemon 子进程**」——agent 只经一个 CLI（`fdx`）请 daemon 代跑，daemon `await` 子进程、完成时**enqueue 一条正常 prompt** 唤回。由此那两个硬伤都被架构消解（白拿 stop_reason、复用现有 worker/卡片/记账；挂起不影响 job，甚至可等待时挂起省名额——P3）。后端无关（任意能跑 shell 的 agent）。
+- **身份**：daemon 启 agent 时经 `AgentSpawn.env` 注入一次性 token（+控制面 URL），env 逐层透传到 agent 的 shell 命令（实测），`fdx` 从环境读、token→task_id 反查——agent 不碰自己的 id、无从冒充。
+
+**实测踩坑**：① 子进程必须 `stdin=DEVNULL`，否则继承 daemon 控制台 stdin，交互式 shell profile（`opam env`）卡死（一条 4s 命令卡 26 分钟）；② argv exec 不经 shell，命令首词须真实可执行、shell 特性要显式 `bash -c`/`pwsh -Command` 包裹；③ watcher task 须存强引用防 GC；④ 超时兜底（config `bg_job_timeout` 默认 0 不超时 + `--timeout`）。实现细节与组件见 CLAUDE.md「后台任务」。**未做**：daemon 重启穿越、brief 注入（让 agent 主动用 fdx）——#68 P2/P3。
 
 ### 已考虑方向 / 决策记录
 
