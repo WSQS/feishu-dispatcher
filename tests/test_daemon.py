@@ -2143,3 +2143,91 @@ async def test_launch_bg_job_real_subprocess_roundtrip(tmp_path: Path):
         lambda: any("HELLO_BG_MARKER" in p for p in created[0].prompts), timeout=15
     )
     await daemon._shutdown()
+
+
+# ---- bg list / logs / kill（#70）---- #
+
+
+class _KillableProc:
+    def __init__(self) -> None:
+        self.killed = False
+        self.pid = 7
+
+    def kill(self) -> None:
+        self.killed = True
+
+
+async def test_ctl_bg_list_scoped_to_task():
+    daemon, _, _ = make_daemon()
+    daemon.job_store.create(task_id="t1", command=["a"], cwd="c")
+    daemon.job_store.create(task_id="t2", command=["b"], cwd="c")
+    daemon.job_store.create(task_id="t1", command=["c"], cwd="c")
+    status, payload = await daemon._ctl_bg_list("t1", {})
+    assert status == 200
+    ids = {j["job_id"] for j in payload["jobs"]}
+    assert ids == {"j1", "j3"}  # 只本 task 的，t2 的 j2 不出现
+    assert all("command" in j and "status" in j for j in payload["jobs"])
+
+
+async def test_ctl_bg_logs_returns_tail_and_status(tmp_path: Path):
+    daemon, _, _ = make_daemon()
+    out = tmp_path / "j1.log"
+    out.write_bytes(b"l1\nl2\nl3\nl4\n")
+    job = daemon.job_store.create(task_id="t1", command=["python", "x"], cwd="c")
+    daemon.job_store.update(
+        job.job_id, output_file=str(out), status="exited", exit_code=0
+    )
+    status, payload = await daemon._ctl_bg_logs("t1", {"id": job.job_id, "tail": 2})
+    assert status == 200
+    assert payload["output"] == "l3\nl4"  # 末 2 行
+    assert payload["exit_code"] == 0
+    assert payload["command"] == "python x"
+
+
+async def test_ctl_bg_logs_rejects_cross_task_and_unknown():
+    daemon, _, _ = make_daemon()
+    job = daemon.job_store.create(task_id="t2", command=["x"], cwd="c")
+    status, _ = await daemon._ctl_bg_logs("t1", {"id": job.job_id, "tail": 10})
+    assert status == 404  # 别的 task 的 job 看不到
+    status2, _ = await daemon._ctl_bg_logs("t1", {"id": "j999", "tail": 10})
+    assert status2 == 404  # 不存在
+
+
+async def test_ctl_bg_kill_running_cross_task_and_not_running():
+    daemon, _, _ = make_daemon()
+    # 在跑的：kill 成功
+    job = daemon.job_store.create(task_id="t1", command=["x"], cwd="c")
+    proc = _KillableProc()
+    daemon._bg_procs[job.job_id] = proc
+    status, payload = await daemon._ctl_bg_kill("t1", {"id": job.job_id})
+    assert status == 200 and payload["killed"] is True and proc.killed
+    # 跨 task：拒绝
+    job2 = daemon.job_store.create(task_id="t2", command=["y"], cwd="c")
+    daemon._bg_procs[job2.job_id] = _KillableProc()
+    s2, _ = await daemon._ctl_bg_kill("t1", {"id": job2.job_id})
+    assert s2 == 404
+    # 不在跑（无 proc）：killed False
+    job3 = daemon.job_store.create(task_id="t1", command=["z"], cwd="c")
+    daemon.job_store.update(job3.job_id, status="exited")
+    s3, p3 = await daemon._ctl_bg_kill("t1", {"id": job3.job_id})
+    assert s3 == 200 and p3["killed"] is False
+
+
+async def test_launch_then_kill_real_subprocess(tmp_path: Path):
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    daemon._bg_logs_dir = tmp_path / "bg-logs"
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    job = await daemon._launch_bg_job(
+        "t1", [sys.executable, "-c", "import time; time.sleep(30)"], str(tmp_path)
+    )
+    await wait_until(lambda: job.job_id in daemon._bg_procs)
+    status, payload = await daemon._ctl_bg_kill("t1", {"id": job.job_id})
+    assert status == 200 and payload["killed"] is True
+    # 被杀后很快结束（不等满 30s），且从「在跑」表清掉
+    await wait_until(
+        lambda: daemon.job_store.get(job.job_id).status == "exited", timeout=10
+    )
+    await wait_until(lambda: job.job_id not in daemon._bg_procs)
+    await daemon._shutdown()
