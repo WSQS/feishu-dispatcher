@@ -142,3 +142,48 @@ async def test_fdx_cli_bg_run_end_to_end():
         assert seen == [("t3", ["python", "-c", "print(1)"])]
     finally:
         cs.stop()
+
+
+async def test_fdx_cli_bg_logs_end_to_end():
+    """真跑 `fdx bg logs j3 --tail 5` 子进程 → HTTP → 校验参数解析与输出打印。"""
+    seen: list = []
+
+    async def bg_logs(task_id: str, body: dict):
+        seen.append((task_id, body))
+        return 200, {
+            "job_id": "j3",
+            "status": "running",
+            "exit_code": None,
+            "command": "python train.py",
+            "output": "epoch 1\nepoch 2",
+        }
+
+    cs = await _make_server({("POST", "/v1/bg/logs"): bg_logs}, {"tok-xyz": "t3"})
+    env = {
+        **os.environ,
+        "FEISHU_DISPATCHER_URL": cs.base_url,
+        "FEISHU_DISPATCHER_TOKEN": "tok-xyz",
+    }
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            [
+                sys.executable,
+                "-m",
+                "feishu_dispatcher.agent_cli",
+                "bg",
+                "logs",
+                "j3",
+                "--tail",
+                "5",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "epoch 2" in proc.stdout  # 输出被打印
+        assert seen == [("t3", {"id": "j3", "tail": 5})]  # 参数正确解析并送达
+    finally:
+        cs.stop()

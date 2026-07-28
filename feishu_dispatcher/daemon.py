@@ -153,6 +153,19 @@ def _read_tail(path: str, nbytes: int = 2000) -> str:
     return ""
 
 
+def _read_tail_lines(path: str, lines: int, *, max_bytes: int = 200_000) -> str:
+    """读文件末尾 ``lines`` 行（供 bg logs 按需查看）。先只读末尾 ``max_bytes`` 防大文件
+    全量载入；读不到返回空串。"""
+    try:
+        if path and Path(path).exists():
+            raw = Path(path).read_bytes()[-max_bytes:]
+            text = raw.decode("utf-8", errors="replace")
+            return "\n".join(text.splitlines()[-lines:])
+    except Exception:
+        logger.debug("读后台任务输出行失败 %s", path, exc_info=True)
+    return ""
+
+
 def _issue_tag(issue_url: str) -> str:
     """从 issue URL 提末段编号拼成 `#N`（GitHub `/issues/3`、GitLab `/-/issues/3`）。
 
@@ -266,6 +279,8 @@ class _Daemon:
     _bg_tokens: dict[str, str] = field(default_factory=dict)
     #: 后台任务 watcher 的强引用（asyncio 只持弱引用，不存会被 GC）。#68
     _bg_watchers: set = field(default_factory=set)
+    #: 在跑的后台进程：job_id → proc（launch 登记、watcher 退出清），供 bg kill。#70
+    _bg_procs: dict = field(default_factory=dict)
     #: 后台任务输出日志目录；run() 注入（默认 config 同目录 bg-logs/）
     _bg_logs_dir: "Path | None" = None
     #: /reboot 收到后置位；run() 返回它，cli.py re-exec 重启进程
@@ -291,7 +306,12 @@ class _Daemon:
         self._control = ControlServer(
             loop,
             resolve_token=self._bg_tokens.get,
-            routes={("POST", "/v1/bg/run"): self._ctl_bg_run},
+            routes={
+                ("POST", "/v1/bg/run"): self._ctl_bg_run,
+                ("POST", "/v1/bg/list"): self._ctl_bg_list,
+                ("POST", "/v1/bg/logs"): self._ctl_bg_logs,
+                ("POST", "/v1/bg/kill"): self._ctl_bg_kill,
+            },
         )
         self._control.start()
         self._bridge.start_background()
@@ -1568,6 +1588,68 @@ class _Daemon:
             return 500, {"error": f"{type(exc).__name__}: {exc}"}
         return 200, {"job_id": job.job_id, "status": job.status}
 
+    def _job_summary(self, job: Job) -> dict:
+        """给 CLI 的 job 摘要（不含大输出）。"""
+        return {
+            "job_id": job.job_id,
+            "status": job.status,
+            "exit_code": job.exit_code,
+            "timed_out": job.timed_out,
+            "command": " ".join(job.command),
+            "created_at": job.created_at,
+            "finished_at": job.finished_at,
+        }
+
+    def _own_job(self, task_id: str, job_id: str) -> "Job | None":
+        """取属于该 task 的 job；不存在或不属于该 task 返回 None（隔离：只能看/管自己的）。"""
+        job = self.job_store.get(job_id)
+        return job if job is not None and job.task_id == task_id else None
+
+    async def _ctl_bg_list(self, task_id: str, body: dict) -> tuple[int, dict]:
+        """``POST /v1/bg/list``：列出本 task 起的后台 job（新→旧）。"""
+        jobs = sorted(
+            self.job_store.by_task(task_id), key=lambda j: j.created_at, reverse=True
+        )
+        return 200, {"jobs": [self._job_summary(j) for j in jobs]}
+
+    async def _ctl_bg_logs(self, task_id: str, body: dict) -> tuple[int, dict]:
+        """``POST /v1/bg/logs``：读某 job 的输出尾部（末 ``tail`` 行）+ 当前状态。"""
+        job_id = str(body.get("id") or "")
+        job = self._own_job(task_id, job_id)
+        if job is None:
+            return 404, {"error": f"未找到属于本任务的后台 job {job_id!r}"}
+        try:
+            tail = int(body.get("tail") or 50)
+        except (TypeError, ValueError):
+            tail = 50
+        tail = max(1, min(tail, 1000))  # 限幅，防超大响应
+        return 200, {
+            **self._job_summary(job),
+            "output": _read_tail_lines(job.output_file, tail),
+        }
+
+    async def _ctl_bg_kill(self, task_id: str, body: dict) -> tuple[int, dict]:
+        """``POST /v1/bg/kill``：终止一个在跑的后台 job（watcher 随后照常收尾）。"""
+        job_id = str(body.get("id") or "")
+        job = self._own_job(task_id, job_id)
+        if job is None:
+            return 404, {"error": f"未找到属于本任务的后台 job {job_id!r}"}
+        proc = self._bg_procs.get(job_id)
+        if proc is None:
+            return 200, {
+                "job_id": job_id,
+                "status": job.status,
+                "killed": False,
+                "note": "该 job 已不在运行",
+            }
+        try:
+            proc.kill()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("kill 后台任务失败 %s", job_id)
+            return 500, {"error": f"{type(exc).__name__}: {exc}"}
+        logger.info("后台任务 %s 被 bg kill 终止 task=%s", job_id, task_id)
+        return 200, {"job_id": job_id, "killed": True}
+
     async def _launch_bg_job(
         self, task_id: str, command: list[str], cwd: str, *, timeout: float = 0.0
     ) -> Job:
@@ -1611,6 +1693,7 @@ class _Daemon:
             timeout or "无",
             " ".join(command),
         )
+        self._bg_procs[job.job_id] = proc  # 供 bg kill（#70）
         # 存强引用：asyncio 只对 task 持弱引用，不存会被 GC 掉、watcher 中途消失（#68）
         watcher = asyncio.create_task(
             self._watch_bg_job(job.job_id, proc, out_file, timeout),
@@ -1642,6 +1725,7 @@ class _Daemon:
             else:
                 rc = await proc.wait()
         finally:
+            self._bg_procs.pop(job_id, None)  # 退出即出「在跑」表（#70）
             try:
                 out_file.close()
             except Exception:

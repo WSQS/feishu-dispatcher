@@ -14,7 +14,23 @@ import argparse
 import json
 import os
 import sys
+import time
 import urllib.request
+
+
+def _fmt_ts(ts: float) -> str:
+    """epoch 秒 → 本地 `MM-DD HH:MM`；0/无 → `-`。"""
+    return time.strftime("%m-%d %H:%M", time.localtime(ts)) if ts else "-"
+
+
+def _status_str(job: dict) -> str:
+    """job 状态串：running / exited(0) / killed / timed_out。"""
+    st = job.get("status") or "?"
+    if job.get("timed_out"):
+        return "timed_out"
+    if st == "exited":
+        return f"exited({job.get('exit_code')})"
+    return st
 
 
 def _post(path: str, payload: dict) -> dict:
@@ -66,6 +82,55 @@ def _cmd_bg_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_bg_list(args: argparse.Namespace) -> int:
+    try:
+        resp = _post("/v1/bg/list", {})
+    except Exception as exc:  # noqa: BLE001
+        print(f"列出后台任务失败：{exc}", file=sys.stderr)
+        return 1
+    jobs = resp.get("jobs") or []
+    if not jobs:
+        print("（本任务暂无后台任务）")
+        return 0
+    for j in jobs:
+        print(
+            f"{j.get('job_id'):<5} {_status_str(j):<12} "
+            f"起于 {_fmt_ts(j.get('created_at', 0))}  {j.get('command', '')}"
+        )
+    return 0
+
+
+def _cmd_bg_logs(args: argparse.Namespace) -> int:
+    try:
+        resp = _post("/v1/bg/logs", {"id": args.id, "tail": args.tail})
+    except Exception as exc:  # noqa: BLE001
+        print(f"读取后台任务输出失败：{exc}", file=sys.stderr)
+        return 1
+    if resp.get("error"):
+        print(resp["error"], file=sys.stderr)
+        return 1
+    print(f"[{resp.get('job_id')}] {_status_str(resp)}  {resp.get('command', '')}")
+    print(f"--- 输出（末 {args.tail} 行）---")
+    print(resp.get("output") or "（暂无输出）")
+    return 0
+
+
+def _cmd_bg_kill(args: argparse.Namespace) -> int:
+    try:
+        resp = _post("/v1/bg/kill", {"id": args.id})
+    except Exception as exc:  # noqa: BLE001
+        print(f"终止后台任务失败：{exc}", file=sys.stderr)
+        return 1
+    if resp.get("error"):
+        print(resp["error"], file=sys.stderr)
+        return 1
+    if resp.get("killed"):
+        print(f"已请求终止 {resp.get('job_id')}。")
+    else:
+        print(f"{resp.get('job_id')}：{resp.get('note') or '未在运行'}。")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fdx", description="feishu-dispatcher agent 侧 CLI"
@@ -90,6 +155,18 @@ def _build_parser() -> argparse.ArgumentParser:
         help="`--` 之后是要在后台跑的命令，如 `-- python train.py`",
     )
     run.set_defaults(func=_cmd_bg_run)
+
+    ls = bg_cmds.add_parser("list", help="列出本任务起的后台任务")
+    ls.set_defaults(func=_cmd_bg_list)
+
+    logs = bg_cmds.add_parser("logs", help="查看某后台任务的输出尾部（中途查进度）")
+    logs.add_argument("id", help="job id，如 j3（用 `fdx bg list` 查）")
+    logs.add_argument("--tail", type=int, default=50, help="末尾行数（默认 50）")
+    logs.set_defaults(func=_cmd_bg_logs)
+
+    kill = bg_cmds.add_parser("kill", help="终止一个在跑的后台任务")
+    kill.add_argument("id", help="job id，如 j3")
+    kill.set_defaults(func=_cmd_bg_kill)
     return parser
 
 

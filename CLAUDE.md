@@ -33,19 +33,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - **命令（root/话题）**：root = `/run`、`/agents`、`/task <id>`（详情+动作日志）、`/project [add|remove]`（项目注册）、`/clear`（清终止历史）、`/help`（控制台用法 `_USAGE`）、`/reboot`（重启整个 daemon：`_stop_event` 跳出主循环→`_shutdown`（agents 关闭、活跃任务标 suspended）→`run()` 返回 True→`cli._reexec` 用同 venv python `os.execv` `-m feishu_dispatcher.cli <原参数>` re-exec；新进程读 `FEISHU_DISPATCHER_REBOOTED` env 发「已重启」回执）；话题内 = 回复追加、`/cancel [新指令]`（停当前轮但**保留** agent；带新指令则停完接着做它，见「agent 生命周期」的 per-turn 取消）、`/stop`（停当前轮**并结束** agent，标 stopped）、`/done`（标 done 归档）、`/model [名]`（查看/切换模型）、`/help`（话题内用法 `_THREAD_USAGE`；早于 session 检查、不入队，挂起话题也能查）。`/done` 与 `mark_done` 共用 `_finish_task`：有活跃 worker 走 None 哨兵优雅收尾（`_AgentSession.terminate_status` 决定落 stopped/done），无活跃则直接改台账。恢复逻辑收敛到 `_try_resume`（check→`_launch` 无 await 防 TOCTOU），`_launch(first_prompt=None)` = 仅拉起在线。
   - **回复分层（勿回退）**：对用户对话/命令用 `_reply_user`（`bridge.reply`，`reply_in_thread=false`，**不建话题**）；只有 agent 输出/状态进它自己的话题才用 `reply_in_thread=true`。
 - **并发隔离**（P1）：仅并发时创建 git worktree + 临时分支（`agent/<project>-<task-id>`）。
+- **后台任务（bg jobs，#67/#68/#70，✅ P1+查看管理已实现，opt-in-by-agent）**：需求 = agent 发起长任务（训练/build/测试）后**当轮立刻释放**（不阻塞、不轮询），任务跑完时 daemon **自动把 agent 唤回同一 task 继续**。核心决策：把长进程从「agent 的子进程」挪成「**daemon 的子进程**」——由此 agent 挂起/恢复不影响它，且完成时走「daemon enqueue 一条正常 prompt」而非带外回合（白拿 `stop_reason`、复用现有 worker/卡片/记账，绕开「无收尾标记」与「挂起杀进程」两难点；否掉了 opencode-pty 带外回合方案，理由见 #67）。
+  - **组件**：`agent_cli.py` = agent 侧 CLI `fdx`（子命令**分组**、`bg` 是第一组，纯标准库、启动快）；`control.py` = daemon 本地控制面（`127.0.0.1` `ThreadingHTTPServer` 后台线程 + `run_coroutine_threadsafe` 回主 loop，Bearer token 鉴权，**通用路由表** `(METHOD,path)->async handler`，加方向只需塞一条）；`store.py` 的 `Job`+`JobStore`（落盘 `jobs.json`，`j<N>` 单调、永不复用）；daemon 的 `_launch_bg_job`/`_watch_bg_job`/`_deliver_bg_result` + `_bg_tokens`（token→task_id）/`_bg_watchers`（watcher 强引用）/`_bg_procs`（job_id→活进程，供 kill）。
+  - **身份传递（命门，实测成立）**：daemon 启 agent 时经 `AgentSpawn.env` 注入 `FEISHU_DISPATCHER_URL` + 一次性 `FEISHU_DISPATCHER_TOKEN`（服务端存 `token→task_id`）；这些 env **逐层透传到 agent 跑的 shell 命令**（`scripts/smoke_env_propagation.py` 验，opencode/claude 均通过）→ `fdx` 从 `os.environ` 读，**agent 无需也拿不到自己的 task_id，token 即身份**（无从冒充别 task）。
+  - **命令（agent 侧 `fdx bg`）**：`run [--timeout N] -- <argv>`（起）、`list`（列本 task 的 job）、`logs <id> [--tail N]`（中途查输出尾部+状态）、`kill <id>`（终止在跑的）。控制面 endpoint：`POST /v1/bg/{run,list,logs,kill}`。**隔离**：logs/kill 校验 `job.task_id == 请求方`，只能看/停自己的 job。
+  - **关键坑（真机踩过）**：① **`stdin=DEVNULL` 必须**——否则子进程继承 daemon 控制台 stdin，交互式 shell profile（实测 `opam env`）会卡死（一条 `Start-Sleep 4` 卡了 26 分钟）；② **argv exec、不经 shell**——命令首词须是真实可执行文件，管道/`&&`/重定向/内置命令要 agent 显式 `bash -c "…"`/`pwsh -Command "…"` 包裹，否则 `FileNotFoundError`（#68 backlog：把该错误变可操作提示）；③ watcher task 必须存强引用（asyncio 只持弱引用，否则中途被 GC）；④ 超时兜底 `bg_job_timeout`（config，默认 0=不超时，长训练不砍）+ `fdx bg run --timeout N`——超时 kill、标 `timed_out`、**仍唤回 agent**。
+  - **完成去向**：`_deliver_bg_result` 先往 task **话题发一条可见完成消息**（`_bg_result_message`，带输出尾部——补上「结果只在注入 prompt 里、用户看不见」的缺口）；再据 session 状态派活（活跃入队 / 挂起 `load_session` 恢复 / 终止只通知）+ 主线 🔔。唤回 prompt = `<bg_job_done>`（id/命令/exit/耗时/Timed Out/输出尾部）。
+  - **后端无关**（任意能跑 shell 的 agent，不锁 opencode）；bg job 进程继承 daemon（=用户）完整环境（训练需 CUDA/conda 等）。**v1 不做 daemon 重启穿越**（重启丢在飞 job）。让 agent 主动用 `fdx`（brief 注入）属 #68 P2。
 
 ## 开发命令
 
 用 `uv` 管理（Python 3.12 已 pin；本机无系统 Python，一律 `uv run`）。
 
 - 安装依赖：`uv sync`
-- 测试：`uv run pytest -q`（199 个，含 daemon 生命周期 + 任务系统 + 审计/收尾回复/模型显示+切换+跨挂起恢复黏住 + 项目注册/删除 + 调度器记忆无损保存集成测试）
+- 测试：`uv run pytest -q`（345 个，含 daemon 生命周期 + 任务系统 + 审计/收尾回复/模型显示+切换+跨挂起恢复黏住 + 项目注册/删除 + 调度器记忆无损保存 + 后台任务（控制面/身份注入/超时/kill）集成测试）
 - Lint / 格式：`uv run ruff check .` / `uv run ruff format .`
 - daemon：`uv run feishu-dispatcher start`（`--discover` 发现 chat_id；`-v` 调试日志；`--config <path>`）
-- ACP 冒烟（不经飞书，真实 Copilot）：`uv run python scripts/smoke_acp.py`
+- ACP 冒烟（不经飞书，真实 Copilot）：`uv run python scripts/smoke_acp.py`；后台任务相关探针 `scripts/smoke_env_propagation.py`（env 透传）、`scripts/smoke_pty_notify.py`（ACP 带外回合，D1 证据）
 - 飞书应用配置全流程：`docs/setup.md`
 
-包结构：`feishu_dispatcher/`（`cli.py` 入口、`config.py`、`daemon.py` 调度主循环、`acp_client.py` ACP 封装、`feishu.py` 飞书 WS+HTTP 桥、`throttler.py` 节流、`_lark_compat.py` SDK 兼容 shim）。
+包结构：`feishu_dispatcher/`（`cli.py` 运维入口、`agent_cli.py` = agent 侧 `fdx` CLI、`config.py`、`daemon.py` 调度主循环、`acp_client.py` ACP 封装、`feishu.py` 飞书 WS+HTTP 桥、`control.py` 本地控制面（agent→daemon）、`store.py` Task/Project/Model/Job 台账、`livecard.py`/`throttler.py` 输出通道、`forge.py` gh/glab 只读、`llm.py`/`scheduler.py` 调度器、`_lark_compat.py` SDK 兼容 shim）。
 
 ## 已知风险与注意事项
 
