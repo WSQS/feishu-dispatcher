@@ -53,6 +53,7 @@ _MODEL_CMD = "/model"  # 话题内：/model 列出可选，/model <名> 切换
 _RAW_CMD = "/raw"  # 话题内：/raw <文本> 把 <文本> 逐字转发给 agent，绕过话题命令解释
 _PROJECT_CMD = "/project"  # root：/project 列出，/project add|remove 增删
 _MODELS_CMD = "/models"  # root：/models 列缓存，/models refresh [agent] 主动刷新
+_LLM_CMD = "/llm"  # root：/llm 列出调度器 LLM profile，/llm <名> 运行时切换（#74）
 _REBOOT_CMD = "/reboot"  # root：重启整个 daemon 进程（cli.py re-exec）
 _HELP_CMDS = ("/help", "/?", "/usage")  # root 与话题内通用
 
@@ -69,6 +70,7 @@ _USAGE = (
     "• `/task <任务id>`  查看某任务详情与动作日志\n"
     "• `/project`  列出项目；`/project add <名> <agent> <路径>` 注册，`/project remove <名>` 删除\n"
     "• `/models`  列出各 agent 已知模型；`/models refresh [agent]` 主动刷新缓存\n"
+    "• `/llm`  列出调度器 LLM profile；`/llm <名>` 运行时切换调度器后端\n"
     "• `/clear`  清理已结束任务的历史\n"
     "• `/reboot`  重启整个 daemon（任务自动恢复）\n"
     "• 在 agent 话题内直接回复 = 追加指令（排队串行执行）\n"
@@ -266,6 +268,8 @@ class _Daemon:
     job_store: JobStore = field(default_factory=lambda: JobStore(None))
     #: 调度器 LLM（P2）；None = 不启用自然语言派发。run() 按 cfg.llm 构造；测试可注入
     _llm: LLMClient | None = None
+    #: 当前激活的 LLM profile 名（/llm 切换时更新，不持久化）；#74
+    _llm_active: str = ""
     #: 调度器主线对话记忆（跨重启持久化）；默认纯内存，run() 注入文件版
     _sched_memory: SchedulerMemory = field(
         default_factory=lambda: SchedulerMemory(None)
@@ -292,6 +296,7 @@ class _Daemon:
         loop = asyncio.get_running_loop()
         if self._llm is None:
             self._llm = build_llm_client(self.cfg.llm)
+            self._llm_active = self.cfg.llm_active
         self._bridge = FeishuBridge(
             app_id=self.cfg.app_id,
             app_secret=self.cfg.app_secret,
@@ -412,6 +417,8 @@ class _Daemon:
             await self._handle_project_cmd(msg, text[len(_PROJECT_CMD) :].strip())
         elif text == _MODELS_CMD or text.startswith(_MODELS_CMD + " "):
             await self._handle_models_cmd(msg, text[len(_MODELS_CMD) :].strip())
+        elif text == _LLM_CMD or text.startswith(_LLM_CMD + " "):
+            await self._handle_llm_cmd(msg, text[len(_LLM_CMD) :].strip())
         elif text == _REBOOT_CMD:
             await self._reboot(msg)
         elif text in _HELP_CMDS:
@@ -523,6 +530,47 @@ class _Daemon:
         tip = f"（有 {refs} 个历史任务引用它，记录仍保留）" if refs else ""
         logger.info("删除项目 %s（%d 个历史任务引用）", name, refs)
         return f"🗑️ 已删除项目 {name}。{tip}"
+
+    # ------------------------------------------------------------------ #
+    # 调度器 LLM profile：/llm 列出 / 切换（#74，运行时换后端，不持久化）
+    # ------------------------------------------------------------------ #
+
+    async def _handle_llm_cmd(self, msg: IncomingMessage, arg: str) -> None:
+        """root：``/llm`` 列出 LLM profile、``/llm <名>`` 切换激活的（重建 client，下轮生效）。"""
+        profiles = self.cfg.llm_profiles
+        if not profiles:
+            await self._reply_user(
+                msg.message_id,
+                "未配置调度器 LLM（`[llm]` 段为空），无可切换的 profile。",
+            )
+            return
+        arg = arg.strip()
+        if not arg:
+            lines = [
+                "调度器 LLM profile（`/llm <名>` 切换，不持久化、重启回到配置默认）:"
+            ]
+            for name, s in profiles.items():
+                mark = "▶ " if name == self._llm_active else "  "
+                lines.append(f"{mark}{name}：{s.model}（{s.api}）")
+            await self._reply_user(msg.message_id, "\n".join(lines))
+            return
+        if arg not in profiles:
+            await self._reply_user(
+                msg.message_id,
+                f"未知 profile '{arg}'。可选：{', '.join(profiles)}",
+            )
+            return
+        if arg == self._llm_active:
+            await self._reply_user(msg.message_id, f"当前已是 profile「{arg}」。")
+            return
+        self._llm = build_llm_client(profiles[arg])
+        self._llm_active = arg
+        s = profiles[arg]
+        logger.info("调度器 LLM 切换 → %s（%s · %s）", arg, s.model, s.api)
+        await self._reply_user(
+            msg.message_id,
+            f"✅ 已切换调度器 LLM → 「{arg}」（{s.model} · {s.api}）。下次派发生效。",
+        )
 
     # ------------------------------------------------------------------ #
     # 模型缓存：/models 列出 / refresh 主动刷新（#65）

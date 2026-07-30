@@ -54,6 +54,21 @@ throttle_window = 0.5
 #                       # deepseek/GLM/openai 等）；responses=OpenAI Responses API（/responses，
 #                       # 某些网关/模型如 gpt-5.4 只走这个）
 # memory_rounds = 12   # 主线对话记忆保留轮数（可选，默认 12；越大上下文越全但越费 token）
+#
+# 多 profile + 运行时切换（可选）：在群里发 `/llm` 列出、`/llm <名>` 切换调度器后端，
+# 不改配置重启。flat [llm]（上面那种）= 单 profile 简写；要多个就写成 profiles：
+# [llm]
+# active = "deepseek"          # 启动激活哪个（省略取第一个）
+# memory_rounds = 12           # 调度器级共享（非 per-profile）
+# [llm.profiles.deepseek]
+# base_url = "https://api.deepseek.com/v1"
+# api_key = "sk-..."
+# model = "deepseek-chat"
+# [llm.profiles.gpt5]
+# base_url = "https://your-gateway/v1"
+# api_key = "sk-..."
+# model = "gpt-5.4"
+# api = "responses"
 
 # 用法：在群里发根消息
 #   /run <项目名> <任务描述>    派发任务给 agent（在根消息下建话题）

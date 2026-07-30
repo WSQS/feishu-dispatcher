@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from feishu_dispatcher.config import Config, Project
+from feishu_dispatcher.config import Config, LLMSettings, Project
 from feishu_dispatcher.daemon import _Daemon
 from feishu_dispatcher.feishu import IncomingMessage
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
@@ -1895,6 +1895,62 @@ async def test_models_refresh_command_boots_throwaway_agent():
     assert "zhipuai/glm-5" in daemon.model_store.get("copilot")
     assert created and created[-1].closed  # 一次性 agent 已关闭
     assert daemon._sessions == {}  # 没占用 session 名额
+
+
+# ---------------------------------------------------------------------- #
+# /llm：调度器 LLM profile 列出 + 运行时切换（#74）
+# ---------------------------------------------------------------------- #
+
+
+def _daemon_with_llm_profiles() -> tuple[_Daemon, FakeBridge]:
+    ds = LLMSettings(base_url="u1", api_key="k", model="deepseek-chat", api="chat")
+    g5 = LLMSettings(base_url="u2", api_key="k", model="gpt-5.4", api="responses")
+    cfg = Config(
+        app_id="a",
+        app_secret="b",
+        chat_id="oc_1",
+        agents={"copilot": ["copilot", "--acp"]},
+        llm=ds,
+        llm_profiles={"deepseek": ds, "gpt5": g5},
+        llm_active="deepseek",
+    )
+    daemon = _Daemon(cfg)
+    bridge = FakeBridge()
+    daemon._bridge = bridge
+    daemon._llm_active = "deepseek"  # 模拟 run() 后状态（run() 未调用）
+    return daemon, bridge
+
+
+async def test_llm_command_lists_profiles_marks_active():
+    daemon, bridge = _daemon_with_llm_profiles()
+    await daemon._handle_message(root_msg("/llm", mid="om_l1"))
+    txt = "\n".join(t for m, t in bridge.plain if m == "om_l1")
+    assert "deepseek" in txt and "gpt5" in txt
+    assert "gpt-5.4" in txt and "responses" in txt
+    assert "▶" in txt  # 标了激活的
+
+
+async def test_llm_command_switches_and_rebuilds_client():
+    from feishu_dispatcher.llm import ResponsesAPIClient
+
+    daemon, bridge = _daemon_with_llm_profiles()
+    await daemon._handle_message(root_msg("/llm gpt5", mid="om_l2"))
+    assert daemon._llm_active == "gpt5"
+    assert isinstance(daemon._llm, ResponsesAPIClient)  # 重建成 responses client
+    assert any("切换" in t and "gpt5" in t for m, t in bridge.plain if m == "om_l2")
+
+
+async def test_llm_command_unknown_profile():
+    daemon, bridge = _daemon_with_llm_profiles()
+    await daemon._handle_message(root_msg("/llm nope", mid="om_l3"))
+    assert daemon._llm_active == "deepseek"  # 未切
+    assert any("未知 profile" in t for m, t in bridge.plain if m == "om_l3")
+
+
+async def test_llm_command_no_profiles_configured():
+    daemon, bridge, _ = make_daemon()  # 无 [llm]
+    await daemon._handle_message(root_msg("/llm", mid="om_l4"))
+    assert any("未配置调度器 LLM" in t for m, t in bridge.plain if m == "om_l4")
 
 
 # ---------------------------------------------------------------------- #
