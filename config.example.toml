@@ -50,6 +50,9 @@ throttle_window = 0.5
 # base_url = "https://api.deepseek.com/v1"
 # api_key = "sk-..."
 # model = "deepseek-chat"
+# api = "chat"          # API 形态（可选，默认 chat）：chat=Chat Completions（/chat/completions，
+#                       # deepseek/GLM/openai 等）；responses=OpenAI Responses API（/responses，
+#                       # 某些网关/模型如 gpt-5.4 只走这个）
 # memory_rounds = 12   # 主线对话记忆保留轮数（可选，默认 12；越大上下文越全但越费 token）
 
 # 用法：在群里发根消息

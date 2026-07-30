@@ -41,6 +41,10 @@ class LLMSettings:
     base_url: str
     api_key: str
     model: str
+    #: API 形态：``chat``=Chat Completions（``/chat/completions``，默认）；
+    #: ``responses``=OpenAI Responses API（``/responses``，某些端点/模型如网关上的
+    #: gpt-5.4 只走这个）。见 llm.py 的两个 client 实现。
+    api: str = "chat"
     #: 主线对话记忆保留的轮数（透传给 SchedulerMemory.max_turns）；默认 12
     memory_rounds: int = 12
 
@@ -106,10 +110,14 @@ class Config:
                 raise ValueError(
                     f"llm.memory_rounds 必须为正整数，当前为 {memory_rounds}"
                 )
+            api = str(llm_data.get("api", "chat")).strip().lower()
+            if api not in ("chat", "responses"):
+                raise ValueError(f"llm.api 必须为 chat 或 responses，当前为 {api}")
             llm = LLMSettings(
                 base_url=llm_data["base_url"],
                 api_key=llm_data["api_key"],
                 model=llm_data["model"],
+                api=api,
                 memory_rounds=memory_rounds,
             )
         agents = {name: list(argv) for name, argv in data.get("agents", {}).items()}

@@ -99,6 +99,34 @@ def test_llm_memory_rounds_must_be_positive(tmp_path: Path):
         Config.load(f)
 
 
+def test_llm_api_defaults_to_chat_and_parses_responses(tmp_path: Path):
+    base = 'app_id = "a"\napp_secret = "b"\nchat_id = "oc_1"\n'
+    # 省略 api → 默认 chat
+    f1 = tmp_path / "c1.toml"
+    f1.write_text(
+        base + '[llm]\nbase_url = "u"\napi_key = "k"\nmodel = "m"\n', encoding="utf-8"
+    )
+    assert Config.load(f1).llm.api == "chat"
+    # 显式 responses（大小写不敏感）
+    f2 = tmp_path / "c2.toml"
+    f2.write_text(
+        base + '[llm]\nbase_url = "u"\napi_key = "k"\nmodel = "m"\napi = "Responses"\n',
+        encoding="utf-8",
+    )
+    assert Config.load(f2).llm.api == "responses"
+
+
+def test_llm_api_validation(tmp_path: Path):
+    f = tmp_path / "c.toml"
+    f.write_text(
+        'app_id = "a"\napp_secret = "b"\nchat_id = "oc_1"\n'
+        '[llm]\nbase_url = "u"\napi_key = "k"\nmodel = "m"\napi = "grpc"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="llm.api"):
+        Config.load(f)
+
+
 def test_minimal_config(tmp_path: Path):
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(
