@@ -90,9 +90,15 @@ throttle_window = 0.5
 #   前置：`npm i -g @agentclientprotocol/claude-agent-acp` + `claude` 已登录
 #   （`claude auth login`，Pro/Max 订阅额度即可；或设 ANTHROPIC_API_KEY 走 API 计费）。
 #   详见 docs/claude-code-backend.md（含实测的握手/流式/load_session 结果）。
+# - cline：Cline CLI 原生带 --acp（v3.0.47+ 实测握手/流式/load_session 通过）。
+#   前置：`npm i -g cline` + `cline auth` 登录某 provider（默认 provider=cline 走其
+#   托管网关）。想固定用别的 provider/model 就在 argv 里带 -P/-m，例如
+#   ["cline", "--acp", "-P", "sapaicore"]。注意 cline 只上报占位模型名「cline」
+#   （类似 copilot 不暴露具体模型），卡片 footer / `/model` 显示会不全，不影响运行。
 copilot = ["copilot", "--acp"]
 opencode = ["opencode", "acp"]
 claude = ["claude-agent-acp"]
+cline = ["cline", "--acp"]
 
 # P0 阶段项目硬编码在这里（设计文档 P2 才做 LLM 自注册）。
 # 每个项目用 default_agent 指定由哪个 agent 处理。
