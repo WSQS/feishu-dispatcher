@@ -49,6 +49,26 @@ class LLMSettings:
     memory_rounds: int = 12
 
 
+def _parse_llm_profile(pd: dict, *, memory_rounds: int, ctx: str) -> LLMSettings:
+    """从一个 profile 表（或 flat ``[llm]``）解析出 :class:`LLMSettings`。
+
+    ``memory_rounds`` 是调度器级共享值（不 per-profile），由调用方从 ``[llm]`` 顶层读入后传入。
+    """
+    api = str(pd.get("api", "chat")).strip().lower()
+    if api not in ("chat", "responses"):
+        raise ValueError(f"{ctx}.api 必须为 chat 或 responses，当前为 {api}")
+    try:
+        return LLMSettings(
+            base_url=pd["base_url"],
+            api_key=pd["api_key"],
+            model=pd["model"],
+            api=api,
+            memory_rounds=memory_rounds,
+        )
+    except KeyError as e:
+        raise ValueError(f"{ctx} 缺少必填项 {e}") from e
+
+
 @dataclass(frozen=True)
 class Config:
     app_id: str
@@ -72,8 +92,12 @@ class Config:
     bg_job_timeout: float = 0.0
     #: 流式输出模式：card=原地更新卡片（默认），text=每批发新消息（兜底）
     stream_mode: str = "card"
-    #: 调度器 LLM（P2）；None = 不启用（自然语言消息回退到「用法」提示）
+    #: 调度器 LLM（P2）；None = 不启用（自然语言消息回退到「用法」提示）。= 当前激活 profile
     llm: LLMSettings | None = None
+    #: 全部 LLM profile（名 → 配置）；flat/单 profile 模式下只有一个（名为 default）。#74
+    llm_profiles: dict[str, LLMSettings] = field(default_factory=dict)
+    #: 启动时激活的 profile 名（运行时 /llm 可切，不持久化，重启回到此值）
+    llm_active: str = ""
 
     @staticmethod
     def load(path: Path | None = None, *, allow_empty_chat_id: bool = False) -> Config:
@@ -104,22 +128,38 @@ class Config:
             raise ValueError(f"stream_mode 必须为 card 或 text，当前为 {stream_mode}")
         llm_data = data.get("llm")
         llm = None
+        llm_profiles: dict[str, LLMSettings] = {}
+        llm_active = ""
         if llm_data:
             memory_rounds = int(llm_data.get("memory_rounds", 12))
             if memory_rounds < 1:
                 raise ValueError(
                     f"llm.memory_rounds 必须为正整数，当前为 {memory_rounds}"
                 )
-            api = str(llm_data.get("api", "chat")).strip().lower()
-            if api not in ("chat", "responses"):
-                raise ValueError(f"llm.api 必须为 chat 或 responses，当前为 {api}")
-            llm = LLMSettings(
-                base_url=llm_data["base_url"],
-                api_key=llm_data["api_key"],
-                model=llm_data["model"],
-                api=api,
-                memory_rounds=memory_rounds,
-            )
+            prof_data = llm_data.get("profiles")
+            if prof_data:
+                # 多 profile 模式：[llm.profiles.<名>] + [llm].active（#74）
+                for name, pd in prof_data.items():
+                    llm_profiles[name] = _parse_llm_profile(
+                        pd, memory_rounds=memory_rounds, ctx=f"llm.profiles.{name}"
+                    )
+                if not llm_profiles:
+                    raise ValueError("llm.profiles 为空")
+                llm_active = str(llm_data.get("active", "")).strip() or next(
+                    iter(llm_profiles)
+                )
+                if llm_active not in llm_profiles:
+                    raise ValueError(
+                        f"llm.active '{llm_active}' 不在 profiles 里"
+                        f"（可选: {', '.join(llm_profiles)}）"
+                    )
+            else:
+                # flat 单 profile（向后兼容）：字段直接写在 [llm] 下
+                llm_profiles["default"] = _parse_llm_profile(
+                    llm_data, memory_rounds=memory_rounds, ctx="llm"
+                )
+                llm_active = "default"
+            llm = llm_profiles[llm_active]
         agents = {name: list(argv) for name, argv in data.get("agents", {}).items()}
         # 种子项目的 default_agent 仍可省略（兜底 copilot，向后兼容）；但若兜底或
         # 显式指定的 agent 不在 [agents] 里，/run 时才会失败——加载时先提醒。
@@ -144,4 +184,6 @@ class Config:
             bg_job_timeout=float(data.get("bg_job_timeout", 0.0)),
             stream_mode=stream_mode,
             llm=llm,
+            llm_profiles=llm_profiles,
+            llm_active=llm_active,
         )

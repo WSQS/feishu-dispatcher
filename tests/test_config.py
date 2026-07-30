@@ -127,6 +127,78 @@ def test_llm_api_validation(tmp_path: Path):
         Config.load(f)
 
 
+_BASE = 'app_id = "a"\napp_secret = "b"\nchat_id = "oc_1"\n'
+
+
+def test_llm_multi_profile_and_active(tmp_path: Path):
+    f = tmp_path / "c.toml"
+    f.write_text(
+        _BASE
+        + """
+[llm]
+active = "gpt5"
+memory_rounds = 8
+
+[llm.profiles.deepseek]
+base_url = "u1"
+api_key = "k1"
+model = "deepseek-chat"
+
+[llm.profiles.gpt5]
+base_url = "u2"
+api_key = "k2"
+model = "gpt-5.4"
+api = "responses"
+""",
+        encoding="utf-8",
+    )
+    cfg = Config.load(f)
+    assert set(cfg.llm_profiles) == {"deepseek", "gpt5"}
+    assert cfg.llm_active == "gpt5"
+    # cfg.llm = 激活的 profile
+    assert cfg.llm.model == "gpt-5.4" and cfg.llm.api == "responses"
+    assert cfg.llm_profiles["deepseek"].api == "chat"  # 未写 → 默认 chat
+    # memory_rounds 是调度器级共享值
+    assert cfg.llm.memory_rounds == 8
+    assert cfg.llm_profiles["deepseek"].memory_rounds == 8
+
+
+def test_llm_active_defaults_to_first_profile(tmp_path: Path):
+    f = tmp_path / "c.toml"
+    f.write_text(
+        _BASE
+        + '[llm.profiles.deepseek]\nbase_url="u1"\napi_key="k"\nmodel="m1"\n'
+        + '[llm.profiles.gpt5]\nbase_url="u2"\napi_key="k"\nmodel="m2"\n',
+        encoding="utf-8",
+    )
+    cfg = Config.load(f)
+    assert cfg.llm_active == "deepseek"  # 省略 active → 取第一个（TOML 顺序）
+
+
+def test_llm_active_unknown_raises(tmp_path: Path):
+    f = tmp_path / "c.toml"
+    f.write_text(
+        _BASE
+        + '[llm]\nactive = "nope"\n'
+        + '[llm.profiles.deepseek]\nbase_url="u"\napi_key="k"\nmodel="m"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="llm.active"):
+        Config.load(f)
+
+
+def test_llm_flat_mode_becomes_default_profile(tmp_path: Path):
+    # flat [llm]（无 profiles）向后兼容 → 单 profile "default"
+    f = tmp_path / "c.toml"
+    f.write_text(
+        _BASE + '[llm]\nbase_url = "u"\napi_key = "k"\nmodel = "m"\n', encoding="utf-8"
+    )
+    cfg = Config.load(f)
+    assert set(cfg.llm_profiles) == {"default"}
+    assert cfg.llm_active == "default"
+    assert cfg.llm.model == "m"
+
+
 def test_minimal_config(tmp_path: Path):
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(
