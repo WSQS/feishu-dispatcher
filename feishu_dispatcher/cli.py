@@ -69,13 +69,34 @@ def main() -> None:
 
         from feishu_dispatcher.config import DEFAULT_CONFIG_PATH, Config
         from feishu_dispatcher.daemon import run
+        from feishu_dispatcher.singleinstance import SingleInstanceLock
 
         cfg_path = args.config or DEFAULT_CONFIG_PATH
         # 日志文件与会话/任务台账同放 config 目录
         _setup_logging(args.verbose, cfg_path.parent)
-        cfg = Config.load(cfg_path, allow_empty_chat_id=args.discover)
-        store_path = cfg_path.parent / "sessions.json"
-        reboot = asyncio.run(run(cfg, discover=args.discover, store_path=store_path))
+
+        # 单实例锁（#81）：一个状态目录同一时刻只允许一个 daemon，杜绝多实例
+        # 共用 tasks.json / WS 互相踩坏台账。持锁进程退出/被杀由 OS 自动释放。
+        lock = SingleInstanceLock(cfg_path.parent / "daemon.lock")
+        holder = lock.acquire()
+        if holder is not None:
+            logger.error(
+                "已有 daemon 实例在运行（pid %s，锁文件 %s），本次启动中止。"
+                "若确认那是僵尸进程，先结束它再重试。",
+                holder,
+                lock.path,
+            )
+            raise SystemExit(1)
+
+        try:
+            cfg = Config.load(cfg_path, allow_empty_chat_id=args.discover)
+            store_path = cfg_path.parent / "sessions.json"
+            reboot = asyncio.run(
+                run(cfg, discover=args.discover, store_path=store_path)
+            )
+        finally:
+            # re-exec 前显式放锁，让重启起来的新进程能立刻重新获取。
+            lock.release()
         if reboot:
             _reexec()
 

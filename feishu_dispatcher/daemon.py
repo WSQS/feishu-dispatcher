@@ -63,6 +63,9 @@ _REBOOTED_ENV = "FEISHU_DISPATCHER_REBOOTED"
 #: message_id 去重窗口大小（飞书 ACK 异常时服务端会重推事件）
 _DEDUP_CAPACITY = 512
 
+#: 关闭时等控制面停下的上限（秒）；超时即放弃继续关（serve_forever 是 daemon 线程）。#81
+_CONTROL_STOP_TIMEOUT = 5.0
+
 _USAGE = (
     "用法：\n"
     "• `/run <项目名> <任务描述> [--agent <名>]`  派发任务给 agent（可选覆盖默认 agent）\n"
@@ -1918,7 +1921,20 @@ class _Daemon:
     async def _shutdown(self) -> None:
         """退出清理：停 WS 线程，取消并等待全部 agent worker 收尾。"""
         if self._control is not None:
-            self._control.stop()
+            # control.stop() 会阻塞（等 serve_forever 确认），且可能与正 run_
+            # coroutine_threadsafe 回等主 loop 的 handler 线程死锁。挪到 worker
+            # 线程跑、主 loop 继续转（解死锁）+ 超时兜底，绝不冻住关闭流程（#81）。
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._control.stop),
+                    timeout=_CONTROL_STOP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "控制面关闭超时，跳过（serve_forever 是 daemon 线程，随进程退出）"
+                )
+            except Exception:
+                logger.warning("控制面关闭失败，忽略", exc_info=True)
         if self._bridge is not None:
             self._bridge.stop()
         # 把仍活跃的任务标记为 suspended，让重启后台账状态准确（且可 load_session 恢复）
