@@ -158,6 +158,79 @@ def test_atomic_write_leaves_no_tmp(tmp_path: Path):
     assert not (tmp_path / "tasks.json.tmp").exists()
 
 
+# ---------------------------------------------------------------------- #
+# 落盘鲁棒性（#83）：fsync 持久化 + .bak 回退 + 损坏存档不清空
+# ---------------------------------------------------------------------- #
+
+
+def test_flush_fsyncs_data(tmp_path: Path, monkeypatch):
+    """落盘时对临时文件 fsync（把数据真正刷到盘，防掉电后原子改名指向未写入的块）。"""
+    import os
+
+    import feishu_dispatcher.store as store_mod
+
+    calls = []
+    real_fsync = os.fsync
+
+    def spy(fd):
+        calls.append(fd)
+        return real_fsync(fd)
+
+    monkeypatch.setattr(store_mod.os, "fsync", spy)
+    make(TaskStore(tmp_path / "tasks.json"))
+    assert calls  # 至少 fsync 了临时文件
+
+
+def test_flush_keeps_backup_of_previous_version(tmp_path: Path):
+    import json
+
+    p = tmp_path / "tasks.json"
+    s = TaskStore(p)
+    make(s, thread="om_1")  # 首次落盘：此前无主文件 → 无 .bak
+    assert not (tmp_path / "tasks.json.bak").exists()
+    make(s, thread="om_2")  # 二次落盘：上一版本降级为 .bak
+    bak = tmp_path / "tasks.json.bak"
+    assert bak.exists()
+    assert set(json.loads(bak.read_text(encoding="utf-8"))["tasks"]) == {"t1"}
+
+
+def test_corrupt_primary_recovers_from_backup_not_wiped(tmp_path: Path):
+    """主文件损坏时从 .bak 恢复历史（不再静默清空），seq 不归零 → 不复用已恢复的 id。"""
+    p = tmp_path / "tasks.json"
+    s1 = TaskStore(p)
+    make(s1, thread="om_1")  # t1
+    make(s1, thread="om_2")  # t2；.bak = {t1}
+    make(s1, thread="om_3")  # t3；.bak = {t1, t2}
+    p.write_text("truncated{", encoding="utf-8")  # 系统崩溃把主文件写花
+    s2 = TaskStore(p)  # 主损坏 → 回退 .bak（含 t1、t2）
+    assert s2.by_thread("om_1").task_id == "t1"  # 历史未被清空
+    assert s2.by_thread("om_2").task_id == "t2"
+    nxt = make(s2, thread="om_4")  # seq 从 .bak 恢复 → 不落回 t1
+    assert nxt.task_id not in {"t1", "t2"}
+    assert int(nxt.task_id[1:]) >= 3  # 旧行为会给 t1（清空+seq 归零）
+
+
+def test_corrupt_primary_without_backup_archives_and_empties(tmp_path: Path):
+    """无 .bak 可退时空起，但损坏主文件被改名存档（.corrupt-*），不再挡下次启动。"""
+    p = tmp_path / "tasks.json"
+    p.write_text("not json{", encoding="utf-8")
+    s = TaskStore(p)
+    assert s.all() == []
+    assert len(list(tmp_path.glob("tasks.json.corrupt-*"))) == 1
+    assert not p.exists()  # 损坏主文件已移走
+
+
+def test_missing_primary_recovers_from_backup(tmp_path: Path):
+    """主文件丢失（.bak 尚在）时也从备份恢复，而非当作全新空台账。"""
+    p = tmp_path / "tasks.json"
+    s1 = TaskStore(p)
+    make(s1, thread="om_1")
+    make(s1, thread="om_2")  # .bak = {t1}
+    p.unlink()
+    s2 = TaskStore(p)
+    assert s2.by_thread("om_1").task_id == "t1"
+
+
 def test_clear_terminal():
     s = TaskStore(None)
     make(s, thread="om_1")
@@ -247,6 +320,17 @@ def test_project_store_corrupt_file_tolerated(tmp_path: Path):
     path.write_text("{ not json", encoding="utf-8")
     s = ProjectStore(path)  # 不抛
     assert s.all() == {}
+
+
+def test_project_store_recovers_from_backup(tmp_path: Path):
+    """共用的落盘鲁棒性（#83）对 ProjectStore 同样生效：损坏主文件回退 .bak。"""
+    path = tmp_path / "projects.json"
+    s1 = ProjectStore(path)
+    s1.add(_proj("foo"))
+    s1.add(_proj("bar"))  # .bak = {foo}
+    path.write_text("broken{", encoding="utf-8")
+    s2 = ProjectStore(path)
+    assert set(s2.all()) == {"foo"}  # 从 .bak 恢复，而非清空
 
 
 def test_project_store_memory_mode_writes_nothing(tmp_path: Path):
