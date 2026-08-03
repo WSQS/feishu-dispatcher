@@ -180,7 +180,14 @@ class TaskStore:
         issue_url: str = "",
         model: str = "",
     ) -> Task:
-        self._seq += 1
+        # 铸号自愈守卫（#81）：不只信持久化的 seq——同时从现有 task id 推出下界，
+        # 取两者较大再 +1。即使 seq 因故被回退/污染（多实例踩踏、手工改 tasks.json、
+        # 半截原子写），也绝不落到已存在的 id 上，守住「task_id 永不复用」不变量。
+        floor = max(
+            (int(tid[1:]) for tid in self._tasks if tid[1:].isdigit()), default=0
+        )
+        self._seq = max(self._seq, floor) + 1
+        assert f"t{self._seq}" not in self._tasks, f"task_id 冲突: t{self._seq}"
         now = self._now()
         task = Task(
             task_id=f"t{self._seq}",

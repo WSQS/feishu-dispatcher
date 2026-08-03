@@ -77,6 +77,39 @@ def test_prune_keeps_recent_terminal_but_counter_monotonic():
     assert make(s, thread="om_3").task_id == "t3"  # 永不复用 t1
 
 
+def test_create_self_heals_reverted_seq_never_reuses_id():
+    """#81：即使 seq 被回退到已存在 id 之下，create() 也从现有 id 推下界、不复用。"""
+    s = TaskStore(None)
+    make(s, thread="om_1")  # t1
+    make(s, thread="om_2")  # t2
+    make(s, thread="om_3")  # t3
+    # 模拟多实例踩踏 / 台账被回退：计数器倒退到 1
+    s._seq = 1
+    t = make(s, thread="om_4")
+    assert t.task_id == "t4"  # 不是 t2/t3——现有最大 id 是 3，跳到 4
+    assert s.by_thread("om_1").task_id == "t1"  # 老任务映射未被覆盖
+    assert s.by_thread("om_4").task_id == "t4"
+
+
+def test_create_reload_with_tampered_seq_does_not_clobber(tmp_path: Path):
+    """#81 现实路径：tasks.json 里 seq 被回退后重载，新建仍不覆盖已有任务。"""
+    import json
+
+    p = tmp_path / "tasks.json"
+    s1 = TaskStore(p)
+    make(s1, thread="om_1")  # t1
+    make(s1, thread="om_2")  # t2
+    # 把落盘的 seq 篡改回退（模拟另一进程写了个旧 seq）
+    data = json.loads(p.read_text(encoding="utf-8"))
+    data["seq"] = 0
+    p.write_text(json.dumps(data), encoding="utf-8")
+    s2 = TaskStore(p)  # 重载：seq=0，但仍有 t1/t2
+    t = make(s2, thread="om_3")
+    assert t.task_id == "t3"  # 不复用 t1
+    assert s2.by_thread("om_1").task_id == "t1"
+    assert s2.by_thread("om_2").task_id == "t2"
+
+
 def test_failed_is_resumable_not_terminal_and_error_persists(tmp_path: Path):
     p = tmp_path / "tasks.json"
     s1 = TaskStore(p)

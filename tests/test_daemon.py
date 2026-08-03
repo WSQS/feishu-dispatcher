@@ -496,6 +496,35 @@ async def test_shutdown_cancels_workers_and_stops_bridge():
     assert created[0].closed
 
 
+async def test_shutdown_survives_hung_control_stop():
+    """#81：即使 control.stop() 永久阻塞，_shutdown 也在超时内返回、后续步骤照走。
+
+    复现旧 bug 的场景（关控制面卡死冻住关闭流程 → reboot 停不干净 → 僵尸堆积），
+    验证 to_thread + 超时保护让它安全退化。
+    """
+    import threading
+
+    import feishu_dispatcher.daemon as daemon_mod
+
+    daemon, bridge, created = make_daemon()
+    unblock = threading.Event()
+
+    class HungControl:
+        def stop(self) -> None:
+            unblock.wait(30)  # 模拟 server.shutdown() 卡死，直到测试放行
+
+    daemon._control = HungControl()  # type: ignore[assignment]
+    orig = daemon_mod._CONTROL_STOP_TIMEOUT
+    daemon_mod._CONTROL_STOP_TIMEOUT = 0.2
+    try:
+        # 无超时保护会等 30s；有保护则 ~0.2s 返回。外层 5s 上限做安全网。
+        await asyncio.wait_for(daemon._shutdown(), timeout=5.0)
+    finally:
+        daemon_mod._CONTROL_STOP_TIMEOUT = orig
+        unblock.set()  # 放行后台线程，避免 executor 关闭时 join 卡住
+    assert bridge.stopped  # 控制面卡住不影响后续清理（停 bridge 等照常走完）
+
+
 # ---------------------------------------------------------------------- #
 # R11: max_agents 并发上限
 # ---------------------------------------------------------------------- #

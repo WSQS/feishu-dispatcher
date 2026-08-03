@@ -63,11 +63,21 @@ class ControlServer:
         return f"http://{host}:{port}"
 
     def stop(self) -> None:
+        """停 HTTP server（阻塞调用）。**调用方勿在事件循环线程上直接调它**——
+        ``shutdown()`` 会阻塞等 serve_forever 确认，冻住 loop 且可能与正回等主
+        loop 的 handler 线程死锁；daemon 用 ``asyncio.to_thread`` + 超时包起来。
+
+        两步拆成独立 try：``shutdown()`` 万一卡/抛也不该跳过 ``server_close()``
+        释放监听 socket。serve_forever 跑在 daemon 线程，最坏情况随进程退出回收。
+        """
         try:
             self._server.shutdown()
+        except Exception:
+            logger.debug("控制面 shutdown 异常（忽略）", exc_info=True)
+        try:
             self._server.server_close()
         except Exception:
-            logger.debug("控制面关闭异常（忽略）", exc_info=True)
+            logger.debug("控制面 server_close 异常（忽略）", exc_info=True)
 
     def dispatch(
         self, method: str, path: str, token: str, body: dict
