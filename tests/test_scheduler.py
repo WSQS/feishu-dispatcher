@@ -255,6 +255,20 @@ async def test_spawn_agent_validates_missing_args():
     assert "参数不足" in await spawn_tool.handler({"project": "demo"})
 
 
+def test_spawn_agent_schema_exposes_model():
+    """回归 #85：model 必须出现在 advertise 给 LLM 的 schema 里。
+
+    LLM 只按拿到的 schema 行事——schema 不声明 model，它就不会传（handler 支持也白搭）。
+    test_spawn_agent_passes_model 是直接把 model 塞进 ToolCall args、绕过 schema 调
+    handler，测不到这个盲区，故单独断言 schema。
+    """
+    spawn_tool = next(t for t in _tools() if t.name == "spawn_agent")
+    props = spawn_tool.parameters["properties"]
+    assert "model" in props
+    assert props["model"]["type"] == "string"
+    assert "model" not in spawn_tool.parameters.get("required", [])  # 可选，非必填
+
+
 def _tool(tools, name):
     return next(t for t in tools if t.name == name)
 
