@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -26,6 +27,97 @@ from pathlib import Path
 from .config import Project
 
 logger = logging.getLogger(__name__)
+
+
+# ---- 台账落盘的持久化原语（四个 store 共用，#83）---- #
+#
+# 事故背景：系统硬崩（掉电 / BSOD / 内核 panic）后 tasks.json 损坏。根因是原来的
+# 「写临时文件 + replace」只挡**应用层**崩溃——数据先进 OS page cache，replace 改的是
+# 目录项；机器硬崩时可能改名已生效、数据块还没落盘 → 重启得到 0 字节/半截文件。
+# 下面三件事把这个窗口关掉：写临时文件后 fsync 让数据真正落盘、保留 .bak 作回退源、
+# 读损坏时存档而非静默清空（守住 task_id/seq 单调，避免撞回旧 id）。
+
+
+def _fsync_dir(path: Path) -> None:
+    """fsync 目录，让其中的改名/创建对掉电持久。
+
+    POSIX 才有该语义；Windows 无法对目录取句柄 fsync，跳过——临时文件本身已 fsync，
+    挡住了「改名指向未落盘数据块」这个主要坑，目录项持久性退化为尽力而为。
+    """
+    if os.name == "nt":
+        return
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError:
+        logger.warning("fsync 目录失败（忽略）: %s", path, exc_info=True)
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    """原子且**持久**地把 payload 写到 path。
+
+    写临时文件 → flush+fsync（数据真正落盘）→ 把旧主文件改名成 .bak（回退源，与新写
+    互不覆盖）→ replace 临时文件（原子改名）→ fsync 父目录（改名持久）。
+
+    .bak 用改名而非拷贝：便宜、原子，且天然 = 上一份好数据。改名到 replace 之间有个极
+    短窗口主文件暂缺，但 _read_json 会在主文件缺失/损坏时回退 .bak，故可安全降级。
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    if path.exists():
+        try:
+            path.replace(path.with_name(path.name + ".bak"))
+        except OSError:
+            logger.warning("保留台账备份失败（忽略）: %s", path, exc_info=True)
+    tmp.replace(path)
+    _fsync_dir(path.parent)
+
+
+def _archive_corrupt(path: Path) -> None:
+    """把损坏的台账主文件改名存档（.corrupt-<秒级时间戳>），不再挡下次启动、留作诊断。"""
+    try:
+        dest = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+        path.replace(dest)
+        logger.warning("损坏台账已存档: %s", dest)
+    except OSError:
+        logger.warning("存档损坏台账失败（忽略）: %s", path, exc_info=True)
+
+
+def _read_json(path: Path) -> dict | None:
+    """读台账 JSON，带损坏容错与备份回退。
+
+    主文件 OK → 返回其 payload；主文件损坏 → 存档 .corrupt-<ts> 再回退 .bak；
+    主文件缺失 → 直接试 .bak；主/备都不可用 → None（调用方空起）。
+
+    关键：损坏时**不再静默清空**——先存档主文件、再尽力从 .bak 恢复，守住 task_id/seq
+    的单调（丢台账 + seq 归零会让新 task 撞回飞书话题仍引用的旧 id）。
+    """
+    if path.exists():
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            logger.warning(
+                "台账主文件损坏，存档并尝试回退备份: %s", path, exc_info=True
+            )
+            _archive_corrupt(path)
+    bak = path.with_name(path.name + ".bak")
+    if bak.exists():
+        try:
+            data = json.loads(bak.read_text(encoding="utf-8"))
+            logger.warning("已从备份恢复台账: %s", bak)
+            return data
+        except Exception:
+            logger.warning("台账备份也损坏，忽略: %s", bak, exc_info=True)
+    return None
+
 
 #: 仍在活跃视图里的状态（failed = turn 异常卡住、可恢复，不算终止）
 ACTIVE_STATES = frozenset({"starting", "running", "idle", "suspended", "failed"})
@@ -107,38 +199,35 @@ class TaskStore:
         self._keep = keep_terminal
         self._tasks: dict[str, Task] = {}
         self._seq = 0  # 单调计数器，永不复用
-        if path is not None and path.exists():
+        if path is not None:
             self._load()
 
     # ---- 持久化 ---- #
 
     def _load(self) -> None:
         assert self._path is not None
+        data = _read_json(self._path)
+        if data is None:
+            return
         try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
             self._seq = int(data.get("seq", 0))
             for tid, d in (data.get("tasks") or {}).items():
                 self._tasks[tid] = Task(**{k: d[k] for k in _TASK_FIELDS if k in d})
             logger.info("已加载 %d 个任务: %s", len(self._tasks), self._path)
         except Exception:
-            logger.warning("任务台账读取失败，忽略: %s", self._path, exc_info=True)
+            logger.warning("任务台账解析失败，忽略: %s", self._path, exc_info=True)
             self._tasks = {}
             self._seq = 0
 
     def _flush(self) -> None:
         if self._path is None:
             return
+        payload = {
+            "seq": self._seq,
+            "tasks": {tid: asdict(t) for tid, t in self._tasks.items()},
+        }
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_name(self._path.name + ".tmp")
-            payload = {
-                "seq": self._seq,
-                "tasks": {tid: asdict(t) for tid, t in self._tasks.items()},
-            }
-            tmp.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            tmp.replace(self._path)
+            _atomic_write_json(self._path, payload)
         except Exception:
             logger.warning("任务台账写入失败: %s", self._path, exc_info=True)
 
@@ -271,13 +360,15 @@ class ProjectStore:
     def __init__(self, path: Path | None) -> None:
         self._path = path
         self._projects: dict[str, Project] = {}
-        if path is not None and path.exists():
+        if path is not None:
             self._load()
 
     def _load(self) -> None:
         assert self._path is not None
+        data = _read_json(self._path)
+        if data is None:
+            return
         try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
             for name, d in (data.get("projects") or {}).items():
                 self._projects[name] = Project(
                     name=d["name"],
@@ -287,30 +378,25 @@ class ProjectStore:
                 )
             logger.info("已加载 %d 个注册项目: %s", len(self._projects), self._path)
         except Exception:
-            logger.warning("项目台账读取失败，忽略: %s", self._path, exc_info=True)
+            logger.warning("项目台账解析失败，忽略: %s", self._path, exc_info=True)
             self._projects = {}
 
     def _flush(self) -> None:
         if self._path is None:
             return
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_name(self._path.name + ".tmp")
-            payload = {
-                "projects": {
-                    name: {
-                        "name": p.name,
-                        "path": str(p.path),
-                        "default_agent": p.default_agent,
-                        "repo": p.repo,
-                    }
-                    for name, p in self._projects.items()
+        payload = {
+            "projects": {
+                name: {
+                    "name": p.name,
+                    "path": str(p.path),
+                    "default_agent": p.default_agent,
+                    "repo": p.repo,
                 }
+                for name, p in self._projects.items()
             }
-            tmp.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            tmp.replace(self._path)
+        }
+        try:
+            _atomic_write_json(self._path, payload)
         except Exception:
             logger.warning("项目台账写入失败: %s", self._path, exc_info=True)
 
@@ -395,35 +481,32 @@ class JobStore:
         self._path = path
         self._jobs: dict[str, Job] = {}
         self._seq = 0
-        if path is not None and path.exists():
+        if path is not None:
             self._load()
 
     def _load(self) -> None:
         assert self._path is not None
+        data = _read_json(self._path)
+        if data is None:
+            return
         try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
             self._seq = int(data.get("seq", 0))
             for jid, d in (data.get("jobs") or {}).items():
                 self._jobs[jid] = Job(**{k: d[k] for k in _JOB_FIELDS if k in d})
         except Exception:
-            logger.warning("后台任务台账读取失败，忽略: %s", self._path, exc_info=True)
+            logger.warning("后台任务台账解析失败，忽略: %s", self._path, exc_info=True)
             self._jobs = {}
             self._seq = 0
 
     def _flush(self) -> None:
         if self._path is None:
             return
+        payload = {
+            "seq": self._seq,
+            "jobs": {jid: asdict(j) for jid, j in self._jobs.items()},
+        }
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_name(self._path.name + ".tmp")
-            payload = {
-                "seq": self._seq,
-                "jobs": {jid: asdict(j) for jid, j in self._jobs.items()},
-            }
-            tmp.write_text(
-                json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-            tmp.replace(self._path)
+            _atomic_write_json(self._path, payload)
         except Exception:
             logger.warning("后台任务台账写入失败: %s", self._path, exc_info=True)
 
@@ -477,13 +560,15 @@ class ModelStore:
         self._path = path
         #: backend -> {"models": list[str], "refreshed_at": float}
         self._by_backend: dict[str, dict] = {}
-        if path is not None and path.exists():
+        if path is not None:
             self._load()
 
     def _load(self) -> None:
         assert self._path is not None
+        data = _read_json(self._path)
+        if data is None:
+            return
         try:
-            data = json.loads(self._path.read_text(encoding="utf-8"))
             for backend, d in (data.get("backends") or {}).items():
                 models = [str(m) for m in (d.get("models") or [])]
                 self._by_backend[backend] = {
@@ -491,22 +576,14 @@ class ModelStore:
                     "refreshed_at": float(d.get("refreshed_at", 0.0)),
                 }
         except Exception:
-            logger.warning("模型缓存读取失败，忽略: %s", self._path, exc_info=True)
+            logger.warning("模型缓存解析失败，忽略: %s", self._path, exc_info=True)
             self._by_backend = {}
 
     def _flush(self) -> None:
         if self._path is None:
             return
         try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self._path.with_name(self._path.name + ".tmp")
-            tmp.write_text(
-                json.dumps(
-                    {"backends": self._by_backend}, ensure_ascii=False, indent=2
-                ),
-                encoding="utf-8",
-            )
-            tmp.replace(self._path)
+            _atomic_write_json(self._path, {"backends": self._by_backend})
         except Exception:
             logger.warning("模型缓存写入失败: %s", self._path, exc_info=True)
 
