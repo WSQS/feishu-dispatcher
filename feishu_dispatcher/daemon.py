@@ -225,6 +225,28 @@ async def run(
     return daemon._reboot_requested
 
 
+#: 唤回 agent 处理后台任务完成的引导语（单条；合并批次时也只出现一次）。
+_BG_GUIDANCE = (
+    "你之前用 `fdx bg run` 起的后台任务已完成（可能多个，见上）。请逐个根据退出码与"
+    "输出继续：成功就推进下一步，失败/超时就用输出诊断并修复。"
+)
+
+
+@dataclass
+class _BgBatch:
+    """待唤回 agent 的后台任务完成批次（#79）。作为**可变**队列项入队；同一 task 相邻
+    完成的多个 job 把各自的 ``<bg_job_done>`` 块 append 进来，只唤回一轮。渲染时把所有块
+    拼起来 + 一条引导语——多个 job 合并成一轮 prompt，避免各自冷启动/打断。"""
+
+    blocks: list[str] = field(default_factory=list)
+
+    def add(self, block: str) -> None:
+        self.blocks.append(block)
+
+    def render(self) -> str:
+        return "\n\n".join(self.blocks) + "\n\n" + _BG_GUIDANCE
+
+
 @dataclass
 class _AgentSession:
     """一个活跃 agent 的运行时状态。"""
@@ -244,8 +266,11 @@ class _AgentSession:
     agent: "AcpAgent | None" = None
     #: 当前回合的输出通道（card 或 text 模式）；回合间为 None
     current_channel: "object | None" = None
-    #: prompt 队列；None 是关闭哨兵（/stop / /done / mark_done）
-    queue: "asyncio.Queue[str | None]" = field(default_factory=asyncio.Queue)
+    #: prompt 队列；None 是关闭哨兵（/stop / /done / mark_done），_BgBatch 是后台完成批次
+    queue: "asyncio.Queue[str | _BgBatch | None]" = field(default_factory=asyncio.Queue)
+    #: 队尾未消费的后台任务批次（#79）；非 None ⟺ 队尾是可继续合并的 _BgBatch。
+    #: 入任何非 bg 项（enqueue）或被 worker 消费即清空——据此判「队尾能否再合并」。
+    pending_bg: "_BgBatch | None" = None
     #: 收到 None 哨兵时置入的终止态：stopped（/stop，默认）或 done（/done / mark_done）
     terminate_status: str = "stopped"
     #: 本轮是否正在跑（worker 卡在 agent.prompt() 里）；/stop 据此决定要不要发 cancel
@@ -254,6 +279,25 @@ class _AgentSession:
     bg_token: str = ""
     #: 单消费者 worker，持有 agent 完整生命周期
     worker: "asyncio.Task[None] | None" = None
+
+    def enqueue(self, item: str) -> None:
+        """入队一个普通 prompt（话题回复 / 首轮 / 新指令 / send_to_task），**断开** bg
+        合并邻接（清 pending_bg）——之后完成的 bg 不会跨这个普通项去合并，保 FIFO。"""
+        self.pending_bg = None
+        self.queue.put_nowait(item)
+
+    def terminate(self) -> None:
+        """入队终止哨兵 None，并**丢弃**队列里所有未处理的后台批次（/stop、/done 立即
+        停、不排空后台结果，#79）。单线程、无 await，原子——排空后再放 None。"""
+        kept: list = []
+        while not self.queue.empty():
+            it = self.queue.get_nowait()
+            if not isinstance(it, _BgBatch):
+                kept.append(it)
+        for it in kept:
+            self.queue.put_nowait(it)
+        self.pending_bg = None
+        self.queue.put_nowait(None)
 
 
 @dataclass
@@ -798,7 +842,7 @@ class _Daemon:
             resume_session_id=resume_session_id,
         )
         if first_prompt is not None:
-            sess.queue.put_nowait(first_prompt)
+            sess.enqueue(first_prompt)
         self._sessions[task.thread_root_id] = sess
         sess.worker = asyncio.create_task(
             self._agent_worker(sess), name=f"agent-{task.task_id}"
@@ -910,6 +954,11 @@ class _Daemon:
                         else "🛑 agent 已停止。",
                     )
                     break
+                if isinstance(prompt, _BgBatch):
+                    # 后台完成批次（#79）：清 pending_bg（队尾不再有可合并批次），
+                    # 渲染成本轮 prompt（可能含多个 job 块）。清空须紧接 get、无 await。
+                    sess.pending_bg = None
+                    prompt = prompt.render()
                 title = f"{sess.project_name} · {sess.agent_label}"
                 model = getattr(sess.agent, "model", "") or ""
                 # footer 与模型同一行显示项目名（#44）：滚到任意卡片都可辨归属
@@ -1072,12 +1121,13 @@ class _Daemon:
             )
             return
         if forward_raw:
-            sess.queue.put_nowait(text)  # 逐字直传，跳过保留命令解释
+            sess.enqueue(text)  # 逐字直传，跳过保留命令解释
             return
         if text == _STOP_CMD:
-            sess.queue.put_nowait(None)  # 终止信号：worker 收到即标 stopped 收尾
+            # 终止信号：丢弃未处理 bg 批次 + 入队 None（#79 立即停、不排空后台结果）。
+            sess.terminate()
             # 有在途 turn 时协作式取消它，否则 None 要等整轮跑完才生效（跑偏时干瞪眼）。
-            # put_nowait 在 cancel 之前：cancel 让在途 prompt() 返回后，队列里已有 None。
+            # terminate() 在 cancel 之前：cancel 让在途 prompt() 返回后，队列里已有 None。
             if sess.turn_in_flight:
                 await self._cancel_turn(sess)
             return
@@ -1089,7 +1139,7 @@ class _Daemon:
                 if new_input:
                     # 排在 cancel 之前：取消让在途 prompt() 返回后，队列里已有新输入 →
                     # worker 的 cancelled 分支 continue 后即取到它，作为新一轮跑。
-                    sess.queue.put_nowait(new_input)
+                    sess.enqueue(new_input)
                 await self._cancel_turn(sess)
                 await self._safe_reply(
                     thread_root or msg.message_id,
@@ -1099,7 +1149,7 @@ class _Daemon:
                 )
             elif new_input:
                 # 无在途轮：没什么可取消，新输入当普通消息执行
-                sess.queue.put_nowait(new_input)
+                sess.enqueue(new_input)
             else:
                 await self._safe_reply(
                     thread_root or msg.message_id, "当前没有在跑的轮，无需取消。"
@@ -1111,7 +1161,7 @@ class _Daemon:
         if text == _MODEL_CMD or text.startswith(_MODEL_CMD + " "):
             await self._handle_model_cmd(sess, thread_root, text)
             return
-        sess.queue.put_nowait(text)
+        sess.enqueue(text)
 
     async def _handle_model_cmd(
         self, sess: _AgentSession, reply_target: str, text: str
@@ -1235,7 +1285,7 @@ class _Daemon:
         sess = self._sessions.get(task.thread_root_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             sess.terminate_status = status
-            sess.queue.put_nowait(None)
+            sess.terminate()  # 丢弃未处理 bg 批次 + 入队 None（#79，与 /stop 同机制）
         else:
             self.store.update(task_id, status=status)
         return True
@@ -1471,7 +1521,7 @@ class _Daemon:
             return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
         sess = self._sessions.get(task.thread_root_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
-            sess.queue.put_nowait(message)
+            sess.enqueue(message)
             logger.info(
                 "send_to_task[%s] 入队（活跃 session，队列深度=%d，task.status=%s）",
                 task_id,
@@ -1798,10 +1848,11 @@ class _Daemon:
             rc,
             job.task_id,
         )
-        await self._deliver_bg_result(job, rc, self._build_bg_prompt(job, rc))
+        await self._deliver_bg_result(job, rc)
 
-    def _build_bg_prompt(self, job: Job, rc: int) -> str:
-        """构造唤回 agent 的 prompt：`<bg_job_done>` 块（id/命令/exit/耗时/输出尾部）+ 引导。"""
+    def _build_bg_block(self, job: Job, rc: int) -> str:
+        """单个后台任务完成的 `<bg_job_done>` 块（id/命令/exit/耗时/超时/输出尾部）。
+        多个 job 合并唤回时各出一块（见 _BgBatch），引导语由 render() 单独补一条。"""
         tail = _read_tail(job.output_file)
         dur = (
             _fmt_duration(job.finished_at - job.created_at) if job.finished_at else "?"
@@ -1817,11 +1868,13 @@ class _Daemon:
                 "Output (tail):",
                 tail,
                 "</bg_job_done>",
-                "",
-                "你之前用 `fdx bg run` 起的后台任务已完成。请根据退出码与输出继续："
-                "成功就推进下一步，失败/超时就用输出诊断并修复。",
             ]
         )
+
+    def _build_bg_prompt(self, job: Job, rc: int) -> str:
+        """单个后台任务的完整唤回 prompt（块 + 引导语）——用于挂起恢复的首轮（不合并）。
+        与单块 _BgBatch.render() 等价。"""
+        return f"{self._build_bg_block(job, rc)}\n\n{_BG_GUIDANCE}"
 
     def _bg_result_message(self, job: Job, rc: int) -> str:
         """后台任务完成的**可见**话题消息：状态 + exit + 耗时 + 输出尾部（用户直接看结果）。
@@ -1838,11 +1891,14 @@ class _Daemon:
         tail = _clip(_read_tail(job.output_file), 600)
         return f"{head}\n输出（尾部）:\n{tail}" if tail else head
 
-    async def _deliver_bg_result(self, job: Job, rc: int, prompt: str) -> None:
-        """把后台任务完成的 prompt 送回对应 task：活跃则入队，挂起则恢复，终止则只通知。
+    async def _deliver_bg_result(self, job: Job, rc: int) -> None:
+        """把后台任务完成送回对应 task：活跃则合并入队，挂起则恢复，终止则只通知。
 
         无论哪种去向，只要 task 还在，都先往它的话题发一条**可见**完成消息（带输出尾部），
         让用户直接看到结果，再驱动 agent 接续（主线 🔔 保留作「快去看」提醒）。
+
+        活跃分支按 #79 合并：队尾已有未消费批次（``pending_bg``）时只把本 job 的块追加进
+        去、不再入队，让相邻完成的多个 job 只唤回一轮。挂起 task 不合并（各自恢复）。
         """
         verb = "成功" if rc == 0 else f"失败(exit {rc})"
         tag = f"[{job.task_id}]"
@@ -1856,18 +1912,28 @@ class _Daemon:
         await self._safe_reply(task.thread_root_id, self._bg_result_message(job, rc))
         sess = self._sessions.get(task.thread_root_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
-            sess.queue.put_nowait(prompt)
-            await self._notify_main(
-                f"🔔 {tag} 后台任务 {job.job_id} {verb}，已让 agent 继续。"
-            )
+            # check-set 之间无 await：单线程原子，并发完成的 job 不会漏合并/重复入队。
+            if sess.pending_bg is not None:
+                sess.pending_bg.add(self._build_bg_block(job, rc))  # 合并进队尾批次
+                await self._notify_main(
+                    f"🔔 {tag} 后台任务 {job.job_id} {verb}，已并入待处理批次。"
+                )
+            else:
+                batch = _BgBatch()
+                batch.add(self._build_bg_block(job, rc))
+                sess.pending_bg = batch
+                sess.queue.put_nowait(batch)  # 首个：入队一次
+                await self._notify_main(
+                    f"🔔 {tag} 后台任务 {job.job_id} {verb}，已让 agent 继续。"
+                )
             return
         if task.is_terminal:
             await self._notify_main(
                 f"🔔 {tag} 后台任务 {job.job_id} {verb}，但任务已{task.status}，未自动继续。"
             )
             return
-        # 挂起/idle 但无活跃 session：load_session 恢复，把完成 prompt 作为首轮
-        ok, why = self._try_resume(task, first_prompt=prompt)
+        # 挂起/idle 但无活跃 session：load_session 恢复，把完成 prompt 作为首轮（不合并）
+        ok, why = self._try_resume(task, first_prompt=self._build_bg_prompt(job, rc))
         if ok:
             await self._notify_main(
                 f"🔔 {tag} 后台任务 {job.job_id} {verb}，已恢复 agent 继续。"

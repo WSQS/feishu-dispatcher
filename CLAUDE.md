@@ -38,7 +38,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - **身份传递（命门，实测成立）**：daemon 启 agent 时经 `AgentSpawn.env` 注入 `FEISHU_DISPATCHER_URL` + 一次性 `FEISHU_DISPATCHER_TOKEN`（服务端存 `token→task_id`）；这些 env **逐层透传到 agent 跑的 shell 命令**（`scripts/smoke_env_propagation.py` 验，opencode/claude 均通过）→ `fdx` 从 `os.environ` 读，**agent 无需也拿不到自己的 task_id，token 即身份**（无从冒充别 task）。
   - **命令（agent 侧 `fdx bg`）**：`run [--timeout N] -- <argv>`（起）、`list`（列本 task 的 job）、`logs <id> [--tail N]`（中途查输出尾部+状态）、`kill <id>`（终止在跑的）。控制面 endpoint：`POST /v1/bg/{run,list,logs,kill}`。**隔离**：logs/kill 校验 `job.task_id == 请求方`，只能看/停自己的 job。
   - **关键坑（真机踩过）**：① **`stdin=DEVNULL` 必须**——否则子进程继承 daemon 控制台 stdin，交互式 shell profile（实测 `opam env`）会卡死（一条 `Start-Sleep 4` 卡了 26 分钟）；② **argv exec、不经 shell**——命令首词须是真实可执行文件，管道/`&&`/重定向/内置命令要 agent 显式 `bash -c "…"`/`pwsh -Command "…"` 包裹，否则 `FileNotFoundError`（#68 backlog：把该错误变可操作提示）；③ watcher task 必须存强引用（asyncio 只持弱引用，否则中途被 GC）；④ 超时兜底 `bg_job_timeout`（config，默认 0=不超时，长训练不砍）+ `fdx bg run --timeout N`——超时 kill、标 `timed_out`、**仍唤回 agent**。
-  - **完成去向**：`_deliver_bg_result` 先往 task **话题发一条可见完成消息**（`_bg_result_message`，带输出尾部——补上「结果只在注入 prompt 里、用户看不见」的缺口）；再据 session 状态派活（活跃入队 / 挂起 `load_session` 恢复 / 终止只通知）+ 主线 🔔。唤回 prompt = `<bg_job_done>`（id/命令/exit/耗时/Timed Out/输出尾部）。
+  - **完成去向**：`_deliver_bg_result` 先往 task **话题发一条可见完成消息**（`_bg_result_message`，带输出尾部——补上「结果只在注入 prompt 里、用户看不见」的缺口）；再据 session 状态派活（活跃合并入队 / 挂起 `load_session` 恢复 / 终止只通知）+ 主线 🔔。唤回 prompt = `<bg_job_done>` 块（id/命令/exit/耗时/Timed Out/输出尾部，`_build_bg_block`）+ 一条引导语（`_BG_GUIDANCE`，`_build_bg_prompt` 拼全，`_watch_bg_job` 里 build）。
+  - **合并唤回（#79，✅ 已实现）**：同 task **相邻**完成的多个 job 只唤回**一轮**——bg 完成是普通可变队列项 `_BgBatch`（`daemon.py`），`_AgentSession.pending_bg` 指向队尾未消费的批次：非空就把本 job 的块 append 进去（不再入队），否则新建批次入队。`pending_bg is not None` ⟺「队尾是可继续合并的 bg 批次」——**任何非 bg 项入队都走 `_AgentSession.enqueue()` 清 `pending_bg`**（断开合并邻接、保全局 FIFO：晚完成的 job 不会被排到早到的用户回复之前）；worker 取到 `_BgBatch` 清 `pending_bg` + `render()`（多块拼接 + 单条引导语）当本轮 prompt。check-set / 取-清之间**无 await**（单线程原子）。**`/stop`·`/done` 立即停、丢弃 pending bg**：走 `_AgentSession.terminate()` 排空队列里所有未处理 `_BgBatch`（`get_nowait`/`put_nowait`，无 await）再入队 None（用户已在话题看到可见完成消息，丢的只是自动接续）。**挂起 task 不合并**（各自 `_try_resume`，首轮用单块 `_build_bg_prompt`）。
   - **后端无关**（任意能跑 shell 的 agent，不锁 opencode）；bg job 进程继承 daemon（=用户）完整环境（训练需 CUDA/conda 等）。**v1 不做 daemon 重启穿越**（重启丢在飞 job）。让 agent 主动用 `fdx`（brief 注入）属 #68 P2。
 
 ## 开发命令
@@ -46,7 +47,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 用 `uv` 管理（Python 3.12 已 pin；本机无系统 Python，一律 `uv run`）。
 
 - 安装依赖：`uv sync`
-- 测试：`uv run pytest -q`（370 个，含 daemon 生命周期 + 任务系统 + 审计/收尾回复/模型显示+切换+跨挂起恢复黏住 + 项目注册/删除 + 调度器记忆无损保存 + 后台任务（控制面/身份注入/超时/kill）+ 单实例锁/关闭不卡死/铸号自愈 集成测试）
+- 测试：`uv run pytest -q`（380 个，含 daemon 生命周期 + 任务系统 + 审计/收尾回复/模型显示+切换+跨挂起恢复黏住 + 项目注册/删除 + 调度器记忆无损保存 + 后台任务（控制面/身份注入/超时/kill/合并唤回）+ 单实例锁/关闭不卡死/铸号自愈 集成测试）
 - Lint / 格式：`uv run ruff check .` / `uv run ruff format .`
 - daemon：`uv run feishu-dispatcher start`（`--discover` 发现 chat_id；`-v` 调试日志；`--config <path>`）
 - ACP 冒烟（不经飞书，真实 Copilot）：`uv run python scripts/smoke_acp.py`；后台任务相关探针 `scripts/smoke_env_propagation.py`（env 透传）、`scripts/smoke_pty_notify.py`（ACP 带外回合，D1 证据）
