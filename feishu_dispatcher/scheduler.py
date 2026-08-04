@@ -453,6 +453,14 @@ def build_scheduler_tools(
                             "只在用户明确要基于某 issue 派活时填。"
                         ),
                     },
+                    "model": {
+                        "type": "string",
+                        "description": (
+                            "可选：指定 agent 的初始模型（如用户说「用 X 模型跑」）；不填用后端"
+                            "默认。只对暴露模型的后端（如 opencode）有效，copilot/cline 不暴露"
+                            "则忽略、回退默认。给值前可用 list_models(agent) 查该后端可选模型。"
+                        ),
+                    },
                 },
                 "required": ["project", "task"],
             },
