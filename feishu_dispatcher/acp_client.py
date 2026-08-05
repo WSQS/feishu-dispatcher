@@ -20,6 +20,7 @@ from typing import Any
 
 import acp
 from acp import text_block
+from acp.connection import StreamDirection
 from acp.transports import spawn_stdio_transport
 
 logger = logging.getLogger(__name__)
@@ -390,6 +391,40 @@ class _StreamFormatter:
         return ""
 
 
+class _MethodNotFoundTap:
+    """ACP 连接的流观察器：记住 agent→client 请求的方法名，在我们回
+    ``-32601 Method not found`` 时补一条带方法名的 WARNING（#80）。
+
+    SDK 把方法名塞进 ``exc.data``（``str(exc)`` 只有 "Method not found"），且由
+    task supervisor 记成裸 ``ERROR: Background task failed``——日志里看不出到底是
+    哪个未接线的 client 方法。这里把它点出来，让能力协商失败可诊断（cli 侧再把
+    那条冗余 ERROR 过滤掉）。良性：agent 收到 -32601 通常忽略并跑完本轮。
+    """
+
+    def __init__(self) -> None:
+        #: 在途 agent→client 请求 id -> method；收到我们回的响应即弹出（有界）
+        self._pending: dict[Any, str] = {}
+
+    def __call__(self, event: Any) -> None:
+        msg = event.message
+        if event.direction == StreamDirection.INCOMING:
+            # 只登记 agent→client 请求（通知无 id、响应无 method）
+            if "id" in msg and msg.get("method") is not None:
+                self._pending[msg["id"]] = msg["method"]
+            return
+        # OUTGOING：只认我们回给 agent 的响应（有 id、无 method）
+        if "method" in msg or "id" not in msg:
+            return
+        method = self._pending.pop(msg["id"], None)
+        error = msg.get("error")
+        if method and isinstance(error, dict) and error.get("code") == -32601:
+            logger.warning(
+                "ACP: agent 调了未接线的 client 方法 %r，已回 -32601"
+                "（能力协商失败，agent 通常忽略并跑完本轮）",
+                method,
+            )
+
+
 @dataclass
 class AgentSpawn:
     """启动一个 agent 所需的参数���"""
@@ -525,7 +560,9 @@ class AcpAgent:
 
         cb = _Callbacks(on_output=self._on_output, on_action=self._on_action)
         self._client_impl = _ClientImpl(cb)
-        self._conn = acp.connect_to_agent(self._client_impl, writer, reader)
+        self._conn = acp.connect_to_agent(
+            self._client_impl, writer, reader, observers=[_MethodNotFoundTap()]
+        )
 
         init_resp = await self._conn.initialize(
             protocol_version=_PROTOCOL_VERSION,

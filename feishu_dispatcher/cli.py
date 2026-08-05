@@ -7,7 +7,24 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from acp.exceptions import RequestError
+
 logger = logging.getLogger(__name__)
+
+
+class _AcpMethodNotFoundFilter(logging.Filter):
+    """丢掉 ACP task supervisor 对「已回过 -32601 的 client 请求」记的裸
+    ``Background task failed`` ERROR（#80）：方法名已由 acp_client 的观察器以
+    WARNING 记下，这条 ERROR+traceback 纯属噪声。其它后台任务错误照常保留。
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.msg != "Background task failed" or not record.exc_info:
+            return True
+        exc = record.exc_info[1]
+        return not (
+            isinstance(exc, RequestError) and getattr(exc, "code", None) == -32601
+        )
 
 
 def _setup_logging(verbose: bool, log_dir: Path) -> None:
@@ -20,7 +37,9 @@ def _setup_logging(verbose: bool, log_dir: Path) -> None:
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     root = logging.getLogger()
     root.handlers.clear()  # 幂等：重复调用（如测试）不重复挂 handler
+    root.filters.clear()  # 幂等：同上，不重复挂过滤器
     root.setLevel(level)
+    root.addFilter(_AcpMethodNotFoundFilter())
 
     console = logging.StreamHandler()
     console.setFormatter(fmt)
