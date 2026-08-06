@@ -13,8 +13,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import signal
 import sys
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -425,6 +426,86 @@ class _MethodNotFoundTap:
             )
 
 
+# --- Windows 进程树兜底清理（#92） ------------------------------------- #
+# cursor-agent 在 Windows 经 cmd.exe→powershell→node 两层 shim 启动；ACP SDK 关闭
+# 时只 terminate 直接子进程 cmd.exe，而 TerminateProcess 不递归、node 又不因 stdin
+# EOF 退出，导致 powershell+node 后代泄漏（真机堆过 18 个僵尸、~1.2GB）。aclose 里
+# 趁进程树还活着快照全部 pid，按 pid 直杀，堵住 shim 链泄漏。POSIX 无此 shim 链。
+
+
+def _proc_tree_pids(root: int, ppid_of: dict[int, int]) -> list[int]:
+    """root 及其所有后代 pid（含 root），由 pid→ppid 映射算出。纯函数、可单测。"""
+    children: dict[int, list[int]] = {}
+    for pid, ppid in ppid_of.items():
+        children.setdefault(ppid, []).append(pid)
+    out: list[int] = []
+    seen: set[int] = set()
+    stack = [root]
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        out.append(pid)
+        stack.extend(children.get(pid, ()))
+    return out
+
+
+def _win_snapshot_ppids() -> dict[int, int]:
+    """Windows 全进程表快照：pid -> ppid（Toolhelp32）。失败返回空 dict。"""
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class _ProcessEntry32(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_char * 260),
+        ]
+
+    kernel32 = ctypes.windll.kernel32
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel32.Process32First.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_ProcessEntry32),
+    ]
+    kernel32.Process32Next.argtypes = [wintypes.HANDLE, ctypes.POINTER(_ProcessEntry32)]
+
+    snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if not snap or snap == wintypes.HANDLE(-1).value:
+        return {}
+    ppids: dict[int, int] = {}
+    try:
+        entry = _ProcessEntry32()
+        entry.dwSize = ctypes.sizeof(_ProcessEntry32)
+        ok = kernel32.Process32First(snap, ctypes.byref(entry))
+        while ok:
+            ppids[int(entry.th32ProcessID)] = int(entry.th32ParentProcessID)
+            ok = kernel32.Process32Next(snap, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snap)
+    return ppids
+
+
+def _win_reap_pids(pids: Iterable[int]) -> None:
+    """逐个 force-kill（Windows: TerminateProcess）；已退出 / 无权限静默跳过。"""
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except (OSError, ValueError):
+            pass
+
+
 @dataclass
 class AgentSpawn:
     """启动一个 agent 所需的参数���"""
@@ -689,11 +770,32 @@ class AcpAgent:
                 await self._conn.close()
             except Exception:
                 logger.debug("conn.close 异常（忽略）", exc_info=True)
+        # Windows 兜底（#92）：SDK 的 transport 收尾只 terminate 直接子进程 cmd.exe，
+        # cursor-agent 的 powershell+node 后代会泄漏。趁进程树还活着（cursor 的 node
+        # 不因 close 退出）快照并按 pid 直杀整棵树，再走 SDK 收尾（此时进程已死、快速）。
+        self._reap_process_tree()
         if self._transport_ctx is not None:
             try:
                 await self._transport_ctx.__aexit__(None, None, None)
             except Exception:
                 logger.debug("transport 退出异常（忽略）", exc_info=True)
+
+    def _reap_process_tree(self) -> None:
+        """Windows：杀掉 agent 进程（cmd.exe）及其全部后代（powershell/node），堵住
+        SDK 只杀直接子进程留下的 shim 链泄漏（#92）。非 Windows 或未启动时 no-op。
+
+        仅在进程**确认仍存活**（``returncode is None``）时动手：若它已自行退出，其 pid
+        可能已被系统复用，从复用后的 root 算树会误杀无关进程——宁可漏收也不错杀。"""
+        if sys.platform != "win32" or self._proc is None:
+            return
+        if self._proc.returncode is not None:
+            return
+        try:
+            tree = _proc_tree_pids(self._proc.pid, _win_snapshot_ppids())
+        except Exception:
+            logger.debug("进程树快照失败（忽略）", exc_info=True)
+            tree = [self._proc.pid]
+        _win_reap_pids(tree)
 
 
 _SENSITIVE_ARG_WORDS = ("token", "secret", "password", "apikey", "api-key", "api_key")

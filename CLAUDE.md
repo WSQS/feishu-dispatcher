@@ -47,7 +47,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 用 `uv` 管理（Python 3.12 已 pin；本机无系统 Python，一律 `uv run`）。
 
 - 安装依赖：`uv sync`
-- 测试：`uv run pytest -q`（380 个，含 daemon 生命周期 + 任务系统 + 审计/收尾回复/模型显示+切换+跨挂起恢复黏住 + 项目注册/删除 + 调度器记忆无损保存 + 后台任务（控制面/身份注入/超时/kill/合并唤回）+ 单实例锁/关闭不卡死/铸号自愈 集成测试）
+- 测试：`uv run pytest -q`（388 个，含 daemon 生命周期 + 任务系统 + 审计/收尾回复/模型显示+切换+跨挂起恢复黏住 + 项目注册/删除 + 调度器记忆无损保存 + 后台任务（控制面/身份注入/超时/kill/合并唤回）+ 单实例锁/关闭不卡死/铸号自愈 + Windows agent 进程树兜底清理 集成测试）
 - Lint / 格式：`uv run ruff check .` / `uv run ruff format .`
 - daemon：`uv run feishu-dispatcher start`（`--discover` 发现 chat_id；`-v` 调试日志；`--config <path>`）
 - ACP 冒烟（不经飞书，真实 Copilot）：`uv run python scripts/smoke_acp.py`；后台任务相关探针 `scripts/smoke_env_propagation.py`（env 透传）、`scripts/smoke_pty_notify.py`（ACP 带外回合，D1 证据）
@@ -62,6 +62,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - **飞书限频**：同群全部机器人共享 5 QPS（全应用 50/s）。**出站令牌桶**（`feishu.py` 的 `_RateLimiter`，`_im_post`/`_im_patch` 发送前 `acquire`，`[config] feishu_qps` 默认 5、`<=0` 关闭）把多 agent 汇总 QPS 压在限额下——故 `max_agents` 默认已提到 7（#36）。HTTP 层另带 Retry（429/5xx，尊重 Retry-After）当兜底。**当前是全局桶**（不分 chat，个人多为单群够用）；严格 per-chat 桶 + 同项目 worktree 隔离见 #37。
 - **安全默认**：`chat_id` 必填（空则拒绝启动，发现模式用 `--discover`）；`sender_whitelist` 建议配置；`/run` 并发上限 `max_agents`。
 - **单实例锁（#81）**：`start` 时对状态目录下 `daemon.lock` 加 OS 文件锁（`singleinstance.py`，Windows `msvcrt`/POSIX `fcntl`，进程退出含被杀由 OS 自动释放；Windows 锁高偏移哨兵字节让文件头 pid 仍可被竞争者读出报错）。已有实例在跑则第二个 `start` 直接报错中止——杜绝多 daemon 共用 `tasks.json`/WS 互相踩坏台账（曾出过 task_id 复用、话题台账被覆盖）。re-exec 前显式放锁。**配套**：`_shutdown` 关控制面用 `asyncio.wait_for(asyncio.to_thread(control.stop), _CONTROL_STOP_TIMEOUT=5s)`——挪到 worker 线程跑（主 loop 继续转、解与在途控制面请求的死锁）+ 超时兜底，保证 reboot 能干净杀掉旧进程、不再叠僵尸。`store.create()` 铸号自愈：`max(seq, 现有最大 id)+1`，即便 seq 被回退也不复用已有 id。
+- **Windows agent 进程树兜底清理（#92）**：cursor-agent 在 Windows 经 `cmd.exe→powershell→node` 两层 shim 启动，而 ACP SDK 的 `spawn_stdio_transport` 收尾只 `terminate` 直接子进程 cmd.exe（`TerminateProcess` 不递归、cursor 的 node 又不因 stdin EOF 退出）——`powershell+node` 后代泄漏（真机堆过 18 个僵尸、~1.2GB）。`AcpAgent.aclose()` 里 `_reap_process_tree()` 兜底：`close_session`+`conn.close()` 后、SDK `__aexit__` 前，趁进程树还活着用 Toolhelp 快照（`_win_snapshot_ppids`）算出整棵树（`_proc_tree_pids`，纯函数可单测）并按 pid 直杀（`_win_reap_pids`=`os.kill`→`TerminateProcess`）。仅 Windows 生效（POSIX 无此 shim 链）；真机验证 `scripts/smoke_proc_tree_kill.py`。
 - WS 线程死亡由 daemon 30s 看门狗自动重启；agent 子进程 stderr 有后台 drain（防管道满卡死）。
 - **待办 / backlog**：可执行任务条目统一走 **GitHub issues**（`gh issue list`，按 `size:` / `area:` label 分类）；设计理由与已评估/暂缓的决策记录留在 `docs/design.md`。**不要**再在本文件或 design.md 里另起任务清单（避免与 issues 漂移）。大块方向：同项目 worktree 隔离（#37）、权限审批 B（#20）。
 - **动手前先开 issue（工作流约束）**：任何要修复/实现的**独立**问题，在开始改动前先 `gh issue create` 记录（打好 `size:`/`area:` label），再开分支写修复，PR 里 `Closes #N` 闭环——不要先写代码、事后再补 issue。同一 PR 范围内顺手带的琐碎修正（如改个错字）不必单独开 issue。
