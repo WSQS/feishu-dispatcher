@@ -167,6 +167,25 @@ class UsageAgent(ModelAgent):
         return reason
 
 
+class GatedAgent(FakeAgent):
+    """首轮 prompt() 阻塞在 gate 事件上（保持 turn_in_flight），之后各轮立即完成——
+    用于确定性地在「turn 在途」窗口内投递 bg 结果、观察合并（#79）。"""
+
+    def __init__(self, *a, **k) -> None:
+        super().__init__(*a, **k)
+        self.gate = asyncio.Event()
+        self._first = True
+
+    async def prompt(self, text: str) -> str:
+        self.prompts.append(text)
+        if self._first:
+            self._first = False
+            await self.gate.wait()
+        self.last_message = f"reply:{text}"
+        await self.on_output(f"echo:{text}")
+        return "end_turn"
+
+
 def make_daemon(
     agent_cls: type[FakeAgent] = FakeAgent,
     *,
@@ -2058,8 +2077,7 @@ async def test_bg_job_completion_enqueues_resume_to_active_agent():
     await wait_until(lambda: created and created[0].prompts == ["task"])
     job = daemon.job_store.create(task_id="t1", command=["x"], cwd="C:/tmp/demo")
     daemon.job_store.update(job.job_id, exit_code=0, finished_at=time.time())
-    prompt = "<bg_job_done>\nJob: j1\nExit Code: 0\n</bg_job_done>\n继续"
-    await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 0, prompt)
+    await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 0)
     await wait_until(
         lambda: any(p.startswith("<bg_job_done>") for p in created[0].prompts)
     )
@@ -2078,7 +2096,7 @@ async def test_bg_job_completion_posts_visible_result_to_thread(tmp_path: Path):
     daemon.job_store.update(
         job.job_id, output_file=str(out), exit_code=0, finished_at=time.time()
     )
-    await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 0, "PROMPT")
+    await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 0)
     # 话题里出现**可见**的完成消息 + 输出尾部（不只是主线 🔔）
     thread_texts = bridge.texts("om_root1")
     assert any("后台任务 j1 完成" in t and "exit 0" in t for t in thread_texts)
@@ -2091,8 +2109,14 @@ async def test_bg_job_completion_resumes_suspended_task():
     _seed_task(store, thread="om_s", session_id="sid_s", status="suspended")
     daemon, bridge, created = make_daemon(store=store)
     job = daemon.job_store.create(task_id="t1", command=["x"], cwd="c")
-    await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 0, "PROMPT")
-    await wait_until(lambda: created and created[0].prompts == ["PROMPT"])
+    await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 0)
+    await wait_until(
+        lambda: (
+            created
+            and created[0].prompts
+            and created[0].prompts[0].startswith("<bg_job_done>")
+        )
+    )
     assert created[0].resume_session_id == "sid_s"  # 走 load_session
     await daemon._shutdown()
 
@@ -2102,9 +2126,78 @@ async def test_bg_job_completion_terminal_task_notifies_only():
     _seed_task(store, thread="om_x", status="done")
     daemon, bridge, created = make_daemon(store=store)
     job = daemon.job_store.create(task_id="t1", command=["x"], cwd="c")
-    await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 1, "P")
+    await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 1)
     assert created == []  # 终止任务不恢复
     assert any("未自动继续" in t and "失败" in t for _, t in bridge.roots)
+
+
+async def test_bg_completions_merge_into_single_batch_and_one_turn():
+    # #79：turn 在途时相继完成的多个 job 合并进同一批次，只唤回一轮
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(GatedAgent, store=store)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    agent = created[0]
+    sess = daemon._sessions["om_root1"]
+    assert sess.turn_in_flight  # 首轮卡在 gate 上
+    j1 = daemon.job_store.create(task_id="t1", command=["a"], cwd="c")
+    daemon.job_store.update(j1.job_id, exit_code=0, finished_at=time.time())
+    await daemon._deliver_bg_result(daemon.job_store.get(j1.job_id), 0)
+    j2 = daemon.job_store.create(task_id="t1", command=["b"], cwd="c")
+    daemon.job_store.update(j2.job_id, exit_code=0, finished_at=time.time())
+    await daemon._deliver_bg_result(daemon.job_store.get(j2.job_id), 0)
+    # 两个 job 合并进队尾同一批次，只入队一次
+    assert sess.pending_bg is not None and len(sess.pending_bg.blocks) == 2
+    assert sess.queue.qsize() == 1
+    # 放行首轮 → worker 取走批次 → 一轮 prompt 同时含 j1 与 j2
+    agent.gate.set()
+    await wait_until(
+        lambda: any("Job: j1" in p and "Job: j2" in p for p in agent.prompts)
+    )
+    assert sum(p.startswith("<bg_job_done>") for p in agent.prompts) == 1  # 只一轮
+    assert sess.pending_bg is None  # 消费后清空
+    await daemon._shutdown()
+
+
+async def test_normal_reply_between_bg_completions_prevents_merge():
+    # #79：两个 bg 完成之间夹了用户话题回复 → 断开合并邻接，保 FIFO（不 reorder）
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(GatedAgent, store=store)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    sess = daemon._sessions["om_root1"]
+    j1 = daemon.job_store.create(task_id="t1", command=["a"], cwd="c")
+    await daemon._deliver_bg_result(daemon.job_store.get(j1.job_id), 0)
+    batch1 = sess.pending_bg
+    assert batch1 is not None
+    await daemon._handle_message(thread_msg("hi there"))  # 用户回复夹在中间
+    assert sess.pending_bg is None  # enqueue 清了合并邻接
+    j2 = daemon.job_store.create(task_id="t1", command=["b"], cwd="c")
+    await daemon._deliver_bg_result(daemon.job_store.get(j2.job_id), 0)
+    # j2 另起批次、不并入 batch1（保 FIFO：j2 晚于 "hi there"）
+    assert sess.pending_bg is not None and sess.pending_bg is not batch1
+    assert len(batch1.blocks) == 1 and len(sess.pending_bg.blocks) == 1
+    assert sess.queue.qsize() == 3  # [batch1, "hi there", batch2]
+    await daemon._shutdown()
+
+
+async def test_stop_drops_pending_bg_batch():
+    # #79：/stop 立即停、丢弃未处理的 bg 批次（不排空后台结果再停）
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(CancelableAgent, store=store)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await created[0].in_prompt.wait()  # 首轮在途
+    sess = daemon._sessions["om_root1"]
+    j1 = daemon.job_store.create(task_id="t1", command=["a"], cwd="c")
+    daemon.job_store.update(j1.job_id, exit_code=0, finished_at=time.time())
+    await daemon._deliver_bg_result(daemon.job_store.get(j1.job_id), 0)
+    assert sess.pending_bg is not None and sess.queue.qsize() == 1  # 批次已入队
+    await daemon._handle_message(thread_msg("/stop"))
+    await wait_until(lambda: daemon.store.get("t1").status == "stopped")
+    # agent 只收到过首轮，从未收到被丢弃的 bg 批次
+    assert created[0].prompts == ["task"]
+    assert sess.pending_bg is None
+    await daemon._shutdown()
 
 
 async def test_watch_bg_job_updates_status_and_delivers(tmp_path: Path):
