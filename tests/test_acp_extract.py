@@ -8,11 +8,14 @@ from acp import (
     start_tool_call,
     update_tool_call,
 )
+from acp.connection import StreamDirection
 from acp.schema import ToolCallLocation
 
+import logging
 from types import SimpleNamespace as NS
 
 from feishu_dispatcher.acp_client import (
+    _MethodNotFoundTap,
     _StreamFormatter,
     _extract_action,
     _extract_model,
@@ -412,3 +415,46 @@ def test_empty_thought_chunk_does_not_change_state():
     assert f.format(update_agent_thought_text("")) == ""
     # 空 chunk 不重置连续态，后续 thought 仍不重复加 💭
     assert f.format(update_agent_thought_text(" more")) == " more"
+
+
+# --- 未接线 client 方法观察器 (_MethodNotFoundTap) --------------------- #
+
+
+def _event(direction, message):
+    return NS(direction=direction, message=message)
+
+
+def test_method_not_found_tap_names_the_method(caplog):
+    tap = _MethodNotFoundTap()
+    tap(_event(StreamDirection.INCOMING, {"id": 7, "method": "cursor/doThing"}))
+    with caplog.at_level(logging.WARNING):
+        tap(
+            _event(
+                StreamDirection.OUTGOING,
+                {"id": 7, "error": {"code": -32601, "message": "Method not found"}},
+            )
+        )
+    assert "cursor/doThing" in caplog.text
+
+
+def test_method_not_found_tap_ignores_success_and_other_errors(caplog):
+    tap = _MethodNotFoundTap()
+    tap(_event(StreamDirection.INCOMING, {"id": 1, "method": "fs/read_text_file"}))
+    tap(
+        _event(
+            StreamDirection.INCOMING, {"id": 2, "method": "session/request_permission"}
+        )
+    )
+    with caplog.at_level(logging.WARNING):
+        tap(_event(StreamDirection.OUTGOING, {"id": 1, "error": {"code": -32603}}))
+        tap(_event(StreamDirection.OUTGOING, {"id": 2, "result": {"ok": True}}))
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+
+
+def test_method_not_found_tap_bounded_pops_pending():
+    # 每条 agent 请求都会有一条我们回的响应弹出登记，_pending 不无限增长
+    tap = _MethodNotFoundTap()
+    tap(_event(StreamDirection.INCOMING, {"id": 5, "method": "x/y"}))
+    assert tap._pending
+    tap(_event(StreamDirection.OUTGOING, {"id": 5, "result": {}}))
+    assert not tap._pending
