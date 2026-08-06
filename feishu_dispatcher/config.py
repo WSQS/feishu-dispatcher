@@ -90,6 +90,10 @@ class Config:
     #: 后台任务（fdx bg run）默认超时秒数；<=0 = 不超时（默认，长训练/build 不该被砍）。
     #: 兜底防卡死进程堆积；agent 也可用 `fdx bg run --timeout N` 单次覆盖。#68
     bg_job_timeout: float = 0.0
+    #: agent 启动/会话恢复（initialize + new/load_session）整体超时秒数（#94）。后端卡在
+    #: 握手/load_session 时快速失败（标 failed 可恢复 + 通知）而非永久冻结、静默不回复。
+    #: <=0 = 关闭（不建议）。默认 120s，足够冷启动/大会话恢复，又兜住无限卡死。
+    agent_start_timeout: float = 120.0
     #: 流式输出模式：card=原地更新卡片（默认），text=每批发新消息（兜底）
     stream_mode: str = "card"
     #: 调度器 LLM（P2）；None = 不启用（自然语言消息回退到「用法」提示）。= 当前激活 profile
@@ -182,6 +186,7 @@ class Config:
             feishu_qps=float(data.get("feishu_qps", 5.0)),
             idle_timeout=float(data.get("idle_timeout", 1800.0)),
             bg_job_timeout=float(data.get("bg_job_timeout", 0.0)),
+            agent_start_timeout=float(data.get("agent_start_timeout", 120.0)),
             stream_mode=stream_mode,
             llm=llm,
             llm_profiles=llm_profiles,

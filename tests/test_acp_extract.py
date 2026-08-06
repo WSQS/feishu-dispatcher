@@ -11,10 +11,15 @@ from acp import (
 from acp.connection import StreamDirection
 from acp.schema import ToolCallLocation
 
+import asyncio
 import logging
 from types import SimpleNamespace as NS
 
+import pytest
+
 from feishu_dispatcher.acp_client import (
+    AcpAgent,
+    AgentSpawn,
     _MethodNotFoundTap,
     _StreamFormatter,
     _extract_action,
@@ -24,6 +29,19 @@ from feishu_dispatcher.acp_client import (
     _extract_usage_tokens,
     _proc_tree_pids,
 )
+
+
+async def _noop_out(_t: str) -> None:
+    pass
+
+
+def _agent(start_timeout=5.0, resume=None) -> AcpAgent:
+    return AcpAgent(
+        AgentSpawn(command=["x"], cwd="."),
+        _noop_out,
+        resume_session_id=resume,
+        start_timeout=start_timeout,
+    )
 
 
 def fmt(update) -> str:
@@ -485,3 +503,54 @@ def test_proc_tree_pids_leaf_returns_only_self():
 def test_proc_tree_pids_ignores_ppid_cycle():
     # 防御坏快照里的环：不死循环、每个 pid 只算一次
     assert set(_proc_tree_pids(10, {10: 11, 11: 10})) == {10, 11}
+
+
+# --- 握手/会话恢复超时 (AcpAgent.start, #94) --------------------------- #
+
+
+def test_start_timeout_normalizes_nonpositive():
+    # <=0 归一化为 None（不超时）；正值保留
+    assert _agent(start_timeout=0)._start_timeout is None
+    assert _agent(start_timeout=-1)._start_timeout is None
+    assert _agent(start_timeout=30)._start_timeout == 30
+
+
+async def test_await_start_passes_through_fast_result():
+    async def quick():
+        return 42
+
+    assert await _agent(start_timeout=5)._await_start(quick(), "initialize") == 42
+
+
+async def test_await_start_raises_timeout_on_hang():
+    async def hang():
+        await asyncio.sleep(10)
+
+    with pytest.raises(TimeoutError, match="load_session"):
+        await _agent(start_timeout=0.05)._await_start(hang(), "load_session")
+
+
+async def test_start_raises_timeout_when_load_session_hangs(monkeypatch):
+    # 复刻真机：initialize 成功但 load_session 永不返回 → start() 抛 TimeoutError 而非挂起
+    import feishu_dispatcher.acp_client as mod
+
+    class _FakeTransport:
+        async def __aenter__(self):
+            return (object(), object(), NS(stderr=None))
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _FakeConn:
+        async def initialize(self, **_k):
+            return NS(agent_info="fake", agent_capabilities="caps")
+
+        async def load_session(self, **_k):
+            await asyncio.sleep(10)  # 卡死
+
+    monkeypatch.setattr(mod, "spawn_stdio_transport", lambda *a, **k: _FakeTransport())
+    monkeypatch.setattr(mod.acp, "connect_to_agent", lambda *a, **k: _FakeConn())
+
+    agent = _agent(start_timeout=0.1, resume="sess-1")
+    with pytest.raises(TimeoutError, match="load_session"):
+        await agent.start()
