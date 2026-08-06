@@ -22,6 +22,7 @@ from feishu_dispatcher.acp_client import (
     _extract_model_options,
     _extract_tool_detail,
     _extract_usage_tokens,
+    _proc_tree_pids,
 )
 
 
@@ -458,3 +459,29 @@ def test_method_not_found_tap_bounded_pops_pending():
     assert tap._pending
     tap(_event(StreamDirection.OUTGOING, {"id": 5, "result": {}}))
     assert not tap._pending
+
+
+# --- Windows 进程树计算 (_proc_tree_pids, #92) ------------------------- #
+
+
+def test_proc_tree_pids_collects_cmd_powershell_node_chain():
+    # 复刻 cursor 的 shim 链：daemon → cmd → powershell → node（+ 旁支）
+    ppid_of = {
+        1000: 1,  # daemon
+        2000: 1000,  # cmd.exe（传入的 root）
+        3000: 2000,  # powershell
+        4000: 3000,  # node
+        4100: 3000,  # 同 powershell 下另一个后代
+        5000: 1,  # 无关进程
+        2001: 1000,  # daemon 的另一个 cmd（不该被算进 2000 的树）
+    }
+    assert set(_proc_tree_pids(2000, ppid_of)) == {2000, 3000, 4000, 4100}
+
+
+def test_proc_tree_pids_leaf_returns_only_self():
+    assert _proc_tree_pids(4000, {4000: 3000}) == [4000]
+
+
+def test_proc_tree_pids_ignores_ppid_cycle():
+    # 防御坏快照里的环：不死循环、每个 pid 只算一次
+    assert set(_proc_tree_pids(10, {10: 11, 11: 10})) == {10, 11}
