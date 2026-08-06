@@ -787,6 +787,7 @@ class _Daemon:
             on_output,
             on_action=on_action,
             resume_session_id=resume_session_id,
+            start_timeout=self.cfg.agent_start_timeout,
         )
 
     def _launch(

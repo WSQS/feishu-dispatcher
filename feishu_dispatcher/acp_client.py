@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 #: ACP 协议版本（当前 SDK 与 Copilot/OpenCode 实测握手成功值）
 _PROTOCOL_VERSION = 1
 
+#: 握手（initialize + new/load_session）整体超时秒数默认值（#94）。后端卡在
+#: load_session 时快速失败而非永久冻结；<=0/None = 不超时。可经 config 覆盖。
+_DEFAULT_START_TIMEOUT = 120.0
+
 OnOutput = Callable[[str], Awaitable[None]]
 #: 审计动作回调：收到一个 tool_call 时推一条结构化动作（{"kind","title"}）
 OnAction = Callable[[dict], Awaitable[None]]
@@ -535,12 +539,17 @@ class AcpAgent:
         *,
         on_action: OnAction | None = None,
         resume_session_id: str | None = None,
+        start_timeout: float | None = _DEFAULT_START_TIMEOUT,
     ) -> None:
         self._spawn = spawn
         self._on_output = on_output
         self._on_action = on_action
         #: 非 None 则恢复该 ACP 会话（load_session）而非新建（new_session）
         self._resume_session_id = resume_session_id
+        #: 握手/会话恢复超时秒数；<=0 归一化为 None（不超时）
+        self._start_timeout: float | None = (
+            start_timeout if start_timeout and start_timeout > 0 else None
+        )
         self._conn: acp.ClientSideConnection | None = None
         self._session_id: str | None = None
         #: 当前模型（opencode/claude 从 new_session config_options 取；copilot 无、留空）
@@ -596,11 +605,28 @@ class AcpAgent:
         )
         self._model = name
 
+    async def _await_start(self, coro: Awaitable[Any], what: str) -> Any:
+        """带超时地 await 握手/会话调用；超时抛 TimeoutError 供 worker 快速失败（#94）。
+
+        后端卡在 ``initialize`` / ``load_session`` 时，无超时会让 ``start()`` 永久挂起、
+        worker 冻结、静默不回复（真机踩过）。超时后 ``start()`` 抛错 → worker 标 failed
+        （可恢复）+ 通知 + aclose（顺带 #92 清进程）。``_start_timeout`` 为 None 则不超时。
+        """
+        try:
+            return await asyncio.wait_for(coro, timeout=self._start_timeout)
+        except asyncio.TimeoutError as e:
+            raise TimeoutError(
+                f"agent {what} 超时（>{self._start_timeout:g}s），后端可能卡住"
+            ) from e
+
     async def start(self) -> None:
         """启动 agent 进程、完成 initialize + new_session 握手。
 
         每个实例只允许启动一次：进程与 session 跨 turn 存活（上下文
         保留在 session 里），重复 start 会泄漏旧进程，直接报错。
+
+        握手（initialize + new/load_session）带整体超时（``start_timeout``，#94），
+        后端卡死时抛 TimeoutError 而非永久挂起。
         """
         if self._conn is not None:
             raise RuntimeError("agent 已启动，禁止重复 start()")
@@ -645,9 +671,12 @@ class AcpAgent:
             self._client_impl, writer, reader, observers=[_MethodNotFoundTap()]
         )
 
-        init_resp = await self._conn.initialize(
-            protocol_version=_PROTOCOL_VERSION,
-            client_info={"name": "feishu-dispatcher", "version": "0.0.1"},
+        init_resp = await self._await_start(
+            self._conn.initialize(
+                protocol_version=_PROTOCOL_VERSION,
+                client_info={"name": "feishu-dispatcher", "version": "0.0.1"},
+            ),
+            "initialize",
         )
         logger.info(
             "ACP 握手成功: agent=%s capabilities=%s",
@@ -660,8 +689,11 @@ class AcpAgent:
             # 抑制转发避免旧对话灌进新卡片（历史已在旧飞书话题里）。
             self._client_impl.set_suppress(True)
             try:
-                resp = await self._conn.load_session(
-                    cwd=self._spawn.cwd, session_id=self._resume_session_id
+                resp = await self._await_start(
+                    self._conn.load_session(
+                        cwd=self._spawn.cwd, session_id=self._resume_session_id
+                    ),
+                    "load_session",
                 )
             finally:
                 self._client_impl.set_suppress(False)
@@ -674,7 +706,9 @@ class AcpAgent:
                 self._model or "?",
             )
         else:
-            session = await self._conn.new_session(cwd=self._spawn.cwd)
+            session = await self._await_start(
+                self._conn.new_session(cwd=self._spawn.cwd), "new_session"
+            )
             self._session_id = session.session_id
             self._model = _extract_model(session)
             self._available_models = _extract_model_options(session)
