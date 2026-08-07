@@ -31,7 +31,7 @@ daemon 跑起来之后，日常怎么用。第一次配置见 [setup.md](setup.m
 
 ### 2. 自然语言（需先配调度器 LLM）
 
-配了 `[llm]`（见 setup.md 6.5）后，**群里直接说人话**即可，不用打 `/run`：
+配了 `[llm]`（见 setup.md「自然语言派发」）后，**群里直接说人话**即可，不用打 `/run`：
 
 ```
 帮 feishu-dispatcher 把 README 补个英文版
@@ -107,7 +107,7 @@ daemon 崩了 / 升级 / 重开机之后，**不用重新 `/run`**：直接在�
 ## 排障 FAQ
 
 **daemon 起不来 / 报 chat_id 为空？**
-`chat_id` 必填。先 `uv run feishu-dispatcher start --discover`，在群里发条消息，日志会打印 `chat_id`，填进 `config.toml`。详见 [setup.md](setup.md) 第 5 步。
+`chat_id` 必填。先 `uv run feishu-dispatcher start --discover`，在群里发条消息，日志会打印 `chat_id`，填进 `config.toml`。详见 [setup.md](setup.md)「本地配置」。
 
 **已经有一个 daemon 在跑，第二个 `start` 直接报错？**
 这是**单实例锁**在保护你——同时跑两个 daemon 会共用 `tasks.json` / 抢 WS，把台账踩坏。先把旧的停掉（或用 `/reboot` 让它自己重启），再启新的。
