@@ -38,6 +38,8 @@ from .scheduler import (
     run_tool_loop,
 )
 from .store import Job, JobStore, ModelStore, ProjectStore, Task, TaskStore
+from ._viewer_token import ensure_token
+from .viewer import ViewerServer, health as viewer_health
 
 logger = logging.getLogger(__name__)
 
@@ -215,6 +217,7 @@ async def run(
         model_store=ModelStore(store_path.parent / "models.json"),
         job_store=JobStore(store_path.parent / "jobs.json"),
         _bg_logs_dir=store_path.parent / "bg-logs",
+        _viewer_token_path=store_path.parent / "viewer.token",
         _sched_memory=SchedulerMemory(
             store_path.parent / "scheduler_memory.json",
             # [llm].memory_rounds 可配；未配 [llm] 时记忆不参与派发，取默认即可
@@ -326,6 +329,8 @@ class _Daemon:
     _seen_message_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
     #: 本地控制面（agent CLI 入口）；run() 里启动，测试构造 _Daemon 时为 None（不起 HTTP）
     _control: "ControlServer | None" = None
+    #: 移动端查看器（只读 HTTP，给手机）；run() 里按 cfg.viewer.enabled 启动，否则 None。
+    _viewer: "ViewerServer | None" = None
     #: 后台任务身份表：token → task_id（启 agent 时登记，关 session 时清）。#68
     _bg_tokens: dict[str, str] = field(default_factory=dict)
     #: 后台任务 watcher 的强引用（asyncio 只持弱引用，不存会被 GC）。#68
@@ -334,6 +339,8 @@ class _Daemon:
     _bg_procs: dict = field(default_factory=dict)
     #: 后台任务输出日志目录；run() 注入（默认 config 同目录 bg-logs/）
     _bg_logs_dir: "Path | None" = None
+    #: viewer token 文件路径；run() 注入（默认 config 同目录 viewer.token），_start_viewer 用
+    _viewer_token_path: "Path | None" = None
     #: /reboot 收到后置位；run() 返回它，cli.py re-exec 重启进程
     _reboot_requested: bool = False
     #: run() 里创建的退出事件；/reboot 或退出信号 set 它跳出主循环
@@ -366,6 +373,11 @@ class _Daemon:
             },
         )
         self._control.start()
+        # 移动端查看器（#104/#107/#111）：只读 HTTP，给手机经私有网络连。默认不起
+        # （cfg.viewer 为 None 或 enabled=false）。失败不拖累 daemon —— 记 ERROR 日志、
+        # 飞书功能照常（决策 Q3=β）。token 未填则自动生成 + 持久化（决策 Q3/Q8）。
+        if self.cfg.viewer and self.cfg.viewer.enabled:
+            self._viewer = self._start_viewer(loop)
         self._bridge.start_background()
         logger.info(
             "feishu-dispatcher daemon 已启动（调度器 LLM: %s），等待飞书消息…",
@@ -391,6 +403,40 @@ class _Daemon:
             logger.info("收到退出信号，清理 agent…")
         finally:
             await self._shutdown()
+
+    def _start_viewer(self, loop: asyncio.AbstractEventLoop) -> ViewerServer | None:
+        """拉起移动端查看器（只读 HTTP）。token 永远自动生成 + 持久化 + 日志打印
+        （决策 Q3/Q8，config 里不配 token）；端口/绑定失败记 ERROR、返回 None，
+        不拖累 daemon（Q3=β）。
+
+        token 落 ``_viewer_token_path``（run() 注入 = config 同目录 viewer.token）；
+        None 时（测试构造 _Daemon 不经 run()）兜底 DEFAULT_CONFIG_PATH 同目录。
+        """
+        assert self.cfg.viewer is not None
+        v = self.cfg.viewer
+        token_path = self._viewer_token_path or DEFAULT_CONFIG_PATH.parent / "viewer.token"
+        token = ensure_token(token_path)
+        logger.info(
+            "移动端查看器 token（已存 viewer.token，重启不变；填进手机 App）: %s", token
+        )
+        try:
+            vs = ViewerServer(
+                token,
+                routes={("GET", "/api/health"): viewer_health},
+                host=v.bind,
+                port=v.port,
+                main_loop=loop,
+            )
+            vs.start()
+            return vs
+        except OSError:
+            logger.error(
+                "移动端查看器启动失败（bind %s:%s 可能被占用）；飞书功能不受影响",
+                v.bind,
+                v.port,
+                exc_info=True,
+            )
+            return None
 
     # ------------------------------------------------------------------ #
     # 消息分发
