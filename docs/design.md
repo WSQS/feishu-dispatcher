@@ -225,12 +225,12 @@ ACP SDK 也暴露了 `load_session(cwd, session_id)`（`connection.py`）/ `list
 **目标**：群里发消息不用 @ 机器人就触发流程。
 
 **现状**：飞书群里机器人**默认只收到 @ 它的消息**；要收全部消息需授予
-`im:message.group_msg:readonly` 权限（setup.md 已要求）。代码侧 `_parse_event_message`
+`im:message.group_msg` 权限（setup.md 已要求）。代码侧 `_parse_event_message`
 已剥离 `@_user_N` 前缀、并不强制 @。**所以授予该权限后，「不用 @ 自动触发」基本已成立**
 （尤其话题内回复无需 @）。
 
 **待办**：
-- 确认并文档化：授予 `group_msg:readonly` 后，root `/run` 与话题回复均无需 @ 即被处理。
+- 确认并文档化：授予 `group_msg` 后，root `/run` 与话题回复均无需 @ 即被处理。
 - 噪音取舍：控制台群若只有「你 + bot」，自动处理所有消息没问题；但当前**非命令的
   root 消息会回「用法…」**，若群里有闲聊会打扰。可考虑：非命令 root 消息静默（不回用法），
   或用法提示仅在明确请求（如 `/help`）时给。

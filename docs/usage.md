@@ -107,13 +107,13 @@ daemon 崩了 / 升级 / 重开机之后，**不用重新 `/run`**：直接在�
 ## 排障 FAQ
 
 **daemon 起不来 / 报 chat_id 为空？**
-`chat_id` 必填。先 `uv run feishu-dispatcher start --discover`，在群里发条消息，日志会打印 `chat_id`，填进 `config.toml`。详见 [setup.md](setup.md)「本地配置」。
+`chat_id` 必填。先 `uv run feishu-dispatcher start --discover`，在群里发条消息，日志会打印 `chat_id`，填进 `config.toml`。详见 [setup.md](setup.md)「配置文件与启动」。
 
 **已经有一个 daemon 在跑，第二个 `start` 直接报错？**
 这是**单实例锁**在保护你——同时跑两个 daemon 会共用 `tasks.json` / 抢 WS，把台账踩坏。先把旧的停掉（或用 `/reboot` 让它自己重启），再启新的。
 
 **群里发消息 agent 没反应？**
-- 确认权限 `im:message.group_msg:readonly` 已开并**发布版本**（默认机器人只收 @ 它的消息，话题回复不会 @ 机器人）。
+- 确认权限 `im:message.group_msg` 已开并**发布版本**（默认机器人只收 @ 它的消息，话题回复不会 @ 机器人）。
 - 确认发消息的人在 `sender_whitelist` 里（配了白名单的话）。
 - `-v` 启动看调试日志，确认事件有到、命中了哪条路由。
 
