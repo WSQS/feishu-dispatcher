@@ -2409,3 +2409,39 @@ async def test_launch_then_kill_real_subprocess(tmp_path: Path):
     )
     await wait_until(lambda: job.job_id not in daemon._bg_procs)
     await daemon._shutdown()
+
+
+async def test_launch_threads_agent_env_into_spawn():
+    # [agents.<名>].env 声明的追加环境变量应进到该 agent 的 AcpAgent spawn.env
+    # （codex 靠 CODEX_PATH 复用全局 codex）。无控制面时不叠 bg 身份 env。
+    cfg = Config(
+        app_id="a",
+        app_secret="b",
+        chat_id="oc_1",
+        agents={"codex": ["codex-acp"]},
+        agent_env={"codex": {"CODEX_PATH": "codex"}},
+        projects={
+            "demo": Project(
+                name="demo", path=Path("C:/tmp/demo"), default_agent="codex"
+            )
+        },
+        throttle_window=0.01,
+        stream_mode="text",
+    )
+    daemon = _Daemon(cfg, store=TaskStore(None), project_store=ProjectStore(None))
+    bridge = FakeBridge()
+    daemon._bridge = bridge
+    created: list[FakeAgent] = []
+
+    def factory(spawn, on_output, on_action=None, *, resume_session_id=None):
+        agent = FakeAgent(
+            spawn, on_output, on_action, resume_session_id=resume_session_id
+        )
+        created.append(agent)
+        return agent
+
+    daemon._make_agent = factory  # type: ignore[method-assign]
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    assert created[0].spawn.env.get("CODEX_PATH") == "codex"
+    await daemon._shutdown()

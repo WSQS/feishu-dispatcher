@@ -256,3 +256,48 @@ def test_seed_project_agent_not_configured_warns(tmp_path: Path, caplog):
         cfg = Config.load(cfg_file)
     assert cfg.projects["demo"].default_agent == "copilot"  # 兜底仍生效
     assert "copilot" in caplog.text and "demo" in caplog.text
+
+
+def _agents_cfg(tmp_path: Path, agents_block: str) -> Config:
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        'app_id = "a"\napp_secret = "b"\nchat_id = "oc_1"\n' + agents_block,
+        encoding="utf-8",
+    )
+    return Config.load(cfg_file)
+
+
+def test_agent_table_form_parses_command_and_env(tmp_path: Path):
+    # 表形式 [agents.<名>]：command=argv + env=追加环境变量（如 codex 的 CODEX_PATH）。
+    cfg = _agents_cfg(
+        tmp_path,
+        '[agents]\ncopilot = ["copilot", "--acp"]\n'
+        '[agents.codex]\ncommand = ["codex-acp"]\nenv = { CODEX_PATH = "codex" }\n',
+    )
+    assert cfg.agents == {"copilot": ["copilot", "--acp"], "codex": ["codex-acp"]}
+    assert cfg.agent_env == {"codex": {"CODEX_PATH": "codex"}}
+
+
+def test_agent_table_form_without_env_has_no_agent_env(tmp_path: Path):
+    # 表形式但没写 env：argv 正常解析，agent_env 不留空条目。
+    cfg = _agents_cfg(
+        tmp_path,
+        '[agents]\n[agents.codex]\ncommand = ["codex-acp"]\n',
+    )
+    assert cfg.agents == {"codex": ["codex-acp"]}
+    assert cfg.agent_env == {}
+
+
+def test_simple_agent_form_has_empty_agent_env(tmp_path: Path):
+    # 简写数组形式向后兼容：无 env、agent_env 为空。
+    cfg = _agents_cfg(tmp_path, '[agents]\ncopilot = ["copilot", "--acp"]\n')
+    assert cfg.agents == {"copilot": ["copilot", "--acp"]}
+    assert cfg.agent_env == {}
+
+
+def test_agent_table_form_missing_command_raises(tmp_path: Path):
+    with pytest.raises(ValueError, match="command"):
+        _agents_cfg(
+            tmp_path,
+            '[agents]\n[agents.codex]\nenv = { CODEX_PATH = "codex" }\n',
+        )

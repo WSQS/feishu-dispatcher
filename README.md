@@ -53,6 +53,7 @@ agent 边干边把输出流式发回飞书 —— 每个任务一个独立「话
 | **OpenCode** | `opencode acp` | `opencode` 配好 provider |
 | **Claude Code** | `claude-agent-acp` | 装社区适配器 + `claude` 已登录（详见 [docs/claude-code-backend.md](docs/claude-code-backend.md)） |
 | **Cline** | `cline --acp` | `cline` v3.0.47+ 且 `cline auth` 登录 |
+| **Codex CLI** | `codex-acp` | 装社区适配器 + `codex login`（Windows 需设 `CODEX_PATH` 指向全局 codex，详见 [config.example.toml](config.example.toml)） |
 
 ## 快速开始
 
