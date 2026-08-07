@@ -18,6 +18,7 @@ diff）逐个往上加；本文件 v1 只实现 ``GET /api/health``。
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
@@ -48,9 +49,13 @@ class ViewerServer:
         *,
         host: str = "0.0.0.0",
         port: int = 0,
+        main_loop: asyncio.AbstractEventLoop | None = None,
     ) -> None:
         self._token = token
         self._routes = routes
+        #: daemon 主 loop 引用；#105 的 store 接口要 marshal 回主 loop 读（决策 Q4）。
+        #: M1/health 不用，存住即可；默认 None 让底座单测不必构造 loop。
+        self._loop = main_loop
         self._server = ThreadingHTTPServer((host, port), _make_handler(self))
         self._thread = threading.Thread(
             target=self._server.serve_forever, name="viewer-http", daemon=True
