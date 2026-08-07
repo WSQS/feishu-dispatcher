@@ -2,7 +2,17 @@
 
 从零把 feishu-dispatcher 跑起来的完整步骤。跑起来之后日常怎么用，见 [usage.md 使用手册](usage.md)。
 
-前置：本机装好 `uv`，以及至少一个 coding agent CLI（npm 全局）——都经 ACP 协议控制、本地实测握手/流式/会话恢复通过：
+从整体上看，初始化包含三个部分：**飞书机器人**、**飞书群聊**、**配置文件**。
+
+- **飞书机器人**——提供 App ID 和 App Secret，供我们的应用连接飞书。
+- **飞书群聊**——作为主要的对话场所，让我们和机器人在其中对话、分配话题（thread）。
+- **配置文件**——记录机器人的 App ID/Secret 和群聊的 chat_id，daemon 据此知道连哪个应用、管哪个群。
+
+下面按这个顺序来。
+
+## 前置环境
+
+本机装好 [`uv`](https://docs.astral.sh/uv/)，以及至少一个 coding agent CLI（npm 全局）——都经 ACP 协议控制、本地实测握手/流式/会话恢复通过：
 
 - **Copilot CLI**：`copilot` 已登录过 GitHub 账号。冒烟 `uv run python scripts/smoke_acp.py`。
 - **OpenCode**：`opencode` 已配好 provider/凭据（`opencode providers`）。冒烟 `uv run python scripts/smoke_opencode.py`。
@@ -12,73 +22,94 @@
 
 在 `config.toml` 的 `[[projects]]` 里用 `default_agent` 指定每个项目由哪个 agent 处理（agent 名须在 `[agents]` 里配过）。
 
-## 1. 创建飞书应用
+## 获取代码
+
+```powershell
+git clone https://github.com/WSQS/feishu-dispatcher.git
+cd feishu-dispatcher
+uv sync                                  # 装依赖
+```
+
+后续步骤都默认你在仓库根目录下操作。
+
+## 飞书机器人
+
+在飞书后台造一个能收发消息的机器人。这一节做完，机器人就「存在且有能力」（能登录、有权限、已发布）。
 
 1. 打开 [飞书开发者后台](https://open.feishu.cn/app)，创建**企业自建应用**（长连接模式只支持自建应用，商店应用不行）。
 2. 「应用能力」→ 添加**机器人**能力。
-3. 记下「凭证与基础信息」里的 **App ID** 和 **App Secret**。
+3. 记下「凭证与基础信息」里的 **App ID** 和 **App Secret**——待会儿填进 `~/.feishu-dispatcher/config.toml`（见「配置文件与启动」）。
+4. 「权限管理」中开通：
 
-## 2. 开通权限（重要）
+   | 权限 | 用途 | 说明 |
+   |---|---|---|
+   | `im:message.group_msg` | 接收群聊中**所有**用户消息 | **必须**。默认机器人只收 @ 它的消息，而话题内回复不会 @ 机器人 |
+   | `im:message` | 以机器人身份发送消息 | 发状态/转发 agent 输出 |
 
-「权限管理」中开通：
+   个人 tenant（你自己注册的飞书账号）可自行审批；企业 tenant 的 `group_msg` 属敏感权限可能需管理员审批。
 
-| 权限 | 用途 | 说明 |
-|---|---|---|
-| `im:message.group_msg:readonly` | 接收群聊中**所有**用户消息 | **必须**。默认机器人只收 @ 它的消息，而话题内回复不会 @ 机器人 |
-| `im:message` | 以机器人身份发送消息 | 发状态/转发 agent 输出 |
+5. 开完权限后**创建版本并发布**（权限发布后才生效）。
 
-个人租户可自行审批；企业租户的 `group_msg` 属敏感权限可能需管理员审批。
+> 长连接事件订阅**不**在这一节——飞书后台保存订阅方式时会校验「本地客户端已连上」，而那个客户端是「配置文件与启动」里跑起来的 `start --discover`。所以订阅放到那一节的后半段，等本地能连上了再回后台点。
 
-开完权限后**创建版本并发布**（权限发布后才生效）。
+## 群
 
-## 3. 配置长连接事件订阅
+建个群、把机器人拉进去，给它一个工作场所。
 
-注意先后顺序——保存长连接订阅方式时，飞书会检查本地客户端是否已连上：
-
-1. 先在本地把 daemon 以发现模式跑起来（见第 5 步，此时 chat_id 可以为空）：
-   ```
-   uv run feishu-dispatcher start --discover
-   ```
-2. 开发者后台 →「事件与回调」→「事件配置」→ 订阅方式改为**使用长连接接收事件**，保存。
-3. 「添加事件」→ 订阅 `im.message.receive_v1`（接收消息），并授予其要求的权限。
-
-长连接为纯出站 WebSocket，无需公网地址、无需 encrypt key / verification token。约束：每应用最多 50 个连接；事件须 3 秒内处理完（daemon 已即时 ACK + 异步处理，满足）；集群模式下多实例只有随机一个收到事件——**只跑一个 daemon 实例**。
-
-## 4. 建控制台群
-
-当前实现用**普通群**（不是「话题形式群」）：群主线 = 控制台（发 `/run` 等命令），机器人对根消息 `reply_in_thread` 建话题 = agent 子会话。
+建**普通群**即可（不要建「话题形式群」）——运行时 daemon 会用 `reply_in_thread` 在根消息下建话题（群主线 = 控制台，话题 = agent 子会话），心智模型见 [usage.md](usage.md)「控制台 vs 话题」。
 
 1. 飞书客户端建一个普通群（只有你自己即可）。
 2. 群设置 → 群机器人 → 添加机器人 → 选你的应用。
 
-## 5. 本地配置
+## 配置文件与启动
+
+把前两节拿到的东西（App ID/Secret、群）接进 daemon，连上飞书、拿到群 id、正式启动。这一节内部有严格的先后——`chat_id` 得先 discover 才能拿到，而 discover 得先有 App ID 才能连上。
+
+### 1. 复制模板、填 App 凭证（chat_id 暂留空）
 
 ```powershell
 mkdir ~/.feishu-dispatcher
 cp config.example.toml ~/.feishu-dispatcher/config.toml
 ```
 
-填入 `app_id` / `app_secret`，然后跑发现模式拿群 id：
+填入「飞书机器人」里拿到的 `app_id` / `app_secret`，`chat_id` 先留着空（下一步 discover 拿）。
+
+### 2. discover 连上飞书
 
 ```powershell
 uv run feishu-dispatcher start --discover
 ```
 
-在群里随便发条消息，日志会打印：
+发现模式允许 `chat_id` 为空启动，只把收到的消息打印到日志，不执行任何命令。此时 daemon 已作为一个客户端连上飞书——**先别关它**，下一步要用这个连接去后台保存订阅。
+
+### 3. 回开发者后台配长连接订阅
+
+此时本地客户端已连上，保存订阅方式能通过飞书的校验：
+
+1. 开发者后台 →「事件与回调」→「事件配置」→ 订阅方式改为**使用长连接接收事件**，保存。
+2. 「添加事件」→ 订阅 `im.message.receive_v1`（接收消息），并授予其要求的权限。
+
+长连接为纯出站 WebSocket，无需公网地址、无需 encrypt key / verification token。约束：每应用最多 50 个连接；事件须 3 秒内处理完（daemon 已即时 ACK + 异步处理，满足）；集群模式下多实例只有随机一个收到事件——**只跑一个 daemon 实例**。
+
+### 4. 拿 chat_id
+
+回到「群」里建的那个群里随便发条消息，discover 进程的日志会打印：
 
 ```
 [discover] chat_id='oc_xxx' sender_id='ou_xxx' — 填入 config.toml 的 chat_id 即可
 ```
 
-把 `chat_id` 填进配置；建议同时把自己的 `ou_xxx` 填进 `sender_whitelist`（否则群里任何成员都能指挥 daemon）。`[[projects]]` 按需增改。
+### 5. 回填 config
 
-## 6. 正式启动与使用
+把 `chat_id` 填进配置；建议同时把自己的 `ou_xxx` 填进 `sender_whitelist`（否则群里任何成员都能指挥 daemon）。`[[projects]]` 按需增改。然后停掉 discover（Ctrl+C）。
+
+### 6. 正式启动
 
 ```powershell
 uv run feishu-dispatcher start        # 前台运行；-v 出调试日志
 ```
 
-群里最常用的几个（**完整命令、心智模型、排障 FAQ 见 [usage.md](usage.md)**）：
+初始化到此结束。群里最常用的几个（**完整命令、心智模型、排障 FAQ 见 [usage.md](usage.md)**）：
 
 | 操作 | 效果 |
 |---|---|
@@ -90,7 +121,7 @@ uv run feishu-dispatcher start        # 前台运行；-v 出调试日志
 
 **重启恢复**：daemon 重启后（崩溃/升级/重开机），在旧 agent 话题里直接回复即可——daemon 会自动 `load_session` 恢复该会话的上下文继续对话；`sessions.json` 记录随之维护。若会话已在 agent 侧过期或 agent 已从配置移除，会明确提示你 `/run` 重开（不再石沉大海）。
 
-## 6.5 自然语言派发（可选，配了 LLM 就能直接说人话）
+## 自然语言派发（可选，配了 LLM 就能直接说人话）
 
 配了 `[llm]` 后，群里**不用 `/run`、直接用自然语言说需求**，调度器 LLM 会识别项目并派 agent（如「帮 feishu-dispatcher 加个深色模式」），还支持追问 / 修正 / 指代（记着最近几轮对话）。任何 OpenAI 兼容端点均可，可直接照抄 `~/.config/opencode/opencode.json` 里的 provider 配置：
 
@@ -103,7 +134,7 @@ model = "deepseek-chat"
 
 不配则自然语言消息回退到「用法」提示，`/run`/`/agents`/`/stop` 照常。冒烟：`uv run python scripts/smoke_llm.py "你的需求"`。
 
-## 7. 已知约束
+## 已知约束
 
 - **群内限频 5 QPS**（群里全部机器人共享，全应用 50/s）：单 agent 的 500ms 节流窗口 ≈ 2 msg/s 没问题；多 agent 并发共享此额度，`max_agents` 默认 7 是配套上限（配 `feishu_qps` 令牌桶兜底）。撞限流时 HTTP 层会自动退避重试（尊重 Retry-After）。
 - **文本消息上限 150KB**：节流器单批 4000 字符，远低于上限。
@@ -111,7 +142,6 @@ model = "deepseek-chat"
 - **在途 turn 不恢复**：重启时正好在跑的那一轮（未完成的 prompt + 排队指令）无法恢复，只恢复会话上下文——重启后重发那条指令即可。
 - **ACP 冒烟**：`uv run python scripts/smoke_acp.py`（copilot）/ `scripts/smoke_opencode.py`（opencode）；`scripts/smoke_resume.py` 验证 load_session 跨进程恢复。
 
-## 8. 后续可选优化（来自调研，未实现）
+## 后续可选优化（来自调研，未实现）
 
 - **话题形式群**（`group_message_type: "thread"`）可由 API 直接创建（机器人自动入群当群主），事件带 `thread_id` 可做更稳的路由——如果普通群方案路由不可靠可切换。
-- **卡片流式**：`PATCH /im/v1/messages/:id`（interactive card）单条消息 5 QPS、无编辑次数上限（文本 PUT 编辑上限 20 次），适合做「单条消息原地更新」的流式展示，替代刷屏。
