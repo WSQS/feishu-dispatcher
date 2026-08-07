@@ -13,7 +13,7 @@ import urllib.error
 import urllib.request
 
 from feishu_dispatcher import __version__
-from feishu_dispatcher.viewer import ViewerServer, health
+from feishu_dispatcher.viewer import ViewerServer, health, list_projects
 
 
 def _get(url: str, token: str | None) -> tuple[int, dict]:
@@ -66,7 +66,7 @@ async def test_unknown_route_404():
 
 
 async def test_handler_exception_becomes_500():
-    def boom() -> tuple[int, dict]:
+    async def boom(_ctx: dict) -> tuple[int, dict]:
         raise RuntimeError("kaboom")
 
     vs = await _make_server(routes={("GET", "/api/x"): boom})
@@ -74,5 +74,35 @@ async def test_handler_exception_becomes_500():
         status, payload = await asyncio.to_thread(_get, vs.base_url + "/api/x", "tok-view")
         assert status == 500
         assert "kaboom" in payload.get("error", "")
+    finally:
+        vs.stop()
+
+
+async def test_list_projects_returns_items():
+    # ctx 注入假的 all_projects：返回一个 project dict
+    from feishu_dispatcher.config import Project
+
+    fake = {
+        "demo": Project(name="demo", path="/tmp/demo"),
+        "lib": Project(name="lib", path="/tmp/lib", default_agent="opencode"),
+    }
+    vs = ViewerServer(
+        "tok-view",
+        routes={("GET", "/api/projects"): list_projects},
+        host="127.0.0.1",
+        port=0,
+        ctx={"all_projects": lambda: fake},
+    )
+    vs.start()
+    try:
+        status, payload = await asyncio.to_thread(
+            _get, vs.base_url + "/api/projects", "tok-view"
+        )
+        assert status == 200
+        names = {p["name"] for p in payload["items"]}
+        assert names == {"demo", "lib"}
+        # default_agent 兜底 copilot + 显式 opencode 都正确
+        agents = {p["name"]: p["default_agent"] for p in payload["items"]}
+        assert agents == {"demo": "copilot", "lib": "opencode"}
     finally:
         vs.stop()
