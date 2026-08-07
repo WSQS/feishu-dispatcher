@@ -678,7 +678,13 @@ class _Daemon:
             pass
 
         agent = self._make_agent(
-            AgentSpawn(command=list(argv), cwd=cwd), _noop_out, _noop_act
+            AgentSpawn(
+                command=list(argv),
+                cwd=cwd,
+                env=dict(self.cfg.agent_env.get(backend, {})),
+            ),
+            _noop_out,
+            _noop_act,
         )
         try:
             await asyncio.wait_for(agent.start(), timeout=60)
@@ -824,18 +830,21 @@ class _Daemon:
             turn = (cur.turns if cur else 0) + 1
             self.store.add_action(sess.task_id, {"turn": turn, **action})
 
+        # 配置里给该后端声明的追加 env（[agents.<名>].env，如 codex 的 CODEX_PATH）打底。
+        env: dict[str, str] = dict(self.cfg.agent_env.get(task.agent_label, {}))
         # 身份注入（#68）：给 agent 子进程一份一次性 token + 控制面 URL（经 env 逐层
-        # 透传到 agent 跑的 shell → fdx）。有控制面才注入（测试无控制面时为空 env）。
-        env: dict[str, str] = {}
+        # 透传到 agent 跑的 shell → fdx）。有控制面才注入（测试无控制面时不注入）。
         if self._control is not None:
             token = secrets.token_urlsafe(16)
             self._bg_tokens[token] = task.task_id
             sess.bg_token = token
-            env = {
-                "FEISHU_DISPATCHER_URL": self._control.base_url,
-                "FEISHU_DISPATCHER_TOKEN": token,
-                "FEISHU_DISPATCHER_TASK_ID": task.task_id,
-            }
+            env.update(
+                {
+                    "FEISHU_DISPATCHER_URL": self._control.base_url,
+                    "FEISHU_DISPATCHER_TOKEN": token,
+                    "FEISHU_DISPATCHER_TASK_ID": task.task_id,
+                }
+            )
         sess.agent = self._make_agent(
             AgentSpawn(command=list(agent_argv), cwd=task.workspace, env=env),
             on_output,

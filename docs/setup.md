@@ -8,6 +8,7 @@
 - **OpenCode**：`opencode` 已配好 provider/凭据（`opencode providers`）。冒烟 `uv run python scripts/smoke_opencode.py`。
 - **Claude Code**：无原生 ACP，经社区适配器接入——`npm i -g @agentclientprotocol/claude-agent-acp` + `claude` 已登录。详见 [claude-code-backend.md](claude-code-backend.md)，冒烟 `uv run python scripts/smoke_claude.py`。
 - **Cline**：`cline` v3.0.47+ 原生带 `--acp`，`cline auth` 登录某 provider。冒烟 `uv run python scripts/smoke_cline.py`。
+- **Codex CLI**：无原生 ACP，经社区适配器接入——`npm i -g @agentclientprotocol/codex-acp` + `codex login`（或在 `~/.codex/config.toml` 配好自定义 provider/model，如 deepseek 等 OpenAI 兼容端点）。**Windows 注意**：适配器自带的 codex 常缺原生二进制，需用 `[agents.codex]` 表形式设 `CODEX_PATH` 指向本机全局 codex（`npm i -g @openai/codex`）——见 [config.example.toml](../config.example.toml)。冒烟 `uv run python scripts/smoke_codex.py`。
 
 在 `config.toml` 的 `[[projects]]` 里用 `default_agent` 指定每个项目由哪个 agent 处理（agent 名须在 `[agents]` 里配过）。
 

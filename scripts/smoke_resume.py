@@ -3,15 +3,16 @@
   1. 起 agent，new_session，让它记住一个数字，拿 session_id，关闭（模拟 daemon 重启）。
   2. 起全新 agent 进程，load_session(同 id)，问它记住的数字——答对即恢复成功。
 
-用法：uv run python scripts/smoke_resume.py [copilot|opencode|claude]（默认 opencode）
+用法：uv run python scripts/smoke_resume.py [copilot|opencode|claude|codex]（默认 opencode）
 前置：对应 agent 已可用（opencode 需配好 provider；claude 需装 claude-agent-acp
-适配器且已登录，见 docs/claude-code-backend.md）。
+适配器且已登录，见 docs/claude-code-backend.md；codex 需装 codex-acp 适配器且已 codex login）。
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -24,7 +25,11 @@ _AGENTS = {
     "copilot": ["copilot", "--acp"],
     "opencode": ["opencode", "acp"],
     "claude": ["claude-agent-acp"],
+    "codex": ["codex-acp"],
 }
+# codex-acp 的 bundled codex 在 Windows 常缺原生二进制；用 CODEX_PATH 指向本机全局
+# codex（见 scripts/smoke_codex.py 注释）。其它 agent 无需额外 env。
+_ENV = {"codex": {"CODEX_PATH": os.environ.get("CODEX_PATH", "codex")}}
 
 
 class Collector:
@@ -43,9 +48,10 @@ class Collector:
 async def main() -> int:
     name = sys.argv[1] if len(sys.argv) > 1 else "opencode"
     argv = _AGENTS[name]
+    env = _ENV.get(name, {})
     col = Collector()
 
-    a1 = AcpAgent(AgentSpawn(command=argv, cwd=CWD), col)
+    a1 = AcpAgent(AgentSpawn(command=argv, cwd=CWD, env=env), col)
     await a1.start()
     sid = a1.session_id
     print(f"=== phase1 session_id = {sid} ===", flush=True)
@@ -56,7 +62,9 @@ async def main() -> int:
     await a1.aclose()
     print("=== phase1 closed (simulating daemon restart) ===", flush=True)
 
-    a2 = AcpAgent(AgentSpawn(command=argv, cwd=CWD), col, resume_session_id=sid)
+    a2 = AcpAgent(
+        AgentSpawn(command=argv, cwd=CWD, env=env), col, resume_session_id=sid
+    )
     await a2.start()
     print(f"=== phase2 resumed session_id = {a2.session_id} ===", flush=True)
     await a2.prompt(

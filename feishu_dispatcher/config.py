@@ -75,6 +75,10 @@ class Config:
     app_secret: str
     chat_id: str
     agents: dict[str, list[str]] = field(default_factory=dict)
+    #: 后端名 → 追加给该 agent 子进程的环境变量（SDK 白名单之外的显式追加项）。
+    #: 用表形式 `[agents.<名>]` 的 `env` 声明——如 codex-acp 需 `CODEX_PATH` 指向本机
+    #: 全局 codex（其 bundled codex 在 Windows 常缺原生二进制）。
+    agent_env: dict[str, dict[str, str]] = field(default_factory=dict)
     projects: dict[str, Project] = field(default_factory=dict)
     throttle_window: float = 0.5
     #: 发送者 open_id 白名单；空 = 不限制（R10）
@@ -164,7 +168,29 @@ class Config:
                 )
                 llm_active = "default"
             llm = llm_profiles[llm_active]
-        agents = {name: list(argv) for name, argv in data.get("agents", {}).items()}
+        # [agents] 每个后端有两种写法：
+        #   简写   copilot = ["copilot", "--acp"]          （只有 argv）
+        #   表形式 [agents.codex]                          （需要追加 env 的后端）
+        #            command = ["codex-acp"]
+        #            env = { CODEX_PATH = "codex" }
+        agents: dict[str, list[str]] = {}
+        agent_env: dict[str, dict[str, str]] = {}
+        for name, spec in data.get("agents", {}).items():
+            if isinstance(spec, dict):
+                cmd = spec.get("command")
+                if not isinstance(cmd, list) or not cmd:
+                    raise ValueError(
+                        f"[agents.{name}] 的 command 必须是非空数组，"
+                        f'例如 command = ["codex-acp"]'
+                    )
+                agents[name] = [str(a) for a in cmd]
+                env = spec.get("env")
+                if env:
+                    if not isinstance(env, dict):
+                        raise ValueError(f"[agents.{name}] 的 env 必须是键值表")
+                    agent_env[name] = {str(k): str(v) for k, v in env.items()}
+            else:
+                agents[name] = [str(a) for a in spec]
         # 种子项目的 default_agent 仍可省略（兜底 copilot，向后兼容）；但若兜底或
         # 显式指定的 agent 不在 [agents] 里，/run 时才会失败——加载时先提醒。
         for p in projects.values():
@@ -179,6 +205,7 @@ class Config:
             app_secret=data["app_secret"],
             chat_id=chat_id,
             agents=agents,
+            agent_env=agent_env,
             projects=projects,
             throttle_window=float(data.get("throttle_window", 0.5)),
             sender_whitelist=list(data.get("sender_whitelist", [])),
