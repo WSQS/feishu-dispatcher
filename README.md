@@ -60,19 +60,12 @@ agent 边干边把输出流式发回飞书 —— 每个任务一个独立「话
 前置：本机装好 [`uv`](https://docs.astral.sh/uv/)，以及至少一个上面的 agent CLI。
 
 ```powershell
+git clone https://github.com/WSQS/feishu-dispatcher.git
+cd feishu-dispatcher
 uv sync                                  # 装依赖
-uv run feishu-dispatcher start --discover  # 首次：发现模式，跟着 docs/setup.md 配飞书应用
 ```
 
-飞书应用怎么建、权限怎么开、chat_id 怎么拿，**一步步跟着 👉 [docs/setup.md](docs/setup.md) 走**（从零到能用）。
-
-配好之后正式启动：
-
-```powershell
-uv run feishu-dispatcher start           # -v 出调试日志
-```
-
-然后回飞书群，发 `/run <项目> <任务>` 或直接说人话即可。
+项目就绪。接下来配飞书应用、拿 chat_id、启动 daemon，**一步步跟着 👉 [docs/setup.md](docs/setup.md) 走**（从零到能用）。
 
 ## 常用命令速查
 
