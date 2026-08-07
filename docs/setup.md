@@ -1,11 +1,15 @@
 # 飞书应用配置指南
 
-从零把 feishu-dispatcher 跑起来的完整步骤。前置：本机装好 `uv`，以及至少一个 coding agent CLI（npm 全局）——两者均经 ACP 协议控制、本地实测可用：
+从零把 feishu-dispatcher 跑起来的完整步骤。跑起来之后日常怎么用，见 [usage.md 使用手册](usage.md)。
 
-- **Copilot CLI**：`copilot` 已登录过 GitHub 账号。ACP 冒烟 `uv run python scripts/smoke_acp.py`。
-- **OpenCode**：`opencode` 已配好 provider/凭据（`opencode providers`）。ACP 冒烟 `uv run python scripts/smoke_opencode.py`。
+前置：本机装好 `uv`，以及至少一个 coding agent CLI（npm 全局）——都经 ACP 协议控制、本地实测握手/流式/会话恢复通过：
 
-在 `config.toml` 的 `[[projects]]` 里用 `default_agent = "copilot" | "opencode"` 指定每个项目由哪个 agent 处理。
+- **Copilot CLI**：`copilot` 已登录过 GitHub 账号。冒烟 `uv run python scripts/smoke_acp.py`。
+- **OpenCode**：`opencode` 已配好 provider/凭据（`opencode providers`）。冒烟 `uv run python scripts/smoke_opencode.py`。
+- **Claude Code**：无原生 ACP，经社区适配器接入——`npm i -g @agentclientprotocol/claude-agent-acp` + `claude` 已登录。详见 [claude-code-backend.md](claude-code-backend.md)，冒烟 `uv run python scripts/smoke_claude.py`。
+- **Cline**：`cline` v3.0.47+ 原生带 `--acp`，`cline auth` 登录某 provider。冒烟 `uv run python scripts/smoke_cline.py`。
+
+在 `config.toml` 的 `[[projects]]` 里用 `default_agent` 指定每个项目由哪个 agent 处理（agent 名须在 `[agents]` 里配过）。
 
 ## 1. 创建飞书应用
 
@@ -73,23 +77,21 @@ uv run feishu-dispatcher start --discover
 uv run feishu-dispatcher start        # 前台运行；-v 出调试日志
 ```
 
-群里用法：
+群里最常用的几个（**完整命令、心智模型、排障 FAQ 见 [usage.md](usage.md)**）：
 
 | 操作 | 效果 |
 |---|---|
 | `/run <项目名> <任务描述>` | 启动 agent，在该消息下建话题，流式输出回话题 |
 | 话题内直接回复 | 追加指令（排队串行执行，同一 session 保留上下文） |
-| 话题内发 `/stop` | 结束该 agent（标记 stopped，保留历史） |
-| 话题内发 `/done` | 标记该任务完成并归档（done） |
-| `/agents` | 列出活跃 + 历史任务 |
-| `/task <任务id>` | 查看某任务详情、最近回复与动作日志（编辑/命令等，事后审计） |
-| `/clear` | 清理已结束任务的历史 |
+| 话题内 `/cancel` \| `/stop` \| `/done` | 停当前轮保留 agent \| 停并结束 \| 归档 |
+| `/agents` / `/task <id>` | 列出任务 / 看某任务详情与动作日志 |
+| `/project add <名> <agent> <路径>` | 运行时注册新项目（不用改配置重启） |
 
 **重启恢复**：daemon 重启后（崩溃/升级/重开机），在旧 agent 话题里直接回复即可——daemon 会自动 `load_session` 恢复该会话的上下文继续对话；`sessions.json` 记录随之维护。若会话已在 agent 侧过期或 agent 已从配置移除，会明确提示你 `/run` 重开（不再石沉大海）。
 
-## 6.5 自然语言派发（可选，P2）
+## 6.5 自然语言派发（可选，配了 LLM 就能直接说人话）
 
-配了 `[llm]` 后，群里**不用 `/run`、直接用自然语言说需求**，调度器 LLM 会识别项目并派 agent（如「帮 feishu-dispatcher 加个深色模式」）。任何 OpenAI 兼容端点均可，可直接照抄 `~/.config/opencode/opencode.json` 里的 provider 配置：
+配了 `[llm]` 后，群里**不用 `/run`、直接用自然语言说需求**，调度器 LLM 会识别项目并派 agent（如「帮 feishu-dispatcher 加个深色模式」），还支持追问 / 修正 / 指代（记着最近几轮对话）。任何 OpenAI 兼容端点均可，可直接照抄 `~/.config/opencode/opencode.json` 里的 provider 配置：
 
 ```toml
 [llm]
@@ -102,7 +104,7 @@ model = "deepseek-chat"
 
 ## 7. 已知约束
 
-- **群内限频 5 QPS**（群里全部机器人共享，全应用 50/s）：单 agent 的 500ms 节流窗口 ≈ 2 msg/s 没问题；多 agent 并发共享此额度，`max_agents` 默认 3 是配套上限。撞限流时 HTTP 层会自动退避重试（尊重 Retry-After）。
+- **群内限频 5 QPS**（群里全部机器人共享，全应用 50/s）：单 agent 的 500ms 节流窗口 ≈ 2 msg/s 没问题；多 agent 并发共享此额度，`max_agents` 默认 7 是配套上限（配 `feishu_qps` 令牌桶兜底）。撞限流时 HTTP 层会自动退避重试（尊重 Retry-After）。
 - **文本消息上限 150KB**：节流器单批 4000 字符，远低于上限。
 - **消息重推**：飞书对 ACK 异常/超时的事件会重推，daemon 已按 `message_id` 幂等去重。
 - **在途 turn 不恢复**：重启时正好在跑的那一轮（未完成的 prompt + 排队指令）无法恢复，只恢复会话上下文——重启后重发那条指令即可。

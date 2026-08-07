@@ -100,7 +100,8 @@ opencode = ["opencode", "acp"]
 claude = ["claude-agent-acp"]
 cline = ["cline", "--acp"]
 
-# P0 阶段项目硬编码在这里（设计文档 P2 才做 LLM 自注册）。
+# 在这里预置项目（内置、只读）。也可在群里运行时注册，不用改配置重启：
+#   /project add <名> <agent> <路径>   或对调度器 LLM 说「注册一个项目…」
 # 每个项目用 default_agent 指定由哪个 agent 处理。
 [[projects]]
 name = "feishu-dispatcher"
