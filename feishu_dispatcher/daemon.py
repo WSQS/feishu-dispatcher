@@ -40,6 +40,7 @@ from .scheduler import (
 from .store import Job, JobStore, ModelStore, ProjectStore, Task, TaskStore
 from ._viewer_token import ensure_token
 from .viewer import ViewerServer, health as viewer_health, list_projects as viewer_list_projects
+from .viewer import tree as viewer_tree, file as viewer_file, diff as viewer_diff
 
 logger = logging.getLogger(__name__)
 
@@ -425,6 +426,9 @@ class _Daemon:
                 routes={
                     ("GET", "/api/health"): viewer_health,
                     ("GET", "/api/projects"): viewer_list_projects,
+                    ("GET", "/api/projects/{name}/tree"): viewer_tree,
+                    ("GET", "/api/projects/{name}/file"): viewer_file,
+                    ("GET", "/api/projects/{name}/diff"): viewer_diff,
                 },
                 host=v.bind,
                 port=v.port,

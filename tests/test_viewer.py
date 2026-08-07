@@ -9,11 +9,21 @@ from __future__ import annotations
 
 import asyncio
 import json
+import subprocess
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 from feishu_dispatcher import __version__
-from feishu_dispatcher.viewer import ViewerServer, health, list_projects
+from feishu_dispatcher.config import Project
+from feishu_dispatcher.viewer import (
+    ViewerServer,
+    diff as viewer_diff,
+    file as viewer_file,
+    health,
+    list_projects,
+    tree as viewer_tree,
+)
 
 
 def _get(url: str, token: str | None) -> tuple[int, dict]:
@@ -66,7 +76,7 @@ async def test_unknown_route_404():
 
 
 async def test_handler_exception_becomes_500():
-    async def boom(_ctx: dict) -> tuple[int, dict]:
+    async def boom(_ctx: dict, _request: dict) -> tuple[int, dict]:
         raise RuntimeError("kaboom")
 
     vs = await _make_server(routes={("GET", "/api/x"): boom})
@@ -80,8 +90,6 @@ async def test_handler_exception_becomes_500():
 
 async def test_list_projects_returns_items():
     # ctx 注入假的 all_projects：返回一个 project dict
-    from feishu_dispatcher.config import Project
-
     fake = {
         "demo": Project(name="demo", path="/tmp/demo"),
         "lib": Project(name="lib", path="/tmp/lib", default_agent="opencode"),
@@ -106,3 +114,151 @@ async def test_list_projects_returns_items():
         assert agents == {"demo": "copilot", "lib": "opencode"}
     finally:
         vs.stop()
+
+
+def _init_git_repo(ws: Path) -> None:
+    """在 ws 建一个最小 git repo：提交 main.py，然后改它（产生工作区 diff）。"""
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    subprocess.run(["git", "-C", str(ws), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(ws), "config", "user.name", "t"], check=True)
+    (ws / "main.py").write_text("print('v1')\n")
+    subprocess.run(["git", "-C", str(ws), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-q", "-m", "init"], check=True)
+    # 工作区改 + 新增未跟踪，产生 diff
+    (ws / "main.py").write_text("print('v2')\n")
+    (ws / "new.py").write_text("# new\n")
+
+
+def _make_git_server(ws: Path, routes) -> ViewerServer:
+    """起一个 viewer，ctx.all_projects 返回 {demo: Project(path=ws)}。"""
+    vs = ViewerServer(
+        "tok-view",
+        routes,
+        host="127.0.0.1",
+        port=0,
+        ctx={"all_projects": lambda: {"demo": Project(name="demo", path=ws)}},
+    )
+    vs.start()
+    return vs
+
+
+async def test_tree_lists_tracked_files():
+    ws = Path(__file__).parent / "_ws_tree"
+    _init_git_repo(ws)
+    try:
+        vs = _make_git_server(ws, {("GET", "/api/projects/{name}/tree"): viewer_tree})
+        try:
+            status, payload = await asyncio.to_thread(
+                _get, vs.base_url + "/api/projects/demo/tree", "tok-view"
+            )
+            assert status == 200
+            paths = {e["path"] for e in payload["entries"]}
+            assert "main.py" in paths
+            assert "new.py" not in paths  # 默认不含未跟踪
+        finally:
+            vs.stop()
+    finally:
+        import shutil
+
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_tree_with_untracked_includes_new_files():
+    ws = Path(__file__).parent / "_ws_untracked"
+    _init_git_repo(ws)
+    try:
+        vs = _make_git_server(ws, {("GET", "/api/projects/{name}/tree"): viewer_tree})
+        try:
+            status, payload = await asyncio.to_thread(
+                _get, vs.base_url + "/api/projects/demo/tree?untracked=1", "tok-view"
+            )
+            assert status == 200
+            paths = {e["path"] for e in payload["entries"]}
+            assert {"main.py", "new.py"} <= paths  # untracked=1 含未跟踪
+        finally:
+            vs.stop()
+    finally:
+        import shutil
+
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_file_reads_workspace_content():
+    ws = Path(__file__).parent / "_ws_file"
+    _init_git_repo(ws)
+    try:
+        vs = _make_git_server(ws, {("GET", "/api/projects/{name}/file"): viewer_file})
+        try:
+            status, payload = await asyncio.to_thread(
+                _get, vs.base_url + "/api/projects/demo/file?path=main.py", "tok-view"
+            )
+            assert status == 200
+            assert payload["binary"] is False
+            assert "v2" in payload["text"]  # 工作区当前内容
+        finally:
+            vs.stop()
+    finally:
+        import shutil
+
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_file_rejects_path_traversal():
+    ws = Path(__file__).parent / "_ws_traversal"
+    _init_git_repo(ws)
+    try:
+        vs = _make_git_server(ws, {("GET", "/api/projects/{name}/file"): viewer_file})
+        try:
+            status, payload = await asyncio.to_thread(
+                _get,
+                vs.base_url + "/api/projects/demo/file?path=../../etc/passwd",
+                "tok-view",
+            )
+            assert status == 400  # PathTraversalError → 400
+        finally:
+            vs.stop()
+    finally:
+        import shutil
+
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_diff_returns_workdir_vs_head():
+    ws = Path(__file__).parent / "_ws_diff"
+    _init_git_repo(ws)
+    try:
+        vs = _make_git_server(ws, {("GET", "/api/projects/{name}/diff"): viewer_diff})
+        try:
+            status, payload = await asyncio.to_thread(
+                _get, vs.base_url + "/api/projects/demo/diff", "tok-view"
+            )
+            assert status == 200
+            files = {f["path"]: f for f in payload["files"]}
+            assert "main.py" in files
+            assert files["main.py"]["status"] == "M"
+            assert "v1" in files["main.py"]["patch"]
+            assert "v2" in files["main.py"]["patch"]
+        finally:
+            vs.stop()
+    finally:
+        import shutil
+
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_unknown_project_returns_404():
+    ws = Path(__file__).parent / "_ws_404"
+    _init_git_repo(ws)
+    try:
+        vs = _make_git_server(ws, {("GET", "/api/projects/{name}/tree"): viewer_tree})
+        try:
+            status, payload = await asyncio.to_thread(
+                _get, vs.base_url + "/api/projects/nope/tree", "tok-view"
+            )
+            assert status == 404
+        finally:
+            vs.stop()
+    finally:
+        import shutil
+
+        shutil.rmtree(ws, ignore_errors=True)
