@@ -55,5 +55,8 @@ dependencies {
     implementation("io.ktor:ktor-serialization-kotlinx-json:3.0.3")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
 
+    // DataStore Preferences：存 viewer 地址 + token，协程友好
+    implementation("androidx.datastore:datastore-preferences:1.1.1")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
