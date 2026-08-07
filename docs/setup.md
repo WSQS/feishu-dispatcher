@@ -145,4 +145,3 @@ model = "deepseek-chat"
 ## 后续可选优化（来自调研，未实现）
 
 - **话题形式群**（`group_message_type: "thread"`）可由 API 直接创建（机器人自动入群当群主），事件带 `thread_id` 可做更稳的路由——如果普通群方案路由不可靠可切换。
-- **卡片流式**：`PATCH /im/v1/messages/:id`（interactive card）单条消息 5 QPS、无编辑次数上限（文本 PUT 编辑上限 20 次），适合做「单条消息原地更新」的流式展示，替代刷屏。
