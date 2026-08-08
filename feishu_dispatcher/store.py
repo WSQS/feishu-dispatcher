@@ -146,6 +146,7 @@ _TASK_FIELDS = (
     "model",
     "error_message",
     "issue_url",
+    "agent_history",
 )
 
 
@@ -173,6 +174,10 @@ class Task:
     #: 关联的 forge issue URL（派活时锚定的意图/brief，#63）；空 = 未绑定。
     #: 单字段、控制平面拥有；PR 不存这里（经 forge 的 Closes #N 反查）。
     issue_url: str = ""
+    #: agent 切换轨迹（#52）：每条 = {from_agent, agent_label, switched_at}，从创建后
+    #: 第一次 /agent 切换起累积。agent_label 始终是「切换后的目标」，首任 agent 不
+    #: 计入（它记在 from_agent 里，可重建切换链）。老 tasks.json 缺该键 → 加载默认 []。
+    agent_history: list[dict] = field(default_factory=list)
 
     @property
     def is_active(self) -> bool:
