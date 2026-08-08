@@ -31,6 +31,14 @@ android {
     kotlinOptions {
         jvmTarget = "17"
     }
+
+    testOptions {
+        unitTests {
+            // JVM 单测里 android.util.Log 等框架类是空 stub，默认会抛 RuntimeException("Not mocked")；
+            // 让它们返回默认值（Log.i/w 返回 0），不阻断业务逻辑测试。
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 dependencies {
@@ -63,4 +71,12 @@ dependencies {
     implementation("com.github.WSQS:libzt-prebuild:main-a707ea6-20260808")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
+
+    // ---- JVM 单测依赖（testImplementation，跑在开发机 JVM，非 androidTest/设备）----
+    // kotlin("test") 绑当前 Kotlin 版本的 kotlin.test + JUnit 运行器
+    testImplementation(kotlin("test"))
+    // MockEngine 与 Ktor 同版（3.0.3），避免引入冲突的 ktor-core
+    testImplementation("io.ktor:ktor-client-mock:3.0.3")
+    // 协程测试与 Ktor 3.0.3 依赖的 kotlinx-coroutines 1.9.0 对齐
+    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
 }
