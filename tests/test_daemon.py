@@ -1649,6 +1649,53 @@ async def test_project_register_rejects_name_with_space(tmp_path):
     assert "空格" in msg
 
 
+async def test_project_register_rejects_path_pointing_at_file(tmp_path):
+    # 指到了文件上 →「这是文件不是目录」
+    daemon, _, _ = make_daemon()
+    target = tmp_path / "not_a_dir.txt"
+    target.write_text("x")
+    ok, msg = daemon._register_project("p", "copilot", str(target))
+    assert ok is False
+    assert "这是文件不是目录" in msg
+    assert daemon.project_store.get("p") is None
+
+
+async def test_project_register_rejects_middle_typo_with_siblings(tmp_path):
+    # 中间某一级拼错：parent 存在但 typo 这一级不存在 → 指出断点 + 列兄弟目录
+    daemon, _, _ = make_daemon()
+    parent = tmp_path / "parent"
+    (parent / "realdir").mkdir(parents=True)  # 一个真实兄弟目录供对照
+    bad = parent / "typo" / "deeper"
+    ok, msg = daemon._register_project("p", "copilot", str(bad))
+    assert ok is False
+    assert "从「typo」这一级开始找不到" in msg
+    assert "realdir" in msg  # 列出了兄弟目录
+    assert daemon.project_store.get("p") is None
+
+
+async def test_project_register_rejects_completely_missing_root():
+    # 完全不存在的盘符/根（祖先也不可达）→ 不抛异常，给出可读报错
+    daemon, _, _ = make_daemon()
+    ok, msg = daemon._register_project(
+        "p", "copilot", "Z:/no/such/drive_xyz/deep"
+    )
+    assert ok is False
+    assert "路径不存在" in msg
+    assert daemon.project_store.get("p") is None
+
+
+def test_classify_path_error_caps_sibling_listing(tmp_path):
+    # 兄弟目录过多 → 截断到 10 + 「…（共 N 个）」，避免刷屏
+    parent = tmp_path / "parent"
+    parent.mkdir()
+    for i in range(12):
+        (parent / f"d{i:02d}").mkdir()
+    msg = _Daemon._classify_path_error(str(parent / "typo"))
+    assert msg is not None
+    assert "...（共 12 个）" in msg
+    assert "d11" not in msg  # 第 11 个被截断（d00..d09 + 省略提示）
+
+
 async def test_project_remove(tmp_path):
     daemon, bridge, _ = make_daemon()
     daemon.project_store.add(
