@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- manifest 引用的主题：Compose 接管实际绘制前用这个 XML 主题作启动屏底色。
+         继承 Material3，避免遗留 AppCompat 依赖。 -->
+    <style name="Theme.FdxViewer" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
