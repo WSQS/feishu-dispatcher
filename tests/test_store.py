@@ -248,8 +248,77 @@ def test_add_action_appends_and_persists(tmp_path: Path):
     s.add_action("t1", {"turn": 1, "kind": "edit", "title": "Editing a.py"})
     s.add_action("t1", {"turn": 1, "kind": "execute", "title": "pytest"})
     assert [a["title"] for a in s.get("t1").actions] == ["Editing a.py", "pytest"]
-    # 持久化：重载后动作还在
+    # 批量刷盘（#17）：add_action 只置脏不落盘，flush_dirty 才真正写盘
+    s.flush_dirty()
     assert len(TaskStore(p).get("t1").actions) == 2
+
+
+def test_add_action_does_not_flush_until_flush_dirty(tmp_path: Path):
+    # 批量刷盘（#17）：多条 add_action 之间不写盘，flush_dirty 只写一次
+    p = tmp_path / "tasks.json"
+    s = TaskStore(p)
+    make(s, thread="om_1")
+    count = _spy_writes(s)
+    s.add_action("t1", {"turn": 1, "kind": "edit", "title": "a"})
+    s.add_action("t1", {"turn": 1, "kind": "edit", "title": "b"})
+    s.add_action("t1", {"turn": 1, "kind": "edit", "title": "c"})
+    assert count[0] == 0  # 期间零写盘
+    s.flush_dirty()
+    assert count[0] == 1  # 一次 flush_dirty 只写一次（而非每条写一次）
+    # 再次 flush_dirty 无变更时 no-op
+    s.flush_dirty()
+    assert count[0] == 1
+
+
+def test_update_action_status_backfills_by_tool_call_id():
+    # tool_call_update 完成状态：按 tool_call_id 回填到已记录的起始动作（#17）
+    s = TaskStore(None)
+    make(s, thread="om_1")
+    s.add_action("t1", {"turn": 1, "kind": "edit", "title": "Editing a.py", "tool_call_id": "tc1"})
+    s.add_action("t1", {"turn": 1, "kind": "execute", "title": "pytest", "tool_call_id": "tc2"})
+    s.update_action_status("t1", "tc2", "failed")
+    actions = s.get("t1").actions
+    assert actions[0].get("status") is None  # tc1 未结算
+    assert actions[1]["status"] == "failed"  # tc2 按命中的 id 回填
+
+
+def test_update_action_status_does_not_overwrite_already_set():
+    # 已结算的动作不被后续同名 update 覆盖；回填到更早的、尚无 status 的同名条目
+    s = TaskStore(None)
+    make(s, thread="om_1")
+    s.add_action("t1", {"turn": 1, "kind": "edit", "title": "e1", "tool_call_id": "tc1"})
+    s.add_action("t1", {"turn": 2, "kind": "edit", "title": "e2", "tool_call_id": "tc1"})
+    s.update_action_status("t1", "tc1", "completed")  # 命中最近的 tc1（第2轮）
+    s.update_action_status("t1", "tc1", "completed")  # 命中更早的 tc1（第1轮）
+    assert s.get("t1").actions[1]["status"] == "completed"
+    assert s.get("t1").actions[0]["status"] == "completed"
+
+
+def test_update_action_status_unknown_id_is_noop():
+    s = TaskStore(None)
+    make(s, thread="om_1")
+    s.add_action("t1", {"turn": 1, "kind": "edit", "title": "x", "tool_call_id": "tc1"})
+    s.update_action_status("t1", "tc404", "completed")  # 找不到，忽略
+    assert s.get("t1").actions[0].get("status") is None
+
+
+def test_update_action_status_unknown_task_is_noop():
+    s = TaskStore(None)
+    s.update_action_status("t404", "tc1", "completed")  # 不抛
+
+
+def _spy_writes(store: TaskStore) -> list[int]:
+    """计数 store 落盘次数：把 _flush 包一层计数器（add_action/flush_dirty 共用）。
+    返回单元素列表（``count[0]``），随 store 写盘自增。"""
+    count = [0]
+    orig = store._flush
+
+    def counting() -> None:
+        orig()
+        count[0] += 1
+
+    store._flush = counting  # type: ignore[method-assign]
+    return count
 
 
 def test_add_action_caps_at_max_dropping_oldest():
