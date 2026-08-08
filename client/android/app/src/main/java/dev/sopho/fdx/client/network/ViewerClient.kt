@@ -7,6 +7,7 @@ import io.ktor.client.call.body
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.plugins.expectSuccess
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.get
 import io.ktor.http.URLBuilder
@@ -62,8 +63,13 @@ class ViewerClient(
     useZerotier: Boolean = false,
     ztHost: String = "",
     ztPort: Int = 7321,
+    /**
+     * 注入的 [HttpClient]（含 engine）；不传则按 [useZerotier] 自建 CIO/OkHttp engine。
+     * 测试用它注入 MockEngine；生产代码走默认值。
+     */
+    httpClient: HttpClient? = null,
 ) : java.io.Closeable {
-    private val http: HttpClient = if (useZerotier) {
+    private val http: HttpClient = httpClient ?: if (useZerotier) {
         HttpClient(OkHttp) {
             install(ContentNegotiation) {
                 json(Json { ignoreUnknownKeys = true })
@@ -105,6 +111,10 @@ class ViewerClient(
             val r = http.get {
                 url.takeFrom(URLBuilder(baseUrl).apply { pathSegments = listOf("api", "projects") }.build())
                 bearerAuth(token)
+                // expectSuccess 让非 2xx 响应抛 ResponseException，再由 ViewerException.from(e)
+                // 分类成 AUTH(401/403)/PROTOCOL(其余)；否则错误响应体走 .body<>() 会因格式不符
+                // 抛 JSON 异常被误判为 NETWORK。
+                expectSuccess = true
             }.body<ListProjectsResponse>()
             Log.i(TAG, "projects: ${(System.nanoTime() - t) / 1_000_000}ms (${r.items.size} items)")
             r
@@ -123,6 +133,10 @@ class ViewerClient(
                     URLBuilder(baseUrl).apply { pathSegments = listOf("api", "projects", projectName, "tree") }.build(),
                 )
                 bearerAuth(token)
+                // expectSuccess 让非 2xx 响应抛 ResponseException，再由 ViewerException.from(e)
+                // 分类成 AUTH(401/403)/PROTOCOL(其余)；否则错误响应体走 .body<>() 会因格式不符
+                // 抛 JSON 异常被误判为 NETWORK。
+                expectSuccess = true
             }.body<TreeResponse>()
             Log.i(TAG, "tree: ${(System.nanoTime() - t) / 1_000_000}ms (${r.entries.size} files)")
             r
