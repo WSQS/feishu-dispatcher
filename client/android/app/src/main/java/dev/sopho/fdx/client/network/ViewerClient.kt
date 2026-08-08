@@ -1,5 +1,6 @@
 package dev.sopho.fdx.client.network
 
+import dev.sopho.fdx.client.data.Connection
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
 import io.ktor.client.engine.cio.CIO
@@ -12,12 +13,26 @@ import io.ktor.http.takeFrom
 import io.ktor.serialization.kotlinx.json.json
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
+import java.net.URI
 
 /** /api/health 的响应体（对应服务端 viewer.py 的 health()）。 */
 @Serializable
 data class HealthResponse(val ok: Boolean, val version: String)
+
+/** /api/projects 返回的单个项目。 */
+@Serializable
+data class ProjectItem(
+    val name: String,
+    val path: String,
+    @SerialName("default_agent") val defaultAgent: String,
+)
+
+/** /api/projects 的响应体。 */
+@Serializable
+data class ListProjectsResponse(val items: List<ProjectItem>)
 
 /**
  * 连 daemon viewer 的客户端。封装 [baseUrl] + [token]，按 [useZerotier] 选 engine：
@@ -70,5 +85,33 @@ class ViewerClient(
         }
     }
 
+    /** GET /api/projects —— 列出所有项目。失败抛 [ViewerException]（含分类）。 */
+    suspend fun projects(): ListProjectsResponse = withContext(Dispatchers.IO) {
+        try {
+            http.get {
+                url.takeFrom(URLBuilder(baseUrl).apply { pathSegments = listOf("api", "projects") }.build())
+                bearerAuth(token)
+            }.body()
+        } catch (e: Exception) {
+            throw ViewerException.from(e)
+        }
+    }
+
     override fun close() = http.close()
+
+    companion object {
+        /** 从 [Connection] 构造 ViewerClient（按 zerotier.enabled 选 engine + 解析 URL）。 */
+        fun fromConnection(conn: Connection): ViewerClient {
+            val url = conn.url.trim()
+            val host = try { URI(url).host } catch (e: Exception) { "" }
+            val port = try { URI(url).port } catch (e: Exception) { -1 }.let { if (it > 0) it else 7321 }
+            return ViewerClient(
+                baseUrl = url,
+                token = conn.token.trim(),
+                useZerotier = conn.zerotier.enabled,
+                ztHost = host,
+                ztPort = port,
+            )
+        }
+    }
 }
