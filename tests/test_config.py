@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from feishu_dispatcher.config import Config, Project
+from feishu_dispatcher.config import Config, Project, ViewerConfig
 
 SAMPLE = """
 app_id = "cli_abc"
@@ -301,3 +301,36 @@ def test_agent_table_form_missing_command_raises(tmp_path: Path):
             tmp_path,
             '[agents]\n[agents.codex]\nenv = { CODEX_PATH = "codex" }\n',
         )
+
+
+def test_viewer_section_parses_full_values(tmp_path: Path):
+    # 配置含 [viewer] enabled/bind/port → 正确解析成 ViewerConfig（#116）。
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        _BASE
+        + '[viewer]\nenabled = true\nbind = "127.0.0.1"\nport = 8000\n',
+        encoding="utf-8",
+    )
+    cfg = Config.load(cfg_file)
+    assert cfg.viewer == ViewerConfig(enabled=True, bind="127.0.0.1", port=8000)
+
+
+def test_viewer_absent_means_none(tmp_path: Path):
+    # 配置无 [viewer] 段 → Config.viewer is None（viewer 不起，默认安全）。
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(_BASE, encoding="utf-8")
+    assert Config.load(cfg_file).viewer is None
+
+
+def test_viewer_section_defaults_when_fields_omitted(tmp_path: Path):
+    # [viewer] 段存在但只写部分字段 → 缺省项用默认值（bind=0.0.0.0 / port=7321）。
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(_BASE + '[viewer]\nenabled = true\n', encoding="utf-8")
+    assert Config.load(cfg_file).viewer == ViewerConfig(enabled=True)
+
+
+def test_viewer_section_empty_table_uses_defaults(tmp_path: Path):
+    # 空表 [viewer]（无任何字段）→ 构造默认 ViewerConfig（enabled=False）。
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(_BASE + "[viewer]\n", encoding="utf-8")
+    assert Config.load(cfg_file).viewer == ViewerConfig()
