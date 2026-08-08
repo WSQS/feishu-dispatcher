@@ -38,7 +38,6 @@ import dev.sopho.fdx.client.network.ZtManager
 import dev.sopho.fdx.client.network.ZtState
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import java.net.URI
 
 /** 测试连接的状态：idle（未测）/ 阶段提示（loading）/ 结果。 */
 sealed interface TestState {
@@ -60,7 +59,7 @@ fun ConfigScreen(
     repo: ConnectionRepository,
     storagePath: String,
     modifier: Modifier = Modifier,
-    onConnected: ((Connection) -> Unit)? = null,
+    onConnected: ((ViewerClient) -> Unit)? = null,
 ) {
     var connection by remember { mutableStateOf(Connection()) }
     var savedMsg by remember { mutableStateOf<String?>(null) }
@@ -169,9 +168,16 @@ fun ConfigScreen(
                     isTesting = true
                     testState = TestState.Loading("连接中…")
                     scope.launch {
-                        testState = runTest(connection, storagePath)
+                        // 一个 ViewerClient 贯穿 health() 与后续项目列表：runTest 只调 health，
+                        // 不再 .use{} 自闭；成功后把这同一个 client 交给 onConnected 复用，
+                        // 失败时由 runTest 负责关闭（避免泄漏）。
+                        val client = ViewerClient.fromConnection(connection)
+                        testState = runTest(connection, storagePath, client)
                         isTesting = false
-                        if (testState is TestState.Success) onConnected?.invoke(connection)
+                        when (testState) {
+                            is TestState.Success -> onConnected?.invoke(client)
+                            else -> client.close()
+                        }
                     }
                 },
                 enabled = connection.isValid && !isTesting,
@@ -195,31 +201,22 @@ fun ConfigScreen(
  * 执行测试连接。按 useZerotier 走两条路，返回最终 [TestState]。
  * 中间态（Loading）通过 ZtManager.state 观察但不在这返回（简化：只返回最终态）。
  *
+ * [client] 由调用方构造、跨 health() 与项目列表复用——本函数只负责「启动 ZT + 调 health」，
+ * 不接管 client 生命周期：成功不关（交给 onConnected 继续用），失败时由调用方关闭。
+ *
  * 注：本函数 suspend，调用方在 scope.launch 里调。中间 loading 提示靠 ZtManager.state
  * 流——v1 简化版直接等最终态，分阶段提示留后续增强。
  */
-private suspend fun runTest(connection: Connection, storagePath: String): TestState {
-    val url = connection.url.trim()
-    val token = connection.token.trim()
-    val host = try { URI(url).host } catch (e: Exception) { null } ?: return TestState.Error("无法解析地址")
-    val port = try { URI(url).port } catch (e: Exception) { -1 }.let { if (it > 0) it else 7321 }
-
+private suspend fun runTest(connection: Connection, storagePath: String, client: ViewerClient): TestState {
     return try {
         if (connection.zerotier.enabled) {
             // libzt 路径：先 startNode + 等 NetworkReady
             ZtManager.startNode(storagePath, connection.zerotier.networkId.trim(), connection.zerotier.moonId.trim())
             val ready = ZtManager.state.first { it is ZtState.NetworkReady || it is ZtState.Error }
             if (ready is ZtState.Error) return TestState.Error("ZT: ${ready.message}")
-            ViewerClient(url, token, useZerotier = true, ztHost = host, ztPort = port).use {
-                val h = it.health()
-                TestState.Success(h.version)
-            }
-        } else {
-            ViewerClient(url, token).use {
-                val h = it.health()
-                TestState.Success(h.version)
-            }
         }
+        val h = client.health()
+        TestState.Success(h.version)
     } catch (e: ViewerException) {
         TestState.Error("${e.kind}: ${e.message}")
     } catch (e: Exception) {

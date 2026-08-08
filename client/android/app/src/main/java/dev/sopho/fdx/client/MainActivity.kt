@@ -38,8 +38,8 @@ class MainActivity : ComponentActivity() {
                         else -> ConfigScreen(
                             repo = store,
                             storagePath = applicationContext.filesDir.absolutePath,
-                            onConnected = { conn ->
-                                client = ViewerClient.fromConnection(conn)
+                            onConnected = { c ->
+                                client = c
                             },
                         )
                     }
