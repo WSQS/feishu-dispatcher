@@ -58,5 +58,8 @@ dependencies {
     // DataStore Preferences：存 viewer 地址 + token，协程友好
     implementation("androidx.datastore:datastore-preferences:1.1.1")
 
+    // libzt（ZeroTier SDK）：App 自带 zerotier 组网，连 daemon viewer（来源 libzt-prebuild）
+    implementation("com.github.WSQS:libzt-prebuild:main-a707ea6-20260808")
+
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
