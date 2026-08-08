@@ -41,6 +41,13 @@ from .store import Job, JobStore, ModelStore, ProjectStore, Task, TaskStore
 from ._viewer_token import ensure_token
 from .viewer import ViewerServer, health as viewer_health, list_projects as viewer_list_projects
 from .viewer import tree as viewer_tree
+from .webhook import (
+    CIFailure,
+    DedupCache,
+    WebhookServer,
+    match_project_by_repo,
+    parse_github_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +339,10 @@ class _Daemon:
     _control: "ControlServer | None" = None
     #: 移动端查看器（只读 HTTP，给手机）；run() 里按 cfg.viewer.enabled 启动，否则 None。
     _viewer: "ViewerServer | None" = None
+    #: CI 失败 webhook（#54）；run() 里按 cfg.webhook.port != 0 启动，否则 None。
+    _webhook: "WebhookServer | None" = None
+    #: CI run_id 去重缓存（#54）；run() 里随 webhook 一起建。进程内、TTL 1h。
+    _webhook_dedup: DedupCache = field(default_factory=DedupCache)
     #: 后台任务身份表：token → task_id（启 agent 时登记，关 session 时清）。#68
     _bg_tokens: dict[str, str] = field(default_factory=dict)
     #: 后台任务 watcher 的强引用（asyncio 只持弱引用，不存会被 GC）。#68
@@ -379,6 +390,10 @@ class _Daemon:
         # 飞书功能照常（决策 Q3=β）。token 未填则自动生成 + 持久化（决策 Q3/Q8）。
         if self.cfg.viewer and self.cfg.viewer.enabled:
             self._viewer = self._start_viewer(loop)
+        # CI 失败 webhook（#54）：cfg.webhook.port != 0 才起。失败不拖累 daemon——
+        # 记 ERROR 日志、飞书功能照常（同 viewer 决策 Q3=β）。
+        if self.cfg.webhook and self.cfg.webhook.port:
+            self._webhook = self._start_webhook(loop)
         self._bridge.start_background()
         logger.info(
             "feishu-dispatcher daemon 已启动（调度器 LLM: %s），等待飞书消息…",
@@ -443,6 +458,110 @@ class _Daemon:
                 exc_info=True,
             )
             return None
+
+    def _start_webhook(self, loop: asyncio.AbstractEventLoop) -> WebhookServer | None:
+        """拉起 CI 失败 webhook（#54）。端口/绑定失败记 ERROR、返回 None，不拖累 daemon。
+
+        仅当 ``cfg.webhook.secret`` 非空才真正可用——空密钥的 WebhookServer 会拒绝所有
+        回调（见 ``webhook.verify_signature``），但仍起 server（让用户从「401」日志发现
+        漏配 secret）。唤醒/新建 agent 的逻辑在 ``_handle_ci_webhook``，marshal 回主 loop。
+        """
+        assert self.cfg.webhook is not None
+        w = self.cfg.webhook
+        try:
+            ws = WebhookServer(
+                w.secret,
+                routes={("POST", "/webhook/ci"): self._handle_ci_webhook},
+                host="127.0.0.1",
+                port=w.port,
+                main_loop=loop,
+            )
+            ws.start()
+            if not w.secret:
+                logger.error(
+                    "webhook 已起在 %s 但 secret 为空——所有回调会被拒。"
+                    "请在 [webhook] 配 secret（GitHub webhook 密钥）",
+                    ws.base_url,
+                )
+            return ws
+        except OSError:
+            logger.error(
+                "CI 失败 webhook 启动失败（127.0.0.1:%s 可能被占用）；飞书功能不受影响",
+                w.port,
+                exc_info=True,
+            )
+            return None
+
+    async def _handle_ci_webhook(
+        self, body: bytes, headers: dict[str, str]
+    ) -> tuple[int, dict]:
+        """``POST /webhook/ci``：解析 GitHub 回调 → 匹配项目 → 唤醒/新建 agent（#54）。
+
+        在主 loop 上执行（经 WebhookServer.dispatch marshal 回来）。签名已由 dispatch
+        校验。步骤：解析 payload → 失败才继续 → 去重 → 匹配项目 → 命中则唤醒（活跃/挂起
+        Task 入队，无 Task 则新建），最后回 200 + 摘要。所有分支都回 200（GitHub 见非 2xx
+        会重推，反而触发更多），用 body 区分结果。
+        """
+        assert self.cfg.webhook is not None
+        allowed = self.cfg.webhook.allowed_events
+        event = headers.get("x-github-event", "")
+        if event and event not in allowed:
+            return 200, {"ignored": f"event {event} not in allowed_events"}
+        try:
+            payload = json.loads(body.decode("utf-8")) if body else {}
+        except (ValueError, UnicodeDecodeError):
+            return 400, {"error": "invalid JSON payload"}
+        failure = parse_github_payload(event, payload)
+        if failure is None:
+            return 200, {"ignored": "not a CI failure (success/skipped/unsupported)"}
+        if not self._webhook_dedup.check_and_mark(failure.run_id):
+            logger.info("CI 回调 run_id=%s 已处理过，跳过（去重）", failure.run_id)
+            return 200, {"ignored": "duplicate run_id"}
+        project = match_project_by_repo(
+            self._all_projects(), failure.project_full_name, failure.project_clone_url
+        )
+        if project is None:
+            logger.info(
+                "CI 回调 %s 未匹配到项目（full_name=%s），忽略",
+                failure.run_id,
+                failure.project_full_name,
+            )
+            await self._notify_main(
+                f"🔴 收到未知项目的 CI 失败回调：{failure.project_full_name}"
+                f" · {failure.workflow}（未匹配到已配 repo 的项目）"
+            )
+            return 200, {"ignored": "no matching project"}
+        result = await self._wake_or_spawn(project, failure)
+        await self._notify_main(
+            f"🔴 {project.name} CI 失败（{failure.workflow} · {failure.branch}），已派 agent 修复"
+        )
+        logger.info(
+            "CI 回调 run_id=%s → 项目 %s：%s",
+            failure.run_id,
+            project.name,
+            result,
+        )
+        return 200, {"ok": True, "project": project.name, "result": result}
+
+    async def _wake_or_spawn(self, project: Project, failure: "CIFailure") -> str:
+        """按项目现有 Task 状态决定唤醒还是新建（#54 唤醒策略表）。
+
+        复用既有调度器工具口径：有非终止 Task → ``_sched_send_to_task``（活跃 session
+        排队，挂起先 load_session 恢复再入队）；否则 → ``_sched_spawn_agent`` 新建 Task，
+        CI 失败作首条 prompt。多个非终止 Task 取最近更新的一个。
+        """
+        # 命中非终止 Task：最近更新的优先（最近活跃过的更可能是「该项目的当前任务」）
+        candidates = [
+            t
+            for t in self.store.all()
+            if t.project_name == project.name and not t.is_terminal
+        ]
+        prompt = failure.prompt
+        if candidates:
+            candidates.sort(key=lambda t: t.updated_at, reverse=True)
+            task = candidates[0]
+            return await self._sched_send_to_task(task.task_id, prompt)
+        return await self._sched_spawn_agent(project.name, prompt)
 
     # ------------------------------------------------------------------ #
     # 消息分发
@@ -2063,6 +2182,17 @@ class _Daemon:
                 )
             except Exception:
                 logger.warning("控制面关闭失败，忽略", exc_info=True)
+        if self._webhook is not None:
+            # 同控制面：stop() 阻塞，挪到 worker 线程 + 超时兜底（#81）。
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(self._webhook.stop),
+                    timeout=_CONTROL_STOP_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("webhook 关闭超时，跳过（serve_forever 是 daemon 线程，随进程退出）")
+            except Exception:
+                logger.warning("webhook 关闭失败，忽略", exc_info=True)
         if self._bridge is not None:
             self._bridge.stop()
         # 把仍活跃的任务标记为 suspended，让重启后台账状态准确（且可 load_session 恢复）
