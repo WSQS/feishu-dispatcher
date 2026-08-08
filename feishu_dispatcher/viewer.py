@@ -30,7 +30,7 @@ from feishu_dispatcher import __version__
 logger = logging.getLogger(__name__)
 
 #: 路由处理器：async，在主 loop 上执行（handler 线程经 run_coroutine_threadsafe marshal 回来）。
-#: 统一 async 是因为 #105 的 projects/tree/file/diff 要读 daemon stores（只在主 loop 单线程
+#: 统一 async 是因为 projects/tree/file/diff 要读 daemon stores（只在主 loop 单线程
 #: 访问，决策 Q4）；health 虽不读 store，也统一 async 保持口径一致。daemon 上下文经参数注入。
 RouteHandler = Callable[[dict], Awaitable[tuple[int, dict]]]
 
