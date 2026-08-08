@@ -2,7 +2,6 @@ package dev.sopho.fdx.client.ui
 
 import android.util.Log
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -18,54 +17,50 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import dev.sopho.fdx.client.network.ProjectItem
+import dev.sopho.fdx.client.network.TreeEntry
 import dev.sopho.fdx.client.network.ViewerClient
 
 /**
- * 项目列表页：调 [ViewerClient.projects] 显示 daemon 注册的项目。
+ * 文件树页：调 [ViewerClient.tree] 显示 project 的文件列表（扁平）。
  *
- * 点击项目暂不跳转（Toast 留后续）；先验通 /api/projects 端到端。
+ * 点击文件暂不跳转（文件内容页后续做）。
  */
 @Composable
-fun ProjectListScreen(
+fun TreeScreen(
     client: ViewerClient,
+    projectName: String,
     modifier: Modifier = Modifier,
-    onProjectClick: ((String) -> Unit)? = null,
 ) {
-    var projects by remember { mutableStateOf<List<ProjectItem>?>(null) }
+    var entries by remember { mutableStateOf<List<TreeEntry>?>(null) }
     var error by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(Unit) {
-        runCatching { client.projects().items }
-            .onSuccess { projects = it }
+    LaunchedEffect(projectName) {
+        runCatching { client.tree(projectName).entries }
+            .onSuccess { entries = it }
             .onFailure {
-                Log.e("ProjectList", "failed to load projects", it)
+                Log.e("TreeScreen", "failed to load tree", it)
                 error = it.message
             }
     }
 
     Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
-        Text("项目列表", style = MaterialTheme.typography.titleLarge)
+        Text(projectName, style = MaterialTheme.typography.titleLarge)
         when {
             error != null -> Text("❌ $error")
-            projects == null -> CircularProgressIndicator(modifier = Modifier.padding(top = 16.dp))
-            projects!!.isEmpty() -> Text("（无项目）", modifier = Modifier.padding(top = 16.dp))
-            else -> LazyColumn(
-                modifier = Modifier.fillMaxSize(),
-                verticalArrangement = Arrangement.spacedBy(4.dp),
-            ) {
-                items(projects!!) { project ->
-                    Column(
-                        modifier = Modifier
-                            .padding(vertical = 8.dp)
-                            .clickable { onProjectClick?.invoke(project.name) },
-                    ) {
-                        Text(project.name, style = MaterialTheme.typography.titleMedium)
+            entries == null -> CircularProgressIndicator(modifier = Modifier.padding(top = 16.dp))
+            entries!!.isEmpty() -> Text("（空）", modifier = Modifier.padding(top = 16.dp))
+            else -> LazyColumn(modifier = Modifier.fillMaxSize()) {
+                items(entries!!) { entry ->
+                    Column(modifier = Modifier.padding(vertical = 8.dp)) {
                         Text(
-                            "${project.defaultAgent} · ${project.path}",
+                            entry.path,
+                            style = MaterialTheme.typography.bodyMedium,
+                            modifier = Modifier.clickable { /* TODO: open file content */ },
+                        )
+                        Text(
+                            "${entry.size} bytes",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                         )
