@@ -140,7 +140,8 @@ async def list_projects(ctx: dict) -> tuple[int, dict]:
 
 def _make_handler(vs: ViewerServer):
     class _Handler(BaseHTTPRequestHandler):
-        # 静音默认往 stderr 打的访问日志（daemon 有自己的日志）
+        # 静音 BaseHTTPRequestHandler 默认往 stderr 打的访问日志；
+        # 改用 logger.info 在 do_GET 里记（格式统一、走 daemon 日志通道）。
         def log_message(self, *args) -> None:  # noqa: D401
             return None
 
@@ -160,7 +161,9 @@ def _make_handler(vs: ViewerServer):
             return self.path.split("?", 1)[0]
 
         def do_GET(self) -> None:  # noqa: N802
-            status, payload = vs.dispatch("GET", self._path(), self._token())
+            path = self._path()
+            status, payload = vs.dispatch("GET", path, self._token())
+            logger.info("viewer GET %s → %d", path, status)
             self._respond(status, payload)
 
     return _Handler

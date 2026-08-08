@@ -229,7 +229,7 @@ class Config:
                 bind=str(viewer_data.get("bind", "0.0.0.0")),
                 port=int(viewer_data.get("port", 7321)),
             )
-            if viewer_data
+            if viewer_data is not None
             else None
         )
         return Config(
