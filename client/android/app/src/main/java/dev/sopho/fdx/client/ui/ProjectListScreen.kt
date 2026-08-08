@@ -27,7 +27,7 @@ import dev.sopho.fdx.client.network.ViewerClient
 /**
  * 项目列表页：调 [ViewerClient.projects] 显示 daemon 注册的项目。
  *
- * 点击项目暂不跳转（Toast 留后续）；先验通 /api/projects 端到端。
+ * 点击项目暂不跳转；先验通 /api/projects 端到端。
  */
 @Composable
 fun ProjectListScreen(
