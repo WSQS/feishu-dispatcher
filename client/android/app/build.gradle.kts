@@ -44,10 +44,10 @@ dependencies {
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
-    // lifecycle-viewmodel-compose 给后续 #123 配置页 ViewModel 用，先带上
+    // lifecycle-viewmodel-compose：ViewModel 的 Compose 集成
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
 
-    // Ktor Client（#122 网络层）：core + CIO engine（纯 Kotlin，无原生依赖）+
+    // Ktor Client：core + CIO engine（纯 Kotlin，无原生依赖）+
     // content-negotiation + json + kotlinx.serialization
     implementation("io.ktor:ktor-client-core:3.0.3")
     implementation("io.ktor:ktor-client-cio:3.0.3")

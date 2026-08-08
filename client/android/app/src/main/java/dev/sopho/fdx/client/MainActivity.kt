@@ -26,7 +26,7 @@ import dev.sopho.fdx.client.network.ViewerException
 import dev.sopho.fdx.client.ui.theme.FdxViewerTheme
 import kotlinx.coroutines.launch
 
-// 临时硬编码的 viewer 地址 + token（#123 配置页会替换成可输入 + DataStore 持久化）。
+// 临时硬编码的 viewer 地址 + token（正式配置入口待后续补）。
 // 验证时改成你 daemon 的实际地址（局域网/zerotier IP）+ 日志里打印的 token。
 private const val VIEWER_URL = "http://10.0.2.2:7321"  // 10.0.2.2 = 模拟器访本机宿主
 private const val VIEWER_TOKEN = "REPLACE_ME"
@@ -46,7 +46,7 @@ class MainActivity : ComponentActivity() {
 
 @Composable
 private fun HealthScreen(modifier: Modifier = Modifier) {
-    // health() 用一次 client；正式配置页改用注入的 client（#123/#125）。
+    // 用 remember 缓存 client，避免每次 recomposition 重建。
     val client = remember { ViewerClient(VIEWER_URL, VIEWER_TOKEN) }
     val scope = rememberCoroutineScope()
     var result by remember { mutableStateOf<Result<HealthResponse>?>(null) }
