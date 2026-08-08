@@ -38,7 +38,7 @@ class ViewerClient(
     useZerotier: Boolean = false,
     ztHost: String = "",
     ztPort: Int = 7321,
-) {
+) : java.io.Closeable {
     private val http: HttpClient = if (useZerotier) {
         HttpClient(OkHttp) {
             install(ContentNegotiation) {
@@ -70,5 +70,5 @@ class ViewerClient(
         }
     }
 
-    fun close() = http.close()
+    override fun close() = http.close()
 }
