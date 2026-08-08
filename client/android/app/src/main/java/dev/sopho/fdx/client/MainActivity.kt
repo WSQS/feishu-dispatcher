@@ -14,6 +14,7 @@ import dev.sopho.fdx.client.data.ConnectionStore
 import dev.sopho.fdx.client.network.ViewerClient
 import dev.sopho.fdx.client.ui.ConfigScreen
 import dev.sopho.fdx.client.ui.ProjectListScreen
+import dev.sopho.fdx.client.ui.TreeScreen
 import dev.sopho.fdx.client.ui.theme.FdxViewerTheme
 
 class MainActivity : ComponentActivity() {
@@ -23,18 +24,22 @@ class MainActivity : ComponentActivity() {
         setContent {
             FdxViewerTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    var showProjects by remember { mutableStateOf(false) }
                     var client by remember { mutableStateOf<ViewerClient?>(null) }
+                    var selectedProject by remember { mutableStateOf<String?>(null) }
 
-                    if (showProjects && client != null) {
-                        ProjectListScreen(client = client!!)
-                    } else {
-                        ConfigScreen(
+                    val c = client
+                    val proj = selectedProject
+                    when {
+                        c != null && proj != null -> TreeScreen(client = c, projectName = proj)
+                        c != null -> ProjectListScreen(
+                            client = c,
+                            onProjectClick = { name -> selectedProject = name },
+                        )
+                        else -> ConfigScreen(
                             repo = store,
                             storagePath = applicationContext.filesDir.absolutePath,
                             onConnected = { conn ->
                                 client = ViewerClient.fromConnection(conn)
-                                showProjects = true
                             },
                         )
                     }
