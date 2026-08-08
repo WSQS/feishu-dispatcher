@@ -40,6 +40,7 @@ from .scheduler import (
 from .store import Job, JobStore, ModelStore, ProjectStore, Task, TaskStore
 from ._viewer_token import ensure_token
 from .viewer import ViewerServer, health as viewer_health, list_projects as viewer_list_projects
+from .viewer import tree as viewer_tree
 
 logger = logging.getLogger(__name__)
 
@@ -425,6 +426,7 @@ class _Daemon:
                 routes={
                     ("GET", "/api/health"): viewer_health,
                     ("GET", "/api/projects"): viewer_list_projects,
+                    ("GET", "/api/projects/{name}/tree"): viewer_tree,
                 },
                 host=v.bind,
                 port=v.port,
