@@ -81,8 +81,9 @@ class MainActivity : ComponentActivity() {
                             is Destination.Config -> ConfigScreen(
                                 repo = store,
                                 storagePath = applicationContext.filesDir.absolutePath,
-                                onConnected = { conn ->
-                                    client = ViewerClient.fromConnection(conn)
+                                // onConnected 接收已建好并测过 health 的 client（复用，不再重建）。
+                                onConnected = { c ->
+                                    client = c
                                     push(Destination.ProjectList)
                                 },
                             )
