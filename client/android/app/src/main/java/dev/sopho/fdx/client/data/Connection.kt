@@ -12,7 +12,12 @@ import kotlinx.serialization.Serializable
 data class Connection(
     val url: String = "",
     val token: String = "",
+    val networkId: String = "", // ZeroTier network ID（16 位 hex）；v1 走 libzt 组网，必填
 ) {
-    /** 简单非空校验（地址和 token 都非空才算有效；正式格式校验留后续）。 */
-    val isValid: Boolean get() = url.isNotBlank() && token.isNotBlank()
+    /**
+     * 简单非空校验（地址、token、networkId 都非空才算有效；正式格式校验留后续）。
+     *
+     * v1 阶段 ZT 是必经路径，所以 networkId 也纳入必填。
+     */
+    val isValid: Boolean get() = url.isNotBlank() && token.isNotBlank() && networkId.isNotBlank()
 }

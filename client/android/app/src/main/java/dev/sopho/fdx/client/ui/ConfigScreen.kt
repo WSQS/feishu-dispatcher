@@ -25,7 +25,7 @@ import dev.sopho.fdx.client.data.ConnectionRepository
 import kotlinx.coroutines.launch
 
 /**
- * 配置页：填 viewer 地址 + token，保存（[ConnectionRepository] 持久化）。
+ * 配置页：填 viewer 地址 + token + ZeroTier network ID，保存（[ConnectionRepository] 持久化）。
  *
  * UI 对整个 [Connection] 模型读写——字段改动用 `connection.copy(...)`，保存存整个模型。
  * 不依赖具体存储（参数是 [ConnectionRepository] 接口）；启动读回填，验证持久化。
@@ -63,11 +63,25 @@ fun ConfigScreen(
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
+        OutlinedTextField(
+            value = connection.networkId,
+            onValueChange = { connection = connection.copy(networkId = it); savedMsg = null },
+            label = { Text("ZeroTier Network ID") },
+            placeholder = { Text("16 位 hex，如 a1b2c3d4e5f60718") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
         Spacer(Modifier.height(4.dp))
         Button(
             onClick = {
                 scope.launch {
-                    repo.save(connection.copy(url = connection.url.trim(), token = connection.token.trim()))
+                    repo.save(
+                        connection.copy(
+                            url = connection.url.trim(),
+                            token = connection.token.trim(),
+                            networkId = connection.networkId.trim(),
+                        ),
+                    )
                     savedMsg = "已保存（杀进程重启仍在）"
                 }
             },
