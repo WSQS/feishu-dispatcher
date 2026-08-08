@@ -47,10 +47,11 @@ dependencies {
     // lifecycle-viewmodel-compose：ViewModel 的 Compose 集成
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
 
-    // Ktor Client：core + CIO engine（纯 Kotlin，无原生依赖）+
+    // Ktor Client：core + CIO engine（普通 HTTP）+ OkHttp engine（libzt socket）+
     // content-negotiation + json + kotlinx.serialization
     implementation("io.ktor:ktor-client-core:3.0.3")
     implementation("io.ktor:ktor-client-cio:3.0.3")
+    implementation("io.ktor:ktor-client-okhttp:3.0.3")
     implementation("io.ktor:ktor-client-content-negotiation:3.0.3")
     implementation("io.ktor:ktor-serialization-kotlinx-json:3.0.3")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
