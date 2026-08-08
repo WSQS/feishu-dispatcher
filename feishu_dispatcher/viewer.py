@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
 from feishu_dispatcher import __version__
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +140,34 @@ async def list_projects(ctx: dict, _request: dict) -> tuple[int, dict]:
         for p in all_projects().values()
     ]
     return 200, {"items": items}
+
+
+async def tree(ctx: dict, request: dict) -> tuple[int, dict]:
+    """``GET /api/projects/{name}/tree``：列 project workspace 的文件树（os.walk）。"""
+    name = request["segments"]["name"]
+    ws = _resolve_workspace(ctx, name)
+    if isinstance(ws, tuple):
+        return ws
+    ignore = {".git", ".venv", "build", "node_modules", "__pycache__"}
+    entries = []
+    for root, dirs, fnames in ws.walk():
+        dirs[:] = [d for d in dirs if d not in ignore]
+        for f in fnames:
+            full = root / f
+            entries.append({"path": str(full.relative_to(ws)), "type": "file", "size": full.stat().st_size})
+    entries.sort(key=lambda x: x["path"])
+    return 200, {"entries": entries}
+
+
+def _resolve_workspace(ctx: dict, name: str) -> "Path | tuple[int, dict]":
+    """按 project name 查 workspace 路径；project 不存在返回错误响应 tuple。"""
+    all_projects = ctx.get("all_projects")
+    if all_projects is None:
+        return 500, {"error": "all_projects not in ctx"}
+    p = all_projects().get(name)
+    if p is None:
+        return 404, {"error": f"unknown project: {name}"}
+    return p.path
 
 
 def _match_route(
