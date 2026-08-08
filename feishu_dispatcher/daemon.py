@@ -1513,7 +1513,12 @@ class _Daemon:
             self._sched_memory.add_turn(turn)
         else:
             self._sched_memory.add_exchange(text, reply)  # 出错兜底：至少存问答对
-        await self._reply_user(msg.message_id, reply)
+        # 调度器成功回复按 markdown 渲染（表格/列表/代码块）；出错/空输出的兜底仍是
+        # 纯文本（不该给异常提示套卡片）。见 _reply_user_markdown / #59。
+        if turn:
+            await self._reply_user_markdown(msg.message_id, reply)
+        else:
+            await self._reply_user(msg.message_id, reply)
 
     def _sched_list_projects(self) -> list[dict]:
         return [
@@ -2076,6 +2081,19 @@ class _Daemon:
     async def _reply_user(self, message_id: str, text: str) -> None:
         """对用户对话/命令消息的普通回复（不建话题）。"""
         await self._safe_reply(message_id, text, in_thread=False)
+
+    async def _reply_user_markdown(self, message_id: str, text: str) -> None:
+        """对用户对话/命令消息回复一张 markdown 卡片（不建话题）。
+
+        调度器主线回复用：卡片支持表格/列表/代码块，纯文本不支持（#59）。
+        卡片发送失败时退化成纯文本 :meth:`_reply_user`——渲染层出错不该吞掉回复。
+        """
+        assert self._bridge is not None
+        try:
+            await asyncio.to_thread(self._bridge.reply_markdown, message_id, text)
+        except Exception:
+            logger.exception("markdown 卡片回复失败，退化纯文本 msg=%s", message_id)
+            await self._reply_user(message_id, text)
 
     async def _notify_main(self, text: str) -> None:
         """向控制台主线推一条独立通知（不建话题）——agent 完成/出错/挂起时用。"""
