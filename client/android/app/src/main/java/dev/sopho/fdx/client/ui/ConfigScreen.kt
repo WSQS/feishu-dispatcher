@@ -60,6 +60,7 @@ fun ConfigScreen(
     repo: ConnectionRepository,
     storagePath: String,
     modifier: Modifier = Modifier,
+    onConnected: ((Connection) -> Unit)? = null,
 ) {
     var connection by remember { mutableStateOf(Connection()) }
     var savedMsg by remember { mutableStateOf<String?>(null) }
@@ -170,6 +171,7 @@ fun ConfigScreen(
                     scope.launch {
                         testState = runTest(connection, storagePath)
                         isTesting = false
+                        if (testState is TestState.Success) onConnected?.invoke(connection)
                     }
                 },
                 enabled = connection.isValid && !isTesting,
