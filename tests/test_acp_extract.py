@@ -54,7 +54,24 @@ def fmt(update) -> str:
 
 def test_extract_action_from_tool_call():
     action = _extract_action(start_tool_call("tc1", "Editing src/foo.py", kind="edit"))
-    assert action == {"kind": "edit", "title": "Editing src/foo.py"}
+    assert action == {
+        "kind": "edit",
+        "title": "Editing src/foo.py",
+        "tool_call_id": "tc1",
+    }
+
+
+def test_extract_action_includes_detail_when_present():
+    # 文件路径细节：复用 _extract_tool_detail，能取到就带上（#17 文件路径部分）
+    action = _extract_action(
+        start_tool_call(
+            "e1",
+            "Edit",
+            kind="edit",
+            locations=[ToolCallLocation(path="src/foo.py")],
+        )
+    )
+    assert action["detail"] == "src/foo.py"
 
 
 def test_extract_action_ignores_message_and_thought():
@@ -62,9 +79,20 @@ def test_extract_action_ignores_message_and_thought():
     assert _extract_action(update_agent_thought_text("thinking")) is None
 
 
-def test_extract_action_ignores_tool_call_update():
-    # 只认首次通告，完成/失败的状态更新不重复记
+def test_extract_action_from_tool_call_completion_update():
+    # 完成状态更新：返回 {tool_call_id, status} 供上层按 id 回填（#17）
     upd = update_tool_call("tc1", title="Editing src/foo.py", status="completed")
+    assert _extract_action(upd) == {"tool_call_id": "tc1", "status": "completed"}
+
+
+def test_extract_action_from_tool_call_failure_update():
+    upd = update_tool_call("tc2", title="Run tests", status="failed")
+    assert _extract_action(upd) == {"tool_call_id": "tc2", "status": "failed"}
+
+
+def test_extract_action_ignores_in_progress_update():
+    # in_progress 不是终态，不记账（避免噪声）
+    upd = update_tool_call("tc1", title="x", status="in_progress")
     assert _extract_action(upd) is None
 
 
