@@ -24,15 +24,16 @@ import logging
 import threading
 from collections.abc import Awaitable, Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
 
 from feishu_dispatcher import __version__
 
 logger = logging.getLogger(__name__)
 
-#: 路由处理器：async，在主 loop 上执行（handler 线程经 run_coroutine_threadsafe marshal 回来）。
-#: 统一 async 是因为 projects/tree/file/diff 要读 daemon stores（只在主 loop 单线程
-#: 访问，决策 Q4）；health 虽不读 store，也统一 async 保持口径一致。daemon 上下文经参数注入。
-RouteHandler = Callable[[dict], Awaitable[tuple[int, dict]]]
+#: 路由处理器：async (ctx, request) -> (status, dict)，在主 loop 上执行（经 dispatch marshal 回来）。
+#: - ctx：daemon 上下文（跨请求不变）。
+#: - request：{"path": str, "query": dict[str,str], "segments": dict[str,str]}（每次请求不同）。
+RouteHandler = Callable[[dict, dict], Awaitable[tuple[int, dict]]]
 
 #: 单个请求在主 loop 上处理的最长等待（store 读/git 调用都该很快）
 _DISPATCH_TIMEOUT = 30.0
@@ -90,19 +91,21 @@ class ViewerServer:
         except Exception:
             logger.debug("查看器 server_close 异常（忽略）", exc_info=True)
 
-    def dispatch(self, method: str, path: str, token: str) -> tuple[int, dict]:
-        """在 handler 线程里调用：鉴权 → 找路由 → marshal 到主 loop 执行 async handler。
+    def dispatch(self, method: str, path: str, query: str, token: str) -> tuple[int, dict]:
+        """鉴权 → 模板匹配路由 → marshal 到主 loop 执行 async handler。
 
-        handler 是 async、接收 ctx dict、返回 (status, dict)。主 loop 存在时 marshal 回去
-        执行（store 安全访问）；无主 loop（单测）时直接 event_loop 跑（测试自备 loop）。
+        handler 是 async (ctx, request) -> (status, dict)。query 解析成 dict；
+        路由模板含 {name} 占位符，匹配后提取进 request.segments。
         """
         if token != self._token:
             return 401, {"error": "invalid or missing token"}
-        handler = self._routes.get((method, path))
-        if handler is None:
+        match = _match_route(self._routes, method, path)
+        if match is None:
             return 404, {"error": f"no route for {method} {path}"}
+        handler, segments = match
+        request = {"path": path, "query": _parse_query(query), "segments": segments}
         try:
-            coro = handler(self._ctx)
+            coro = handler(self._ctx, request)
             if self._loop is not None:
                 # 照 control.py：marshal 回主 loop，等结果（handler 只做快操作）
                 fut = asyncio.run_coroutine_threadsafe(coro, self._loop)
@@ -114,7 +117,7 @@ class ViewerServer:
             return 500, {"error": f"{type(exc).__name__}: {exc}"}
 
 
-async def health(_ctx: dict) -> tuple[int, dict]:
+async def health(_ctx: dict, _request: dict) -> tuple[int, dict]:
     """``GET /api/health``：存活探针 + 版本，供安卓端确认连得上、对得上版本。
 
     不读 store（ctx 不用），但统一 async 签名（dispatch 全走 marshal）。
@@ -122,7 +125,7 @@ async def health(_ctx: dict) -> tuple[int, dict]:
     return 200, {"ok": True, "version": __version__}
 
 
-async def list_projects(ctx: dict) -> tuple[int, dict]:
+async def list_projects(ctx: dict, _request: dict) -> tuple[int, dict]:
     """``GET /api/projects``：列出所有 project（合并 config 种子 + 运行时注册，决策 Q5）。
 
     ctx 须含 ``all_projects``：一个返回 ``dict[str, Project]`` 的可调用（daemon 的
@@ -136,6 +139,44 @@ async def list_projects(ctx: dict) -> tuple[int, dict]:
         for p in all_projects().values()
     ]
     return 200, {"items": items}
+
+
+def _match_route(
+    routes: dict[tuple[str, str], RouteHandler], method: str, path: str
+) -> "tuple[RouteHandler, dict[str, str]] | None":
+    """匹配 (method, path) 到路由（含 {name} 占位符的模板路由）。返回 (handler, segments) 或 None。
+
+    精确匹配优先于模板匹配。
+    """
+    exact = routes.get((method, path))
+    if exact is not None:
+        return exact, {}
+    path_parts = path.strip("/").split("/")
+    for (m, tmpl), handler in routes.items():
+        if m != method or "{" not in tmpl:
+            continue
+        tmpl_parts = tmpl.strip("/").split("/")
+        if len(tmpl_parts) != len(path_parts):
+            continue
+        segments: dict[str, str] = {}
+        ok = True
+        for tp, pp in zip(tmpl_parts, path_parts, strict=True):
+            if tp.startswith("{") and tp.endswith("}"):
+                segments[tp[1:-1]] = pp
+            elif tp != pp:
+                ok = False
+                break
+        if ok:
+            return handler, segments
+    return None
+
+
+def _parse_query(query: str) -> dict[str, str]:
+    """``a=b&c=d`` → ``{a:b, c:d}``（取每个 key 第一个值，单值场景够用）。"""
+    if not query:
+        return {}
+    pairs = parse_qs(query, keep_blank_values=True)
+    return {k: v[0] for k, v in pairs.items()}
 
 
 def _make_handler(vs: ViewerServer):
@@ -157,12 +198,14 @@ def _make_handler(vs: ViewerServer):
             self.end_headers()
             self.wfile.write(data)
 
-        def _path(self) -> str:
-            return self.path.split("?", 1)[0]
+        def _split(self) -> tuple[str, str]:
+            """返回 (path, query) — path 不含 ?，query 是 ? 之后的串。"""
+            p, _, q = self.path.partition("?")
+            return p, q
 
         def do_GET(self) -> None:  # noqa: N802
-            path = self._path()
-            status, payload = vs.dispatch("GET", path, self._token())
+            path, query = self._split()
+            status, payload = vs.dispatch("GET", path, query, self._token())
             logger.info("viewer GET %s → %d", path, status)
             self._respond(status, payload)
 

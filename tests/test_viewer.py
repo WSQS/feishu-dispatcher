@@ -66,7 +66,7 @@ async def test_unknown_route_404():
 
 
 async def test_handler_exception_becomes_500():
-    async def boom(_ctx: dict) -> tuple[int, dict]:
+    async def boom(_ctx: dict, _request: dict) -> tuple[int, dict]:
         raise RuntimeError("kaboom")
 
     vs = await _make_server(routes={("GET", "/api/x"): boom})
