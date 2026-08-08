@@ -2,7 +2,13 @@ from pathlib import Path
 
 import pytest
 
-from feishu_dispatcher.config import Config, Project, ViewerConfig
+from feishu_dispatcher.config import (
+    CARD_FOOTER_MODES,
+    Config,
+    DisplayConfig,
+    Project,
+    ViewerConfig,
+)
 
 SAMPLE = """
 app_id = "cli_abc"
@@ -334,3 +340,32 @@ def test_viewer_section_empty_table_uses_defaults(tmp_path: Path):
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(_BASE + "[viewer]\n", encoding="utf-8")
     assert Config.load(cfg_file).viewer == ViewerConfig()
+
+
+def test_display_absent_means_none(tmp_path: Path):
+    # 配置无 [display] 段 → Config.display is None（daemon 兜底用默认 model 模式）。
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(_BASE, encoding="utf-8")
+    assert Config.load(cfg_file).display is None
+
+
+def test_display_card_footer_parsed(tmp_path: Path):
+    # [display].card_footer 合法值 → 解析成 DisplayConfig。
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(_BASE + '[display]\ncard_footer = "task"\n', encoding="utf-8")
+    assert Config.load(cfg_file).display == DisplayConfig(card_footer="task")
+
+
+def test_display_card_footer_invalid_raises(tmp_path: Path):
+    # 非法 card_footer → 拒绝启动（同 stream_mode）。
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        _BASE + '[display]\ncard_footer = "bogus"\n', encoding="utf-8"
+    )
+    with pytest.raises(ValueError, match="display.card_footer"):
+        Config.load(cfg_file)
+
+
+def test_card_footer_modes_are_the_four_named():
+    # 守住契约：四种具名模式（issue #60 的核心需求，自定义模板另议）。
+    assert CARD_FOOTER_MODES == ("model", "task", "model+task", "none")
