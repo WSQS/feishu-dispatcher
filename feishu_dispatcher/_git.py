@@ -1,4 +1,4 @@
-"""workspace git 操作封装（#105 第二半）：供 tree/file/diff 接口调 git。
+"""workspace git 操作封装：供 tree/file/diff 接口调 git。
 
 零依赖（用 subprocess 调系统 git，不用 GitPython）。三个操作：
 - :func:`list_files`：git ls-files（+ 可选未跟踪），非仓降级 os.walk（决策 D10）
