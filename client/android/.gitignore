@@ -1,0 +1,29 @@
+# Gradle
+.gradle/
+build/
+
+# Android Studio / IntelliJ
+.idea/
+*.iml
+.cxx/
+# 每人本地 SDK 路径，不进 git
+local.properties
+
+# Kotlin 编译器会话/缓存
+.kotlin/
+
+# 构建产物
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Kotlin / Java
+*.class
+
+# 本地签名（骨架无，正式 release 时注意）
+*.keystore
+*.jks
+
+# 日志
+*.log
