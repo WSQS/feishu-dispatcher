@@ -17,7 +17,7 @@ class MainActivity : ComponentActivity() {
         setContent {
             FdxViewerTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    ConfigScreen(store)
+                    ConfigScreen(store, storagePath = applicationContext.filesDir.absolutePath)
                 }
             }
         }
