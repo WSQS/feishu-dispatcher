@@ -1,5 +1,6 @@
 package dev.sopho.fdx.client.network
 
+import android.util.Log
 import dev.sopho.fdx.client.data.Connection
 import io.ktor.client.HttpClient
 import io.ktor.client.call.body
@@ -75,24 +76,32 @@ class ViewerClient(
 
     /** GET /api/health —— 存活探针 + 版本。失败抛 [ViewerException]（含分类）。 */
     suspend fun health(): HealthResponse = withContext(Dispatchers.IO) {
+        val t = System.nanoTime()
         try {
-            http.get {
+            val r = http.get {
                 url.takeFrom(URLBuilder(baseUrl).apply { pathSegments = listOf("api", "health") }.build())
                 bearerAuth(token)
-            }.body()
+            }.body<HealthResponse>()
+            Log.i(TAG, "health: ${(System.nanoTime() - t) / 1_000_000}ms")
+            r
         } catch (e: Exception) {
+            Log.w(TAG, "health: failed in ${(System.nanoTime() - t) / 1_000_000}ms", e)
             throw ViewerException.from(e)
         }
     }
 
     /** GET /api/projects —— 列出所有项目。失败抛 [ViewerException]（含分类）。 */
     suspend fun projects(): ListProjectsResponse = withContext(Dispatchers.IO) {
+        val t = System.nanoTime()
         try {
-            http.get {
+            val r = http.get {
                 url.takeFrom(URLBuilder(baseUrl).apply { pathSegments = listOf("api", "projects") }.build())
                 bearerAuth(token)
-            }.body()
+            }.body<ListProjectsResponse>()
+            Log.i(TAG, "projects: ${(System.nanoTime() - t) / 1_000_000}ms (${r.items.size} items)")
+            r
         } catch (e: Exception) {
+            Log.w(TAG, "projects: failed in ${(System.nanoTime() - t) / 1_000_000}ms", e)
             throw ViewerException.from(e)
         }
     }
@@ -100,6 +109,8 @@ class ViewerClient(
     override fun close() = http.close()
 
     companion object {
+        private const val TAG = "ViewerClient"
+
         /** 从 [Connection] 构造 ViewerClient（按 zerotier.enabled 选 engine + 解析 URL）。 */
         fun fromConnection(conn: Connection): ViewerClient {
             val url = conn.url.trim()

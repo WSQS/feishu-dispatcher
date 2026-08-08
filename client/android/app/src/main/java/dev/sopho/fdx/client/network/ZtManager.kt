@@ -1,5 +1,6 @@
 package dev.sopho.fdx.client.network
 
+import android.util.Log
 import com.zerotier.sockets.ZeroTierNative
 import com.zerotier.sockets.ZeroTierNode
 import kotlinx.coroutines.Dispatchers
@@ -46,6 +47,7 @@ sealed interface ZtState {
  * 单例（`object`）—— libzt node 进程内一份；filesDir 由调用方传（startNode 的 storagePath）。
  */
 object ZtManager {
+    private const val TAG = "ZtManager"
     private var node: ZeroTierNode? = null
 
     private val _state = MutableStateFlow<ZtState>(ZtState.Idle)
@@ -78,6 +80,8 @@ object ZtManager {
         node = n
         try {
             _state.value = ZtState.Starting
+            val t0 = System.nanoTime()
+            Log.i(TAG, "startNode: initFromStorage + start")
             n.initFromStorage(storagePath)
             n.start()
 
@@ -85,20 +89,25 @@ object ZtManager {
             val onlineOk = withTimeoutOrNull(timeoutMs) {
                 while (!n.isOnline) delay(50)
             }
+            val onlineMs = (System.nanoTime() - t0) / 1_000_000
             if (onlineOk == null) {
+                Log.w(TAG, "startNode: node online timeout (${timeoutMs}ms)")
                 _state.value = ZtState.Error("等 node 上线超时（${timeoutMs}ms）")
                 return@withContext
             }
+            Log.i(TAG, "startNode: node online in ${onlineMs}ms")
             _state.value = ZtState.Online
 
             // moon（可选）：moonId 非空时 orbit
             if (moonId.isNotBlank()) {
                 val moon = moonId.toLong(16)
+                Log.i(TAG, "startNode: orbit moon $moonId")
                 ZeroTierNative.zts_moon_orbit(moon, moon)
             }
 
             // 加入网络
             val nwid = networkId.toLong(16)
+            val t1 = System.nanoTime()
             n.join(nwid)
             _state.value = ZtState.Joining
 
@@ -106,10 +115,14 @@ object ZtManager {
             val readyOk = withTimeoutOrNull(timeoutMs) {
                 while (!n.isNetworkTransportReady(nwid)) delay(50)
             }
+            val readyMs = (System.nanoTime() - t1) / 1_000_000
             if (readyOk == null) {
+                Log.w(TAG, "startNode: network ready timeout (${timeoutMs}ms)")
                 _state.value = ZtState.Error("等网络就绪超时（${timeoutMs}ms）；检查 networkId 或 ZeroTier Central 是否 authorize 了本节点")
                 return@withContext
             }
+            val totalMs = (System.nanoTime() - t0) / 1_000_000
+            Log.i(TAG, "startNode: network ready in ${readyMs}ms (join->ready), total ${totalMs}ms")
             _state.value = ZtState.NetworkReady
         } catch (e: NumberFormatException) {
             _state.value = ZtState.Error("networkId/moonId 不是合法 hex：${e.message}")

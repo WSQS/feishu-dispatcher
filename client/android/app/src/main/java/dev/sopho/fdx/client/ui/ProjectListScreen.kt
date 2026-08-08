@@ -40,7 +40,7 @@ fun ProjectListScreen(
         runCatching { client.projects().items }
             .onSuccess { projects = it }
             .onFailure {
-                Log.e("ProjectList", "加载项目列表失败", it)
+                Log.e("ProjectList", "failed to load projects", it)
                 error = it.message
             }
     }
