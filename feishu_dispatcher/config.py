@@ -17,6 +17,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = Path.home() / ".feishu-dispatcher" / "config.toml"
 
+#: 卡片底栏（footer）可选模式（[display].card_footer，#60）。见 daemon._card_footer。
+CARD_FOOTER_MODES = ("model", "task", "model+task", "none")
+
 
 @dataclass(frozen=True)
 class Project:
@@ -65,6 +68,18 @@ class ViewerConfig:
     enabled: bool = False
     bind: str = "0.0.0.0"
     port: int = 7321
+
+
+@dataclass(frozen=True)
+class DisplayConfig:
+    """卡片展示配置（``[display]`` 段，#60）。目前只管 LiveCard 底栏 ``card_footer``：
+
+    取值见 :data:`CARD_FOOTER_MODES`（``model``/``task``/``model+task``/``none``），
+    默认 ``model``（当前行为）。实际字符串拼接见 daemon ``_card_footer``；运行时还可用
+    话题内 ``/footer`` 命令对当前任务热切换（不写配置，本次会话有效）。
+    """
+
+    card_footer: str = "model"
 
 
 def _parse_llm_profile(pd: dict, *, memory_rounds: int, ctx: str) -> LLMSettings:
@@ -126,6 +141,8 @@ class Config:
     llm_active: str = ""
     #: 移动端查看器配置；None = 配置里没有 [viewer] 段（默认，viewer 不起）。
     viewer: ViewerConfig | None = None
+    #: 卡片展示配置（[display] 段，#60）。None = 用默认 DisplayConfig（card_footer=model）。
+    display: DisplayConfig | None = None
 
     @staticmethod
     def load(path: Path | None = None, *, allow_empty_chat_id: bool = False) -> Config:
@@ -232,6 +249,17 @@ class Config:
             if viewer_data is not None
             else None
         )
+        # [display] 段可选：没有则 display=None（daemon 用默认 model 模式）。有则解析
+        # card_footer（合法值见 CARD_FOOTER_MODES），非法直接拒绝启动（同 stream_mode）。
+        display_data = data.get("display")
+        display = None
+        if display_data is not None:
+            card_footer = str(display_data.get("card_footer", "model")).strip()
+            if card_footer not in CARD_FOOTER_MODES:
+                raise ValueError(
+                    f"display.card_footer 必须为 {CARD_FOOTER_MODES} 之一，当前为 {card_footer}"
+                )
+            display = DisplayConfig(card_footer=card_footer)
         return Config(
             app_id=data["app_id"],
             app_secret=data["app_secret"],
@@ -251,4 +279,5 @@ class Config:
             llm_profiles=llm_profiles,
             llm_active=llm_active,
             viewer=viewer,
+            display=display,
         )
