@@ -329,10 +329,8 @@ def test_viewer_section_defaults_when_fields_omitted(tmp_path: Path):
     assert Config.load(cfg_file).viewer == ViewerConfig(enabled=True)
 
 
-@pytest.mark.xfail(reason="空表 [viewer] 被 falsy 折叠成 None，见 #138")
 def test_viewer_section_empty_table_uses_defaults(tmp_path: Path):
-    # 空表 [viewer]（无任何字段）应构造默认 ViewerConfig（enabled=False）。
-    # 当前 config.py 的 `if viewer_data` 把空 dict 当 falsy → None；修 #138 后转绿。
+    # 空表 [viewer]（无任何字段）→ 构造默认 ViewerConfig（enabled=False）。
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(_BASE + "[viewer]\n", encoding="utf-8")
     assert Config.load(cfg_file).viewer == ViewerConfig()
