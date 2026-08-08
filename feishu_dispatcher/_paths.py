@@ -1,11 +1,11 @@
-"""路径穿越校验工具（#108）：供 #105 的 file/tree/diff 接口校验请求 path。
+"""路径穿越校验工具：供 viewer 的 file/tree/diff 接口校验请求 path。
 
 判定：把请求 path resolve 后，检查是否落在 workspace 根之内（决策 D9）。拒绝：
 - 含 ``..`` 的路径
 - 绝对路径（请求 path 必须相对 workspace）
 - 经软链逃逸到 workspace 外的路径（resolve 展开软链）
 
-设计：纯函数，无副作用；失败抛 :class:`PathTraversalError`（#105 接口据此返 400）。
+设计：纯函数，无副作用；失败抛 :class:`PathTraversalError`（调用方据此返 400）。
 """
 
 from __future__ import annotations

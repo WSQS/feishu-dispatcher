@@ -1,4 +1,4 @@
-"""路径穿越校验工具的单测（#108）。"""
+"""路径穿越校验工具的单测。"""
 
 from __future__ import annotations
 
