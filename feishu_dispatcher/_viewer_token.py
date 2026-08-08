@@ -7,15 +7,17 @@
   ``--discover`` 体验）；之后重启调 :func:`load_token` 读回，token 稳定不变。
 
 token 文件是**纯文本**（就一行 token 字符串），落在 config 同目录
-``~/.feishu-dispatcher/viewer.token``（决策 Q8，不回写 config.toml）。原子写：temp +
-fsync + replace + fsync_dir，照 ``store._atomic_write_json`` 的持久化模式，但不留
-.bak —— token 丢了重新生成就行，不需要历史回退。
+``~/.feishu-dispatcher/viewer.token``（决策 Q8，不回写 config.toml）。原子写：调共享
+原语 ``_atomic.atomic_write(keep_bak=False)``（temp + fsync + replace + fsync_dir），
+**不留 .bak** —— token 丢了重新生成就行，不需要历史回退。
 """
 
 from __future__ import annotations
 
 import secrets
 from pathlib import Path
+
+from ._atomic import atomic_write
 
 #: 模块公开面：只有 :func:`ensure_token` 是对外 API。``generate_token`` / ``load_token``
 #: 是它的实现细节（``__all__`` 排除 = 非公开，外部勿依赖）。测试是内部消费者，可碰非公开名。
@@ -55,26 +57,7 @@ def load_token(path: Path) -> str | None:
 def _atomic_write_text(path: Path, text: str) -> None:
     """原子且持久地把 ``text`` 写到 ``path``（纯文本，非 JSON）。
 
-    模式照 ``store._atomic_write_json``：临时文件 → flush+fsync（数据落盘）→ replace
-    （原子改名）→ fsync 父目录（改名持久）。**不留 .bak**：token 重新生成代价低，
-    不需要历史回退。
+    薄包装：调 ``_atomic.atomic_write(keep_bak=False)``——temp + fsync + replace +
+    fsync_dir。**不留 .bak**：token 重新生成代价低，不需要历史回退。
     """
-    import os
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    tmp.replace(path)
-    # fsync 父目录，让 replace 的改名对掉电持久。POSIX 才有目录 fsync；Windows 跳过
-    # （与 store._fsync_dir 同口径）。
-    try:
-        dir_fd = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(dir_fd)
-        finally:
-            os.close(dir_fd)
-    except OSError:
-        pass
+    atomic_write(path, text, keep_bak=False)

@@ -19,11 +19,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from ._atomic import atomic_write
 from .config import Project
 
 logger = logging.getLogger(__name__)
@@ -34,51 +34,24 @@ logger = logging.getLogger(__name__)
 # 事故背景：系统硬崩（掉电 / BSOD / 内核 panic）后 tasks.json 损坏。根因是原来的
 # 「写临时文件 + replace」只挡**应用层**崩溃——数据先进 OS page cache，replace 改的是
 # 目录项；机器硬崩时可能改名已生效、数据块还没落盘 → 重启得到 0 字节/半截文件。
-# 下面三件事把这个窗口关掉：写临时文件后 fsync 让数据真正落盘、保留 .bak 作回退源、
-# 读损坏时存档而非静默清空（守住 task_id/seq 单调，避免撞回旧 id）。
-
-
-def _fsync_dir(path: Path) -> None:
-    """fsync 目录，让其中的改名/创建对掉电持久。
-
-    POSIX 才有该语义；Windows 无法对目录取句柄 fsync，跳过——临时文件本身已 fsync，
-    挡住了「改名指向未落盘数据块」这个主要坑，目录项持久性退化为尽力而为。
-    """
-    if os.name == "nt":
-        return
-    try:
-        fd = os.open(path, os.O_RDONLY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-    except OSError:
-        logger.warning("fsync 目录失败（忽略）: %s", path, exc_info=True)
+# 三件事把这个窗口关掉：写临时文件后 fsync 让数据真正落盘、保留 .bak 作回退源、读
+# 损坏时存档而非静默清空（守住 task_id/seq 单调，避免撞回旧 id）。
+#
+# 持久化原语（temp+fsync+replace+fsync_dir）已抽到 ``_atomic.py`` 共享（#113）。
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
-    """原子且**持久**地把 payload 写到 path。
+    """原子且**持久**地把 payload 写到 path（台账：留 .bak 回退）。
 
-    写临时文件 → flush+fsync（数据真正落盘）→ 把旧主文件改名成 .bak（回退源，与新写
-    互不覆盖）→ replace 临时文件（原子改名）→ fsync 父目录（改名持久）。
+    ``json.dumps`` 后调用 ``_atomic.atomic_write(keep_bak=True)``：写临时文件 →
+    flush+fsync（数据落盘）→ 把旧主文件改名成 .bak（回退源，与新写互不覆盖）→
+    replace 临时文件（原子改名）→ fsync 父目录（改名持久）。
 
     .bak 用改名而非拷贝：便宜、原子，且天然 = 上一份好数据。改名到 replace 之间有个极
     短窗口主文件暂缺，但 _read_json 会在主文件缺失/损坏时回退 .bak，故可安全降级。
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
     text = json.dumps(payload, ensure_ascii=False, indent=2)
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
-    if path.exists():
-        try:
-            path.replace(path.with_name(path.name + ".bak"))
-        except OSError:
-            logger.warning("保留台账备份失败（忽略）: %s", path, exc_info=True)
-    tmp.replace(path)
-    _fsync_dir(path.parent)
+    atomic_write(path, text, keep_bak=True)
 
 
 def _archive_corrupt(path: Path) -> None:
