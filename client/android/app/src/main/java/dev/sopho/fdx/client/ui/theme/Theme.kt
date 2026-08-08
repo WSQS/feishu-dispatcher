@@ -6,7 +6,7 @@ import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 
-// Material3 配色。骨架阶段用默认紫调；正式 UI 再细调（#123 配置页时）。
+// Material3 配色，默认紫调，UI 细调待后续
 private val DarkColors = darkColorScheme()
 private val LightColors = lightColorScheme()
 
