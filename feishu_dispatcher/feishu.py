@@ -39,6 +39,8 @@ from lark_oapi.ws.const import (
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+from .card import build_markdown_card
+
 # 延迟 import：event 模型属于 im.v1 namespace（单 ns，安全），但顶部 import
 # 会触发 lark_oapi/__init__；shim 必须先装好。调用方 import 顺序：
 #   import feishu_dispatcher._lark_compat  # noqa: F401
@@ -588,6 +590,24 @@ class FeishuBridge:
             {
                 "msg_type": "text",
                 "content": json.dumps({"text": text}),
+                "reply_in_thread": False,
+            },
+        )
+        return result["data"]["message_id"]
+
+    def reply_markdown(self, message_id: str, text: str) -> str:
+        """普通回复（不建话题）一张**无标题 markdown 卡片**，返回 message_id。
+
+        调度器主线回复用：卡片 2.0 的 markdown 组件支持表格/列表/代码块，而
+        ``text`` / ``post`` 都不支持表格（见 :func:`build_markdown_card`）。
+        与 :meth:`reply` 同走 ``/reply`` + ``reply_in_thread=False``，不挂话题。
+        """
+        card = build_markdown_card(text)
+        result = self._im_post(
+            f"/open-apis/im/v1/messages/{message_id}/reply",
+            {
+                "msg_type": "interactive",
+                "content": json.dumps(card, ensure_ascii=False),
                 "reply_in_thread": False,
             },
         )
