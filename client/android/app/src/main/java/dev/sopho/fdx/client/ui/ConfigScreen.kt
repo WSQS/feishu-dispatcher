@@ -66,11 +66,14 @@ fun ConfigScreen(
     var savedMsg by remember { mutableStateOf<String?>(null) }
     var testState by remember { mutableStateOf<TestState>(TestState.Idle) }
     var isTesting by remember { mutableStateOf(false) }
+    // 配置加载完成后再挂载 ZT 区块，避免 useZerotier 由 false→true 触发展开动画
+    var loaded by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     // 启动时读已存的配置，填进输入框（验证持久化）
     LaunchedEffect(Unit) {
         repo.load()?.let { connection = it }
+        loaded = true
     }
 
     Column(
@@ -116,36 +119,40 @@ fun ConfigScreen(
             },
         )
         Spacer(Modifier.height(12.dp))
-        AnimatedVisibility(
-            visible = connection.zerotier.enabled,
-            enter = expandVertically() + fadeIn(),
-            exit = shrinkVertically() + fadeOut(),
-        ) {
-            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                OutlinedTextField(
-                    value = connection.zerotier.networkId,
-                    onValueChange = {
-                        connection = connection.copy(zerotier = connection.zerotier.copy(networkId = it))
-                        savedMsg = null
-                        testState = TestState.Idle
-                    },
-                    label = { Text("ZeroTier 网络 ID（16 位 hex）") },
-                    placeholder = { Text("a1b2c3d4e5f60718") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
-                OutlinedTextField(
-                    value = connection.zerotier.moonId,
-                    onValueChange = {
-                        connection = connection.copy(zerotier = connection.zerotier.copy(moonId = it))
-                        savedMsg = null
-                        testState = TestState.Idle
-                    },
-                    label = { Text("ZeroTier Moon ID（10 位 hex，可选）") },
-                    placeholder = { Text("deadbeef00") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
-                )
+        // loaded 后才挂载 AnimatedVisibility：首次组合时 visible 已是加载后的值，
+        // 首帧 visible=true 不会播进入动画，从而避免 useZerotier 由 false→true 的展开闪动
+        if (loaded) {
+            AnimatedVisibility(
+                visible = connection.zerotier.enabled,
+                enter = expandVertically() + fadeIn(),
+                exit = shrinkVertically() + fadeOut(),
+            ) {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    OutlinedTextField(
+                        value = connection.zerotier.networkId,
+                        onValueChange = {
+                            connection = connection.copy(zerotier = connection.zerotier.copy(networkId = it))
+                            savedMsg = null
+                            testState = TestState.Idle
+                        },
+                        label = { Text("ZeroTier 网络 ID（16 位 hex）") },
+                        placeholder = { Text("a1b2c3d4e5f60718") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = connection.zerotier.moonId,
+                        onValueChange = {
+                            connection = connection.copy(zerotier = connection.zerotier.copy(moonId = it))
+                            savedMsg = null
+                            testState = TestState.Idle
+                        },
+                        label = { Text("ZeroTier Moon ID（10 位 hex，可选）") },
+                        placeholder = { Text("deadbeef00") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
             }
         }
         Spacer(Modifier.height(12.dp))
