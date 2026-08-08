@@ -135,7 +135,9 @@ class Task:
     turns: int = 0
     created_at: float = 0.0
     updated_at: float = 0.0
-    #: 审计动作日志：每条 = {"turn", "kind", "title"}，来自 ACP tool_call 事件
+    #: 审计动作日志：每条 = {"turn", "kind", "title", "tool_call_id"?,
+    #: "status"?}，来自 ACP tool_call/tool_call_update（status 仅在收到 completed/
+    #: failed 的 tool_call_update 后填，作「动作完成状态」审计；tool_call_id 供按 id 匹配）
     actions: list[dict] = field(default_factory=list)
     #: 最近一轮 agent 的收尾回复（截断），供 get_task / 完成通知摘要
     last_output: str = ""
@@ -172,6 +174,10 @@ class TaskStore:
         self._keep = keep_terminal
         self._tasks: dict[str, Task] = {}
         self._seq = 0  # 单调计数器，永不复用
+        #: 动作日志脏标记（#17）：add_action/update_action_status 只置脏不落盘，
+        #: 由 daemon 在回合边界/终止态调 flush_dirty 批量刷盘，避免每个 tool_call
+        #: 事件都写盘（chatty agent 一轮可发几十条 tool_call_update）。
+        self._actions_dirty = False
         if path is not None:
             self._load()
 
@@ -286,10 +292,12 @@ class TaskStore:
         return task
 
     def add_action(self, task_id: str, action: dict) -> None:
-        """追加一条动作到任务的审计日志（超 ``_MAX_ACTIONS`` 丢最旧），落盘。
+        """追加一条动作到任务的审计日志（超 ``_MAX_ACTIONS`` 丢最旧），仅置脏不落盘。
 
-        写透式：每条 tool_call 都刷一次盘，与 store 其余部分一致；chatty agent
-        的写量对个人工具可接受（max_agents 默认 3），需要再批量化。
+        批量刷盘（#17）：tool_call 事件高频，每条都写盘会让 chatty agent 一轮刷几十
+        次盘。这里只改内存 + 置 ``_actions_dirty``，由 daemon 在回合边界调
+        :meth:`flush_dirty` 统一刷。Task 其余字段的写入（status/turns…）仍即时落盘，
+        回合收尾的 ``update()`` 之后必跟一次 ``flush_dirty``，故动作最迟在回合结束时持久化。
         """
         task = self._tasks.get(task_id)
         if task is None:
@@ -298,6 +306,36 @@ class TaskStore:
         if len(task.actions) > _MAX_ACTIONS:
             del task.actions[:-_MAX_ACTIONS]
         task.updated_at = self._now()
+        self._actions_dirty = True
+
+    def update_action_status(
+        self, task_id: str, tool_call_id: str, status: str
+    ) -> None:
+        """按 ``tool_call_id`` 给最近一条同名动作补完成/失败状态（#17），仅置脏不落盘。
+
+        匹配**末尾**最近一条 ``tool_call_id`` 相同且尚无 status 的动作（同 id 的旧条目
+        已结算则不再回填）。tool_call 首次通告与 tool_call_update 分两条事件到达，按 id
+        关联；找不到（如 load_session 重放期间首次通告被 suppress 掉）则忽略。
+        """
+        task = self._tasks.get(task_id)
+        if task is None:
+            return
+        for action in reversed(task.actions):
+            if action.get("tool_call_id") == tool_call_id and "status" not in action:
+                action["status"] = status
+                task.updated_at = self._now()
+                self._actions_dirty = True
+                return
+
+    def flush_dirty(self) -> None:
+        """若有动作日志变更未落盘，刷一次盘并清脏标记（批量刷盘，#17）。
+
+        TaskStore 单线程访问（单 daemon event loop，无并发），脏标记 + 一次性 flush 即可，
+        无需加锁。无变更时 no-op（避免空写）。
+        """
+        if not self._actions_dirty:
+            return
+        self._actions_dirty = False
         self._flush()
 
     def _prune(self) -> None:

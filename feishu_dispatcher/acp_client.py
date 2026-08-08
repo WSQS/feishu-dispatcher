@@ -34,7 +34,8 @@ _PROTOCOL_VERSION = 1
 _DEFAULT_START_TIMEOUT = 120.0
 
 OnOutput = Callable[[str], Awaitable[None]]
-#: 审计动作回调：收到一个 tool_call 时推一条结构化动作（{"kind","title"}）
+#: 审计动作回调：收到 tool_call/tool_call_update 时推一条结构化动作——
+#: 起始通告 {"kind","title","tool_call_id","detail"?} 或终态更新 {"tool_call_id","status"}
 OnAction = Callable[[dict], Awaitable[None]]
 
 
@@ -188,17 +189,40 @@ def _content_text(update: Any) -> str:
 
 
 def _extract_action(update: Any) -> dict | None:
-    """从 session_update 里抽出一条审计动作，非 tool_call 或无标题则返回 None。
+    """从 session_update 里抽出一条审计动作；非 tool_call 类或无标题/无终态则 None。
 
-    只认 ``tool_call`` 首次通告（带 title + kind，即「做了什么」）——每个动作稳定
-    记一次；``tool_call_update`` 的完成/失败状态是后续增强（挂 tool_call_id 匹配）。
+    返回两类（都带 ``tool_call_id`` 供 daemon 按 id 关联）：
+
+    - **起始通告**（``session_update == "tool_call"``）：``{"kind","title","tool_call_id",
+      "detail"?}``——「做了什么」。``detail`` 是命令/路径细节（复用
+      :func:`_extract_tool_detail`），取不到则不带。
+    - **终态更新**（``session_update == "tool_call_update"`` 且 ``status`` ∈
+      {completed, failed}）：``{"tool_call_id","status"}``——「完成/失败」，由上层按 id
+      回填到已记录的起始动作。其余 status（in_progress/pending）不记账。
     """
-    if getattr(update, "session_update", None) != "tool_call":
-        return None
-    title = getattr(update, "title", "") or ""
-    if not title:
-        return None
-    return {"kind": getattr(update, "kind", "") or "", "title": title}
+    kind = getattr(update, "session_update", None)
+    if kind == "tool_call":
+        title = getattr(update, "title", "") or ""
+        if not title:
+            return None
+        action: dict = {
+            "kind": getattr(update, "kind", "") or "",
+            "title": title,
+            "tool_call_id": getattr(update, "tool_call_id", "") or "",
+        }
+        detail = _extract_tool_detail(update)
+        if detail:
+            action["detail"] = detail
+        return action
+    if kind == "tool_call_update":
+        status = getattr(update, "status", None)
+        if status not in {"completed", "failed"}:
+            return None
+        return {
+            "tool_call_id": getattr(update, "tool_call_id", "") or "",
+            "status": status,
+        }
+    return None
 
 
 def _extract_usage_tokens(response: Any) -> int | None:
