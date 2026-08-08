@@ -1,14 +1,22 @@
 package dev.sopho.fdx.client.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.expandVertically
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.shrinkVertically
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
+import androidx.compose.material3.ListItem
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -45,8 +53,7 @@ fun ConfigScreen(
     }
 
     Column(
-        modifier = modifier.fillMaxSize().padding(24.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
+        modifier = modifier.padding(24.dp),
     ) {
         OutlinedTextField(
             value = connection.url,
@@ -56,6 +63,7 @@ fun ConfigScreen(
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
+        Spacer(Modifier.height(12.dp))
         OutlinedTextField(
             value = connection.token,
             onValueChange = { connection = connection.copy(token = it); savedMsg = null },
@@ -63,7 +71,59 @@ fun ConfigScreen(
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )
-        Spacer(Modifier.height(4.dp))
+        Spacer(Modifier.height(12.dp))
+        // ZeroTier 开关行：ListItem（标准设置行，整行可点 + trailing Switch）
+        ListItem(
+            headlineContent = { Text("ZeroTier") },
+            supportingContent = { Text("启用 zerotier 组网") },
+            trailingContent = {
+                Switch(
+                    checked = connection.zerotier.enabled,
+                    onCheckedChange = {
+                        connection = connection.copy(zerotier = connection.zerotier.copy(enabled = it))
+                        savedMsg = null
+                    },
+                )
+            },
+            modifier = Modifier.clickable {
+                connection = connection.copy(
+                    zerotier = connection.zerotier.copy(enabled = !connection.zerotier.enabled),
+                )
+                savedMsg = null
+            },
+        )
+        Spacer(Modifier.height(12.dp))
+        AnimatedVisibility(
+            visible = connection.zerotier.enabled,
+            enter = expandVertically() + fadeIn(),
+            exit = shrinkVertically() + fadeOut(),
+        ) {
+            Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                OutlinedTextField(
+                    value = connection.zerotier.networkId,
+                    onValueChange = {
+                        connection = connection.copy(zerotier = connection.zerotier.copy(networkId = it))
+                        savedMsg = null
+                    },
+                    label = { Text("ZeroTier 网络 ID（16 位 hex）") },
+                    placeholder = { Text("a1b2c3d4e5f60718") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = connection.zerotier.moonId,
+                    onValueChange = {
+                        connection = connection.copy(zerotier = connection.zerotier.copy(moonId = it))
+                        savedMsg = null
+                    },
+                    label = { Text("ZeroTier Moon ID（10 位 hex，可选）") },
+                    placeholder = { Text("deadbeef00") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        }
+        Spacer(Modifier.height(12.dp))
         Button(
             onClick = {
                 scope.launch {
