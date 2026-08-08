@@ -30,6 +30,8 @@ class FakeBridge:
 
         self.roots: list[tuple[str, str]] = []
         self.plain: list[tuple[str, str]] = []  # reply_in_thread=False（不建话题）
+        # 调度器主线回复（markdown 卡片，#59）；同样不建话题
+        self.markdown_replies: list[tuple[str, str]] = []
 
     def reply_in_thread(self, root_message_id: str, text: str) -> str:
         self.replies.append((root_message_id, text))
@@ -38,6 +40,12 @@ class FakeBridge:
     def reply(self, message_id: str, text: str) -> str:
         self.replies.append((message_id, text))
         self.plain.append((message_id, text))
+        return f"om_reply_{len(self.replies)}"
+
+    def reply_markdown(self, message_id: str, text: str) -> str:
+        # 调度器主线回复走 markdown 卡片（#59）：同样不建话题，但单独记录以便区分
+        self.replies.append((message_id, text))
+        self.markdown_replies.append((message_id, text))
         return f"om_reply_{len(self.replies)}"
 
     def send_root_message(self, chat_id: str, text: str) -> str:
@@ -942,8 +950,9 @@ async def test_nl_dispatch_spawns_agent_via_llm():
     await daemon._handle_message(root_msg("帮 demo 加个 dark mode", mid="om_nl"))
     await wait_until(lambda: created and created[0].prompts == ["加 dark mode"])
     assert bridge.roots  # agent 有自己的话题根消息
-    # LLM 对用户的回复是**普通回复、不建话题**（bug 修复：只有派 agent 才建话题）
-    assert any(m == "om_nl" and "已给 demo 派发" in t for m, t in bridge.plain)
+    # LLM 对用户的回复是**普通回复、不建话题**（bug 修复：只有派 agent 才建话题）；
+    # 调度器回复按 markdown 卡片渲染（#59），但仍以 om_nl 为目标、不建话题
+    assert any(m == "om_nl" and "已给 demo 派发" in t for m, t in bridge.markdown_replies)
     # 用户的对话消息 om_nl 不应成为任何 agent 话题的根
     assert all(root != "om_nl" for root, _ in bridge.roots)
     await daemon._shutdown()
@@ -953,10 +962,38 @@ async def test_nl_reply_does_not_create_thread():
     daemon, bridge, created = make_daemon()
     daemon._llm = ScriptedLLM([LLMResponse(content="你好，需要我做什么？")])
     await daemon._handle_message(root_msg("在吗", mid="om_chat"))
-    # 纯对话（无 spawn）：回复走普通回复、不建话题、不起 agent
-    assert any(m == "om_chat" and "需要我做什么" in t for m, t in bridge.plain)
+    # 纯对话（无 spawn）：回复走 markdown 卡片、不建话题、不起 agent（#59）
+    assert any(m == "om_chat" and "需要我做什么" in t for m, t in bridge.markdown_replies)
     assert created == []
     assert bridge.roots == []
+
+
+async def test_scheduler_success_reply_renders_as_markdown_card():
+    """#59：调度器成功回复走 markdown 卡片（不建话题）；出错兜底仍是纯文本。"""
+    daemon, bridge, created = make_daemon()
+    daemon._llm = ScriptedLLM(
+        [LLMResponse(content="| ID | 项目 |\n|----|------|\n| t9 | SuFei |")]
+    )
+    await daemon._handle_message(root_msg("有哪些任务", mid="om_md"))
+    # 成功回复走 markdown 卡片
+    assert any(m == "om_md" for m, _ in bridge.markdown_replies)
+    # 仍是普通回复（不建话题）：用户消息 om_md 不会成为任何 agent 话题根
+    assert all(root != "om_md" for root, _ in bridge.roots)
+
+
+async def test_scheduler_error_fallback_stays_plain_text():
+    """#59：LLM 抛异常时走兜底纯文本回复，不套卡片（异常提示不该渲染成 markdown）。"""
+    daemon, bridge, created = make_daemon()
+
+    class BoomLLM:
+        async def chat(self, messages, tools):
+            raise RuntimeError("LLM 挂了")
+
+    daemon._llm = BoomLLM()
+    await daemon._handle_message(root_msg("做点什么", mid="om_err"))
+    # 出错兜底：纯文本回复、不走 markdown 卡片
+    assert any(m == "om_err" and "调度器出错" in t for m, t in bridge.plain)
+    assert not any(m == "om_err" for m, _ in bridge.markdown_replies)
 
 
 # ---------------------------------------------------------------------- #
