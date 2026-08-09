@@ -71,7 +71,7 @@ def test_build_card_config():
     assert card["config"]["wide_screen_mode"] is True
 
 
-# build_markdown_card：调度器主线回复用的无标题 markdown 卡片（#59）
+# build_markdown_card：调度器主线回复用的无标题 markdown 卡片
 
 
 def test_build_markdown_card_is_v2_no_header():

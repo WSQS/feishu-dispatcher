@@ -86,7 +86,7 @@ def _tools(
 
 
 def test_system_prompt_prescribes_markdown_output_format():
-    """#59：调度器回复按 markdown 渲染，prompt 必须明确输出格式约束。
+    """调度器回复按 markdown 渲染，prompt 必须明确输出格式约束。
 
     只断言关键约束存在（表格/分组/简洁/代码块），不锁死措辞——给后续微调留余地。
     """
