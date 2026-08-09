@@ -479,6 +479,34 @@ async def test_raw_in_dormant_thread_recovers_not_stops():
     await daemon._shutdown()
 
 
+async def test_bang_prefix_wraps_command_as_run_prompt():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    # !ls -la：剥掉 ! 后包成「请执行命令并汇报结果」入队，而非逐字直传
+    await daemon._handle_message(thread_msg("!ls -la", mid="om_bang1"))
+    await wait_until(
+        lambda: created[0].prompts == ["task", "请执行命令并汇报结果：ls -la"]
+    )
+    assert not created[0].closed
+    await daemon._shutdown()
+
+
+async def test_bang_alone_is_ignored_silently():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    # 等首轮收尾回复落定，避免 reply 计数与空 ! 断言竞态
+    await wait_until(lambda: any("✅" in t for _, t in bridge.replies))
+    # 空 !（仅前缀、无内容）：静默忽略，不入队也不回复任何噪声
+    before = len(bridge.replies)
+    await daemon._handle_message(thread_msg("!   ", mid="om_bang0"))
+    await asyncio.sleep(0.05)
+    assert created[0].prompts == ["task"]
+    assert len(bridge.replies) == before  # ! 未触发任何回复（无噪声）
+    await daemon._shutdown()
+
+
 async def test_duplicate_message_id_spawns_only_once():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo task", mid="om_dup"))
