@@ -136,4 +136,3 @@ default_agent = "copilot"
 enabled = false        # 默认关闭，显式开启
 bind = "0.0.0.0"       # 只走 Tailscale 时填 tailnet 网卡 IP
 port = 7321            # 默认端口
-# token 不配：永远自动生成 + 存 viewer.token + 日志打印
