@@ -22,7 +22,10 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
@@ -56,6 +59,25 @@ sealed class Destination {
     data class Tree(val projectName: String) : Destination()
 }
 
+/** [Destination] → Bundle 可存的字符串，供 [destinationListSaver] 跨配置变更/进程死亡恢复。 */
+private fun Destination.toSaveKey(): String = when (this) {
+    Destination.Config -> "config"
+    Destination.ProjectList -> "projects"
+    is Destination.Tree -> "tree:$projectName"
+}
+
+private fun destinationFromSaveKey(key: String): Destination = when {
+    key == "config" -> Destination.Config
+    key == "projects" -> Destination.ProjectList
+    key.startsWith("tree:") -> Destination.Tree(key.removePrefix("tree:"))
+    else -> error("unknown Destination save key: $key")
+}
+
+private val destinationListSaver = listSaver<SnapshotStateList<Destination>, String>(
+    save = { stack -> stack.map { it.toSaveKey() } },
+    restore = { saved -> mutableStateListOf(*saved.map { destinationFromSaveKey(it) }.toTypedArray()) },
+)
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -68,7 +90,10 @@ class MainActivity : ComponentActivity() {
                     var client by remember { mutableStateOf<ViewerClient?>(null) }
 
                     // 屏幕栈：栈底恒为 Config（根屏）。push 压入新屏，pop 弹回上一屏。
-                    val screenStack = remember { mutableStateListOf<Destination>(Destination.Config) }
+                    // rememberSaveable + Saver：旋转/进程死亡后恢复栈，不丢回 Config。
+                    val screenStack = rememberSaveable(saver = destinationListSaver) {
+                        mutableStateListOf(Destination.Config)
+                    }
 
                     fun push(dest: Destination) {
                         // 同目的地不重复压栈（避免连点造成栈里塞多个相同项）。
