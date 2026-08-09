@@ -53,7 +53,7 @@ _CANCEL_CMD = "/cancel"
 _DONE_CMD = "/done"
 _CLEAR_CMD = "/clear"
 _MODEL_CMD = "/model"  # 话题内：/model 列出可选，/model <名> 切换
-_FOOTER_CMD = "/footer"  # 话题内：/footer <mode> 热切换当前任务卡片底栏（#60，不写配置）
+_FOOTER_CMD = "/footer"  # 话题内：/footer <mode> 热切换当前任务卡片底栏（不写配置）
 _RAW_CMD = "/raw"  # 话题内：/raw <文本> 把 <文本> 逐字转发给 agent，绕过话题命令解释
 _PROJECT_CMD = "/project"  # root：/project 列出，/project add|remove 增删
 _MODELS_CMD = "/models"  # root：/models 列缓存，/models refresh [agent] 主动刷新
@@ -141,15 +141,15 @@ def _card_footer(
     model: str,
     issue_tag: str = "",
 ) -> str:
-    """按 :data:`~feishu_dispatcher.config.CARD_FOOTER_MODES` 拼卡片底栏主内容（#60）：
+    """按 :data:`~feishu_dispatcher.config.CARD_FOOTER_MODES` 拼卡片底栏主内容：
 
     - ``model``（默认）：`模型：X`
     - ``task``：`[t18] SuFei`（task_id + 项目名）
     - ``model+task``：`[t18] SuFei · 模型：X`
     - ``none``：空串（无底栏）
 
-    主内容为空（``none``、或对应字段缺失）时不补分隔。``issue_tag``（绑定 forge issue，
-    #63）非空则作为独立后缀拼上——它是归属标记，不随底栏模式开关。未知 mode 视作 ``model``。
+    主内容为空（``none``、或对应字段缺失）时不补分隔。``issue_tag``（绑定 forge issue）
+    非空则作为独立后缀拼上——它是归属标记，不随底栏模式开关。未知 mode 视作 ``model``。
     """
     parts: list[str] = []
     show_task = mode in ("task", "model+task")
@@ -302,9 +302,9 @@ class _AgentSession:
     cwd: str = ""
     #: 是否由 load_session 恢复而来（影响启动失败时的提示文案）
     resumed: bool = False
-    #: 关联的 forge issue URL（= Task.issue_url，#63）；供 footer/展示标归属，空 = 未绑定
+    #: 关联的 forge issue URL（= Task.issue_url）；供 footer/展示标归属，空 = 未绑定
     issue_url: str = ""
-    #: 卡片底栏模式覆盖（#60 ``/footer`` 热切换）；空 = 用 cfg.display.card_footer
+    #: 卡片底栏模式覆盖（``/footer`` 热切换）；空 = 用 cfg.display.card_footer
     footer_mode: str = ""
     #: agent 实例（先建 session、再建 agent，故允许 None）
     agent: "AcpAgent | None" = None
@@ -1105,7 +1105,7 @@ class _Daemon:
                     prompt = prompt.render()
                 title = f"{sess.project_name} · {sess.agent_label}"
                 model = getattr(sess.agent, "model", "") or ""
-                # 卡片底栏按 footer 模式拼接（#60）：model/task/model+task/none。
+                # 卡片底栏按 footer 模式拼接：model/task/model+task/none。
                 # 模式优先取本会话 /footer 覆盖，否则取 cfg [display].card_footer（默认 model）。
                 footer_mode = sess.footer_mode or _footer_mode(self.cfg)
                 footer = _card_footer(
@@ -1113,7 +1113,7 @@ class _Daemon:
                     task_id=sess.task_id,
                     project=sess.project_name,
                     model=model,
-                    issue_tag=_issue_tag(sess.issue_url),  # 绑 issue 则标 · #N（#63）
+                    issue_tag=_issue_tag(sess.issue_url),  # 绑 issue 则标 · #N
                 )
                 channel = self._make_channel(root, title, footer=footer)
                 sess.current_channel = channel
@@ -1355,7 +1355,7 @@ class _Daemon:
     async def _handle_footer_cmd(
         self, sess: _AgentSession, reply_target: str, text: str
     ) -> None:
-        """`/footer <mode>` 热切换当前任务卡片底栏（#60，不写配置，本次会话有效）。
+        """`/footer <mode>` 热切换当前任务卡片底栏（不写配置，本次会话有效）。
 
         合法 mode 见 :data:`~feishu_dispatcher.config.CARD_FOOTER_MODES`。裸 ``/footer``
         列出当前+可选；非法参数回用法。对下一轮生效（footer 在每轮开头按 sess.footer_mode 拼）。
@@ -1662,7 +1662,7 @@ class _Daemon:
                 "description": t.description,
                 "status": t.status,
                 "turns": t.turns,
-                "issue_url": t.issue_url,  # 关联的 issue（#63）；空 = 未绑定
+                "issue_url": t.issue_url,  # 关联的 issue；空 = 未绑定
             }
             for t in self.store.all()
         ]
@@ -1682,7 +1682,7 @@ class _Daemon:
             "has_session": bool(t.session_id),
             "active": t.thread_root_id in self._sessions,
             "model": t.model,  # agent 当前模型（copilot 不暴露则为空）
-            "issue_url": t.issue_url,  # 关联的 issue（#63）；空 = 未绑定
+            "issue_url": t.issue_url,  # 关联的 issue；空 = 未绑定
             "created_at": t.created_at,
             "updated_at": t.updated_at,
             "last_output": t.last_output,  # 最近一轮 agent 的收尾回复
@@ -1758,7 +1758,7 @@ class _Daemon:
 
         ``agent`` 可选：非空则覆盖项目 default_agent（须在 [agents]），否则用默认。
         ``issue`` 可选（>0）：把该 issue 的完整正文当 brief 派给 agent，并把 issue_url
-        锚到 Task（#63）；取不到则优雅退化成普通 spawn（见 _compose_issue_brief）。
+        锚到 Task；取不到则优雅退化成普通 spawn（见 _compose_issue_brief）。
         ``model`` 可选：指定初始模型；启动后由「模型黏住」逻辑下发（#65）。ACP 只在活
         session 报模型，故 spawn 前无法硬校验——不支持/打错会 warning 回退默认。
         """

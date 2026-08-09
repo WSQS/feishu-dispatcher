@@ -367,5 +367,5 @@ def test_display_card_footer_invalid_raises(tmp_path: Path):
 
 
 def test_card_footer_modes_are_the_four_named():
-    # 守住契约：四种具名模式（issue #60 的核心需求，自定义模板另议）。
+    # 守住契约：四种具名模式（核心需求，自定义模板另议）。
     assert CARD_FOOTER_MODES == ("model", "task", "model+task", "none")

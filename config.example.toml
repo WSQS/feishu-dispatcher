@@ -42,7 +42,7 @@ throttle_window = 0.5
 # 流式输出模式：card=原地更新卡片（默认），text=每批发新消息（兜底）
 # stream_mode = "card"
 
-# 卡片底栏（footer）展示（#60）。可选：model（默认，模型名）/ task（[t18] 项目名）
+# 卡片底栏（footer）展示。可选：model（默认，模型名）/ task（[t18] 项目名）
 # / model+task / none（无底栏）。也可在 agent 话题里发 `/footer <模式>` 热切换（不改这里）。
 # [display]
 # card_footer = "model"

@@ -187,7 +187,7 @@ def test_shape_detail_clips_body_and_comments():
 
 
 def test_shape_detail_body_limit_none_keeps_full_body():
-    # brief 用途：body_limit=None 不裁剪，取全文（#63）
+    # brief 用途：body_limit=None 不裁剪，取全文
     ref = forge.ForgeRef("github", "o/r", "github.com", "u")
     out = forge._shape_gh_detail(
         "issue", ref, {"number": 1, "body": "y" * 5000}, body_limit=None

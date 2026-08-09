@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_CONFIG_PATH = Path.home() / ".feishu-dispatcher" / "config.toml"
 
-#: 卡片底栏（footer）可选模式（[display].card_footer，#60）。见 daemon._card_footer。
+#: 卡片底栏（footer）可选模式（[display].card_footer）。见 daemon._card_footer。
 CARD_FOOTER_MODES = ("model", "task", "model+task", "none")
 
 
@@ -72,7 +72,7 @@ class ViewerConfig:
 
 @dataclass(frozen=True)
 class DisplayConfig:
-    """卡片展示配置（``[display]`` 段，#60）。目前只管 LiveCard 底栏 ``card_footer``：
+    """卡片展示配置（``[display]`` 段）。目前只管 LiveCard 底栏 ``card_footer``：
 
     取值见 :data:`CARD_FOOTER_MODES`（``model``/``task``/``model+task``/``none``），
     默认 ``model``（当前行为）。实际字符串拼接见 daemon ``_card_footer``；运行时还可用
@@ -141,7 +141,7 @@ class Config:
     llm_active: str = ""
     #: 移动端查看器配置；None = 配置里没有 [viewer] 段（默认，viewer 不起）。
     viewer: ViewerConfig | None = None
-    #: 卡片展示配置（[display] 段，#60）。None = 用默认 DisplayConfig（card_footer=model）。
+    #: 卡片展示配置（[display] 段）。None = 用默认 DisplayConfig（card_footer=model）。
     display: DisplayConfig | None = None
 
     @staticmethod

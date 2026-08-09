@@ -277,7 +277,7 @@ def test_with_tokens_appends_to_footer():
 
 
 def test_card_footer_modes():
-    # #60：四种具名模式的字符串拼接（纯函数）。字段缺失不补分隔。
+    # 四种具名模式的字符串拼接（纯函数）。字段缺失不补分隔。
     from feishu_dispatcher.daemon import _card_footer
 
     kw = dict(task_id="t18", project="SuFei", model="glm-5")
@@ -301,7 +301,7 @@ def test_card_footer_missing_fields_no_padding():
 
 
 def test_card_footer_issue_tag_appended():
-    # issue_tag（#63 forge 绑定）作为独立后缀，不随模式开关；主内容空时单独显。
+    # issue_tag（forge 绑定）作为独立后缀，不随模式开关；主内容空时单独显。
     from feishu_dispatcher.daemon import _card_footer
 
     kw = dict(task_id="t1", project="p", model="m", issue_tag="#42")
@@ -744,7 +744,7 @@ async def test_card_mode_footer_shows_token_usage():
     all_cards = bridge.card_replies + bridge.card_patches
     last_card = all_cards[-1][1]
     foot = last_card["body"]["elements"][-1]["content"]
-    # footer = 模型 · token 用量（#53）；#60 后默认 model 模式不含项目名
+    # footer = 模型 · token 用量（#53）；默认 model 模式不含项目名
     assert "ns-deepseek/deepseek-v4-pro" in foot
     assert "~3.2k tok" in foot
 
@@ -1453,7 +1453,7 @@ async def test_no_model_agent_leaves_blank():
 
 
 async def test_card_footer_model_plus_task_shows_both():
-    # #60：默认 model 模式只显模型；切到 model+task 才把 [task_id] 项目名与模型同行。
+    # 默认 model 模式只显模型；切到 model+task 才把 [task_id] 项目名与模型同行。
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(
         store=store, agent_cls=ModelAgent, stream_mode="card"
@@ -1481,7 +1481,7 @@ async def test_card_footer_model_plus_task_shows_both():
 
 
 async def test_card_footer_task_mode_shows_project_when_no_model():
-    # #60：默认 model 模式 + 无模型 → footer 空；切到 task 模式才显 [task_id] 项目名。
+    # 默认 model 模式 + 无模型 → footer 空；切到 task 模式才显 [task_id] 项目名。
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store, stream_mode="card")
     await daemon._handle_message(root_msg("/run demo build"))
@@ -1600,7 +1600,7 @@ async def test_model_command_unsupported_agent():
 
 
 # ---------------------------------------------------------------------- #
-# 话题内 /footer：热切换卡片底栏模式（#60，不写配置，本次会话有效）
+# 话题内 /footer：热切换卡片底栏模式（不写配置，本次会话有效）
 # ---------------------------------------------------------------------- #
 
 
@@ -1969,7 +1969,7 @@ async def test_sched_list_forge_all_skipped_is_explicit(monkeypatch):
     assert "未能获取任何仓库" in out
 
 
-# ------------------------- Task 绑定 issue 作 brief（#63） ------------------------- #
+# ------------------------- Task 绑定 issue 作 brief ------------------------- #
 
 
 def test_issue_tag_extracts_number():
