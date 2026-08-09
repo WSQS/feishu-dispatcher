@@ -43,6 +43,14 @@ data class TreeEntry(val path: String, val type: String, val size: Long)
 @Serializable
 data class TreeResponse(val entries: List<TreeEntry>)
 
+/** /api/projects/{name}/diff 返回的单个文件 diff。 */
+@Serializable
+data class DiffFile(val path: String, val status: String, val patch: String)
+
+/** /api/projects/{name}/diff 的响应体。 */
+@Serializable
+data class DiffResponse(val files: List<DiffFile>)
+
 /**
  * 连 daemon viewer 的客户端。封装 [baseUrl] + [token]，按 [useZerotier] 选 engine：
  *
@@ -128,6 +136,24 @@ class ViewerClient(
             r
         } catch (e: Exception) {
             Log.w(TAG, "tree: failed in ${(System.nanoTime() - t) / 1_000_000}ms", e)
+            throw ViewerException.from(e)
+        }
+    }
+
+    /** GET /api/projects/{name}/diff —— 工作区 vs HEAD。失败抛 [ViewerException]。 */
+    suspend fun diff(projectName: String): DiffResponse = withContext(Dispatchers.IO) {
+        val t = System.nanoTime()
+        try {
+            val r = http.get {
+                url.takeFrom(
+                    URLBuilder(baseUrl).apply { pathSegments = listOf("api", "projects", projectName, "diff") }.build(),
+                )
+                bearerAuth(token)
+            }.body<DiffResponse>()
+            Log.i(TAG, "diff: ${(System.nanoTime() - t) / 1_000_000}ms (${r.files.size} files)")
+            r
+        } catch (e: Exception) {
+            Log.w(TAG, "diff: failed in ${(System.nanoTime() - t) / 1_000_000}ms", e)
             throw ViewerException.from(e)
         }
     }

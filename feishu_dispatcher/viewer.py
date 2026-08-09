@@ -27,6 +27,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
 from feishu_dispatcher import __version__
+from feishu_dispatcher._git import diff_workdir
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -157,6 +158,19 @@ async def tree(ctx: dict, request: dict) -> tuple[int, dict]:
             entries.append({"path": str(full.relative_to(ws)), "type": "file", "size": full.stat().st_size})
     entries.sort(key=lambda x: x["path"])
     return 200, {"entries": entries}
+
+
+async def diff(ctx: dict, request: dict) -> tuple[int, dict]:
+    """``GET /api/projects/{name}/diff``：工作区 vs HEAD 的 diff（决策 D7，原样给，Q7）。"""
+    name = request["segments"]["name"]
+    ws = _resolve_workspace(ctx, name)
+    if isinstance(ws, tuple):
+        return ws
+    try:
+        files = diff_workdir(ws)
+    except Exception as exc:
+        return 500, {"error": f"{type(exc).__name__}: {exc}"}
+    return 200, {"files": files}
 
 
 def _resolve_workspace(ctx: dict, name: str) -> "Path | tuple[int, dict]":

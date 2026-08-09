@@ -12,9 +12,15 @@ import json
 import urllib.error
 import urllib.request
 
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
 from feishu_dispatcher import __version__
 from feishu_dispatcher.config import Project
-from feishu_dispatcher.viewer import ViewerServer, health, list_projects, tree as viewer_tree
+from feishu_dispatcher.viewer import ViewerServer, diff as viewer_diff, health, list_projects
+from feishu_dispatcher.viewer import tree as viewer_tree
 
 
 def _get(url: str, token: str | None) -> tuple[int, dict]:
@@ -109,10 +115,19 @@ async def test_list_projects_returns_items():
         vs.stop()
 
 
-async def test_tree_lists_files():
-    import shutil
-    from pathlib import Path
+def _init_git_repo(ws: Path) -> None:
+    """在 ws 建最小 git repo：提交 main.py，再改它（产生工作区 diff）。"""
+    ws.mkdir(exist_ok=True)
+    subprocess.run(["git", "init", "-q", str(ws)], check=True)
+    subprocess.run(["git", "-C", str(ws), "config", "user.email", "t@t"], check=True)
+    subprocess.run(["git", "-C", str(ws), "config", "user.name", "t"], check=True)
+    (ws / "main.py").write_text("print('v1')\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(ws), "add", "."], check=True)
+    subprocess.run(["git", "-C", str(ws), "commit", "-q", "-m", "init"], check=True)
+    (ws / "main.py").write_text("print('v2')\n", encoding="utf-8")
 
+
+async def test_tree_lists_files():
     ws = Path(__file__).parent / "_ws_tree"
     ws.mkdir(exist_ok=True)
     (ws / "main.py").write_text("print(1)")
@@ -155,6 +170,77 @@ async def test_tree_unknown_project_404():
     try:
         status, payload = await asyncio.to_thread(
             _get, vs.base_url + "/api/projects/nope/tree", "tok-view"
+        )
+        assert status == 404
+    finally:
+        vs.stop()
+
+
+async def test_diff_returns_workdir_vs_head():
+    ws = Path(__file__).parent / "_ws_diff"
+    _init_git_repo(ws)
+    try:
+        vs = ViewerServer(
+            "tok-view",
+            routes={("GET", "/api/projects/{name}/diff"): viewer_diff},
+            host="127.0.0.1",
+            port=0,
+            ctx={"all_projects": lambda: {"demo": Project(name="demo", path=ws)}},
+        )
+        vs.start()
+        try:
+            status, payload = await asyncio.to_thread(
+                _get, vs.base_url + "/api/projects/demo/diff", "tok-view"
+            )
+            assert status == 200
+            files = {f["path"]: f for f in payload["files"]}
+            assert "main.py" in files
+            assert files["main.py"]["status"] == "M"
+            assert "v1" in files["main.py"]["patch"]
+            assert "v2" in files["main.py"]["patch"]
+        finally:
+            vs.stop()
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_diff_non_git_returns_500():
+    # 必须落在仓库外：tests/ 在 git worktree 内，git -C 会误判为仓内路径。
+    ws = Path(tempfile.mkdtemp(prefix="fdx-diff-nongit-"))
+    (ws / "main.py").write_text("x\n", encoding="utf-8")
+    try:
+        vs = ViewerServer(
+            "tok-view",
+            routes={("GET", "/api/projects/{name}/diff"): viewer_diff},
+            host="127.0.0.1",
+            port=0,
+            ctx={"all_projects": lambda: {"demo": Project(name="demo", path=ws)}},
+        )
+        vs.start()
+        try:
+            status, payload = await asyncio.to_thread(
+                _get, vs.base_url + "/api/projects/demo/diff", "tok-view"
+            )
+            assert status == 500
+            assert "error" in payload
+        finally:
+            vs.stop()
+    finally:
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_diff_unknown_project_404():
+    vs = ViewerServer(
+        "tok-view",
+        routes={("GET", "/api/projects/{name}/diff"): viewer_diff},
+        host="127.0.0.1",
+        port=0,
+        ctx={"all_projects": lambda: {}},
+    )
+    vs.start()
+    try:
+        status, _payload = await asyncio.to_thread(
+            _get, vs.base_url + "/api/projects/nope/diff", "tok-view"
         )
         assert status == 404
     finally:
