@@ -119,6 +119,7 @@ _TASK_FIELDS = (
     "model",
     "error_message",
     "issue_url",
+    "adopted",
 )
 
 
@@ -146,6 +147,8 @@ class Task:
     #: 关联的 forge issue URL（派活时锚定的意图/brief，#63）；空 = 未绑定。
     #: 单字段、控制平面拥有；PR 不存这里（经 forge 的 Closes #N 反查）。
     issue_url: str = ""
+    #: True = 外部 session 经 /adopt 接管（非 daemon 自建）；话题回复走 load_session
+    adopted: bool = False
 
     @property
     def is_active(self) -> bool:
@@ -241,6 +244,7 @@ class TaskStore:
         status: str = "starting",
         issue_url: str = "",
         model: str = "",
+        adopted: bool = False,
     ) -> Task:
         # 铸号自愈守卫（#81）：不只信持久化的 seq——同时从现有 task id 推出下界，
         # 取两者较大再 +1。即使 seq 因故被回退/污染（多实例踩踏、手工改 tasks.json、
@@ -264,6 +268,7 @@ class TaskStore:
             updated_at=now,
             issue_url=issue_url,
             model=model,
+            adopted=adopted,
         )
         self._tasks[task.task_id] = task
         self._flush()

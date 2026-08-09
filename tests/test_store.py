@@ -53,6 +53,32 @@ def test_update_mutates_and_bumps():
     assert t.session_id == "ses_x"
 
 
+def test_create_adopted_persists(tmp_path: Path):
+    p = tmp_path / "tasks.json"
+    s1 = TaskStore(p)
+    t = s1.create(
+        project_name="demo",
+        agent_label="opencode",
+        description="接管外部会话 abc",
+        thread_root_id="om_adopt",
+        workspace="C:/x",
+        session_id="ext_ses_1",
+        status="idle",
+        adopted=True,
+    )
+    assert t.adopted is True
+    assert t.session_id == "ext_ses_1"
+    assert t.status == "idle"
+    s2 = TaskStore(p)
+    loaded = s2.get(t.task_id)
+    assert loaded is not None
+    assert loaded.adopted is True
+    assert loaded.session_id == "ext_ses_1"
+    # 旧台账缺 adopted 字段 → 默认 False
+    make(s2, thread="om_plain")
+    assert s2.by_thread("om_plain").adopted is False
+
+
 def test_persists_and_counter_never_reuses(tmp_path: Path):
     p = tmp_path / "tasks.json"
     s1 = TaskStore(p)

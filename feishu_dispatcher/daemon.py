@@ -45,6 +45,7 @@ from .viewer import tree as viewer_tree
 logger = logging.getLogger(__name__)
 
 _DISPATCH_PREFIX = "/run "
+_ADOPT_PREFIX = "/adopt "
 _TASK_PREFIX = "/task "
 _LIST_CMD = "/agents"
 _STOP_CMD = "/stop"
@@ -72,6 +73,8 @@ _CONTROL_STOP_TIMEOUT = 5.0
 _USAGE = (
     "用法：\n"
     "• `/run <项目名> <任务描述> [--agent <名>]`  派发任务给 agent（可选覆盖默认 agent）\n"
+    "• `/adopt <项目名> <session_id>`  接管外部 agent 会话为新任务（不跑首轮；"
+    "请选对项目路径，话题回复即 load_session）\n"
     "• `/agents`  列出活跃 + 历史任务\n"
     "• `/task <任务id>`  查看某任务详情与动作日志\n"
     "• `/project`  列出项目；`/project add <名> <agent> <路径>` 注册，`/project remove <名>` 删除\n"
@@ -503,6 +506,8 @@ class _Daemon:
         text = msg.text.strip()
         if text.startswith(_DISPATCH_PREFIX):
             await self._spawn_for_root(msg, text[len(_DISPATCH_PREFIX) :].strip())
+        elif text.startswith(_ADOPT_PREFIX):
+            await self._adopt_for_root(msg, text[len(_ADOPT_PREFIX) :].strip())
         elif text.startswith(_TASK_PREFIX):
             await self._show_task(msg, text[len(_TASK_PREFIX) :].strip())
         elif text == _LIST_CMD:
@@ -871,6 +876,66 @@ class _Daemon:
             thread_root,
             f"🚀 [{new_task.task_id}] 启动 {agent_label} 处理项目 "
             f"{project_name}…\n任务: {task}",
+        )
+
+    async def _adopt_for_root(self, msg: IncomingMessage, body: str) -> None:
+        """解析 ``/adopt <project> <session_id>``：建 idle Task 绑定外部会话，不启 agent。
+
+        话题回复走既有 ``_try_resume`` / ``load_session``。项目 path 须与外部会话 cwd
+        一致（daemon 无法校验，由用户负责）。
+        """
+        usage = (
+            "格式：`/adopt <项目名> <session_id>`\n"
+            "把终端里已有的 agent 会话接管为飞书任务（状态 idle，不跑首轮）；"
+            "在本话题回复即 load_session。请选对项目（工作目录须与原会话一致）。"
+        )
+        parts = body.split(maxsplit=1)
+        if len(parts) < 2:
+            await self._reply_user(msg.message_id, usage)
+            return
+        project_name = parts[0].strip()
+        session_id = parts[1].strip()
+        if not session_id:
+            await self._reply_user(msg.message_id, usage)
+            return
+        project = self._resolve_project(project_name)
+        if project is None:
+            known = ", ".join(self._all_projects()) or "(无)"
+            await self._reply_user(
+                msg.message_id, f"未知项目 '{project_name}'。已知项目: {known}"
+            )
+            return
+        agent_label, agent_argv, err = self._resolve_agent(project, None)
+        if agent_argv is None:
+            await self._reply_user(msg.message_id, err)
+            return
+
+        thread_root = msg.message_id
+        if thread_root in self._sessions:
+            logger.info("根消息 %s 已有 agent session，忽略重复 adopt", thread_root)
+            return
+        if self.store.by_thread(thread_root) is not None:
+            logger.info("根消息 %s 已有任务台账，忽略重复 adopt", thread_root)
+            return
+
+        # 不占 max_agents：只建台账，等话题回复再 _try_resume 拉起。
+        sid_show = session_id if len(session_id) <= 48 else session_id[:45] + "…"
+        new_task = self.store.create(
+            project_name=project_name,
+            agent_label=agent_label,
+            description=f"接管外部会话 {sid_show}",
+            thread_root_id=thread_root,
+            workspace=str(project.path),
+            session_id=session_id,
+            status="idle",
+            adopted=True,
+        )
+        await self._safe_reply(
+            thread_root,
+            f"🔗 [{new_task.task_id}] 已接管外部会话（{agent_label} / {project_name}）\n"
+            f"session: `{sid_show}`\n"
+            f"工作目录: {project.path}\n"
+            "在本话题回复即可 load_session 继续（请确认项目路径与原会话一致）。",
         )
 
     def _make_agent(
@@ -1442,9 +1507,13 @@ class _Daemon:
             f"[{t.task_id}] {t.project_name} · {t.agent_label} · {t.status}"
             f"（{t.turns} 轮）"
         )
+        if t.adopted:
+            head += " · 外部接管"
         if t.model:
             head += f"\n模型: {t.model}"
         lines = [head, f"任务: {t.description}"]
+        if t.adopted and t.session_id:
+            lines.append(f"外部 session: `{t.session_id}`")
         if t.issue_url:
             lines.append(f"issue: {t.issue_url}")
         if t.status == "failed" and t.error_message:
@@ -1610,6 +1679,7 @@ class _Daemon:
             "active": t.thread_root_id in self._sessions,
             "model": t.model,  # agent 当前模型（copilot 不暴露则为空）
             "issue_url": t.issue_url,  # 关联的 issue（#63）；空 = 未绑定
+            "adopted": t.adopted,  # 外部 session 经 /adopt 接管
             "created_at": t.created_at,
             "updated_at": t.updated_at,
             "last_output": t.last_output,  # 最近一轮 agent 的收尾回复
