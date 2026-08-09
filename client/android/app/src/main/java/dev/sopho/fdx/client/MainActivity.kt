@@ -32,6 +32,7 @@ import androidx.compose.ui.unit.dp
 import dev.sopho.fdx.client.data.ConnectionStore
 import dev.sopho.fdx.client.network.ViewerClient
 import dev.sopho.fdx.client.ui.ConfigScreen
+import dev.sopho.fdx.client.ui.FileContentScreen
 import dev.sopho.fdx.client.ui.ProjectListScreen
 import dev.sopho.fdx.client.ui.TreeScreen
 import dev.sopho.fdx.client.ui.theme.FdxViewerTheme
@@ -45,8 +46,9 @@ import kotlin.math.min
  * - [Config]：配置/连接页（栈底，根屏）。
  * - [ProjectList]：项目列表（连接成功后进入）。
  * - [Tree]：某项目的文件树（点项目进入，带 projectName）。
+ * - [FileContent]：文件内容（点树里文件进入，带 projectName + path）。
  *
- * 后续加 FileContent / Diff 屏时，在这里加一个子类即可。
+ * 后续加 Diff 屏时，在这里加一个子类即可。
  */
 sealed class Destination {
     data object Config : Destination()
@@ -54,6 +56,8 @@ sealed class Destination {
     data object ProjectList : Destination()
 
     data class Tree(val projectName: String) : Destination()
+
+    data class FileContent(val projectName: String, val path: String) : Destination()
 }
 
 class MainActivity : ComponentActivity() {
@@ -105,6 +109,7 @@ class MainActivity : ComponentActivity() {
                                 client = client,
                                 onConnected = {},
                                 onProjectClick = {},
+                                onFileClick = { _, _ -> },
                             )
                         }
 
@@ -160,6 +165,9 @@ class MainActivity : ComponentActivity() {
                                     push(Destination.ProjectList)
                                 },
                                 onProjectClick = { name -> push(Destination.Tree(name)) },
+                                onFileClick = { project, path ->
+                                    push(Destination.FileContent(project, path))
+                                },
                             )
                         }
                     }
@@ -212,6 +220,7 @@ private fun RenderDestination(
     client: ViewerClient?,
     onConnected: (ViewerClient) -> Unit,
     onProjectClick: (String) -> Unit,
+    onFileClick: (String, String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     when (dest) {
@@ -232,7 +241,22 @@ private fun RenderDestination(
 
         is Destination.Tree -> {
             val c = client!!
-            TreeScreen(client = c, projectName = dest.projectName, modifier = modifier)
+            TreeScreen(
+                client = c,
+                projectName = dest.projectName,
+                onFileClick = { path -> onFileClick(dest.projectName, path) },
+                modifier = modifier,
+            )
+        }
+
+        is Destination.FileContent -> {
+            val c = client!!
+            FileContentScreen(
+                client = c,
+                projectName = dest.projectName,
+                path = dest.path,
+                modifier = modifier,
+            )
         }
     }
 }
