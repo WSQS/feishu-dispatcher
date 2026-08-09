@@ -85,7 +85,7 @@ class MainActivity : ComponentActivity() {
                     // pre-commit（手势进行中）当前屏缩小到 0.9 + 跟随手指方向偏移（含 Y 轴），
                     // 不做 alpha 渐变（系统靠 scrim 遮罩挡住缝隙，不是靠透明度）。
                     // post-commit（松手后）才用 alpha 快速渐隐（max(1 - progress*5, 0)）。
-                    var backProgress by remember { mutableFloatStateOf(0f) }
+                    val backProgress = remember { Animatable(0f) }
                     var touchStartY by remember { mutableFloatStateOf(0f) }
                     var touchY by remember { mutableFloatStateOf(0f) }
                     var swipeEdge by remember { mutableIntStateOf(BackEventCompat.EDGE_LEFT) }
@@ -96,7 +96,7 @@ class MainActivity : ComponentActivity() {
                     Box(Modifier.fillMaxSize()) {
                         // 底层（Z 序在下）：返回手势期间渲染上一屏（原地不动，被缩小的当前屏露出）。
                         // backProgress 为 0 时不渲染（正常状态只有顶层）。预览不可交互（回调 no-op）。
-                        if (backProgress > 0f && screenStack.size > 1) {
+                        if (backProgress.value > 0f && screenStack.size > 1) {
                             val prevDest = screenStack[screenStack.size - 2]
                             RenderDestination(
                                 dest = prevDest,
@@ -110,11 +110,11 @@ class MainActivity : ComponentActivity() {
 
                         // scrim 遮罩：黑色半透明，盖在上一屏上方、当前屏下方。
                         // 对齐 AOSP：浅色模式 alpha 0.2，深色模式 0.8——这里取 0.2。
-                        if (backProgress > 0f && screenStack.size > 1) {
+                        if (backProgress.value > 0f && screenStack.size > 1) {
                             Box(
                                 Modifier
                                     .fillMaxSize()
-                                    .background(Color.Black.copy(alpha = 0.2f * backProgress))
+                                    .background(Color.Black.copy(alpha = 0.2f * backProgress.value))
                             )
                         }
 
@@ -125,7 +125,7 @@ class MainActivity : ComponentActivity() {
                             transitionSpec = { fadeIn() togetherWith fadeOut() },
                             label = "navTransition",
                             modifier = Modifier.graphicsLayer {
-                                val gestureProgress = backProgress
+                                val gestureProgress = backProgress.value
                                 val currentAlpha = if (isCommitting) {
                                     // post-commit：快速渐隐，对齐 AOSP max(1 - progress*5, 0)
                                     val cp = commitProgress.value
@@ -169,7 +169,7 @@ class MainActivity : ComponentActivity() {
                     // 中途取消 → spring 弹回原位。
                     // 根屏（栈深 ≤ 1）enabled = false，系统接管退出 App 的 predictive back。
                     PredictiveBackHandler(enabled = screenStack.size > 1) { events ->
-                        backProgress = 0f
+                        backProgress.snapTo(0f)
                         isCommitting = false
                         var firstEvent = true
                         try {
@@ -180,7 +180,7 @@ class MainActivity : ComponentActivity() {
                                 }
                                 touchY = e.touchY
                                 swipeEdge = e.swipeEdge
-                                backProgress = e.progress
+                                backProgress.snapTo(e.progress)
                             }
                             // Flow 正常结束 → 手势完成（commit）：post-commit 动画——alpha 快速渐隐，
                             // 对齐 AOSP 的 max(1 - progress*5, 0)，时长 ~450ms。
@@ -188,11 +188,11 @@ class MainActivity : ComponentActivity() {
                             commitProgress.snapTo(0f)
                             commitProgress.animateTo(1f, spring())
                             pop()
-                            backProgress = 0f
+                            backProgress.snapTo(0f)
                             isCommitting = false
                         } catch (c: CancellationException) {
                             // Flow 被取消 → 手势取消：spring 弹回原位。
-                            backProgress = 0f
+                            backProgress.animateTo(0f, spring())
                             isCommitting = false
                             throw c
                         }
