@@ -18,7 +18,7 @@ import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
- * `ViewerException.from(e)` 分类器的单测（#127 / #132）。
+ * `ViewerException.from(e)` 分类器的单测。
  *
  * 分类规则（见 ViewerException.kt）：
  * - ResponseException 且 status 401/403 → AUTH

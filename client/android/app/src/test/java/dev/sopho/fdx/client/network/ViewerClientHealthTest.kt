@@ -20,7 +20,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /**
- * `ViewerClient.health()` 集成测试（MockEngine，不依赖 daemon）（#127 / #132）。
+ * `ViewerClient.health()` 集成测试（MockEngine，不依赖 daemon）。
  *
  * 覆盖：
  * - 200 + JSON → 返回 HealthResponse(ok=true, version=...)（解析正确）

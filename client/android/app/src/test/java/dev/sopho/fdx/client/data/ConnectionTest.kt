@@ -5,10 +5,10 @@ import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
- * `Connection.isValid`（地址/token 非空校验）单测（#128 / #132）。
+ * `Connection.isValid`（地址/token 非空校验）单测。
  *
  * 规则（见 Connection.kt）：`url.isNotBlank() && token.isNotBlank()`
- * —— 仅判非空白，不做格式校验（留后续）。ZT 配置另有 `zerotier.isValid`。
+ * —— 仅判非空白，不做格式校验。ZT 配置另有 `zerotier.isValid`。
  */
 class ConnectionTest {
 
@@ -58,7 +58,7 @@ class ConnectionTest {
 }
 
 /**
- * `ZerotierConfig.isValid` 单测（#128 / #132）。
+ * `ZerotierConfig.isValid` 单测。
  *
  * 规则（见 Connection.kt）：`!enabled || networkId.isNotBlank()`
  * —— enabled=false（普通 HTTP）恒有效；enabled=true 时 networkId 必填。
