@@ -19,6 +19,8 @@ import logging
 import os
 import re
 import secrets
+import signal
+import sys
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -26,7 +28,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import forge
-from .acp_client import AcpAgent, AgentSpawn, OnAction, OnOutput, _resolve_executable
+from .acp_client import (
+    AcpAgent,
+    AgentSpawn,
+    OnAction,
+    OnOutput,
+    _proc_tree_pids,
+    _resolve_executable,
+    _win_reap_pids,
+    _win_snapshot_ppids,
+)
 from .config import DEFAULT_CONFIG_PATH, Config, Project
 from .control import ControlServer
 from .feishu import FeishuBridge, IncomingMessage
@@ -39,7 +50,11 @@ from .scheduler import (
 )
 from .store import Job, JobStore, ModelStore, ProjectStore, Task, TaskStore
 from ._viewer_token import ensure_token
-from .viewer import ViewerServer, health as viewer_health, list_projects as viewer_list_projects
+from .viewer import (
+    ViewerServer,
+    health as viewer_health,
+    list_projects as viewer_list_projects,
+)
 from .viewer import tree as viewer_tree
 
 logger = logging.getLogger(__name__)
@@ -172,6 +187,79 @@ def _read_tail_lines(path: str, lines: int, *, max_bytes: int = 200_000) -> str:
     except Exception:
         logger.debug("读后台任务输出行失败 %s", path, exc_info=True)
     return ""
+
+
+#: Windows：CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS——bg 进程不随 daemon 退出被杀（#89）
+_WIN_BG_CREATE_FLAGS = 0x00000200 | 0x00000008
+
+
+def _bg_detach_kwargs() -> dict:
+    """``asyncio.create_subprocess_exec`` 的脱离参数（Windows / POSIX）。"""
+    if os.name == "nt":
+        return {"creationflags": _WIN_BG_CREATE_FLAGS}
+    return {"start_new_session": True}
+
+
+def _pid_alive(pid: int) -> bool:
+    """进程是否仍在跑（重启后 rediscover 用）。"""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        # SYNCHRONIZE：仅探测存活，不要求 TERMINATE 权限
+        handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, int(pid))
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _kill_bg_tree(pid: int) -> None:
+    """杀掉 bg 包装进程及其后代（超时 / ``bg kill`` / 重启后接管用）。"""
+    if pid <= 0:
+        return
+    if os.name == "nt":
+        try:
+            _win_reap_pids(_proc_tree_pids(pid, _win_snapshot_ppids()))
+        except Exception:
+            logger.debug("Windows 杀 bg 进程树失败 pid=%s", pid, exc_info=True)
+        return
+    try:
+        os.killpg(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+
+
+def _read_exit_file(path: str) -> int | None:
+    """读 bg_wrap 写的 exit-file；不存在/损坏返回 None。"""
+    try:
+        if path and Path(path).exists():
+            text = Path(path).read_text(encoding="utf-8").strip()
+            return int(text.splitlines()[0])
+    except Exception:
+        logger.debug("读 exit-file 失败 %s", path, exc_info=True)
+    return None
+
+
+class _PidKillHandle:
+    """重启 rediscover 后没有 asyncio Process 时，用 pid 充当可 kill 句柄（进 ``_bg_procs``）。"""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+
+    def kill(self) -> None:
+        _kill_bg_tree(self.pid)
 
 
 def _issue_tag(issue_url: str) -> str:
@@ -387,6 +475,8 @@ class _Daemon:
         # re-exec 重启起来的进程：给控制台发一条「已重启」回执（HTTP，不依赖 WS）
         if os.environ.pop(_REBOOTED_ENV, None):
             await self._notify_main("✅ daemon 已重启完成。")
+        # #89：扫 jobs.json 里仍 running 的 bg job——已退出的补交付，仍在跑的重新挂 watcher
+        await self._rediscover_bg_jobs()
         try:
             # R13：看门狗——最多等 30s 或直到 _stop_event 被 set（/reboot / 退出）；
             # 超时则检查 WS 线程是否存活，死了 bridge.restart()。
@@ -415,7 +505,9 @@ class _Daemon:
         """
         assert self.cfg.viewer is not None
         v = self.cfg.viewer
-        token_path = self._viewer_token_path or DEFAULT_CONFIG_PATH.parent / "viewer.token"
+        token_path = (
+            self._viewer_token_path or DEFAULT_CONFIG_PATH.parent / "viewer.token"
+        )
         token = ensure_token(token_path)
         logger.info(
             "移动端查看器 token（已存 viewer.token，重启不变；填进手机 App）: %s", token
@@ -1840,6 +1932,10 @@ class _Daemon:
         if job is None:
             return 404, {"error": f"未找到属于本任务的后台 job {job_id!r}"}
         proc = self._bg_procs.get(job_id)
+        if proc is None and job.pid:
+            # 重启后 rediscover 的活进程：只有 pid，补一个可 kill 句柄
+            proc = _PidKillHandle(job.pid)
+            self._bg_procs[job_id] = proc
         if proc is None:
             return 200, {
                 "job_id": job_id,
@@ -1848,7 +1944,12 @@ class _Daemon:
                 "note": "该 job 已不在运行",
             }
         try:
-            proc.kill()
+            # 先调句柄 kill（测试假进程 / asyncio.Process）；活着的真实 pid 再补进程树
+            if hasattr(proc, "kill"):
+                proc.kill()
+            pid = getattr(proc, "pid", 0) or job.pid
+            if pid and _pid_alive(pid):
+                _kill_bg_tree(pid)
         except Exception as exc:  # noqa: BLE001
             logger.exception("kill 后台任务失败 %s", job_id)
             return 500, {"error": f"{type(exc).__name__}: {exc}"}
@@ -1861,9 +1962,9 @@ class _Daemon:
         """spawn 一个 daemon 拥有的后台进程（argv exec，不经 shell），输出重定向到文件，
         登记 Job 并起 watcher。返回 Job（进程仍在跑）。
 
-        进程是 **daemon 的子进程**（非 agent 的），故 agent 挂起/恢复不影响它。用户自己的
-        build/训练命令——继承 daemon(=用户) 的完整环境（PATH/CUDA/conda 等），与用户在终端
-        直接跑一致。shell 特性（管道/&&）需 agent 显式 `bash -c "..."`。
+        经 ``bg_wrap`` 包装并以脱离标志启动（#89）：daemon 退出不杀 job；pid/exit-file
+        落盘，重启后可重新发现。用户自己的 build/训练命令——继承 daemon(=用户) 的完整
+        环境（PATH/CUDA/conda 等）。shell 特性（管道/&&）需 agent 显式 `bash -c "..."`。
 
         ``stdin=DEVNULL``：给子进程一个立即 EOF 的 stdin——否则它会继承 daemon 的（控制台）
         stdin，交互式 shell profile 里读 stdin 的步骤（实测 `opam env`）会阻塞、卡死整个
@@ -1874,22 +1975,42 @@ class _Daemon:
         logs_dir.mkdir(parents=True, exist_ok=True)
         job = self.job_store.create(task_id=task_id, command=command, cwd=cwd)
         out_path = logs_dir / f"{job.job_id}.log"
-        self.job_store.update(job.job_id, output_file=str(out_path))
+        pid_path = logs_dir / f"{job.job_id}.pid"
+        exit_path = logs_dir / f"{job.job_id}.exit"
+        self.job_store.update(
+            job.job_id,
+            output_file=str(out_path),
+            exit_file=str(exit_path),
+            timeout=float(timeout or 0.0),
+        )
         out_file = open(out_path, "wb")  # noqa: SIM115 —— 交给 watcher 在进程退出后关
         try:
             argv = [_resolve_executable(command[0]), *command[1:]]
-            proc = await asyncio.create_subprocess_exec(
+            wrap = [
+                sys.executable,
+                "-m",
+                "feishu_dispatcher.bg_wrap",
+                "--pid-file",
+                str(pid_path),
+                "--exit-file",
+                str(exit_path),
+                "--",
                 *argv,
+            ]
+            proc = await asyncio.create_subprocess_exec(
+                *wrap,
                 cwd=cwd,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=out_file,
                 stderr=asyncio.subprocess.STDOUT,
                 env=os.environ.copy(),
+                **_bg_detach_kwargs(),
             )
         except Exception:
             out_file.close()
             self.job_store.update(job.job_id, status="killed", exit_code=None)
             raise
+        self.job_store.update(job.job_id, pid=int(proc.pid or 0))
         logger.info(
             "后台任务 %s 启动: task=%s pid=%s timeout=%s cmd=%.80s",
             job.job_id,
@@ -1901,40 +2022,67 @@ class _Daemon:
         self._bg_procs[job.job_id] = proc  # 供 bg kill（#70）
         # 存强引用：asyncio 只对 task 持弱引用，不存会被 GC 掉、watcher 中途消失（#68）
         watcher = asyncio.create_task(
-            self._watch_bg_job(job.job_id, proc, out_file, timeout),
+            self._watch_bg_job(
+                job.job_id, proc, out_file, timeout, after_restart=False
+            ),
             name=f"bgjob-{job.job_id}",
         )
         self._bg_watchers.add(watcher)
         watcher.add_done_callback(self._bg_watchers.discard)
         return job
 
-    async def _watch_bg_job(self, job_id: str, proc, out_file, timeout: float) -> None:
+    async def _watch_bg_job(
+        self,
+        job_id: str,
+        proc,
+        out_file,
+        timeout: float,
+        *,
+        after_restart: bool = False,
+    ) -> None:
         """等后台进程退出 → 落 Job 状态 → 把「完成 + 输出尾部」入队回它的 task。
 
         ``timeout>0`` 时超时就 kill 进程、标 timed_out，但**照样唤回 agent**（带超时说明）——
-        兜底防卡死进程无声堆积。
+        兜底防卡死进程无声堆积。``proc`` 可为 asyncio Process，或重启后的 ``_PidKillHandle``
+        （无 ``wait``，改轮询 exit-file / pid）。
         """
         timed_out = False
+        rc: int | None = None
         try:
-            if timeout and timeout > 0:
+            rc = await self._await_bg_proc(job_id, proc, timeout)
+            if rc is None:
+                # 超时路径：_await_bg_proc 返回 None 表示需杀进程再等退出码
+                timed_out = True
+                logger.warning("后台任务 %s 超时（%.0fs），杀掉", job_id, timeout)
                 try:
-                    rc = await asyncio.wait_for(proc.wait(), timeout)
-                except asyncio.TimeoutError:
-                    timed_out = True
-                    logger.warning("后台任务 %s 超时（%.0fs），杀掉", job_id, timeout)
-                    try:
+                    if hasattr(proc, "kill"):
                         proc.kill()
-                    except Exception:
-                        logger.debug("kill 超时进程失败 %s", job_id, exc_info=True)
-                    rc = await proc.wait()
-            else:
-                rc = await proc.wait()
+                    pid = getattr(proc, "pid", 0) or 0
+                    job_now = self.job_store.get(job_id)
+                    if not pid and job_now is not None:
+                        pid = job_now.pid
+                    if pid and _pid_alive(pid):
+                        _kill_bg_tree(pid)
+                except Exception:
+                    logger.debug("kill 超时进程失败 %s", job_id, exc_info=True)
+                rc = await self._await_bg_proc(job_id, proc, 0)
         finally:
             self._bg_procs.pop(job_id, None)  # 退出即出「在跑」表（#70）
-            try:
-                out_file.close()
-            except Exception:
-                pass
+            if out_file is not None:
+                try:
+                    out_file.close()
+                except Exception:
+                    pass
+        job = self.job_store.get(job_id)
+        if job is None:
+            return
+        if job.is_terminal:
+            return  # 已被另一路径（如 rediscover）收尾，防重复交付
+        if rc is None:
+            # exit-file 未写且进程已死：仍交付，退出码按 -1
+            rc = _read_exit_file(job.exit_file)
+            if rc is None:
+                rc = -1
         self.job_store.update(
             job_id,
             status="killed" if timed_out else "exited",
@@ -1946,41 +2094,144 @@ class _Daemon:
         if job is None:
             return
         logger.info(
-            "后台任务 %s %s: exit=%s task=%s",
+            "后台任务 %s %s: exit=%s task=%s restart=%s",
             job_id,
             "超时被杀" if timed_out else "退出",
             rc,
             job.task_id,
+            after_restart,
         )
-        await self._deliver_bg_result(job, rc)
+        await self._deliver_bg_result(job, rc, after_restart=after_restart)
 
-    def _build_bg_block(self, job: Job, rc: int) -> str:
+    async def _await_bg_proc(self, job_id: str, proc, timeout: float) -> int | None:
+        """等 bg 结束。有 ``wait`` 就 await；否则轮询 exit-file / pid。
+
+        返回退出码；``timeout>0`` 且超时返回 ``None``（调用方负责杀进程再等）。
+        """
+        job = self.job_store.get(job_id)
+        exit_path = job.exit_file if job else ""
+
+        async def _poll() -> int:
+            while True:
+                rc = _read_exit_file(exit_path)
+                if rc is not None:
+                    return rc
+                pid = getattr(proc, "pid", 0) or (job.pid if job else 0)
+                if pid and not _pid_alive(pid):
+                    # 进程死了但 exit-file 尚未写出：再给一小会，然后 -1
+                    for _ in range(20):
+                        await asyncio.sleep(0.05)
+                        rc = _read_exit_file(exit_path)
+                        if rc is not None:
+                            return rc
+                    return -1
+                await asyncio.sleep(0.2)
+
+        wait_coro = proc.wait() if hasattr(proc, "wait") else _poll()
+        if timeout and timeout > 0:
+            try:
+                rc = await asyncio.wait_for(wait_coro, timeout)
+            except asyncio.TimeoutError:
+                return None
+        else:
+            rc = await wait_coro
+        # 优先采信 exit-file（与重启路径同一信源）
+        file_rc = _read_exit_file(exit_path)
+        return file_rc if file_rc is not None else int(rc)
+
+    async def _rediscover_bg_jobs(self) -> None:
+        """daemon 启动时扫仍 ``running`` 的 Job：已退出的补交付，仍活的重新挂 watcher（#89）。"""
+        for job in list(self.job_store.all()):
+            if job.status != "running":
+                continue
+            if job.job_id in self._bg_procs:
+                continue
+            exit_rc = _read_exit_file(job.exit_file)
+            if exit_rc is not None:
+                logger.info(
+                    "重新发现已退出的后台任务 %s exit=%s，补交付", job.job_id, exit_rc
+                )
+                self.job_store.update(
+                    job.job_id,
+                    status="exited",
+                    exit_code=exit_rc,
+                    finished_at=time.time(),
+                    timed_out=False,
+                )
+                fresh = self.job_store.get(job.job_id)
+                if fresh is not None:
+                    await self._deliver_bg_result(fresh, exit_rc, after_restart=True)
+                continue
+            if job.pid and _pid_alive(job.pid):
+                logger.info(
+                    "重新发现仍在跑的后台任务 %s pid=%s，重新挂 watcher",
+                    job.job_id,
+                    job.pid,
+                )
+                handle = _PidKillHandle(job.pid)
+                self._bg_procs[job.job_id] = handle
+                watcher = asyncio.create_task(
+                    self._watch_bg_job(
+                        job.job_id,
+                        handle,
+                        None,
+                        job.timeout,
+                        after_restart=True,
+                    ),
+                    name=f"bgjob-{job.job_id}",
+                )
+                self._bg_watchers.add(watcher)
+                watcher.add_done_callback(self._bg_watchers.discard)
+                continue
+            # 无 exit-file、pid 已死或未知：升级前遗留 / 异常丢失
+            logger.warning(
+                "后台任务 %s 标记 running 但无法接管（pid=%s），标 killed",
+                job.job_id,
+                job.pid,
+            )
+            self.job_store.update(
+                job.job_id,
+                status="killed",
+                exit_code=None,
+                finished_at=time.time(),
+            )
+            await self._notify_main(
+                f"🔔 后台任务 {job.job_id} 在 daemon 重启后无法接管（进程已不在），已标终止。"
+            )
+
+    def _build_bg_block(self, job: Job, rc: int, *, after_restart: bool = False) -> str:
         """单个后台任务完成的 `<bg_job_done>` 块（id/命令/exit/耗时/超时/输出尾部）。
         多个 job 合并唤回时各出一块（见 _BgBatch），引导语由 render() 单独补一条。"""
         tail = _read_tail(job.output_file)
         dur = (
             _fmt_duration(job.finished_at - job.created_at) if job.finished_at else "?"
         )
-        return "\n".join(
-            [
-                "<bg_job_done>",
-                f"Job: {job.job_id}",
-                f"Command: {' '.join(job.command)}",
-                f"Exit Code: {rc}",
-                f"Duration: {dur}",
-                f"Timed Out: {'yes（已超时被杀）' if job.timed_out else 'no'}",
-                "Output (tail):",
-                tail,
-                "</bg_job_done>",
-            ]
-        )
+        lines = [
+            "<bg_job_done>",
+            f"Job: {job.job_id}",
+            f"Command: {' '.join(job.command)}",
+            f"Exit Code: {rc}",
+            f"Duration: {dur}",
+            f"Timed Out: {'yes（已超时被杀）' if job.timed_out else 'no'}",
+        ]
+        if after_restart:
+            lines.append("Note: daemon 重启期间完成（重启后接管交付）")
+        lines.extend(["Output (tail):", tail, "</bg_job_done>"])
+        return "\n".join(lines)
 
-    def _build_bg_prompt(self, job: Job, rc: int) -> str:
+    def _build_bg_prompt(
+        self, job: Job, rc: int, *, after_restart: bool = False
+    ) -> str:
         """单个后台任务的完整唤回 prompt（块 + 引导语）——用于挂起恢复的首轮（不合并）。
         与单块 _BgBatch.render() 等价。"""
-        return f"{self._build_bg_block(job, rc)}\n\n{_BG_GUIDANCE}"
+        return (
+            f"{self._build_bg_block(job, rc, after_restart=after_restart)}"
+            f"\n\n{_BG_GUIDANCE}"
+        )
 
-    def _bg_result_message(self, job: Job, rc: int) -> str:
+    def _bg_result_message(
+        self, job: Job, rc: int, *, after_restart: bool = False
+    ) -> str:
         """后台任务完成的**可见**话题消息：状态 + exit + 耗时 + 输出尾部（用户直接看结果）。
 
         与注入给 agent 的 `<bg_job_done>` prompt 分开——prompt 是给 agent 读的、不回显到
@@ -1991,11 +2242,14 @@ class _Daemon:
             _fmt_duration(job.finished_at - job.created_at) if job.finished_at else "?"
         )
         state = "超时被杀" if job.timed_out else "完成"
-        head = f"{mark} 后台任务 {job.job_id} {state}（exit {rc} · 用时 {dur}）"
+        note = " · daemon 重启后接管" if after_restart else ""
+        head = f"{mark} 后台任务 {job.job_id} {state}（exit {rc} · 用时 {dur}{note}）"
         tail = _clip(_read_tail(job.output_file), 600)
         return f"{head}\n输出（尾部）:\n{tail}" if tail else head
 
-    async def _deliver_bg_result(self, job: Job, rc: int) -> None:
+    async def _deliver_bg_result(
+        self, job: Job, rc: int, *, after_restart: bool = False
+    ) -> None:
         """把后台任务完成送回对应 task：活跃则合并入队，挂起则恢复，终止则只通知。
 
         无论哪种去向，只要 task 还在，都先往它的话题发一条**可见**完成消息（带输出尾部），
@@ -2003,6 +2257,7 @@ class _Daemon:
 
         活跃分支按 #79 合并：队尾已有未消费批次（``pending_bg``）时只把本 job 的块追加进
         去、不再入队，让相邻完成的多个 job 只唤回一轮。挂起 task 不合并（各自恢复）。
+        ``after_restart``：重启后补交付时在 prompt / 可见消息里加短注（#89）。
         """
         verb = "成功" if rc == 0 else f"失败(exit {rc})"
         tag = f"[{job.task_id}]"
@@ -2013,18 +2268,22 @@ class _Daemon:
             )
             return
         # 先把「结果」发到话题（可见），再驱动 agent 接续
-        await self._safe_reply(task.thread_root_id, self._bg_result_message(job, rc))
+        await self._safe_reply(
+            task.thread_root_id,
+            self._bg_result_message(job, rc, after_restart=after_restart),
+        )
         sess = self._sessions.get(task.thread_root_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             # check-set 之间无 await：单线程原子，并发完成的 job 不会漏合并/重复入队。
+            block = self._build_bg_block(job, rc, after_restart=after_restart)
             if sess.pending_bg is not None:
-                sess.pending_bg.add(self._build_bg_block(job, rc))  # 合并进队尾批次
+                sess.pending_bg.add(block)  # 合并进队尾批次
                 await self._notify_main(
                     f"🔔 {tag} 后台任务 {job.job_id} {verb}，已并入待处理批次。"
                 )
             else:
                 batch = _BgBatch()
-                batch.add(self._build_bg_block(job, rc))
+                batch.add(block)
                 sess.pending_bg = batch
                 sess.queue.put_nowait(batch)  # 首个：入队一次
                 await self._notify_main(
@@ -2037,7 +2296,10 @@ class _Daemon:
             )
             return
         # 挂起/idle 但无活跃 session：load_session 恢复，把完成 prompt 作为首轮（不合并）
-        ok, why = self._try_resume(task, first_prompt=self._build_bg_prompt(job, rc))
+        ok, why = self._try_resume(
+            task,
+            first_prompt=self._build_bg_prompt(job, rc, after_restart=after_restart),
+        )
         if ok:
             await self._notify_main(
                 f"🔔 {tag} 后台任务 {job.job_id} {verb}，已恢复 agent 继续。"

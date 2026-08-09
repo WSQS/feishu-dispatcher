@@ -427,10 +427,20 @@ def test_job_store_persists_and_counter_monotonic(tmp_path: Path):
     p = tmp_path / "jobs.json"
     s1 = JobStore(p)
     s1.create(task_id="t1", command=["python", "train.py"], cwd="C:/x")
-    s1.update("j1", status="exited", exit_code=0)
+    s1.update(
+        "j1",
+        status="exited",
+        exit_code=0,
+        pid=4321,
+        exit_file=str(tmp_path / "j1.exit"),
+        timeout=30.0,
+    )
     s2 = JobStore(p)  # reload
     assert s2.get("j1").status == "exited"
     assert s2.get("j1").command == ["python", "train.py"]
+    assert s2.get("j1").pid == 4321
+    assert s2.get("j1").exit_file.endswith("j1.exit")
+    assert s2.get("j1").timeout == 30.0
     # 计数器随之持久化 → 下一个是 j2，不复用
     assert s2.create(task_id="t2", command=["x"], cwd="c").job_id == "j2"
 

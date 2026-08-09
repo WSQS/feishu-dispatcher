@@ -405,6 +405,9 @@ _JOB_FIELDS = (
     "created_at",
     "finished_at",
     "timed_out",
+    "pid",
+    "exit_file",
+    "timeout",
 )
 
 #: 后台任务的机械态：running（跑着）→ exited（正常退出）/ killed（被杀/异常）
@@ -421,6 +424,7 @@ class Job:
     它；进程退出时 daemon 把「完成 + 输出尾部」入队该 task，agent 自动接续。
 
     ``command`` 是 argv 列表（exec，不经 shell）；``output_file`` 是重定向的输出文件。
+    ``pid`` / ``exit_file`` / ``timeout`` 供 daemon 重启后重新发现并接管（#89）。
     """
 
     job_id: str
@@ -434,6 +438,12 @@ class Job:
     finished_at: float = 0.0
     #: 是否因超时被 daemon 杀掉（区别于进程自己退出）；#68
     timed_out: bool = False
+    #: 包装进程 pid（bg_wrap）；0 = 未知（升级前遗留）
+    pid: int = 0
+    #: 退出码落盘路径（bg_wrap 原子写）；空 = 无
+    exit_file: str = ""
+    #: 启动时约定的超时秒数（<=0 不超时）；重启后 re-watch 用
+    timeout: float = 0.0
 
     @property
     def is_terminal(self) -> bool:
@@ -446,8 +456,7 @@ class JobStore:
 
     ``path=None`` 为纯内存（测试）。原子写 + 读损坏容错，与 TaskStore 一套。
     只被单个 daemon 实例（单线程 event loop）读写，无需加锁。
-    v1 不做重启穿越——daemon 重启会丢在飞的 Job 的 await（记录仍在盘上，标记为
-    running 的历史 Job 视为「结果未知」，不自动恢复，见 #68）。
+    重启穿越（#89）：running 的 Job 靠 ``pid`` / ``exit_file`` 在 daemon 启动时重新发现。
     """
 
     def __init__(self, path: Path | None) -> None:
