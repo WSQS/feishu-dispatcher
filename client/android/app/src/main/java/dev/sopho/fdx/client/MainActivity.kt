@@ -144,7 +144,9 @@ class MainActivity : ComponentActivity() {
                                 // 位移：垂直方向跟随手指 Y（对齐 AOSP getYOffset）
                                 val rawYDelta = touchY - touchStartY
                                 val yDirection = if (rawYDelta < 0) -1f else 1f
-                                val deltaYRatio = min(size.height / 2f, abs(rawYDelta)) / (size.height / 2f)
+                                val deltaYRatio =
+                                    if (size.height <= 0f) 0f
+                                    else min(size.height / 2f, abs(rawYDelta)) / (size.height / 2f)
                                 val maxShiftY = ((size.height - size.height * scale) / 2f).coerceAtLeast(0f)
                                 translationY = maxShiftY * deltaYRatio * yDirection
                                 alpha = currentAlpha
