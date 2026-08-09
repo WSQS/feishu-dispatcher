@@ -11,17 +11,24 @@ import androidx.compose.animation.core.spring
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.dp
 import dev.sopho.fdx.client.data.ConnectionStore
 import dev.sopho.fdx.client.network.ViewerClient
 import dev.sopho.fdx.client.ui.ConfigScreen
@@ -29,6 +36,8 @@ import dev.sopho.fdx.client.ui.ProjectListScreen
 import dev.sopho.fdx.client.ui.TreeScreen
 import dev.sopho.fdx.client.ui.theme.FdxViewerTheme
 import kotlinx.coroutines.CancellationException
+import kotlin.math.abs
+import kotlin.math.min
 
 /**
  * 导航目的地：sealed class 表示每个屏 + 它所需的参数。
@@ -72,15 +81,22 @@ class MainActivity : ComponentActivity() {
                         return true
                     }
 
-                    // 返回手势进度（0 = 未触发，1 = 完全滑出）。驱动当前屏的位移/缩放，
-                    // 以及底层上一屏的显隐——实现 predictive back 预览。
-                    val backProgress = remember { Animatable(0f) }
+                    // 返回手势状态——对齐 AOSP CrossActivityBackAnimation 的动效参数：
+                    // pre-commit（手势进行中）当前屏缩小到 0.9 + 跟随手指方向偏移（含 Y 轴），
+                    // 不做 alpha 渐变（系统靠 scrim 遮罩挡住缝隙，不是靠透明度）。
+                    // post-commit（松手后）才用 alpha 快速渐隐（max(1 - progress*5, 0)）。
+                    var backProgress by remember { mutableFloatStateOf(0f) }
+                    var touchStartY by remember { mutableFloatStateOf(0f) }
+                    var touchY by remember { mutableFloatStateOf(0f) }
+                    var swipeEdge by remember { mutableIntStateOf(BackEventCompat.EDGE_LEFT) }
+                    var isCommitting by remember { mutableStateOf(false) }
+                    val commitProgress = remember { Animatable(0f) }
+                    val screenHeightPx = with(LocalDensity.current) { LocalDensity.current.run { 0.dp } }
 
                     Box(Modifier.fillMaxSize()) {
-                        // 底层（Z 序在下）：返回手势期间渲染上一屏（逐渐露出）。
+                        // 底层（Z 序在下）：返回手势期间渲染上一屏（原地不动，被缩小的当前屏露出）。
                         // backProgress 为 0 时不渲染（正常状态只有顶层）。预览不可交互（回调 no-op）。
-                        // alpha 随手势进度渐显，和顶层当前屏的渐隐配合。
-                        if (backProgress.value > 0f && screenStack.size > 1) {
+                        if (backProgress > 0f && screenStack.size > 1) {
                             val prevDest = screenStack[screenStack.size - 2]
                             RenderDestination(
                                 dest = prevDest,
@@ -89,24 +105,49 @@ class MainActivity : ComponentActivity() {
                                 client = client,
                                 onConnected = {},
                                 onProjectClick = {},
-                                modifier = Modifier.graphicsLayer {
-                                    alpha = backProgress.value
-                                },
                             )
                         }
 
-                        // 顶层：当前屏。手势期间向右滑 + 轻微缩放 + 渐隐，让底层露出。
+                        // scrim 遮罩：黑色半透明，盖在上一屏上方、当前屏下方。
+                        // 对齐 AOSP：浅色模式 alpha 0.2，深色模式 0.8——这里取 0.2。
+                        if (backProgress > 0f && screenStack.size > 1) {
+                            Box(
+                                Modifier
+                                    .fillMaxSize()
+                                    .background(Color.Black.copy(alpha = 0.2f * backProgress))
+                            )
+                        }
+
+                        // 顶层：当前屏。手势期间缩小 + 跟随手指偏移（对齐 AOSP CrossActivityBackAnimation）。
                         // 前进（push）路径用对称 fade；返回路径由 PredictiveBackHandler 的手势进度驱动。
                         AnimatedContent(
                             targetState = screenStack.last(),
                             transitionSpec = { fadeIn() togetherWith fadeOut() },
                             label = "navTransition",
                             modifier = Modifier.graphicsLayer {
-                                translationX = size.width * backProgress.value
-                                val scale = 1f - 0.05f * backProgress.value
+                                val gestureProgress = backProgress
+                                val currentAlpha = if (isCommitting) {
+                                    // post-commit：快速渐隐，对齐 AOSP max(1 - progress*5, 0)
+                                    val cp = commitProgress.value
+                                    (1f - cp * 5f).coerceAtLeast(0f)
+                                } else {
+                                    // pre-commit：不透明（AOSP 用 scrim 不是 alpha）
+                                    1f
+                                }
+                                // 缩小：1.0 → 0.9（AOSP MAX_SCALE）
+                                val scale = 1f - 0.1f * gestureProgress
                                 scaleX = scale
                                 scaleY = scale
-                                alpha = 1f - backProgress.value
+                                // 位移：水平方向跟随 swipeEdge（左边缘滑→往左偏，右边缘滑→往右偏）
+                                val direction = if (swipeEdge == BackEventCompat.EDGE_LEFT) -1f else 1f
+                                translationX = direction * size.width * 0.1f * gestureProgress
+                                // 位移：垂直方向跟随手指 Y（对齐 AOSP getYOffset）
+                                val rawYDelta = touchY - touchStartY
+                                val yDirection = if (rawYDelta < 0) -1f else 1f
+                                val deltaYRatio = min(size.height / 2f, abs(rawYDelta)) / (size.height / 2f)
+                                val maxShiftY = ((size.height - size.height * scale) / 2f).coerceAtLeast(0f)
+                                translationY = maxShiftY * deltaYRatio * yDirection
+                                alpha = currentAlpha
                             },
                         ) { dest ->
                             RenderDestination(
@@ -123,24 +164,36 @@ class MainActivity : ComponentActivity() {
                         }
                     }
 
-                    // 返回手势：栈深 > 1 时拦截。手势进度实时映射到 backProgress，
-                    // 松手完成 → animateTo(1f) 让当前屏完全滑出，再 pop + 归零；
+                    // 返回手势：栈深 > 1 时拦截。手势进度实时驱动当前屏的缩小/位移；
+                    // 松手完成 → post-commit 动画（alpha 快速渐隐），再 pop + 归零；
                     // 中途取消 → spring 弹回原位。
                     // 根屏（栈深 ≤ 1）enabled = false，系统接管退出 App 的 predictive back。
                     PredictiveBackHandler(enabled = screenStack.size > 1) { events ->
-                        backProgress.snapTo(0f)
+                        backProgress = 0f
+                        isCommitting = false
+                        var firstEvent = true
                         try {
                             events.collect { e: BackEventCompat ->
-                                backProgress.snapTo(e.progress)
+                                if (firstEvent) {
+                                    touchStartY = e.touchY
+                                    firstEvent = false
+                                }
+                                touchY = e.touchY
+                                swipeEdge = e.swipeEdge
+                                backProgress = e.progress
                             }
-                            // Flow 正常结束 → 手势完成（commit）：先让当前屏继续滑到完全移出，
-                            // 再 pop（换栈顶），最后归零（下一帧顶层已是上一屏，归零无视觉跳变）。
-                            backProgress.animateTo(1f, spring())
+                            // Flow 正常结束 → 手势完成（commit）：post-commit 动画——alpha 快速渐隐，
+                            // 对齐 AOSP 的 max(1 - progress*5, 0)，时长 ~450ms。
+                            isCommitting = true
+                            commitProgress.snapTo(0f)
+                            commitProgress.animateTo(1f, spring())
                             pop()
-                            backProgress.snapTo(0f)
+                            backProgress = 0f
+                            isCommitting = false
                         } catch (c: CancellationException) {
                             // Flow 被取消 → 手势取消：spring 弹回原位。
-                            backProgress.animateTo(0f, spring())
+                            backProgress = 0f
+                            isCommitting = false
                             throw c
                         }
                     }
