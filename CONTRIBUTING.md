@@ -1,6 +1,43 @@
 # 贡献约定
 
-本仓库为个人项目，但也接受自动化 agent（如 ZCode）和未来的协作者提交。本文件固化已形成的代码约定，让每个提交者（人或 agent）在动手前就知道标准，而不是撞墙后才发现。
+本仓库为个人项目，但也接受自动化 agent（如 ZCode）和未来的协作者提交。本文件固化已形成的协作约定，让每个提交者（人或 agent）在动手前就知道标准，而不是撞墙后才发现。
+
+## Git 协作约定
+
+开 PR 前先读本节。仓库 GitHub 设置已锁死合并方式；不写下来只能撞墙后才发现。
+
+### 合并策略
+
+- **只用 merge commit**（`Merge pull request #N from …`）。仓库设置：`allow_squash_merge = false`、`allow_rebase_merge = false`——squash / rebase 合并会被拒，不要再试。
+- PR 上的多个 commit **保留原样**，不要求压成单 commit；历史应可见完整迭代。
+
+### 分支命名
+
+从最新 `main` 开分支，按类型前缀命名：
+
+| 前缀 | 用途 | 示例 |
+|------|------|------|
+| `feat/<scope>` | 新功能 | `feat/android-navigation` |
+| `fix/<scope>` | bug 修复 | `fix/android-zt-toggle-animation` |
+| `refactor/<scope>` | 重构 | `refactor/atomic-write` |
+| `docs/<scope>` | 文档 | `docs/viewer-config-example` |
+| `test/<scope>` | 测试 | `test/android-jvm-scaffold` |
+| `style/<scope>` | 风格清理 | `style/android-comment-cleanup` |
+| `perf/<scope>` | 性能 | `perf/android-viewerclient-reuse` |
+
+### Commit message
+
+采用 Conventional Commits，描述以中文为主（与现有历史一致）：
+
+- 格式：`<type>(<scope>): <描述>`
+- 示例：`feat(android): 导航框架`、`docs(config): 补 [viewer] 段`
+- issue 关联写在 **PR body**（`Closes #N` / `Refs #N`），不要塞进代码注释（见下方「注释规范」）。
+
+### PR 流程
+
+- 从最新 `main` 开分支；PR **base = `main`**。
+- 标题或 body 带 `(closes #N)` / `(refs #N)`（或 PR body 里的 `Closes #N` / `Refs #N`）。
+- 写代码遵循 **on-write**（单一结果、最小 diff）；提交 / 合入前按 **on-submit** 自检（一致性、必要性、无 drive-by）。
 
 ## 注释规范
 
