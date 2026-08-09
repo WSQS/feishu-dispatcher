@@ -532,6 +532,47 @@ class _Daemon:
     # 项目：有效项目表（种子 + 注册）解析 + /project 命令 + register_project 工具
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _classify_path_error(path: str) -> str | None:
+        """按失败原因分类校验注册路径，返回给用户/LLM 的中文报错（合法返回 None）。
+
+        路径合法（已是存在的目录）→ None；否则返回区分原因的消息：
+        - 指到了文件上 →「这是文件不是目录」；
+        - 某一级拼错/不存在 → 指出从哪一级断开，并列出其父目录下的子目录（截断防刷屏）。
+        """
+        p = Path(path)
+        if p.is_dir():
+            return None
+        if p.exists():  # 存在但不是目录
+            return f"这是文件不是目录：{path}"
+        # 逐级向上找最后一个存在的祖先目录，定位断点在哪一级
+        missing_segments: list[str] = []
+        ancestor = p
+        while not ancestor.exists() and ancestor != ancestor.parent:
+            missing_segments.append(ancestor.name)
+            ancestor = ancestor.parent
+        missing_segments.reverse()  # 自顶向下：先断的那一级在最前
+        # 列出祖先下的子目录，方便用户对照纠正拼写（截断防刷屏）
+        siblings: list[str] = []
+        try:
+            siblings = sorted(
+                child.name for child in ancestor.iterdir() if child.is_dir()
+            )
+        except OSError:
+            pass  # 无权限或祖先本身也不可达（如不存在的盘符）→ 不列子目录
+        cap = 10
+        if len(siblings) > cap:
+            siblings = siblings[:cap] + [f"...（共 {len(siblings)} 个）"]
+        hint = ancestor.name or str(ancestor)
+        parts = [f"路径不存在：{path}", f"从「{missing_segments[0]}」这一级开始找不到"]
+        if siblings:
+            parts.append(f"「{hint}」下的子目录：" + "、".join(siblings))
+        else:
+            parts.append(
+                f"「{hint}」下没有可列出的子目录（可能是拼写错误或盘符不存在）。"
+            )
+        return "\n".join(parts)
+
     def _all_projects(self) -> dict[str, Project]:
         """有效项目表：config.toml 种子（cfg.projects）+ 运行时注册（projects.json）。
 
@@ -564,9 +605,10 @@ class _Daemon:
         if agent not in self.cfg.agents:
             known = ", ".join(self.cfg.agents) or "(无)"
             return False, f"未知 agent '{agent}'。已配置 agent: {known}"
+        err = self._classify_path_error(path)
+        if err is not None:
+            return False, err
         p = Path(path)
-        if not p.is_dir():
-            return False, f"路径不存在或不是目录：{path}"
         warn = ""
         if not (p / ".git").exists():
             warn = "（注意：该目录不是 git 仓库，P1 并发 worktree 隔离将无法启用）"
