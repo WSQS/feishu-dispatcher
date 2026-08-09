@@ -25,7 +25,7 @@ import dev.sopho.fdx.client.network.ViewerClient
 /**
  * 文件树页：调 [ViewerClient.tree] 显示 project 的文件列表（扁平）。
  *
- * 点击文件暂不跳转（文件内容页后续做）。
+ * 点击文件暂不跳转。
  */
 @Composable
 fun TreeScreen(

@@ -32,6 +32,6 @@ data class Connection(
     val token: String = "",
     val zerotier: ZerotierConfig = ZerotierConfig(),
 ) {
-    /** 简单非空校验（地址、token 必填；正式格式校验留后续）。ZT 配置用 [zerotier.isValid]。 */
+    /** 简单非空校验（地址、token 必填）。ZT 配置用 [zerotier.isValid]。 */
     val isValid: Boolean get() = url.isNotBlank() && token.isNotBlank()
 }

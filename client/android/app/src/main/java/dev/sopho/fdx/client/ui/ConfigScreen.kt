@@ -196,7 +196,7 @@ fun ConfigScreen(
  * 中间态（Loading）通过 ZtManager.state 观察但不在这返回（简化：只返回最终态）。
  *
  * 注：本函数 suspend，调用方在 scope.launch 里调。中间 loading 提示靠 ZtManager.state
- * 流——v1 简化版直接等最终态，分阶段提示留后续增强。
+ * 流——v1 简化版直接等最终态。
  */
 private suspend fun runTest(connection: Connection, storagePath: String): TestState {
     val url = connection.url.trim()
