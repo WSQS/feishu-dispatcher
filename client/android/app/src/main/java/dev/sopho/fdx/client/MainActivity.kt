@@ -79,6 +79,7 @@ class MainActivity : ComponentActivity() {
                     Box(Modifier.fillMaxSize()) {
                         // 底层（Z 序在下）：返回手势期间渲染上一屏（逐渐露出）。
                         // backProgress 为 0 时不渲染（正常状态只有顶层）。预览不可交互（回调 no-op）。
+                        // alpha 随手势进度渐显，和顶层当前屏的渐隐配合。
                         if (backProgress.value > 0f && screenStack.size > 1) {
                             val prevDest = screenStack[screenStack.size - 2]
                             RenderDestination(
@@ -88,10 +89,13 @@ class MainActivity : ComponentActivity() {
                                 client = client,
                                 onConnected = {},
                                 onProjectClick = {},
+                                modifier = Modifier.graphicsLayer {
+                                    alpha = backProgress.value
+                                },
                             )
                         }
 
-                        // 顶层：当前屏。手势期间向右滑 + 轻微缩放，让底层露出。
+                        // 顶层：当前屏。手势期间向右滑 + 轻微缩放 + 渐隐，让底层露出。
                         // 前进（push）路径用对称 fade；返回路径由 PredictiveBackHandler 的手势进度驱动。
                         AnimatedContent(
                             targetState = screenStack.last(),
@@ -102,6 +106,7 @@ class MainActivity : ComponentActivity() {
                                 val scale = 1f - 0.05f * backProgress.value
                                 scaleX = scale
                                 scaleY = scale
+                                alpha = 1f - backProgress.value
                             },
                         ) { dest ->
                             RenderDestination(
@@ -119,7 +124,8 @@ class MainActivity : ComponentActivity() {
                     }
 
                     // 返回手势：栈深 > 1 时拦截。手势进度实时映射到 backProgress，
-                    // 松手完成 → pop；中途取消 → spring 弹回。
+                    // 松手完成 → animateTo(1f) 让当前屏完全滑出，再 pop + 归零；
+                    // 中途取消 → spring 弹回原位。
                     // 根屏（栈深 ≤ 1）enabled = false，系统接管退出 App 的 predictive back。
                     PredictiveBackHandler(enabled = screenStack.size > 1) { events ->
                         backProgress.snapTo(0f)
@@ -127,7 +133,9 @@ class MainActivity : ComponentActivity() {
                             events.collect { e: BackEventCompat ->
                                 backProgress.snapTo(e.progress)
                             }
-                            // Flow 正常结束 → 手势完成（commit）：pop 后重置进度，AnimatedContent 接管 fade 切换。
+                            // Flow 正常结束 → 手势完成（commit）：先让当前屏继续滑到完全移出，
+                            // 再 pop（换栈顶），最后归零（下一帧顶层已是上一屏，归零无视觉跳变）。
+                            backProgress.animateTo(1f, spring())
                             pop()
                             backProgress.snapTo(0f)
                         } catch (c: CancellationException) {
@@ -151,6 +159,7 @@ private fun RenderDestination(
     client: ViewerClient?,
     onConnected: (ViewerClient) -> Unit,
     onProjectClick: (String) -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     when (dest) {
         is Destination.Config -> ConfigScreen(
@@ -158,18 +167,19 @@ private fun RenderDestination(
             storagePath = storagePath,
             // onConnected 接收已建好并测过 health 的 client（复用，不再重建）。
             onConnected = onConnected,
+            modifier = modifier,
         )
 
         is Destination.ProjectList -> {
             // client 在 onConnected 中先于 push(ProjectList) 赋值，
             // 故到达此分支时 client 非空（与原 when 中 c != null 同义）。
             val c = client!!
-            ProjectListScreen(client = c, onProjectClick = onProjectClick)
+            ProjectListScreen(client = c, onProjectClick = onProjectClick, modifier = modifier)
         }
 
         is Destination.Tree -> {
             val c = client!!
-            TreeScreen(client = c, projectName = dest.projectName)
+            TreeScreen(client = c, projectName = dest.projectName, modifier = modifier)
         }
     }
 }
