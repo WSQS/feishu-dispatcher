@@ -167,7 +167,7 @@ def test_flush_fsyncs_data(tmp_path: Path, monkeypatch):
     """落盘时对临时文件 fsync（把数据真正刷到盘，防掉电后原子改名指向未写入的块）。"""
     import os
 
-    import feishu_dispatcher.store as store_mod
+    import feishu_dispatcher._atomic as atomic_mod
 
     calls = []
     real_fsync = os.fsync
@@ -176,7 +176,7 @@ def test_flush_fsyncs_data(tmp_path: Path, monkeypatch):
         calls.append(fd)
         return real_fsync(fd)
 
-    monkeypatch.setattr(store_mod.os, "fsync", spy)
+    monkeypatch.setattr(atomic_mod.os, "fsync", spy)
     make(TaskStore(tmp_path / "tasks.json"))
     assert calls  # 至少 fsync 了临时文件
 
