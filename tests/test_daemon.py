@@ -1623,7 +1623,7 @@ async def test_model_command_unsupported_agent():
 
 
 # ---------------------------------------------------------------------- #
-# 话题内 /agent：跨后端切换（#52 选项 1+2：无状态切换 + git diff 摘要交接）
+# 话题内 /agent：跨后端切换（无状态切换 + git diff 摘要交接）
 # ---------------------------------------------------------------------- #
 
 
@@ -1668,7 +1668,7 @@ async def test_agent_command_same_agent_is_noop():
 
 
 async def test_agent_switch_closes_old_starts_new_with_handoff():
-    # 切换核心（#52 选项 1+2）：关旧 agent、起新 agent、把交接摘要作为新 agent 首条 prompt；
+    # 切换核心：关旧 agent、起新 agent、把交接摘要作为新 agent 首条 prompt；
     # 台账 agent_label 更新、agent_history 记轨迹。
     store = TaskStore(None)
     daemon, bridge, created = await _run_for_agent_switch(store)
@@ -1733,7 +1733,7 @@ async def test_agent_command_documented_in_thread_usage():
 
 
 async def test_task_command_shows_agent_history_trail():
-    # /task 展示切换轨迹（#52）：首任 + 每次 /agent 切换的目标
+    # /task 展示切换轨迹：首任 + 每次 /agent 切换的目标
     store = TaskStore(None)
     daemon, bridge, created = await _run_for_agent_switch(store)
     await daemon._handle_message(thread_msg("/agent opencode", mid="om_a"))

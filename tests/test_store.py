@@ -124,7 +124,7 @@ def test_failed_is_resumable_not_terminal_and_error_persists(tmp_path: Path):
 
 
 def test_agent_history_default_empty_and_persists(tmp_path: Path):
-    # #52：新 Task 的 agent_history 默认空；update 后落盘并读回。
+    # 新 Task 的 agent_history 默认空；update 后落盘并读回。
     p = tmp_path / "tasks.json"
     s1 = TaskStore(p)
     make(s1, thread="om_1")
@@ -137,7 +137,7 @@ def test_agent_history_default_empty_and_persists(tmp_path: Path):
 
 
 def test_agent_history_backward_compat_missing_field(tmp_path: Path):
-    # #52 向后兼容：老 tasks.json 无 agent_history 键 → 加载时落默认 []，不崩。
+    # 向后兼容：老 tasks.json 无 agent_history 键 → 加载时落默认 []，不崩。
     import json
 
     p = tmp_path / "tasks.json"

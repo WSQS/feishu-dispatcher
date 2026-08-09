@@ -53,7 +53,7 @@ _CANCEL_CMD = "/cancel"
 _DONE_CMD = "/done"
 _CLEAR_CMD = "/clear"
 _MODEL_CMD = "/model"  # 话题内：/model 列出可选，/model <名> 切换
-_AGENT_CMD = "/agent"  # 话题内：/agent 列出可选，/agent <名> 跨 session 切换后端（#52）
+_AGENT_CMD = "/agent"  # 话题内：/agent 列出可选，/agent <名> 跨 session 切换后端
 _RAW_CMD = "/raw"  # 话题内：/raw <文本> 把 <文本> 逐字转发给 agent，绕过话题命令解释
 _PROJECT_CMD = "/project"  # root：/project 列出，/project add|remove 增删
 _MODELS_CMD = "/models"  # root：/models 列缓存，/models refresh [agent] 主动刷新
@@ -199,7 +199,7 @@ def _parse_agent_flag(text: str) -> tuple[str, str]:
     return task, m.group(1)
 
 
-#: 切换 agent 时 git diff 摘要的截断上限（控 prompt 体量；#52 选项 2）
+#: 切换 agent 时 git diff 摘要的截断上限（控 prompt 体量）
 _HANDOFF_DIFF_MAX = 6000
 #: 切换 agent 时 last_output 摘要的截断上限（与 _LAST_OUTPUT_MAX 同量级）
 _HANDOFF_OUTPUT_MAX = 800
@@ -207,7 +207,7 @@ _HANDOFF_OUTPUT_MAX = 800
 
 async def _capture_workspace_diff(cwd: str) -> str:
     """抓工作区当前状态摘要（``git diff HEAD`` + 未跟踪文件清单），供 agent 切换时
-    给新 agent 一个代码层面的「上一轮做了什么」速览（#52 选项 2）。
+    给新 agent 一个代码层面的「上一轮做了什么」速览。
 
     非 git 仓 / 无变更 / git 缺失 → 返回空串（调用方据此省略 diff 段）。非阻塞
     （asyncio 子进程）、带超时；命令失败一律降级为空串，不拖累切换主流程。
@@ -247,7 +247,7 @@ async def _capture_workspace_diff(cwd: str) -> str:
 def _build_agent_handoff(
     *, from_agent: str, to_agent: str, task: Task, diff: str
 ) -> str:
-    """把当前状态压成新 agent 的首条 prompt（#52 选项 2：git diff 摘要交接）。
+    """把当前状态压成新 agent 的首条 prompt（git diff 摘要交接）。
 
     纯函数：只拼串，不碰 IO——便于直接单元测试。``diff`` 空则省略代码层面段，
     仍把项目 / 任务描述 / 上一轮 agent 的收尾回复交给新 agent。
@@ -367,7 +367,7 @@ class _AgentSession:
     bg_token: str = ""
     #: 单消费者 worker，持有 agent 完整生命周期
     worker: "asyncio.Task[None] | None" = None
-    #: agent.start() 完成事件（#52 跨 agent 切换用它同步等 spawn 结果）；spawn_error
+    #: agent.start() 完成事件（跨 agent 切换用它同步等 spawn 结果）；spawn_error
     #: 标记是失败。普通 /run 不读它——切换需要据此决定是否回滚台账。
     spawn_done: "asyncio.Event | None" = None
     spawn_error: bool = False
@@ -1253,7 +1253,7 @@ class _Daemon:
         """收尾一个 session：出注册表、清空输出通道、关 agent 进程。
 
         出注册表用 identity 比对：同一个 thread_root 可能已换成新 session（``/agent``
-        跨后端切换，#52），只能摘掉自己、不能误踢新 session。
+        跨后端切换），只能摘掉自己、不能误踢新 session。
         """
         if self._sessions.get(sess.thread_root_id) is sess:
             self._sessions.pop(sess.thread_root_id, None)
@@ -1410,13 +1410,13 @@ class _Daemon:
     async def _handle_agent_cmd(
         self, sess: _AgentSession, reply_target: str, text: str
     ) -> None:
-        """`/agent` 列出可选后端；`/agent <名>` 跨 session 切换后端（#52 选项 1+2）。
+        """`/agent` 列出可选后端；`/agent <名>` 跨 session 切换后端。
 
         切换 = 无状态换人 + git diff 摘要交接：关旧 agent → 把当前状态压成新 agent
         的首条 prompt → 启动新 agent。对话历史随旧 session 丢失，代码层面上下文
         （git diff + last_output）尽量保留。
 
-        边界（issue #52）：在途 turn 先 cancel 再切；切换不增 max_agents 名额（旧 agent
+        边界：在途 turn 先 cancel 再切；切换不增 max_agents 名额（旧 agent
         先从 _sessions 移除再起新的，净 0）；新 agent 启动失败则回滚台账（保持旧
         agent_label、不写 agent_history），并尝试用旧 session_id load_session 接回旧 agent。
         """
@@ -1445,7 +1445,7 @@ class _Daemon:
     async def _switch_agent(
         self, sess: _AgentSession, new_label: str, reply_target: str
     ) -> None:
-        """执行跨后端切换（关旧 → 摘要交接 → 起新），失败回滚台账（#52）。"""
+        """执行跨后端切换（关旧 → 摘要交接 → 起新），失败回滚台账。"""
         old_label = sess.agent_label
         task = self.store.get(sess.task_id)
         if task is None:
@@ -1467,7 +1467,7 @@ class _Daemon:
             f"🔁 [{task.task_id}] 切换后端 {old_label} → {new_label}（正在准备交接…）",
         )
 
-        # 抓工作区变更摘要（git diff），构建交接 prompt（#52 选项 2）。
+        # 抓工作区变更摘要（git diff），构建交接 prompt。
         diff = await _capture_workspace_diff(sess.cwd)
         handoff = _build_agent_handoff(
             from_agent=old_label, to_agent=new_label, task=task, diff=diff
@@ -1477,7 +1477,7 @@ class _Daemon:
         #    worker（其 finally 会 _close_session 关旧进程——identity-safe，不会误踢新
         #    session）。下面 2-3 步与摘除之间**无 await**，保证 max_agents 不被突破。
         # 2) 乐观更新台账（agent_label + agent_history），等新 agent 启动成功才认账；
-        #    失败则回退（issue #52）。
+        #    失败则回退。
         # 3) 启动新 agent（_launch 重新登记 _sessions，净增 0）。
         self._sessions.pop(sess.thread_root_id, None)
         if sess.worker is not None and not sess.worker.done():
@@ -1696,7 +1696,7 @@ class _Daemon:
         if t.last_output:
             lines.append(f"最近回复: {t.last_output}")
         if t.agent_history:
-            # 切换轨迹（#52）：首任（取自首条 from_agent，老数据缺则标「创建时」）
+            # 切换轨迹：首任（取自首条 from_agent，老数据缺则标「创建时」）
             # + 每次 /agent 切换的目标 agent 与时间。
             trail = [f"  • 首任：{t.agent_history[0].get('from_agent', '?')}（创建）"]
             trail += [
