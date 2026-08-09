@@ -37,9 +37,21 @@ from .scheduler import (
     build_scheduler_tools,
     run_tool_loop,
 )
-from .store import Job, JobStore, ModelStore, ProjectStore, Task, TaskStore
+from .store import (
+    JOB_RUNNING,
+    Job,
+    JobStore,
+    ModelStore,
+    ProjectStore,
+    Task,
+    TaskStore,
+)
 from ._viewer_token import ensure_token
-from .viewer import ViewerServer, health as viewer_health, list_projects as viewer_list_projects
+from .viewer import (
+    ViewerServer,
+    health as viewer_health,
+    list_projects as viewer_list_projects,
+)
 from .viewer import tree as viewer_tree
 
 logger = logging.getLogger(__name__)
@@ -415,7 +427,9 @@ class _Daemon:
         """
         assert self.cfg.viewer is not None
         v = self.cfg.viewer
-        token_path = self._viewer_token_path or DEFAULT_CONFIG_PATH.parent / "viewer.token"
+        token_path = (
+            self._viewer_token_path or DEFAULT_CONFIG_PATH.parent / "viewer.token"
+        )
         token = ensure_token(token_path)
         logger.info(
             "移动端查看器 token（已存 viewer.token，重启不变；填进手机 App）: %s", token
@@ -1032,22 +1046,47 @@ class _Daemon:
         await self._safe_reply(root, base)
         try:
             while True:
-                # 空闲挂起（坑 1）：超时无新回复就关掉 agent 腾出 max_agents 名额，
-                # 但**保留** sessions.json 记录（区别于 /stop 的删除）——之后在本
-                # 话题回复即走 load_session 恢复。<=0 表示不自动挂起。
-                timeout = self.cfg.idle_timeout if self.cfg.idle_timeout > 0 else None
-                try:
-                    prompt = await asyncio.wait_for(sess.queue.get(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    self.store.update(sess.task_id, status="suspended")
-                    await self._safe_reply(
-                        root,
-                        "💤 空闲超时，已挂起该 agent（在本话题回复即自动恢复）。",
+                # #88：有在飞 bg 且队列空 → 立刻挂起腾 max_agents 名额（不必等
+                # idle_timeout）。完成时 `_deliver_bg_result` 会 load_session 唤回；
+                # 挂起 task 仍不合并（#79）。get_nowait 把「空 / 有货」原子化，
+                # 避免 empty 检查与挂起之间漏掉刚入队的完成批次。
+                if self._task_has_running_bg(sess.task_id):
+                    try:
+                        prompt = sess.queue.get_nowait()
+                    except asyncio.QueueEmpty:
+                        self.store.update(sess.task_id, status="suspended")
+                        await self._safe_reply(
+                            root,
+                            "💤 等待后台任务中，已挂起该 agent 以释放名额"
+                            "（完成后自动恢复；也可在本话题回复）。",
+                        )
+                        await self._notify_main(
+                            f"💤 {sess.project_name} 等待后台任务中，已挂起"
+                            "（完成后自动恢复）。"
+                        )
+                        break
+                else:
+                    # 空闲挂起（坑 1）：超时无新回复就关掉 agent 腾出 max_agents 名额，
+                    # 但**保留** sessions.json 记录（区别于 /stop 的删除）——之后在本
+                    # 话题回复即走 load_session 恢复。<=0 表示不自动挂起。
+                    timeout = (
+                        self.cfg.idle_timeout if self.cfg.idle_timeout > 0 else None
                     )
-                    await self._notify_main(
-                        f"💤 {sess.project_name} 已空闲挂起（在其话题回复即自动恢复）。"
-                    )
-                    break
+                    try:
+                        prompt = await asyncio.wait_for(
+                            sess.queue.get(), timeout=timeout
+                        )
+                    except asyncio.TimeoutError:
+                        self.store.update(sess.task_id, status="suspended")
+                        await self._safe_reply(
+                            root,
+                            "💤 空闲超时，已挂起该 agent（在本话题回复即自动恢复）。",
+                        )
+                        await self._notify_main(
+                            f"💤 {sess.project_name} 已空闲挂起"
+                            "（在其话题回复即自动恢复）。"
+                        )
+                        break
                 if prompt is None:
                     status = sess.terminate_status  # stopped(/stop) 或 done(/done)
                     self.store.update(sess.task_id, status=status)  # 保留历史
@@ -1406,6 +1445,7 @@ class _Daemon:
                 "活跃任务:\n"
                 + "\n".join(
                     f"• [{t.task_id}] {t.project_name} · {t.status}"
+                    f"{' · 等 bg' if self._task_has_running_bg(t.task_id) else ''}"
                     f"（{t.turns} 轮）：{t.description[:24]}"
                     for t in active
                 )
@@ -1994,6 +2034,10 @@ class _Daemon:
         head = f"{mark} 后台任务 {job.job_id} {state}（exit {rc} · 用时 {dur}）"
         tail = _clip(_read_tail(job.output_file), 600)
         return f"{head}\n输出（尾部）:\n{tail}" if tail else head
+
+    def _task_has_running_bg(self, task_id: str) -> bool:
+        """本 task 是否仍有在飞的后台 job（#88 立刻挂起判定；``/agents`` 标注）。"""
+        return any(j.status == JOB_RUNNING for j in self.job_store.by_task(task_id))
 
     async def _deliver_bg_result(self, job: Job, rc: int) -> None:
         """把后台任务完成送回对应 task：活跃则合并入队，挂起则恢复，终止则只通知。
