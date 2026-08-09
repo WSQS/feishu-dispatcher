@@ -129,3 +129,10 @@ default_agent = "copilot"
 # path = "C:/path/to/project"
 # default_agent = "opencode"
 # repo = "https://git.corp.com/group/my-other-project"   # 自建 GitLab 示例
+
+# 移动端查看器（viewer）：daemon 内嵌的只读 HTTP 服务，给手机看 workspace 的
+# 文件树/文件/diff。默认关闭——新功能默认安全，需显式开启。
+[viewer]
+enabled = false        # 默认关闭，显式开启
+bind = "0.0.0.0"       # 只走 Tailscale 时填 tailnet 网卡 IP
+port = 7321            # 默认端口
