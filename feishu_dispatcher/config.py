@@ -58,7 +58,7 @@ class ViewerConfig:
     （决策 D6/Q1）。
 
     **token 不在配置里**：永远由 daemon 自动生成 + 持久化到
-    ``~/.feishu-dispatcher/viewer.token`` + 启动时日志打印（决策 Q3/Q8）。token 是纯
+    ``~/.feishu-dispatcher/viewer.token`` + 启动时日志打印。token 是纯
     内部管理的鉴权密钥，用户不碰（见 ``_viewer_token.py``）。
     """
 
@@ -69,7 +69,7 @@ class ViewerConfig:
 
 @dataclass(frozen=True)
 class WebhookConfig:
-    """CI 失败 webhook 回调配置（#54）。
+    """CI 失败 webhook 回调配置。
 
     daemon 内嵌的轻量 HTTP server，收 GitHub Actions（MVP）/ 其它 CI 平台（后续）的
     失败回调 → 匹配项目 → 唤醒/新建 agent 修复。默认关闭（``port=0``，决策与 viewer
@@ -145,7 +145,7 @@ class Config:
     llm_active: str = ""
     #: 移动端查看器配置；None = 配置里没有 [viewer] 段（默认，viewer 不起）。
     viewer: ViewerConfig | None = None
-    #: CI 失败 webhook 配置（#54）；None = 配置里没有 [webhook] 段（默认，webhook 不起）。
+    #: CI 失败 webhook 配置；None = 配置里没有 [webhook] 段（默认，webhook 不起）。
     webhook: WebhookConfig | None = None
 
     @staticmethod
@@ -253,7 +253,7 @@ class Config:
             if viewer_data is not None
             else None
         )
-        # [webhook] 段可选（#54）：没有则 webhook=None（默认不起）。有则解析：port 默认 0
+        # [webhook] 段可选：没有则 webhook=None（默认不起）。有则解析：port 默认 0
         # （关闭）、secret 默认空、allowed_events 默认 (workflow_run, check_run)。
         webhook_data = data.get("webhook")
         webhook = None

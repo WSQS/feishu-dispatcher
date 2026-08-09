@@ -339,9 +339,9 @@ class _Daemon:
     _control: "ControlServer | None" = None
     #: 移动端查看器（只读 HTTP，给手机）；run() 里按 cfg.viewer.enabled 启动，否则 None。
     _viewer: "ViewerServer | None" = None
-    #: CI 失败 webhook（#54）；run() 里按 cfg.webhook.port != 0 启动，否则 None。
+    #: CI 失败 webhook；run() 里按 cfg.webhook.port != 0 启动，否则 None。
     _webhook: "WebhookServer | None" = None
-    #: CI run_id 去重缓存（#54）；run() 里随 webhook 一起建。进程内、TTL 1h。
+    #: CI run_id 去重缓存；run() 里随 webhook 一起建。进程内、TTL 1h。
     _webhook_dedup: DedupCache = field(default_factory=DedupCache)
     #: 后台任务身份表：token → task_id（启 agent 时登记，关 session 时清）。#68
     _bg_tokens: dict[str, str] = field(default_factory=dict)
@@ -387,11 +387,11 @@ class _Daemon:
         self._control.start()
         # 移动端查看器（#104/#107/#111）：只读 HTTP，给手机经私有网络连。默认不起
         # （cfg.viewer 为 None 或 enabled=false）。失败不拖累 daemon —— 记 ERROR 日志、
-        # 飞书功能照常（决策 Q3=β）。token 未填则自动生成 + 持久化（决策 Q3/Q8）。
+        # 飞书功能照常。token 未填则自动生成 + 持久化。
         if self.cfg.viewer and self.cfg.viewer.enabled:
             self._viewer = self._start_viewer(loop)
-        # CI 失败 webhook（#54）：cfg.webhook.port != 0 才起。失败不拖累 daemon——
-        # 记 ERROR 日志、飞书功能照常（同 viewer 决策 Q3=β）。
+        # CI 失败 webhook：cfg.webhook.port != 0 才起。失败不拖累 daemon——
+        # 记 ERROR 日志、飞书功能照常（同 viewer）。
         if self.cfg.webhook and self.cfg.webhook.port:
             self._webhook = self._start_webhook(loop)
         self._bridge.start_background()
@@ -422,8 +422,8 @@ class _Daemon:
 
     def _start_viewer(self, loop: asyncio.AbstractEventLoop) -> ViewerServer | None:
         """拉起移动端查看器（只读 HTTP）。token 永远自动生成 + 持久化 + 日志打印
-        （决策 Q3/Q8，config 里不配 token）；端口/绑定失败记 ERROR、返回 None，
-        不拖累 daemon（Q3=β）。
+        （config 里不配 token）；端口/绑定失败记 ERROR、返回 None，
+        不拖累 daemon。
 
         token 落 ``_viewer_token_path``（run() 注入 = config 同目录 viewer.token）；
         None 时（测试构造 _Daemon 不经 run()）兜底 DEFAULT_CONFIG_PATH 同目录。
@@ -460,7 +460,7 @@ class _Daemon:
             return None
 
     def _start_webhook(self, loop: asyncio.AbstractEventLoop) -> WebhookServer | None:
-        """拉起 CI 失败 webhook（#54）。端口/绑定失败记 ERROR、返回 None，不拖累 daemon。
+        """拉起 CI 失败 webhook。端口/绑定失败记 ERROR、返回 None，不拖累 daemon。
 
         仅当 ``cfg.webhook.secret`` 非空才真正可用——空密钥的 WebhookServer 会拒绝所有
         回调（见 ``webhook.verify_signature``），但仍起 server（让用户从「401」日志发现
@@ -495,7 +495,7 @@ class _Daemon:
     async def _handle_ci_webhook(
         self, body: bytes, headers: dict[str, str]
     ) -> tuple[int, dict]:
-        """``POST /webhook/ci``：解析 GitHub 回调 → 匹配项目 → 唤醒/新建 agent（#54）。
+        """``POST /webhook/ci``：解析 GitHub 回调 → 匹配项目 → 唤醒/新建 agent。
 
         在主 loop 上执行（经 WebhookServer.dispatch marshal 回来）。签名已由 dispatch
         校验。步骤：解析 payload → 失败才继续 → 去重 → 匹配项目 → 命中则唤醒（活跃/挂起
@@ -544,7 +544,7 @@ class _Daemon:
         return 200, {"ok": True, "project": project.name, "result": result}
 
     async def _wake_or_spawn(self, project: Project, failure: "CIFailure") -> str:
-        """按项目现有 Task 状态决定唤醒还是新建（#54 唤醒策略表）。
+        """按项目现有 Task 状态决定唤醒还是新建（唤醒策略表）。
 
         复用既有调度器工具口径：有非终止 Task → ``_sched_send_to_task``（活跃 session
         排队，挂起先 load_session 恢复再入队）；否则 → ``_sched_spawn_agent`` 新建 Task，

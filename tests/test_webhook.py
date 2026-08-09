@@ -1,4 +1,4 @@
-"""CI 失败 webhook（#54）测试。
+"""CI 失败 webhook 测试。
 
 两类：
 1. 纯函数——HMAC 校验、GitHub payload 解析、项目匹配、run_id 去重（无需起 server）。

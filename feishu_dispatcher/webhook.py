@@ -1,4 +1,4 @@
-"""CI 失败 webhook 回调（#54）：daemon 内嵌的轻量 HTTP server，收 GitHub Actions
+"""CI 失败 webhook 回调：daemon 内嵌的轻量 HTTP server，收 GitHub Actions
 （MVP）的失败回调 → 匹配项目 → 唤醒/新建 agent 修复。
 
 与 ``control.py`` / ``viewer.py`` 是同一个模子（daemon 进程内
@@ -14,7 +14,7 @@ daemon 状态（stores / sessions）都只在主 loop 单线程访问，避免�
 一致）。唤醒/新建复用 daemon 既有的 ``send_to_task``（活跃→排队，挂起→load_session
 恢复后入队）与 ``spawn_agent``（无活跃 Task→新建）。
 
-MVP 边界（见 issue #54 与 PR 说明）：仅 GitHub Actions；仅 failure/cancelled/error；
+MVP 边界（见 PR 说明）：仅 GitHub Actions；仅 failure/cancelled/error；
 项目按 ``repository.full_name`` / ``clone_url`` 匹配已配 ``repo`` 的项目；同一
 ``run_id`` 1h 内只触发一次（内存 TTL 缓存）。GitLab/Gitea 解析、完整通知矩阵、反向
 代理文档显式延后。
@@ -47,7 +47,7 @@ _MAX_BODY = 5_000_000
 _DISPATCH_TIMEOUT = 60.0
 #: 签名首部前缀（GitHub 风格：``sha256=<hex>``）
 _SIG_PREFIX = "sha256="
-#: 同一 CI run 的去重窗口（issue #54：TTL ~1h）
+#: 同一 CI run 的去重窗口（TTL ~1h）
 _DEDUP_TTL = 3600.0
 
 

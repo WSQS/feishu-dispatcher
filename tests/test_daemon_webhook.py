@@ -1,4 +1,4 @@
-"""daemon 侧 CI 失败 webhook 处理（#54）：``_handle_ci_webhook`` 的决策路径测试。
+"""daemon 侧 CI 失败 webhook 处理：``_handle_ci_webhook`` 的决策路径测试。
 
 mock 掉 wake/spawn/notify（hermetic），验证：
 - 失败 run + 匹配项目 + 有非终止 Task → 走 send_to_task（唤醒/排队）。

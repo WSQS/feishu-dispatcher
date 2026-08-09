@@ -337,14 +337,14 @@ def test_viewer_section_empty_table_uses_defaults(tmp_path: Path):
 
 
 def test_webhook_section_absent_means_none(tmp_path: Path):
-    # 配置无 [webhook] 段 → Config.webhook is None（默认不起，#54）。
+    # 配置无 [webhook] 段 → Config.webhook is None（默认不起）。
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(_BASE, encoding="utf-8")
     assert Config.load(cfg_file).webhook is None
 
 
 def test_webhook_section_parses_full_values(tmp_path: Path):
-    # [webhook] port/secret/allowed_events → 正确解析成 WebhookConfig（#54）。
+    # [webhook] port/secret/allowed_events → 正确解析成 WebhookConfig。
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(
         _BASE
@@ -361,7 +361,7 @@ def test_webhook_section_parses_full_values(tmp_path: Path):
 
 
 def test_webhook_section_defaults_when_fields_omitted(tmp_path: Path):
-    # [webhook] 段存在但只写 port → secret 默认空、allowed_events 默认两类（#54）。
+    # [webhook] 段存在但只写 port → secret 默认空、allowed_events 默认两类。
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(_BASE + "[webhook]\nport = 9001\n", encoding="utf-8")
     cfg = Config.load(cfg_file)
