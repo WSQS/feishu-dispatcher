@@ -1,6 +1,7 @@
 package dev.sopho.fdx.client.ui
 
 import android.util.Log
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -45,7 +46,7 @@ fun TreeScreen(
             }
     }
 
-    Column(modifier = modifier.fillMaxSize().padding(16.dp)) {
+    Column(modifier = modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).padding(16.dp)) {
         Text(projectName, style = MaterialTheme.typography.titleLarge)
         when {
             error != null -> Text("❌ $error")
