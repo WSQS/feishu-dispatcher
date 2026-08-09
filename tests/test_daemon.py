@@ -18,7 +18,7 @@ from feishu_dispatcher.scheduler import LLMResponse, ToolCall
 from feishu_dispatcher.store import ProjectStore, TaskStore
 
 
-#: spawn 简报前缀（_launch 新会话首轮注入，#87）；FakeAgent 记录 prompt 时剥掉它，
+#: spawn 简报前缀（_launch 新会话首轮注入）；FakeAgent 记录 prompt 时剥掉它，
 #: 让现有「任务文本是否送达」的断言不被简报干扰。
 _BRIEF_PREFIX = _AGENT_BRIEF + "\n\n"
 
@@ -85,7 +85,7 @@ class FakeAgent:
         self.on_output = on_output
         self.on_action = on_action
         self.resume_session_id = resume_session_id
-        # raw_prompts：agent 实际收到的完整 prompt（含 spawn 简报 #87）。
+        # raw_prompts：agent 实际收到的完整 prompt（含 spawn 简报）。
         # prompts：剥掉简报前缀后的版本——现有断言关心「任务文本是否送达」，
         # 不该被简报干扰；简报注入本身由专门的测试用 raw_prompts 验证。
         self.prompts: list[str] = []
@@ -807,7 +807,7 @@ async def test_run_creates_task():
 
 
 async def test_spawn_prepends_bg_brief_on_new_session_only():
-    """#87：新会话首轮 prompt 前缀 `fdx bg run` 简报；恢复（load_session）不重复注入。"""
+    """新会话首轮 prompt 前缀 `fdx bg run` 简报；恢复（load_session）不重复注入。"""
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo 训练模型"))

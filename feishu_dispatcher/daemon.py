@@ -235,7 +235,7 @@ _BG_GUIDANCE = (
     "输出继续：成功就推进下一步，失败/超时就用输出诊断并修复。"
 )
 
-#: spawn 时注入的开工简报（#87）：告诉 agent 长任务用 `fdx bg run`，避免它用
+#: spawn 时注入的开工简报：告诉 agent 长任务用 `fdx bg run`，避免它用
 #: `notifyOnExit` 苦等、阻塞当轮。仅新会话首轮前缀；恢复（load_session）不重复注入。
 #: 简短明确：何时用 / 发起后行为 / 边界（快命令别塞 bg）。
 _AGENT_BRIEF = (
@@ -957,7 +957,7 @@ class _Daemon:
             resume_session_id=resume_session_id,
         )
         if first_prompt is not None:
-            # 新会话首轮前缀后台任务简报（#87）；恢复（resume_session_id）不重复注入——
+            # 新会话首轮前缀后台任务简报；恢复（resume_session_id）不重复注入——
             # 恢复的首轮是接续/bg 完成批次，agent 已有 fdx 上下文。
             if resume_session_id is None:
                 first_prompt = f"{_AGENT_BRIEF}\n\n{first_prompt}"
