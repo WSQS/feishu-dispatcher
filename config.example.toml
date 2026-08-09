@@ -131,9 +131,9 @@ default_agent = "copilot"
 # repo = "https://git.corp.com/group/my-other-project"   # 自建 GitLab 示例
 
 # 移动端查看器（viewer）：daemon 内嵌的只读 HTTP 服务，给手机看 workspace 的
-# 文件树/文件/diff。默认关——新功能默认安全，需显式开启才起。
+# 文件树/文件/diff。默认关闭——新功能默认安全，需显式开启。
 [viewer]
-enabled = false        # 默认关，显式开启才起（决策 Q2）
-bind = "0.0.0.0"       # 想只走 Tailscale 就填 tailnet 网卡 IP（决策 D6）
-port = 7321            # 默认端口（决策 Q1）
-# token 不配：永远自动生成 + 存 viewer.token + 日志打印（决策 Q3/Q8）
+enabled = false        # 默认关闭，显式开启
+bind = "0.0.0.0"       # 只走 Tailscale 时填 tailnet 网卡 IP
+port = 7321            # 默认端口
+# token 不配：永远自动生成 + 存 viewer.token + 日志打印
