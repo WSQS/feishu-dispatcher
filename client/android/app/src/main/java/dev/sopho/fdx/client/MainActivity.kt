@@ -51,29 +51,29 @@ class MainActivity : ComponentActivity() {
                     // 连接成功建一次，随导航在各屏间传递（与原逻辑一致，只是改为按栈顶渲染）。
                     var client by remember { mutableStateOf<ViewerClient?>(null) }
 
-                    // 手动返回栈：栈底恒为 Config（根屏）。navigate push，popBack pop。
-                    val backStack = remember { mutableStateListOf<Destination>(Destination.Config) }
+                    // 屏幕栈：栈底恒为 Config（根屏）。push 压入新屏，pop 弹回上一屏。
+                    val screenStack = remember { mutableStateListOf<Destination>(Destination.Config) }
 
-                    fun navigate(dest: Destination) {
+                    fun push(dest: Destination) {
                         // 同目的地不重复压栈（避免连点造成栈里塞多个相同项）。
-                        if (backStack.last() != dest) backStack.add(dest)
+                        if (screenStack.last() != dest) screenStack.add(dest)
                     }
 
-                    fun popBack(): Boolean {
-                        if (backStack.size <= 1) return false
-                        backStack.removeAt(backStack.lastIndex)
+                    fun pop(): Boolean {
+                        if (screenStack.size <= 1) return false
+                        screenStack.removeAt(screenStack.lastIndex)
                         return true
                     }
 
                     // 系统返回键：栈深 > 1 时拦截，回到上一屏；仅根屏时放行系统默认（退出 App）。
-                    BackHandler(enabled = backStack.size > 1) { popBack() }
+                    BackHandler(enabled = screenStack.size > 1) { pop() }
 
                     // 按栈顶渲染，加细微过渡（淡入淡出）。
                     // 注：这里用对称 fade 而非带方向的横滑——AnimatedContent 的 transitionSpec
                     // 仅凭 targetState/initialState 无法可靠区分前进/后退，带方向会出现反向动画。
-                    // 后续若需要方向化过渡，可在 navigate/popBack 时记一个状态再据此选择 enter/exit。
+                    // 后续若需要方向化过渡，可在 push/pop 时记一个状态再据此选择 enter/exit。
                     AnimatedContent(
-                        targetState = backStack.last(),
+                        targetState = screenStack.last(),
                         transitionSpec = { fadeIn() togetherWith fadeOut() },
                         label = "navTransition",
                     ) { dest ->
@@ -83,17 +83,17 @@ class MainActivity : ComponentActivity() {
                                 storagePath = applicationContext.filesDir.absolutePath,
                                 onConnected = { conn ->
                                     client = ViewerClient.fromConnection(conn)
-                                    navigate(Destination.ProjectList)
+                                    push(Destination.ProjectList)
                                 },
                             )
 
                             is Destination.ProjectList -> {
-                                // client 在 onConnected 中先于 navigate(ProjectList) 赋值，
+                                // client 在 onConnected 中先于 push(ProjectList) 赋值，
                                 // 故到达此分支时 client 非空（与原 when 中 c != null 同义）。
                                 val c = client!!
                                 ProjectListScreen(
                                     client = c,
-                                    onProjectClick = { name -> navigate(Destination.Tree(name)) },
+                                    onProjectClick = { name -> push(Destination.Tree(name)) },
                                 )
                             }
 
