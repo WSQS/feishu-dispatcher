@@ -174,7 +174,7 @@ class TaskStore:
         self._keep = keep_terminal
         self._tasks: dict[str, Task] = {}
         self._seq = 0  # 单调计数器，永不复用
-        #: 动作日志脏标记（#17）：add_action/update_action_status 只置脏不落盘，
+        #: 动作日志脏标记：add_action/update_action_status 只置脏不落盘，
         #: 由 daemon 在回合边界/终止态调 flush_dirty 批量刷盘，避免每个 tool_call
         #: 事件都写盘（chatty agent 一轮可发几十条 tool_call_update）。
         self._actions_dirty = False
@@ -294,7 +294,7 @@ class TaskStore:
     def add_action(self, task_id: str, action: dict) -> None:
         """追加一条动作到任务的审计日志（超 ``_MAX_ACTIONS`` 丢最旧），仅置脏不落盘。
 
-        批量刷盘（#17）：tool_call 事件高频，每条都写盘会让 chatty agent 一轮刷几十
+        批量刷盘：tool_call 事件高频，每条都写盘会让 chatty agent 一轮刷几十
         次盘。这里只改内存 + 置 ``_actions_dirty``，由 daemon 在回合边界调
         :meth:`flush_dirty` 统一刷。Task 其余字段的写入（status/turns…）仍即时落盘，
         回合收尾的 ``update()`` 之后必跟一次 ``flush_dirty``，故动作最迟在回合结束时持久化。
@@ -311,7 +311,7 @@ class TaskStore:
     def update_action_status(
         self, task_id: str, tool_call_id: str, status: str
     ) -> None:
-        """按 ``tool_call_id`` 给最近一条同名动作补完成/失败状态（#17），仅置脏不落盘。
+        """按 ``tool_call_id`` 给最近一条同名动作补完成/失败状态，仅置脏不落盘。
 
         匹配**末尾**最近一条 ``tool_call_id`` 相同且尚无 status 的动作（同 id 的旧条目
         已结算则不再回填）。tool_call 首次通告与 tool_call_update 分两条事件到达，按 id
@@ -328,7 +328,7 @@ class TaskStore:
                 return
 
     def flush_dirty(self) -> None:
-        """若有动作日志变更未落盘，刷一次盘并清脏标记（批量刷盘，#17）。
+        """若有动作日志变更未落盘，刷一次盘并清脏标记（批量刷盘）。
 
         TaskStore 单线程访问（单 daemon event loop，无并发），脏标记 + 一次性 flush 即可，
         无需加锁。无变更时 no-op（避免空写）。

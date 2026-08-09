@@ -248,13 +248,13 @@ def test_add_action_appends_and_persists(tmp_path: Path):
     s.add_action("t1", {"turn": 1, "kind": "edit", "title": "Editing a.py"})
     s.add_action("t1", {"turn": 1, "kind": "execute", "title": "pytest"})
     assert [a["title"] for a in s.get("t1").actions] == ["Editing a.py", "pytest"]
-    # 批量刷盘（#17）：add_action 只置脏不落盘，flush_dirty 才真正写盘
+    # 批量刷盘：add_action 只置脏不落盘，flush_dirty 才真正写盘
     s.flush_dirty()
     assert len(TaskStore(p).get("t1").actions) == 2
 
 
 def test_add_action_does_not_flush_until_flush_dirty(tmp_path: Path):
-    # 批量刷盘（#17）：多条 add_action 之间不写盘，flush_dirty 只写一次
+    # 批量刷盘：多条 add_action 之间不写盘，flush_dirty 只写一次
     p = tmp_path / "tasks.json"
     s = TaskStore(p)
     make(s, thread="om_1")
@@ -271,7 +271,7 @@ def test_add_action_does_not_flush_until_flush_dirty(tmp_path: Path):
 
 
 def test_update_action_status_backfills_by_tool_call_id():
-    # tool_call_update 完成状态：按 tool_call_id 回填到已记录的起始动作（#17）
+    # tool_call_update 完成状态：按 tool_call_id 回填到已记录的起始动作
     s = TaskStore(None)
     make(s, thread="om_1")
     s.add_action("t1", {"turn": 1, "kind": "edit", "title": "Editing a.py", "tool_call_id": "tc1"})

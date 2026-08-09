@@ -62,7 +62,7 @@ def test_extract_action_from_tool_call():
 
 
 def test_extract_action_includes_detail_when_present():
-    # 文件路径细节：复用 _extract_tool_detail，能取到就带上（#17 文件路径部分）
+    # 文件路径细节：复用 _extract_tool_detail，能取到就带上（文件路径部分）
     action = _extract_action(
         start_tool_call(
             "e1",
@@ -80,7 +80,7 @@ def test_extract_action_ignores_message_and_thought():
 
 
 def test_extract_action_from_tool_call_completion_update():
-    # 完成状态更新：返回 {tool_call_id, status} 供上层按 id 回填（#17）
+    # 完成状态更新：返回 {tool_call_id, status} 供上层按 id 回填
     upd = update_tool_call("tc1", title="Editing src/foo.py", status="completed")
     assert _extract_action(upd) == {"tool_call_id": "tc1", "status": "completed"}
 

@@ -922,7 +922,7 @@ class _Daemon:
             # 起始通告（带 title）追加一条并标「进行中的回合号」（= 已完成回合数 + 1，
             # 回合结束时 worker 才递增 turns）；终态更新（带 status completed/failed）
             # 按 tool_call_id 回填到已记录的动作上。两者都只置脏、由 worker 在回合
-            # 边界 flush_dirty 批量刷盘（#17），避免每个 tool_call 事件都写盘。
+            # 边界 flush_dirty 批量刷盘，避免每个 tool_call 事件都写盘。
             status = action.get("status")
             if status is not None:
                 tcid = action.get("tool_call_id", "")
@@ -1099,7 +1099,7 @@ class _Daemon:
                         # 不发完成通知）。卡片置停止态；随后循环取到 None 哨兵即终止。
                         await channel.set_status("stopped")
                         self.store.update(sess.task_id, status="idle")
-                        self.store.flush_dirty()  # 回合边界批量刷审计动作（#17）
+                        self.store.flush_dirty()  # 回合边界批量刷审计动作
                         logger.info("任务 %s 本轮被取消", sess.task_id)
                         continue
                     # footer 追加本轮 token 用量（#53）：取不到就不显示、不报错。
@@ -1125,7 +1125,7 @@ class _Daemon:
                         last_output=last_output,
                         error_message="",  # 一轮成功即清掉上次异常诊断（恢复成功）
                     )
-                    self.store.flush_dirty()  # 回合边界批量刷审计动作（#17）
+                    self.store.flush_dirty()  # 回合边界批量刷审计动作
                     await self._safe_reply(
                         root, "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）"
                     )
@@ -1145,7 +1145,7 @@ class _Daemon:
                     # failed 不再是终止态：本轮失败但 session 已建，多半能 load_session
                     # 接回——标 failed（可恢复），话题回复即尝试恢复，而非逼用户重开丢上下文。
                     self.store.update(sess.task_id, status="failed", error_message=err)
-                    self.store.flush_dirty()  # 回合边界批量刷审计动作（#17）
+                    self.store.flush_dirty()  # 回合边界批量刷审计动作
                     try:
                         await channel.set_status("error")
                     except Exception:

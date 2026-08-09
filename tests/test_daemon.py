@@ -1302,7 +1302,7 @@ async def test_get_task_includes_action_log():
 
 
 async def test_tool_call_update_marks_action_status():
-    # #17：tool_call_update（completed/failed）按 tool_call_id 回填到已记录动作上
+    # tool_call_update（completed/failed）按 tool_call_id 回填到已记录动作上
     class UpdateAgent(FakeAgent):
         async def prompt(self, text: str) -> None:
             self.prompts.append(text)
