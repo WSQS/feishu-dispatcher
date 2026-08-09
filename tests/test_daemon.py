@@ -84,6 +84,7 @@ class FakeAgent:
         self.available_models: list[str] = []
         self.set_model_calls: list[str] = []
         self.cancel_calls = 0
+        self.stalled = False  # #208：无进展看门狗置位；用户 /cancel 不置
 
     async def start(self) -> None:
         self.start_count += 1
@@ -141,6 +142,7 @@ class CancelableAgent(FakeAgent):
 
     async def prompt(self, text: str) -> str:
         self.prompts.append(text)
+        self.stalled = False
         self.in_prompt.set()
         await self._cancelled.wait()
         self.in_prompt.clear()
@@ -150,6 +152,17 @@ class CancelableAgent(FakeAgent):
     async def cancel(self) -> None:
         self.cancel_calls += 1
         self._cancelled.set()
+
+
+class AutoStallAgent(FakeAgent):
+    """模拟 #208 无进展看门狗：prompt 短暂阻塞后自 cancel，带 stalled=True。"""
+
+    async def prompt(self, text: str) -> str:
+        self.prompts.append(text)
+        await asyncio.sleep(0.02)
+        self.stalled = True
+        self.cancel_calls += 1
+        return "cancelled"
 
 
 class ModelAgent(FakeAgent):
@@ -401,6 +414,32 @@ async def test_cancel_when_idle_reports_nothing_to_cancel():
     await daemon._handle_message(thread_msg("/cancel"))
     assert created[0].cancel_calls == 0
     assert any("没有在跑的轮" in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+async def test_turn_stall_marks_failed_recoverable():
+    # #208：看门狗 cancel（stalled=True）→ failed 可恢复，session 收起
+    daemon, bridge, created = make_daemon(agent_cls=AutoStallAgent)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    task = daemon.store.by_thread("om_root1")
+    assert task is not None
+    assert task.status == "failed"
+    assert "stalled" in (task.error_message or "")
+    assert any("无进展超时" in t for t in bridge.texts("om_root1"))
+    assert created[0].closed
+
+
+async def test_user_cancel_does_not_mark_stalled_failed():
+    # 用户 /cancel（stalled=False）仍回 idle，不误走 failed
+    daemon, bridge, created = make_daemon(agent_cls=CancelableAgent)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].in_prompt.is_set())
+    await daemon._handle_message(thread_msg("/cancel"))
+    await wait_until(lambda: not daemon._sessions["om_root1"].turn_in_flight)
+    assert daemon.store.by_thread("om_root1").status == "idle"
+    assert not created[0].stalled
     await daemon._shutdown()
 
 

@@ -15,6 +15,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
 from typing import Any
@@ -32,6 +33,10 @@ _PROTOCOL_VERSION = 1
 #: 握手（initialize + new/load_session）整体超时秒数默认值（#94）。后端卡在
 #: load_session 时快速失败而非永久冻结；<=0/None = 不超时。可经 config 覆盖。
 _DEFAULT_START_TIMEOUT = 120.0
+
+#: 在途 turn「无进展」看门狗默认秒数（#208 / #45）。基于最近一次 session_update
+#: 时间戳（非总耗时）；静默超时后 cancel。<=0/None = 关闭。可经 config 覆盖。
+_DEFAULT_STALL_TIMEOUT = 900.0
 
 OnOutput = Callable[[str], Awaitable[None]]
 #: 审计动作回调：收到一个 tool_call 时推一条结构化动作（{"kind","title"}）
@@ -70,6 +75,8 @@ class _ClientImpl:
         #: 本轮流式 usage_update 报的「当前 context 占用 token 数」（used），
         #: 作为 PromptResponse.usage 缺失时的回退；每轮 reset_formatter 时清空
         self._usage_used: int | None = None
+        #: 最近一次非抑制 session_update 的 monotonic 时间（#208 无进展看门狗）
+        self._last_progress_at: float = time.monotonic()
 
     def on_connect(self, conn: Any) -> None:  # noqa: D401
         """Agent 侧握手完成时被 SDK 调用。"""
@@ -80,6 +87,8 @@ class _ClientImpl:
         self._fmt.reset()
         self._message_buf.clear()
         self._usage_used = None
+        # 回合起点也算「有进展」——避免冷启动首包前立刻被看门狗误杀
+        self._last_progress_at = time.monotonic()
 
     def last_message(self) -> str:
         """本轮 agent 的最终 message 文本（收尾回复），供 Task.last_output。"""
@@ -89,6 +98,11 @@ class _ClientImpl:
         """本轮流式 usage_update 报的当前 context 占用 token 数；未报则 None。"""
         return self._usage_used
 
+    @property
+    def last_progress_at(self) -> float:
+        """最近一次本轮进展（session_update 或回合起点）的 monotonic 时间。"""
+        return self._last_progress_at
+
     def set_suppress(self, on: bool) -> None:
         """抑制输出转发。恢复会话时 load_session 会重放历史 session/update，
         这些历史已在旧话题里、不该灌进新卡片，故 load 期间抑制。"""
@@ -97,6 +111,8 @@ class _ClientImpl:
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         if self._suppress:
             return
+        # 任何非抑制 update 都算进展（含 usage / tool_call / thought / message）
+        self._last_progress_at = time.monotonic()
         # token 用量（#53）：usage_update 是「当前 context 占用」的流式通告，
         # _StreamFormatter 有意忽略（无可读文本）。这里旁路攒最新一次的 used，
         # 作为 PromptResponse.usage 缺失时的 footer 回退来源。
@@ -540,6 +556,7 @@ class AcpAgent:
         on_action: OnAction | None = None,
         resume_session_id: str | None = None,
         start_timeout: float | None = _DEFAULT_START_TIMEOUT,
+        stall_timeout: float | None = _DEFAULT_STALL_TIMEOUT,
     ) -> None:
         self._spawn = spawn
         self._on_output = on_output
@@ -550,6 +567,10 @@ class AcpAgent:
         self._start_timeout: float | None = (
             start_timeout if start_timeout and start_timeout > 0 else None
         )
+        #: 在途 turn 无进展超时秒数（#208）；<=0 归一化为 None（关闭看门狗）
+        self._stall_timeout: float | None = (
+            stall_timeout if stall_timeout and stall_timeout > 0 else None
+        )
         self._conn: acp.ClientSideConnection | None = None
         self._session_id: str | None = None
         #: 当前模型（opencode/claude 从 new_session config_options 取；copilot 无、留空）
@@ -558,6 +579,8 @@ class AcpAgent:
         self._available_models: list[str] = []
         #: 最近一轮 prompt 的 token 用量（headline 数）；后端不上报则 None
         self._last_usage_tokens: int | None = None
+        #: 本轮是否被无进展看门狗 cancel（与用户 /cancel 区分，供 worker 标 failed）
+        self._stalled = False
         self._transport_ctx: Any = None
         self._proc: Any = None
         self._closed = False
@@ -592,6 +615,11 @@ class AcpAgent:
         前者、claude 两者都给（且 used==total_tokens）、copilot 都不给。都取不到为 None。
         """
         return self._last_usage_tokens
+
+    @property
+    def stalled(self) -> bool:
+        """本轮是否被无进展看门狗取消（#208）。用户 /cancel 不置此位。"""
+        return self._stalled
 
     async def set_model(self, name: str) -> None:
         """切换当前会话的模型（ACP ``session/set_config_option``，config_id="model"）。
@@ -725,15 +753,33 @@ class AcpAgent:
         的 response 返回（agent 结束本轮）后返回。返回值是 ACP 的 stop_reason
         （``"end_turn"`` / ``"cancelled"`` / ``"max_tokens"`` …），供上层区分
         「正常收尾」与被 :meth:`cancel` 「中途取消」。
+
+        若配置了 ``stall_timeout``（#208），并行监视最近 ``session_update`` 时间戳：
+        静默超时则发 :meth:`cancel` 并置 :attr:`stalled`，在途 prompt 通常以
+        ``stop_reason="cancelled"`` 返回（agent 不理会则照常跑完，优雅退化）。
         """
         if self._conn is None or self._session_id is None:
             raise RuntimeError("agent 尚未启动")
         # 每个回合从头开始：重置流式格式化状态，让本轮首个 thought 重新加 💭
+        self._stalled = False
         if self._client_impl is not None:
             self._client_impl.reset_formatter()
-        resp = await self._conn.prompt(
-            session_id=self._session_id, prompt=[text_block(text)]
-        )
+        watch: asyncio.Task[None] | None = None
+        if self._stall_timeout is not None:
+            watch = asyncio.create_task(
+                self._stall_watch(), name=f"turn-stall-{self._session_id}"
+            )
+        try:
+            resp = await self._conn.prompt(
+                session_id=self._session_id, prompt=[text_block(text)]
+            )
+        finally:
+            if watch is not None:
+                watch.cancel()
+                try:
+                    await watch
+                except asyncio.CancelledError:
+                    pass
         # token 用量（#53）：优先响应里的 usage.total_tokens，回退到流式 usage_update
         # 的 used（当前 context 占用）——两处都是 ACP UNSTABLE 特性，取不到即 None。
         tokens = _extract_usage_tokens(resp)
@@ -741,6 +787,32 @@ class AcpAgent:
             tokens = self._client_impl.usage_tokens()
         self._last_usage_tokens = tokens
         return getattr(resp, "stop_reason", "") or ""
+
+    async def _stall_watch(self) -> None:
+        """无进展看门狗：距上次 session_update 超过 stall_timeout 则 cancel（#208）。"""
+        timeout = self._stall_timeout
+        if timeout is None:
+            return
+        # 短超时（测试）也要够密；长超时不必每 50ms 醒一次
+        interval = min(1.0, max(0.05, timeout / 10))
+        while True:
+            await asyncio.sleep(interval)
+            impl = self._client_impl
+            if impl is None:
+                return
+            idle = time.monotonic() - impl.last_progress_at
+            if idle >= timeout:
+                logger.warning(
+                    "turn 无进展超过 %.0fs（session=%s），请求 cancel",
+                    idle,
+                    self._session_id,
+                )
+                self._stalled = True
+                try:
+                    await self.cancel()
+                except Exception:
+                    logger.exception("无进展看门狗 cancel 失败")
+                return
 
     async def cancel(self) -> None:
         """请求 agent 取消当前进行中的 turn（ACP ``session/cancel`` 通知）。

@@ -20,6 +20,8 @@ import pytest
 from feishu_dispatcher.acp_client import (
     AcpAgent,
     AgentSpawn,
+    _Callbacks,
+    _ClientImpl,
     _MethodNotFoundTap,
     _StreamFormatter,
     _extract_action,
@@ -35,12 +37,13 @@ async def _noop_out(_t: str) -> None:
     pass
 
 
-def _agent(start_timeout=5.0, resume=None) -> AcpAgent:
+def _agent(start_timeout=5.0, resume=None, stall_timeout=0) -> AcpAgent:
     return AcpAgent(
         AgentSpawn(command=["x"], cwd="."),
         _noop_out,
         resume_session_id=resume,
         start_timeout=start_timeout,
+        stall_timeout=stall_timeout,
     )
 
 
@@ -513,6 +516,109 @@ def test_start_timeout_normalizes_nonpositive():
     assert _agent(start_timeout=0)._start_timeout is None
     assert _agent(start_timeout=-1)._start_timeout is None
     assert _agent(start_timeout=30)._start_timeout == 30
+
+
+def test_stall_timeout_normalizes_nonpositive():
+    # <=0 关闭看门狗；正值保留（#208）
+    assert _agent(stall_timeout=0)._stall_timeout is None
+    assert _agent(stall_timeout=-1)._stall_timeout is None
+    assert _agent(stall_timeout=900)._stall_timeout == 900
+
+
+async def test_session_update_touches_progress():
+    impl = _ClientImpl(_Callbacks(_noop_out))
+    impl.reset_formatter()
+    t0 = impl.last_progress_at
+    await asyncio.sleep(0.02)
+    await impl.session_update("s", update_agent_message_text("hi"))
+    assert impl.last_progress_at > t0
+
+
+async def test_prompt_stall_cancels_when_no_progress():
+    # prompt 挂起且无 session_update → 看门狗 cancel，stalled=True
+    class _FakeConn:
+        def __init__(self) -> None:
+            self.cancel_calls = 0
+            self._done = asyncio.Event()
+
+        async def prompt(self, **_k):
+            await self._done.wait()
+            return NS(stop_reason="cancelled", usage=None)
+
+        async def cancel(self, **_k):
+            self.cancel_calls += 1
+            self._done.set()
+
+    agent = _agent(stall_timeout=0.15)
+    conn = _FakeConn()
+    agent._conn = conn  # type: ignore[assignment]
+    agent._session_id = "s-stall"
+    agent._client_impl = _ClientImpl(_Callbacks(_noop_out))
+    reason = await agent.prompt("hang")
+    assert reason == "cancelled"
+    assert agent.stalled
+    assert conn.cancel_calls == 1
+
+
+async def test_prompt_stall_disabled_does_not_cancel():
+    # stall_timeout<=0：无看门狗；prompt 自行结束后 stalled 仍 False
+    class _FakeConn:
+        def __init__(self) -> None:
+            self.cancel_calls = 0
+
+        async def prompt(self, **_k):
+            await asyncio.sleep(0.05)
+            return NS(stop_reason="end_turn", usage=None)
+
+        async def cancel(self, **_k):
+            self.cancel_calls += 1
+
+    agent = _agent(stall_timeout=0)
+    conn = _FakeConn()
+    agent._conn = conn  # type: ignore[assignment]
+    agent._session_id = "s-off"
+    agent._client_impl = _ClientImpl(_Callbacks(_noop_out))
+    reason = await agent.prompt("ok")
+    assert reason == "end_turn"
+    assert not agent.stalled
+    assert conn.cancel_calls == 0
+
+
+async def test_prompt_stall_resets_on_session_update():
+    # 持续有 session_update 时不误杀；停更后才 cancel
+    class _FakeConn:
+        def __init__(self) -> None:
+            self.cancel_calls = 0
+            self._done = asyncio.Event()
+
+        async def prompt(self, **_k):
+            await self._done.wait()
+            return NS(stop_reason="cancelled", usage=None)
+
+        async def cancel(self, **_k):
+            self.cancel_calls += 1
+            self._done.set()
+
+    agent = _agent(stall_timeout=0.2)
+    conn = _FakeConn()
+    agent._conn = conn  # type: ignore[assignment]
+    agent._session_id = "s-prog"
+    impl = _ClientImpl(_Callbacks(_noop_out))
+    agent._client_impl = impl
+
+    async def drip():
+        for _ in range(6):
+            await asyncio.sleep(0.08)
+            if conn.cancel_calls:
+                return
+            await impl.session_update("s-prog", update_agent_message_text("."))
+
+    drip_task = asyncio.create_task(drip())
+    reason = await agent.prompt("slow")
+    await drip_task
+    assert reason == "cancelled"
+    assert agent.stalled
+    assert conn.cancel_calls == 1
 
 
 async def test_await_start_passes_through_fast_result():

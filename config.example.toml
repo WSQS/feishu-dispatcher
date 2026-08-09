@@ -36,6 +36,11 @@ max_agents = 7
 # `fdx bg run --timeout N -- <命令>` 单次覆盖。
 # bg_job_timeout = 0
 
+# 在途 turn「无进展」超时（秒）。距最近一次 session_update 超过此值 → cancel 并标
+# failed（可恢复；话题回复即 load_session）。按无进展而非总耗时，避免误杀正常长任务。
+# <=0 = 关闭。默认 900（15 分钟）。
+# turn_stall_timeout = 900
+
 # agent 输出合并窗口（秒）
 throttle_window = 0.5
 
