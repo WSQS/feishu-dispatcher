@@ -1,6 +1,7 @@
 package dev.sopho.fdx.client
 
 import android.os.Bundle
+import android.util.Log
 import androidx.activity.BackEventCompat
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.PredictiveBackHandler
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableIntStateOf
@@ -24,34 +26,39 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.dp
+import dev.sopho.fdx.client.data.Connection
 import dev.sopho.fdx.client.data.ConnectionStore
 import dev.sopho.fdx.client.network.ViewerClient
+import dev.sopho.fdx.client.network.ViewerException
+import dev.sopho.fdx.client.network.ZtManager
+import dev.sopho.fdx.client.network.ZtState
 import dev.sopho.fdx.client.ui.ConfigScreen
 import dev.sopho.fdx.client.ui.ProjectListScreen
+import dev.sopho.fdx.client.ui.ProjectListSession
 import dev.sopho.fdx.client.ui.TreeScreen
 import dev.sopho.fdx.client.ui.theme.FdxViewerTheme
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.first
 import kotlin.math.abs
 import kotlin.math.min
 
 /**
  * 导航目的地：sealed class 表示每个屏 + 它所需的参数。
  *
- * - [Config]：配置/连接页（栈底，根屏）。
- * - [ProjectList]：项目列表（连接成功后进入）。
+ * - [ProjectList]：项目列表（栈底，根屏）；后台用 DataStore 配置建连。
+ * - [Config]：连接设置页（从 ProjectList 齿轮进入，可 push）。
  * - [Tree]：某项目的文件树（点项目进入，带 projectName）。
  *
  * 后续加 FileContent / Diff 屏时，在这里加一个子类即可。
  */
 sealed class Destination {
-    data object Config : Destination()
-
     data object ProjectList : Destination()
+
+    data object Config : Destination()
 
     data class Tree(val projectName: String) : Destination()
 }
@@ -60,15 +67,21 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val store = ConnectionStore(applicationContext)
+        val storagePath = applicationContext.filesDir.absolutePath
         setContent {
             FdxViewerTheme {
                 Surface(modifier = Modifier.fillMaxSize()) {
-                    // 连接得到的 client：ProjectList / Tree 都靠它请求 daemon。
-                    // 连接成功建一次，随导航在各屏间传递（与原逻辑一致，只是改为按栈顶渲染）。
-                    var client by remember { mutableStateOf<ViewerClient?>(null) }
+                    // 根屏会话：启动即进 ProjectList，后台读 DataStore 建连。
+                    var session by remember {
+                        mutableStateOf<ProjectListSession>(ProjectListSession.Connecting)
+                    }
+                    // 递增以触发重试（失败态「重试」或设置页测连成功后也可再走后台路径）。
+                    var connectAttempt by remember { mutableIntStateOf(0) }
 
-                    // 屏幕栈：栈底恒为 Config（根屏）。push 压入新屏，pop 弹回上一屏。
-                    val screenStack = remember { mutableStateListOf<Destination>(Destination.Config) }
+                    // 屏幕栈：栈底恒为 ProjectList（根屏）。push 压入新屏，pop 弹回上一屏。
+                    val screenStack = remember {
+                        mutableStateListOf<Destination>(Destination.ProjectList)
+                    }
 
                     fun push(dest: Destination) {
                         // 同目的地不重复压栈（避免连点造成栈里塞多个相同项）。
@@ -79,6 +92,36 @@ class MainActivity : ComponentActivity() {
                         if (screenStack.size <= 1) return false
                         screenStack.removeAt(screenStack.lastIndex)
                         return true
+                    }
+
+                    fun adoptClient(client: ViewerClient) {
+                        val prev = (session as? ProjectListSession.Ready)?.client
+                        session = ProjectListSession.Ready(client)
+                        if (prev != null && prev !== client) prev.close()
+                    }
+
+                    LaunchedEffect(connectAttempt) {
+                        session = ProjectListSession.Connecting
+                        val conn = store.load()
+                        if (conn == null || !conn.isValid || !conn.zerotier.isValid) {
+                            session = ProjectListSession.Unconfigured
+                            return@LaunchedEffect
+                        }
+                        val client = ViewerClient.fromConnection(conn)
+                        try {
+                            probeConnection(conn, storagePath, client)
+                            adoptClient(client)
+                        } catch (c: CancellationException) {
+                            client.close()
+                            throw c
+                        } catch (e: Exception) {
+                            client.close()
+                            Log.w("MainActivity", "background connect failed", e)
+                            // 设置页可能已先连上：失败时不要盖掉 Ready。
+                            if (session !is ProjectListSession.Ready) {
+                                session = ProjectListSession.Failed(formatConnectError(e))
+                            }
+                        }
                     }
 
                     // 返回手势状态——对齐 AOSP CrossActivityBackAnimation 的动效参数：
@@ -93,7 +136,7 @@ class MainActivity : ComponentActivity() {
                     val commitProgress = remember { Animatable(0f) }
                     val screenHeightPx = with(LocalDensity.current) { LocalDensity.current.run { 0.dp } }
 
-                    Box(Modifier.fillMaxSize()) {
+                    Box(modifier = Modifier.fillMaxSize()) {
                         // 底层（Z 序在下）：返回手势期间渲染上一屏（原地不动，被缩小的当前屏露出）。
                         // backProgress 为 0 时不渲染（正常状态只有顶层）。预览不可交互（回调 no-op）。
                         if (backProgress > 0f && screenStack.size > 1) {
@@ -101,9 +144,11 @@ class MainActivity : ComponentActivity() {
                             RenderDestination(
                                 dest = prevDest,
                                 store = store,
-                                storagePath = applicationContext.filesDir.absolutePath,
-                                client = client,
+                                storagePath = storagePath,
+                                session = session,
                                 onConnected = {},
+                                onOpenSettings = {},
+                                onRetryConnect = {},
                                 onProjectClick = {},
                             )
                         }
@@ -153,12 +198,11 @@ class MainActivity : ComponentActivity() {
                             RenderDestination(
                                 dest = dest,
                                 store = store,
-                                storagePath = applicationContext.filesDir.absolutePath,
-                                client = client,
-                                onConnected = { c ->
-                                    client = c
-                                    push(Destination.ProjectList)
-                                },
+                                storagePath = storagePath,
+                                session = session,
+                                onConnected = { c -> adoptClient(c) },
+                                onOpenSettings = { push(Destination.Config) },
+                                onRetryConnect = { connectAttempt += 1 },
                                 onProjectClick = { name -> push(Destination.Tree(name)) },
                             )
                         }
@@ -209,8 +253,10 @@ private fun RenderDestination(
     dest: Destination,
     store: ConnectionStore,
     storagePath: String,
-    client: ViewerClient?,
+    session: ProjectListSession,
     onConnected: (ViewerClient) -> Unit,
+    onOpenSettings: () -> Unit,
+    onRetryConnect: () -> Unit,
     onProjectClick: (String) -> Unit,
     modifier: Modifier = Modifier,
 ) {
@@ -223,16 +269,45 @@ private fun RenderDestination(
             modifier = modifier,
         )
 
-        is Destination.ProjectList -> {
-            // client 在 onConnected 中先于 push(ProjectList) 赋值，
-            // 故到达此分支时 client 非空（与原 when 中 c != null 同义）。
-            val c = client!!
-            ProjectListScreen(client = c, onProjectClick = onProjectClick, modifier = modifier)
-        }
+        is Destination.ProjectList -> ProjectListScreen(
+            session = session,
+            onOpenSettings = onOpenSettings,
+            onRetryConnect = onRetryConnect,
+            onProjectClick = onProjectClick,
+            modifier = modifier,
+        )
 
         is Destination.Tree -> {
-            val c = client!!
-            TreeScreen(client = c, projectName = dest.projectName, modifier = modifier)
+            val client = (session as? ProjectListSession.Ready)?.client
+            if (client != null) {
+                TreeScreen(client = client, projectName = dest.projectName, modifier = modifier)
+            }
         }
     }
+}
+
+/**
+ * 启 ZT（若需要）并对 [client] 调 health。成功不关 client；失败抛给调用方关闭。
+ * 与 ConfigScreen 测试连接同路径（后台自动连复用同一语义）。
+ */
+private suspend fun probeConnection(
+    connection: Connection,
+    storagePath: String,
+    client: ViewerClient,
+) {
+    if (connection.zerotier.enabled) {
+        ZtManager.startNode(
+            storagePath,
+            connection.zerotier.networkId.trim(),
+            connection.zerotier.moonId.trim(),
+        )
+        val ready = ZtManager.state.first { it is ZtState.NetworkReady || it is ZtState.Error }
+        if (ready is ZtState.Error) error("ZT: ${ready.message}")
+    }
+    client.health()
+}
+
+private fun formatConnectError(e: Exception): String = when (e) {
+    is ViewerException -> "${e.kind}: ${e.message}"
+    else -> "${e.javaClass.simpleName}: ${e.message}"
 }
