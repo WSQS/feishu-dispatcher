@@ -24,11 +24,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.unit.dp
 import dev.sopho.fdx.client.data.ConnectionStore
 import dev.sopho.fdx.client.network.ViewerClient
 import dev.sopho.fdx.client.ui.ConfigScreen
@@ -91,7 +88,6 @@ class MainActivity : ComponentActivity() {
                     var swipeEdge by remember { mutableIntStateOf(BackEventCompat.EDGE_LEFT) }
                     var isCommitting by remember { mutableStateOf(false) }
                     val commitProgress = remember { Animatable(0f) }
-                    val screenHeightPx = with(LocalDensity.current) { LocalDensity.current.run { 0.dp } }
 
                     Box(Modifier.fillMaxSize()) {
                         // 底层（Z 序在下）：返回手势期间渲染上一屏（原地不动，被缩小的当前屏露出）。
