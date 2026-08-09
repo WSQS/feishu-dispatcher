@@ -7,7 +7,7 @@
   ``--discover`` 体验）；之后重启调 :func:`load_token` 读回，token 稳定不变。
 
 token 文件是**纯文本**（就一行 token 字符串），落在 config 同目录
-``~/.feishu-dispatcher/viewer.token``（决策 Q8，不回写 config.toml）。原子写：调共享
+``~/.feishu-dispatcher/viewer.token``（不回写 config.toml）。原子写：调共享
 原语 ``_atomic.atomic_write(keep_bak=False)``（temp + fsync + replace + fsync_dir），
 **不留 .bak** —— token 丢了重新生成就行，不需要历史回退。
 """

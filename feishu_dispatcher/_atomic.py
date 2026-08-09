@@ -1,7 +1,7 @@
 """共享原子写工具：temp + fsync + replace + fsync_dir 的持久化原语。
 
 抽自 ``store._atomic_write_json`` 与 ``_viewer_token._atomic_write_text`` 两份重复
-实现（#113）。原语本身**不关心格式**：调用方负责序列化（JSON 调 ``json.dumps``，
+实现。原语本身**不关心格式**：调用方负责序列化（JSON 调 ``json.dumps``，
 纯文本直接传字符串），本模块只拿到已序列化的文本落盘。
 
 统一前两处差异：

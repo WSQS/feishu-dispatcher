@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # 三件事把这个窗口关掉：写临时文件后 fsync 让数据真正落盘、保留 .bak 作回退源、读
 # 损坏时存档而非静默清空（守住 task_id/seq 单调，避免撞回旧 id）。
 #
-# 持久化原语（temp+fsync+replace+fsync_dir）已抽到 ``_atomic.py`` 共享（#113）。
+# 持久化原语（temp+fsync+replace+fsync_dir）已抽到 ``_atomic.py`` 共享。
 
 
 def _atomic_write_json(path: Path, payload: dict) -> None:
