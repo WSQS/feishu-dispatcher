@@ -1135,7 +1135,7 @@ class _Daemon:
                         self.store.update(sess.task_id, status="idle")
                         logger.info("任务 %s 本轮被取消", sess.task_id)
                         continue
-                    # footer 追加本轮 token 用量（#53）：取不到就不显示、不报错。
+                    # footer 追加本轮 token 用量：取不到就不显示、不报错。
                     # 只标脏，紧随的 set_status("done") 会把新 footer 一起 emit。
                     tokens = getattr(sess.agent, "last_usage_tokens", None)
                     if tokens is not None and hasattr(channel, "set_footer"):

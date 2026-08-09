@@ -744,7 +744,7 @@ async def test_card_mode_footer_shows_token_usage():
     all_cards = bridge.card_replies + bridge.card_patches
     last_card = all_cards[-1][1]
     foot = last_card["body"]["elements"][-1]["content"]
-    # footer = 模型 · token 用量（#53）；默认 model 模式不含项目名
+    # footer = 模型 · token 用量；默认 model 模式不含项目名
     assert "ns-deepseek/deepseek-v4-pro" in foot
     assert "~3.2k tok" in foot
 
