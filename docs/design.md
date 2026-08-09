@@ -186,6 +186,45 @@ Agent(后端类型+能力) ◄── Task 引用
   - 终止任务默认不自动恢复（可显式 `resume_task`）；`suspended` 才「回复即无缝恢复」。历史留最近 N（+ `/clear`）。
 - **交互落点**：话题回复 → `thread_root_id` → Task → 它的 Session（挂起先 `load_session`）；主线 → 调度器 → 按 `task_id` 操作 Task。
 
+## forge-native MVP（可选 issue 绑定，#49 / #215）
+
+> 父方向 epic [#49](https://github.com/WSQS/feishu-dispatcher/issues/49)；MVP 切片索引 [#215](https://github.com/WSQS/feishu-dispatcher/issues/215)。本节省去重开讨论——决策已裁定并合入 master，供后续 epic 工作锚定。
+
+### 设计红线
+
+**长对话保持默认；issue 绑定是可选 promotion**（工作够格才升级），**不为每次交互强制 issue-first**（[#49 裁定](https://github.com/WSQS/feishu-dispatcher/issues/49#issuecomment-5043003469)）。强化方向，不是替换。
+
+### MVP 模型
+
+- **Task 缩为运行态句柄**：session / thread / workspace / status + **可选** `issue_url`（意图锚）。**不存 `pr_url`**——PR 是输出、经 forge 原生 `Closes #N` 反查即可，不在 Task 冗余。
+- **绑定 = 控制平面状态**：派活时经 `spawn_agent(..., issue=)` 由控制平面（人/调度器）写一次；coding agent **不直接改** Task 控制态。
+- **基数**：单 `issue_url` 覆盖「N task → 1 issue」（同 issue 多次尝试）与「task 无 issue」；「1 task → N issue」留后续。
+- **只读 forge 工具**（调度器侧）：`list_forge_items` / `get_forge_item`（`gh` + `glab` 同一抽象；项目可选 `repo`，否则探 `origin`；CLI 不可用则降级）。
+
+### 已交付（master）
+
+| 切片 | 内容 |
+|------|------|
+| [#56](https://github.com/WSQS/feishu-dispatcher/issues/56) | GitHub / `gh` 只读：`list_forge_items` / `get_forge_item` |
+| [#57](https://github.com/WSQS/feishu-dispatcher/issues/57) | GitLab / `glab` 满配实例（同一抽象） |
+| [#63](https://github.com/WSQS/feishu-dispatcher/issues/63) | `Task.issue_url`；`spawn_agent(issue=)` 取 issue 全文作 brief（取不到优雅退化）；展示：就绪消息 / 卡片 footer `· #N` / `/task` / `get_task`·`list_tasks` |
+
+触点：`store.py`（`issue_url`）、`forge.py`、`daemon.py`（`_sched_spawn_agent` / `_compose_issue_brief` / 展示）、`scheduler.py`（工具 schema）。
+
+### 明确不做（本 MVP / map Out of scope）
+
+指向 [#49](https://github.com/WSQS/feishu-dispatcher/issues/49) 开放问题与 [#215](https://github.com/WSQS/feishu-dispatcher/issues/215) Out of scope，**不毕业进本切片**：
+
+- Source-of-truth 同步 / polling（#49 问题 2）
+- 入站 forge → 飞书推送（#49 问题 4）
+- agent 作 issue 发射器 / 提案制（#49 问题 5）
+- 公司 GitLab autonomy / bot 身份（#49 问题 3，方向阶段已暂缓）
+- 写 forge（开 issue/PR、改标签等）
+- `/run --issue`（forge 目前纯调度器侧；#63 划到后续）
+- per-project tracker 插件化满配（`local` / `none`）——epic 层，非 MVP
+- P1 worktree（#37）真 branch/PR 流——组织框架见 epic，不进本 map
+- 中途绑定/换绑、`1 task → N issue` 列表升级——Not yet specified，另开 map
+
 ## 待办 / 已知限制（post-P0）
 
 ### 会话跨 daemon 重启恢复（✅ 已实现 2026-07-17）
