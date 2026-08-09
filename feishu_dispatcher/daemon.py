@@ -73,7 +73,7 @@ _REBOOTED_ENV = "FEISHU_DISPATCHER_REBOOTED"
 #: message_id 去重窗口大小（飞书 ACK 异常时服务端会重推事件）
 _DEDUP_CAPACITY = 512
 
-#: 关闭时等控制面停下的上限（秒）；超时即放弃继续关（serve_forever 是 daemon 线程）。#81
+#: 关闭时等控制面停下的上限（秒）；超时即放弃继续关（serve_forever 是 daemon 线程）。
 _CONTROL_STOP_TIMEOUT = 5.0
 
 _USAGE = (
@@ -2212,7 +2212,7 @@ class _Daemon:
         if self._control is not None:
             # control.stop() 会阻塞（等 serve_forever 确认），且可能与正 run_
             # coroutine_threadsafe 回等主 loop 的 handler 线程死锁。挪到 worker
-            # 线程跑、主 loop 继续转（解死锁）+ 超时兜底，绝不冻住关闭流程（#81）。
+            # 线程跑、主 loop 继续转（解死锁）+ 超时兜底，绝不冻住关闭流程。
             try:
                 await asyncio.wait_for(
                     asyncio.to_thread(self._control.stop),
@@ -2225,7 +2225,7 @@ class _Daemon:
             except Exception:
                 logger.warning("控制面关闭失败，忽略", exc_info=True)
         if self._webhook is not None:
-            # 同控制面：stop() 阻塞，挪到 worker 线程 + 超时兜底（#81）。
+            # 同控制面：stop() 阻塞，挪到 worker 线程 + 超时兜底。
             try:
                 await asyncio.wait_for(
                     asyncio.to_thread(self._webhook.stop),

@@ -55,8 +55,8 @@ _DEDUP_TTL = 3600.0
 class CIFailure:
     """从 GitHub payload 解析出的「一次 CI 失败」抽象。
 
-    平台无关——GitHub 解析器产出它，匹配/唤醒逻辑只认它。后续加 GitLab/Gitea 解析器
-    时产出同一结构即可（延后，见模块 docstring）。
+    平台无关——GitHub 解析器产出它，匹配/唤醒逻辑只认它。加 GitLab/Gitea 解析器
+    时产出同一结构即可（见模块 docstring）。
 
     ``run_id`` 用作去重键：同一 run 即使回调多次（重推/多事件）也只唤醒一次。
     """
