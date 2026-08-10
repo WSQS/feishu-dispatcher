@@ -1676,9 +1676,7 @@ async def test_project_register_rejects_middle_typo_with_siblings(tmp_path):
 async def test_project_register_rejects_completely_missing_root():
     # 完全不存在的盘符/根（祖先也不可达）→ 不抛异常，给出可读报错
     daemon, _, _ = make_daemon()
-    ok, msg = daemon._register_project(
-        "p", "copilot", "Z:/no/such/drive_xyz/deep"
-    )
+    ok, msg = daemon._register_project("p", "copilot", "Z:/no/such/drive_xyz/deep")
     assert ok is False
     assert "路径不存在" in msg
     assert daemon.project_store.get("p") is None
@@ -2120,6 +2118,63 @@ async def test_launch_injects_bg_identity_env_and_revokes_on_close():
     assert token not in daemon._bg_tokens  # 关 session 后 token 作废
 
 
+async def test_idle_with_running_bg_suspends_immediately():
+    # #88：当轮结束 + 队列空 + 有在飞 bg → 立刻挂起（不消磨 idle_timeout）
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(GatedAgent, store=store, idle_timeout=60)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    daemon.job_store.create(task_id="t1", command=["train"], cwd="c")
+    created[0].gate.set()  # 放行首轮 → worker 见 running bg + 空队列 → 立刻挂起
+    await wait_until(lambda: store.by_thread("om_root1").status == "suspended")
+    await wait_until(lambda: "om_root1" not in daemon._sessions)  # 名额已释放
+    assert created[0].closed
+    assert any("等待后台任务" in t for t in bridge.texts("om_root1"))
+    assert any("等待后台任务" in t for _, t in bridge.roots)
+    await daemon._shutdown()
+
+
+async def test_idle_with_running_bg_suspends_even_when_idle_timeout_disabled():
+    # #88：idle_timeout<=0 关掉普通空闲挂起，但等 bg 的立刻挂起仍生效
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(GatedAgent, store=store, idle_timeout=0)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    daemon.job_store.create(task_id="t1", command=["train"], cwd="c")
+    created[0].gate.set()
+    await wait_until(lambda: store.by_thread("om_root1").status == "suspended")
+    await wait_until(lambda: created[0].closed)
+    await daemon._shutdown()
+
+
+async def test_queued_prompt_prevents_bg_early_suspend():
+    # #88：有在飞 bg 但队列非空 → 先跑排队项，不立刻挂起
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(GatedAgent, store=store, idle_timeout=60)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    daemon.job_store.create(task_id="t1", command=["train"], cwd="c")
+    await daemon._handle_message(thread_msg("keep going"))  # 队列非空
+    created[0].gate.set()
+    await wait_until(lambda: "keep going" in created[0].prompts)
+    assert "om_root1" in daemon._sessions  # 仍在线（第二轮在跑或刚结束将挂起）
+    # 第二轮结束后队列空 + 仍有 running bg → 再挂起
+    await wait_until(lambda: store.by_thread("om_root1").status == "suspended")
+    await daemon._shutdown()
+
+
+async def test_agents_lists_waiting_bg_note():
+    # #88：/agents 对有在飞 bg 的任务标「等 bg」
+    store = TaskStore(None)
+    _seed_task(store, thread="om_s", session_id="sid_s", status="suspended")
+    daemon, bridge, _ = make_daemon(store=store)
+    daemon.job_store.create(task_id="t1", command=["train"], cwd="c")
+    await daemon._handle_message(root_msg("/agents", mid="om_list"))
+    listed = [t for m, t in bridge.plain if m == "om_list"]
+    assert listed and "等 bg" in listed[0] and "t1" in listed[0]
+    await daemon._shutdown()
+
+
 async def test_bg_job_completion_enqueues_resume_to_active_agent():
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store)
@@ -2250,6 +2305,11 @@ async def test_stop_drops_pending_bg_batch():
     await daemon._shutdown()
 
 
+def _any_prompt(created: list, pred) -> bool:
+    """#88：等 bg 时 agent 可能已挂起，完成唤回会起新 agent——在全部 created 里找 prompt。"""
+    return any(pred(p) for a in created for p in a.prompts)
+
+
 async def test_watch_bg_job_updates_status_and_delivers(tmp_path: Path):
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store)
@@ -2264,7 +2324,7 @@ async def test_watch_bg_job_updates_status_and_delivers(tmp_path: Path):
     assert updated.status == "exited" and updated.exit_code == 0
     assert updated.finished_at > 0
     assert updated.timed_out is False
-    await wait_until(lambda: any("final loss 0.1" in p for p in created[0].prompts))
+    await wait_until(lambda: _any_prompt(created, lambda p: "final loss 0.1" in p))
     await daemon._shutdown()
 
 
@@ -2283,9 +2343,10 @@ async def test_watch_bg_job_timeout_kills_marks_and_still_resumes(tmp_path: Path
     updated = daemon.job_store.get(job.job_id)
     assert updated.timed_out is True and updated.status == "killed"
     # 仍唤回 agent（prompt 标 Timed Out: yes），话题可见消息标「超时被杀」
+    # #88：等待期间可能已挂起，唤回在新 agent 上
     await wait_until(
-        lambda: any(
-            "<bg_job_done>" in p and "Timed Out: yes" in p for p in created[0].prompts
+        lambda: _any_prompt(
+            created, lambda p: "<bg_job_done>" in p and "Timed Out: yes" in p
         )
     )
     assert any("超时被杀" in t for t in bridge.texts("om_root1"))
@@ -2366,9 +2427,9 @@ async def test_launch_bg_job_real_subprocess_roundtrip(tmp_path: Path):
         lambda: daemon.job_store.get(job.job_id).status == "exited", timeout=15
     )
     assert daemon.job_store.get(job.job_id).exit_code == 0
-    # 真进程输出经 <bg_job_done> 入队回 agent
+    # 真进程输出经 <bg_job_done> 入队回 agent（#88：等 bg 时可能已挂起再恢复）
     await wait_until(
-        lambda: any("HELLO_BG_MARKER" in p for p in created[0].prompts), timeout=15
+        lambda: _any_prompt(created, lambda p: "HELLO_BG_MARKER" in p), timeout=15
     )
     await daemon._shutdown()
 
@@ -2535,7 +2596,9 @@ def _health_ok(base_url: str, token: str) -> bool:
 
 async def test_start_viewer_launches_server_and_persists_token(tmp_path: Path):
     # enabled=true → 返回 ViewerServer、真绑端口、/api/health 通、token 落 _viewer_token_path。
-    daemon = _viewer_daemon(tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0))
+    daemon = _viewer_daemon(
+        tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0)
+    )
     loop = asyncio.get_event_loop()
     vs = daemon._start_viewer(loop)
     assert vs is not None
@@ -2571,14 +2634,18 @@ async def test_start_viewer_port_in_use_returns_none(tmp_path: Path, caplog):
 
 async def test_start_viewer_token_idempotent_across_calls(tmp_path: Path):
     # 两次 _start_viewer（同 token path）→ 同一个 token（ensure_token 幂等，不重新生成）。
-    daemon = _viewer_daemon(tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0))
+    daemon = _viewer_daemon(
+        tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0)
+    )
     loop = asyncio.get_event_loop()
     vs1 = daemon._start_viewer(loop)
     assert vs1 is not None
     token1 = daemon._viewer_token_path.read_text(encoding="utf-8").strip()
     vs1.stop()
     # 第二次（新端口，避免 TIME_WAIT）：重新构造 daemon 复用同一 token 文件
-    daemon2 = _viewer_daemon(tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0))
+    daemon2 = _viewer_daemon(
+        tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0)
+    )
     daemon2._viewer_token_path = daemon._viewer_token_path
     vs2 = daemon2._start_viewer(loop)
     assert vs2 is not None

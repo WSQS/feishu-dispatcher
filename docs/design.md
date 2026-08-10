@@ -448,10 +448,11 @@ capabilities 比 copilot/opencode 更全（原生 load_session/fork/resume/close
 
 **方向决策：CLI 控制面 + daemon 拥有进程（否掉 opencode-pty 带外回合）**。评估过三条（详见 #67）：
 - **D1 收编 opencode-pty 的 `notifyOnExit` 带外回合**——探针证实带外回合会经 ACP `session/update` 冒出来，但它有两个硬伤：ACP 流里**没有回合结束标记**（普通回合靠 `prompt()` 响应的 `stop_reason`，带外回合无对应请求 → 只能靠静默 debounce 判收尾），且进程是 opencode 子进程 → **空闲挂起会杀掉它**（实测长任务活不过 idle_timeout）。且仅 opencode。
-- **选定方案**：把进程从「agent 子进程」挪成「**daemon 子进程**」——agent 只经一个 CLI（`fdx`）请 daemon 代跑，daemon `await` 子进程、完成时**enqueue 一条正常 prompt** 唤回。由此那两个硬伤都被架构消解（白拿 stop_reason、复用现有 worker/卡片/记账；挂起不影响 job，甚至可等待时挂起省名额——P3）。后端无关（任意能跑 shell 的 agent）。
+- **选定方案**：把进程从「agent 子进程」挪成「**daemon 子进程**」——agent 只经一个 CLI（`fdx`）请 daemon 代跑，daemon `await` 子进程、完成时**enqueue 一条正常 prompt** 唤回。由此那两个硬伤都被架构消解（白拿 stop_reason、复用现有 worker/卡片/记账；挂起不影响 job，甚至可等待时挂起省名额——P3 / #88 ✅）。后端无关（任意能跑 shell 的 agent）。
 - **身份**：daemon 启 agent 时经 `AgentSpawn.env` 注入一次性 token（+控制面 URL），env 逐层透传到 agent 的 shell 命令（实测），`fdx` 从环境读、token→task_id 反查——agent 不碰自己的 id、无从冒充。
+- **P3 等 bg 立刻挂起（#88 ✅）**：当轮收尾转 idle 后，若本 task 仍有 `running` 的 Job 且 prompt 队列空，worker **立刻**挂起（不消磨 `idle_timeout`）腾 `max_agents` 名额；完成路径仍走 `_deliver_bg_result` 的挂起→`_try_resume`（挂起 task 不合并，#79 边界不变）。`/agents` 对有在飞 bg 的任务标「等 bg」。
 
-**实测踩坑**：① 子进程必须 `stdin=DEVNULL`，否则继承 daemon 控制台 stdin，交互式 shell profile（`opam env`）卡死（一条 4s 命令卡 26 分钟）；② argv exec 不经 shell，命令首词须真实可执行、shell 特性要显式 `bash -c`/`pwsh -Command` 包裹；③ watcher task 须存强引用防 GC；④ 超时兜底（config `bg_job_timeout` 默认 0 不超时 + `--timeout`）。实现细节与组件见 CLAUDE.md「后台任务」。**未做**：daemon 重启穿越、brief 注入（让 agent 主动用 fdx）——#68 P2/P3。
+**实测踩坑**：① 子进程必须 `stdin=DEVNULL`，否则继承 daemon 控制台 stdin，交互式 shell profile（`opam env`）卡死（一条 4s 命令卡 26 分钟）；② argv exec 不经 shell，命令首词须真实可执行、shell 特性要显式 `bash -c`/`pwsh -Command` 包裹；③ watcher task 须存强引用防 GC；④ 超时兜底（config `bg_job_timeout` 默认 0 不超时 + `--timeout`）。实现细节与组件见 CLAUDE.md「后台任务」。**未做**：daemon 重启穿越、brief 注入（让 agent 主动用 fdx）——#68 P2。
 
 ### 已考虑方向 / 决策记录
 
