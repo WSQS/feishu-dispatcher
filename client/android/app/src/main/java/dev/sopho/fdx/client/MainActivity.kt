@@ -47,13 +47,22 @@ import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
 
-// —— AOSP CrossActivityBackAnimation 对齐（frameworks/base
-//    libs/WindowManager/Shell/src/com/android/wm/shell/back/）——
+// —— 屏间返回动效对齐 AOSP（android15-release）——
+// 借鉴源（frameworks/base）：
+//   libs/WindowManager/Shell/src/com/android/wm/shell/back/CrossActivityBackAnimation.kt
+//   libs/WindowManager/Shell/src/com/android/wm/shell/back/DefaultCrossActivityBackAnimation.kt
+//   libs/WindowManager/Shell/src/com/android/wm/shell/animation/Interpolators.java
+//   core/java/android/view/animation/BackGestureInterpolator.java
+//   core/java/android/window/BackProgressAnimator.java（系统给 app 回传的进度已在此 spring 平滑）
 
-/** pre-commit 进度曲线：AOSP Interpolators.BACK_GESTURE = BackGestureInterpolator(0.1,0.1,0,1)。 */
+/** pre-commit 进度曲线。对应 CrossActivityBackAnimation.onGestureProgress 里
+ *  `gestureInterpolator.getInterpolation(backEvent.progress)`，
+ *  即 Interpolators.BACK_GESTURE = BackGestureInterpolator(0.1,0.1,0,1)。 */
 private val BackGestureEasing = CubicBezierEasing(0.1f, 0.1f, 0f, 1f)
 
-/** post-commit 曲线：复刻 AOSP createEmphasizedInterpolator 的两段 cubic 路径（Interpolators.EMPHASIZED）。 */
+/** post-commit 曲线。对应 DefaultCrossActivityBackAnimation 的
+ *  `postCommitInterpolator = Interpolators.EMPHASIZED`
+ *  （Interpolators.createEmphasizedInterpolator 的两段 cubic 路径）。 */
 private object EmphasizedEasing : Easing {
     // 段1 x:0→0.166666，控制点 (0.05,0)/(0.133333,0.06)；段2 x:0.166666→1，控制点 (0.208333,0.82)/(0.25,1)
     private fun x1(t: Float) =
@@ -87,12 +96,14 @@ private object EmphasizedEasing : Easing {
     }
 }
 
-private const val POST_COMMIT_MS = 450            // AOSP POST_COMMIT_DURATION
-private const val MAX_SCALE = 0.9f                // AOSP MAX_SCALE（closing/entering 最大缩放）
-private const val ENTERING_START_OFFSET_DP = 96f  // AOSP cross_activity_back_entering_start_offset
-private const val EDGE_MARGIN_DP = 8f             // AOSP cross_task_back_vertical_margin
+// 常量对应 DefaultCrossActivityBackAnimation / CrossActivityBackAnimation 的字段与资源：
+private const val POST_COMMIT_MS = 450            // DefaultCrossActivityBackAnimation.POST_COMMIT_DURATION
+private const val MAX_SCALE = 0.9f                // CrossActivityBackAnimation.MAX_SCALE（closing/entering 最大缩放）
+private const val ENTERING_START_OFFSET_DP = 96f  // R.dimen.cross_activity_back_entering_start_offset
+private const val EDGE_MARGIN_DP = 8f             // R.dimen.cross_task_back_vertical_margin
 
-/** AOSP getYOffset：垂直位移跟随手指 Y，ratio 过 DecelerateInterpolator()，并留 8dp 屏边距。 */
+/** 垂直位移。对应 CrossActivityBackAnimation.getYOffset：随手指 Y 位移，
+ *  ratio 过 DecelerateInterpolator()，并留 displayBoundsMargin(8dp) 屏边距。 */
 private fun calcBackYOffset(
     height: Float,
     scale: Float,
@@ -153,12 +164,16 @@ class MainActivity : ComponentActivity() {
                     }
 
                     // 返回手势状态——对齐 AOSP CrossActivityBackAnimation：
-                    // - 进度：系统已用 BackProgressAnimator spring 平滑，这里再套 BackGestureEasing
-                    //   （AOSP Interpolators.BACK_GESTURE）得到「先快后慢」的减速观感。
-                    // - pre-commit：当前屏缩到 0.9 + 跟随手指位移（含 Y）；上一屏从屏幕左缘外 96dp 起步、
-                    //   随手势缩放；scrim 全程恒亮（浅色 0.2 / 深色 0.8），不随 progress 渐变。
-                    // - post-commit：450ms，closing 右滑淡出（alpha max(1-5p,0)），entering 滑入全屏。
-                    // - cancel：progress 用 spring 弹回 0（AOSP BackProgressAnimator.onBackCancelled）。
+                    // - 进度：系统（BackProgressAnimator，core/java/android/window/）已对原始手势
+                    //   spring 平滑后才回调给 app，这里再套 BackGestureEasing（onGestureProgress 里
+                    //   的 gestureInterpolator）得到「先快后慢」的减速观感。
+                    // - pre-commit：closing 缩放/位移对应 preparePreCommitClosingRectMovement，
+                    //   entering 对应 preparePreCommitEnteringRectMovement；scrim 恒亮对应
+                    //   ensureScrimLayer 的 MAX_SCRIM_ALPHA_LIGHT/DARK。
+                    // - post-commit：对应 onGestureCommitted + DefaultCrossActivityBackAnimation
+                    //   .onPostCommitProgress（450ms，closing 右滑淡出 alpha max(1-5p,0)，
+                    //   entering 滑入全屏）。
+                    // - cancel：progress 用 spring 弹回 0（BackProgressAnimator.onBackCancelled）。
                     val gestureProgress = remember { Animatable(0f) }
                     var touchStartY by remember { mutableFloatStateOf(0f) }
                     var touchY by remember { mutableFloatStateOf(0f) }
@@ -177,17 +192,20 @@ class MainActivity : ComponentActivity() {
                     val postP = EmphasizedEasing.transform(commitProgress.value)
                     val gestureActive = gestureProgress.value > 0f
                     val closingAlpha = if (isCommitting) {
-                        // post-commit 快速渐隐（AOSP max(1 - progress*5, 0)）
+                        // 对应 DefaultCrossActivityBackAnimation.onPostCommitProgress 的
+                        // `closingAlpha = max(1 - linearProgress*5, 0)`
                         max(1f - 5f * commitProgress.value, 0f)
                     } else {
                         1f
                     }
-                    // scrim：pre-commit/cancel 恒亮，post-commit 线性淡出
+                    // scrim：pre-commit/cancel 恒亮（ensureScrimLayer 满 alpha），
+                    // post-commit 线性淡出（CrossActivityBackAnimation.onPostCommitProgress）
                     val scrimAlpha = maxScrimAlpha * (1f - (if (isCommitting) commitProgress.value else 0f))
 
                     Box(Modifier.fillMaxSize()) {
-                        // 底层（Z 序在下）：返回手势期间渲染上一屏（entering），
-                        // AOSP 从屏幕左缘外 96dp 起步、随手势缩放到 0.9，post-commit 滑入全屏。
+                        // 底层（Z 序在下）：返回手势期间渲染上一屏（entering）。
+                        // 对应 DefaultCrossActivityBackAnimation.preparePreCommitEnteringRectMovement
+                        // （起始全屏左移 96dp、随手势缩放 0.9）+ onPostCommitProgress（滑入到 0）。
                         // gestureActive 为 0 时不渲染（正常状态只有顶层）。预览不可交互（回调 no-op）。
                         if (gestureActive && screenStack.size > 1) {
                             val prevDest = screenStack[screenStack.size - 2]
@@ -218,7 +236,8 @@ class MainActivity : ComponentActivity() {
                         }
 
                         // scrim 遮罩：黑色半透明，盖在上一屏上方、当前屏下方。
-                        // 对齐 AOSP：浅色 0.2 / 深色 0.8，pre-commit 全程恒亮，post-commit 线性淡出。
+                        // 对应 CrossActivityBackAnimation.ensureScrimLayer（MAX_SCRIM_ALPHA_LIGHT/DARK）
+                        // + onPostCommitProgress：浅色 0.2 / 深色 0.8，pre-commit 恒亮，post-commit 淡出。
                         if (gestureActive && screenStack.size > 1) {
                             Box(
                                 Modifier
@@ -281,8 +300,9 @@ class MainActivity : ComponentActivity() {
                     LaunchedEffect(screenStack.last()) { navigatingBack = false }
 
                     // 返回手势：栈深 > 1 时拦截。手势进度实时驱动当前屏的缩小/位移；
-                    // 松手完成 → post-commit 动画（450ms，closing 右滑淡出 + entering 滑入），再 pop；
-                    // 中途取消 → progress 用 spring 弹回 0（AOSP BackProgressAnimator.onBackCancelled）。
+                    // 松手完成 → 对应 onGestureCommitted 的 post-commit 动画
+                    // （450ms，closing 右滑淡出 + entering 滑入），再 pop；
+                    // 中途取消 → progress 用 spring 弹回 0（BackProgressAnimator.onBackCancelled）。
                     // 根屏（栈深 ≤ 1）enabled = false，系统接管退出 App 的 predictive back。
                     PredictiveBackHandler(enabled = screenStack.size > 1) { events ->
                         isCommitting = false
@@ -296,10 +316,12 @@ class MainActivity : ComponentActivity() {
                                 }
                                 touchY = e.touchY
                                 swipeEdge = e.swipeEdge
-                                // 系统已用 spring 平滑 progress，这里直接采纳（AOSP BackProgressAnimator）
+                                // 系统（BackProgressAnimator）已 spring 平滑 progress，这里直接采纳
                                 gestureProgress.snapTo(e.progress)
                             }
                             // Flow 正常结束 → 手势完成（commit）：450ms post-commit 动画。
+                            // AOSP 里 post-commit 时长固定为 POST_COMMIT_DURATION，
+                            // 这里用线性 tween 驱动、曲线由 EmphasizedEasing 施加（见 onPostCommitProgress）。
                             isCommitting = true
                             commitProgress.snapTo(0f)
                             commitProgress.animateTo(
@@ -311,8 +333,10 @@ class MainActivity : ComponentActivity() {
                             gestureProgress.snapTo(0f)
                             isCommitting = false
                         } catch (c: CancellationException) {
-                            // Flow 被取消 → 手势取消：progress 用 spring 弹回 0
-                            // （AOSP STIFFNESS_MEDIUM / DAMPING_RATIO_NO_BOUNCY，即 Compose spring() 默认）。
+                            // Flow 被取消 → 手势取消：progress 用 spring 弹回 0。
+                            // 对应 BackProgressAnimator.onBackCancelled 的
+                            // SpringForce(STIFFNESS_MEDIUM, DAMPING_RATIO_NO_BOUNCY)，
+                            // 即 Compose spring() 默认参数。
                             gestureProgress.animateTo(0f, spring())
                             isCommitting = false
                             throw c
