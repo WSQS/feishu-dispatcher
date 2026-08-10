@@ -62,25 +62,9 @@ class ViewerClient(
     useZerotier: Boolean = false,
     ztHost: String = "",
     ztPort: Int = 7321,
+    // 测试缝：单测可注入 MockEngine 的 HttpClient；默认按 useZerotier 选引擎。
+    private val http: HttpClient = defaultHttp(useZerotier, ztHost, ztPort),
 ) : java.io.Closeable {
-    private val http: HttpClient = if (useZerotier) {
-        HttpClient(OkHttp) {
-            install(ContentNegotiation) {
-                json(Json { ignoreUnknownKeys = true })
-            }
-            engine {
-                config {
-                    socketFactory(ZeroTierSocketsSocketFactory(ztHost, ztPort))
-                }
-            }
-        }
-    } else {
-        HttpClient(CIO) {
-            install(ContentNegotiation) {
-                json(Json { ignoreUnknownKeys = true })
-            }
-        }
-    }
 
     /** GET /api/health —— 存活探针 + 版本。失败抛 [ViewerException]（含分类）。 */
     suspend fun health(): HealthResponse = withContext(Dispatchers.IO) {
@@ -152,3 +136,24 @@ class ViewerClient(
         }
     }
 }
+
+/** 默认引擎：普通 HTTP 用 CIO；ZeroTier 用 OkHttp + libzt SocketFactory。 */
+private fun defaultHttp(useZerotier: Boolean, ztHost: String, ztPort: Int): HttpClient =
+    if (useZerotier) {
+        HttpClient(OkHttp) {
+            install(ContentNegotiation) {
+                json(Json { ignoreUnknownKeys = true })
+            }
+            engine {
+                config {
+                    socketFactory(ZeroTierSocketsSocketFactory(ztHost, ztPort))
+                }
+            }
+        }
+    } else {
+        HttpClient(CIO) {
+            install(ContentNegotiation) {
+                json(Json { ignoreUnknownKeys = true })
+            }
+        }
+    }
