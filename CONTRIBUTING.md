@@ -13,7 +13,7 @@
 
 ### 分支命名
 
-从最新 `main` 开分支，按类型前缀命名：
+按类型前缀命名（默认从最新 `main` 拉出；大型 feature 的后续切片可从其父 feature 分支拉出）：
 
 | 前缀 | 用途 | 示例 |
 |------|------|------|
@@ -36,7 +36,8 @@
 
 ### PR 流程
 
-- 从最新 `main` 开分支；PR **base = `main`**。
+- **默认**从最新 `main` 开分支，PR **base = `main`**。
+- **大型 feature / 叠罗汉 PR**：后续切片以**父分支**为 base（合入父 feature，而不是直接合进 `main`）；父分支最终再合 `main`。在 PR 描述里写清依赖（例如「基于 #N / `feat/…`」），避免审阅者按「一律 base=main」误合。
 - 标题或 body 带 `(closes #N)` / `(refs #N)`（或 PR body 里的 `Closes #N` / `Refs #N`）。
 - 写代码遵循 **on-write**（单一结果、最小 diff）；提交 / 合入前按 **on-submit** 自检（一致性、必要性、无 drive-by）。
 
