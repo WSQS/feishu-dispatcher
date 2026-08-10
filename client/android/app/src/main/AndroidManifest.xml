@@ -3,7 +3,6 @@
 
     <!-- 网络权限：连 daemon viewer -->
     <uses-permission android:name="android.permission.INTERNET" />
-    <uses-permission android:name="android.permission.INTERNET" />
 
     <application
         android:allowBackup="true"
