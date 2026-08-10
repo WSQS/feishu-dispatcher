@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from feishu_dispatcher.config import Config, Project, ViewerConfig
+from feishu_dispatcher.config import Config, Project, ViewerConfig, WebhookConfig
 
 SAMPLE = """
 app_id = "cli_abc"
@@ -334,3 +334,37 @@ def test_viewer_section_empty_table_uses_defaults(tmp_path: Path):
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(_BASE + "[viewer]\n", encoding="utf-8")
     assert Config.load(cfg_file).viewer == ViewerConfig()
+
+
+def test_webhook_section_absent_means_none(tmp_path: Path):
+    # 配置无 [webhook] 段 → Config.webhook is None（默认不起）。
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(_BASE, encoding="utf-8")
+    assert Config.load(cfg_file).webhook is None
+
+
+def test_webhook_section_parses_full_values(tmp_path: Path):
+    # [webhook] port/secret/allowed_events → 正确解析成 WebhookConfig。
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        _BASE
+        + '[webhook]\nport = 9001\nsecret = "s3cr3t"\n'
+        'allowed_events = ["workflow_run", "check_run"]\n',
+        encoding="utf-8",
+    )
+    cfg = Config.load(cfg_file)
+    assert cfg.webhook == WebhookConfig(
+        port=9001,
+        secret="s3cr3t",
+        allowed_events=("workflow_run", "check_run"),
+    )
+
+
+def test_webhook_section_defaults_when_fields_omitted(tmp_path: Path):
+    # [webhook] 段存在但只写 port → secret 默认空、allowed_events 默认两类。
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(_BASE + "[webhook]\nport = 9001\n", encoding="utf-8")
+    cfg = Config.load(cfg_file)
+    assert cfg.webhook == WebhookConfig(port=9001)
+    assert cfg.webhook.secret == ""
+    assert cfg.webhook.allowed_events == ("workflow_run", "check_run")

@@ -58,13 +58,32 @@ class ViewerConfig:
     （决策 D6/Q1）。
 
     **token 不在配置里**：永远由 daemon 自动生成 + 持久化到
-    ``~/.feishu-dispatcher/viewer.token`` + 启动时日志打印（决策 Q3/Q8）。token 是纯
+    ``~/.feishu-dispatcher/viewer.token`` + 启动时日志打印。token 是纯
     内部管理的鉴权密钥，用户不碰（见 ``_viewer_token.py``）。
     """
 
     enabled: bool = False
     bind: str = "0.0.0.0"
     port: int = 7321
+
+
+@dataclass(frozen=True)
+class WebhookConfig:
+    """CI 失败 webhook 回调配置。
+
+    daemon 内嵌的轻量 HTTP server，收 GitHub Actions（MVP）/ 其它 CI 平台（后续）的
+    失败回调 → 匹配项目 → 唤醒/新建 agent 修复。默认关闭（``port=0``，决策与 viewer
+    一致：新功能默认安全）。``port`` 非 0 才起 server（绑 ``127.0.0.1``，建议经反向
+    代理暴露）。
+
+    ``secret`` 是 GitHub 风格 HMAC 签名密钥（``X-Hub-Signature-256``），空串则拒绝所有
+    回调（避免误把无鉴权端点开到公网）。``allowed_events`` 限定受理的事件类型
+    （默认 ``workflow_run`` / ``check_run``）。
+    """
+
+    port: int = 0
+    secret: str = ""
+    allowed_events: tuple[str, ...] = ("workflow_run", "check_run")
 
 
 def _parse_llm_profile(pd: dict, *, memory_rounds: int, ctx: str) -> LLMSettings:
@@ -126,6 +145,8 @@ class Config:
     llm_active: str = ""
     #: 移动端查看器配置；None = 配置里没有 [viewer] 段（默认，viewer 不起）。
     viewer: ViewerConfig | None = None
+    #: CI 失败 webhook 配置；None = 配置里没有 [webhook] 段（默认，webhook 不起）。
+    webhook: WebhookConfig | None = None
 
     @staticmethod
     def load(path: Path | None = None, *, allow_empty_chat_id: bool = False) -> Config:
@@ -232,6 +253,21 @@ class Config:
             if viewer_data is not None
             else None
         )
+        # [webhook] 段可选：没有则 webhook=None（默认不起）。有则解析：port 默认 0
+        # （关闭）、secret 默认空、allowed_events 默认 (workflow_run, check_run)。
+        webhook_data = data.get("webhook")
+        webhook = None
+        if webhook_data is not None:
+            allowed = webhook_data.get("allowed_events")
+            webhook = WebhookConfig(
+                port=int(webhook_data.get("port", 0)),
+                secret=str(webhook_data.get("secret", "")),
+                allowed_events=(
+                    tuple(str(e) for e in allowed)
+                    if allowed is not None
+                    else ("workflow_run", "check_run")
+                ),
+            )
         return Config(
             app_id=data["app_id"],
             app_secret=data["app_secret"],
@@ -251,4 +287,5 @@ class Config:
             llm_profiles=llm_profiles,
             llm_active=llm_active,
             viewer=viewer,
+            webhook=webhook,
         )

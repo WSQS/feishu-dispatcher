@@ -136,3 +136,13 @@ default_agent = "copilot"
 enabled = false        # 默认关闭，显式开启
 bind = "0.0.0.0"       # 只走 Tailscale 时填 tailnet 网卡 IP
 port = 7321            # 默认端口
+
+# CI 失败 webhook 回调：daemon 内嵌 HTTP server，收 GitHub Actions（MVP）的
+# 失败回调 → 按 repo 匹配项目 → 唤醒/新建 agent 修复。默认关闭（port=0）。port 非 0
+# 才起 server；建议绑 127.0.0.1 经反向代理暴露到公网，并配 secret 做 HMAC 签名校验
+# （X-Hub-Signature-256，GitHub 风格）。仅对 allowed_events 里且 conclusion=failure/
+# cancelled/errored 的 run 触发；同一 run_id 1h 内只触发一次。
+# [webhook]
+# port = 0
+# secret = ""                                              # 必填（空=拒绝所有回调）
+# allowed_events = ["workflow_run", "check_run"]
