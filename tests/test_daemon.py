@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import socket
 import sys
 import time
@@ -11,8 +12,14 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from feishu_dispatcher import bg_wrap
 from feishu_dispatcher.config import Config, LLMSettings, Project, ViewerConfig
-from feishu_dispatcher.daemon import _Daemon
+from feishu_dispatcher.daemon import (
+    _Daemon,
+    _bg_detach_kwargs,
+    _pid_alive,
+    _read_exit_file,
+)
 from feishu_dispatcher.feishu import IncomingMessage
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
 from feishu_dispatcher.store import ProjectStore, TaskStore
@@ -1676,9 +1683,7 @@ async def test_project_register_rejects_middle_typo_with_siblings(tmp_path):
 async def test_project_register_rejects_completely_missing_root():
     # 完全不存在的盘符/根（祖先也不可达）→ 不抛异常，给出可读报错
     daemon, _, _ = make_daemon()
-    ok, msg = daemon._register_project(
-        "p", "copilot", "Z:/no/such/drive_xyz/deep"
-    )
+    ok, msg = daemon._register_project("p", "copilot", "Z:/no/such/drive_xyz/deep")
     assert ok is False
     assert "路径不存在" in msg
     assert daemon.project_store.get("p") is None
@@ -2306,12 +2311,19 @@ async def test_launch_bg_job_uses_devnull_stdin(monkeypatch, tmp_path: Path):
             return 0
 
     async def fake_exec(*args, **kwargs):
+        captured["args"] = args
         captured["kwargs"] = kwargs
         return _DummyProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
     await daemon._launch_bg_job("t1", ["python", "x.py"], str(tmp_path))
     assert captured["kwargs"]["stdin"] is asyncio.subprocess.DEVNULL
+    # #89：脱离标志必须带上（Windows creationflags / POSIX start_new_session）
+    for k, v in _bg_detach_kwargs().items():
+        assert captured["kwargs"][k] == v
+    # 经 bg_wrap 启动，真实命令在 `--` 之后
+    assert "feishu_dispatcher.bg_wrap" in captured["args"]
+    assert "--" in captured["args"]
     await asyncio.sleep(0.05)  # 让 watcher 收尾
     await daemon._shutdown()
 
@@ -2461,6 +2473,172 @@ async def test_launch_then_kill_real_subprocess(tmp_path: Path):
     await daemon._shutdown()
 
 
+# ---- bg 重启穿越（#89）---- #
+
+
+def test_bg_wrap_writes_pid_and_exit_file(tmp_path: Path):
+    pid_path = tmp_path / "j1.pid"
+    exit_path = tmp_path / "j1.exit"
+    rc = bg_wrap.main(
+        [
+            "--pid-file",
+            str(pid_path),
+            "--exit-file",
+            str(exit_path),
+            "--",
+            sys.executable,
+            "-c",
+            "print('ok')",
+        ]
+    )
+    assert rc == 0
+    assert pid_path.exists() and int(pid_path.read_text().strip()) > 0
+    assert _read_exit_file(str(exit_path)) == 0
+
+
+def test_bg_wrap_nonzero_exit(tmp_path: Path):
+    exit_path = tmp_path / "j1.exit"
+    rc = bg_wrap.main(
+        [
+            "--pid-file",
+            str(tmp_path / "j1.pid"),
+            "--exit-file",
+            str(exit_path),
+            "--",
+            sys.executable,
+            "-c",
+            "raise SystemExit(3)",
+        ]
+    )
+    assert rc == 3
+    assert _read_exit_file(str(exit_path)) == 3
+
+
+def test_pid_alive_self():
+    assert _pid_alive(os.getpid()) is True
+    assert _pid_alive(0) is False
+
+
+def test_build_bg_block_restart_note(tmp_path: Path):
+    daemon, _, _ = make_daemon()
+    out = tmp_path / "j1.log"
+    out.write_bytes(b"done\n")
+    job = daemon.job_store.create(task_id="t1", command=["x"], cwd="c")
+    daemon.job_store.update(
+        job.job_id, output_file=str(out), finished_at=job.created_at + 1
+    )
+    block = daemon._build_bg_block(
+        daemon.job_store.get(job.job_id), 0, after_restart=True
+    )
+    assert "Note: daemon 重启期间完成" in block
+    assert "Note:" not in daemon._build_bg_block(daemon.job_store.get(job.job_id), 0)
+
+
+async def test_rediscover_delivers_exited_job_with_restart_note(tmp_path: Path):
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    out = tmp_path / "j1.log"
+    out.write_bytes(b"finished while down\n")
+    exit_path = tmp_path / "j1.exit"
+    exit_path.write_text("0\n", encoding="utf-8")
+    job = daemon.job_store.create(task_id="t1", command=["train"], cwd="c")
+    daemon.job_store.update(
+        job.job_id,
+        output_file=str(out),
+        exit_file=str(exit_path),
+        pid=1,
+        status="running",
+    )
+    await daemon._rediscover_bg_jobs()
+    updated = daemon.job_store.get(job.job_id)
+    assert updated.status == "exited" and updated.exit_code == 0
+    await wait_until(
+        lambda: any(
+            "<bg_job_done>" in p and "daemon 重启期间完成" in p
+            for p in created[0].prompts
+        )
+    )
+    assert any("daemon 重启后接管" in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+async def test_rediscover_rewatches_alive_pid(tmp_path: Path, monkeypatch):
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    exit_path = tmp_path / "j1.exit"
+    out = tmp_path / "j1.log"
+    out.write_bytes(b"still going\n")
+    job = daemon.job_store.create(task_id="t1", command=["long"], cwd="c")
+    daemon.job_store.update(
+        job.job_id,
+        output_file=str(out),
+        exit_file=str(exit_path),
+        pid=424242,
+        timeout=0,
+        status="running",
+    )
+    monkeypatch.setattr(
+        "feishu_dispatcher.daemon._pid_alive", lambda pid: pid == 424242
+    )
+
+    # 模拟「仍在跑」一小会后写出 exit-file
+    async def _later_exit():
+        await asyncio.sleep(0.15)
+        exit_path.write_text("0\n", encoding="utf-8")
+        monkeypatch.setattr("feishu_dispatcher.daemon._pid_alive", lambda pid: False)
+
+    asyncio.create_task(_later_exit())
+    await daemon._rediscover_bg_jobs()
+    assert job.job_id in daemon._bg_procs
+    await wait_until(
+        lambda: daemon.job_store.get(job.job_id).status == "exited", timeout=5
+    )
+    await wait_until(
+        lambda: any("daemon 重启期间完成" in p for p in created[0].prompts), timeout=5
+    )
+    await daemon._shutdown()
+
+
+async def test_rediscover_orphans_without_pid_marked_killed():
+    store = TaskStore(None)
+    daemon, bridge, _ = make_daemon(store=store)
+    job = daemon.job_store.create(task_id="t1", command=["old"], cwd="c")
+    # 升级前遗留：running 但无 pid / exit-file
+    await daemon._rediscover_bg_jobs()
+    assert daemon.job_store.get(job.job_id).status == "killed"
+    assert any("无法接管" in t for _, t in bridge.roots)
+
+
+async def test_launch_persists_pid_exit_file_timeout(tmp_path: Path, monkeypatch):
+    daemon, _, _ = make_daemon()
+    daemon._bg_logs_dir = tmp_path / "bg"
+
+    class _DummyProc:
+        pid = 5555
+
+        async def wait(self) -> int:
+            return 0
+
+    async def fake_exec(*args, **kwargs):
+        return _DummyProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_exec)
+    job = await daemon._launch_bg_job(
+        "t1", ["python", "x.py"], str(tmp_path), timeout=12.5
+    )
+    got = daemon.job_store.get(job.job_id)
+    assert got.pid == 5555
+    assert got.timeout == 12.5
+    assert got.exit_file.endswith(f"{job.job_id}.exit")
+    assert Path(got.exit_file).parent == tmp_path / "bg"
+    await asyncio.sleep(0.05)
+    await daemon._shutdown()
+
+
 async def test_launch_threads_agent_env_into_spawn():
     # [agents.<名>].env 声明的追加环境变量应进到该 agent 的 AcpAgent spawn.env
     # （codex 靠 CODEX_PATH 复用全局 codex）。无控制面时不叠 bg 身份 env。
@@ -2535,7 +2713,9 @@ def _health_ok(base_url: str, token: str) -> bool:
 
 async def test_start_viewer_launches_server_and_persists_token(tmp_path: Path):
     # enabled=true → 返回 ViewerServer、真绑端口、/api/health 通、token 落 _viewer_token_path。
-    daemon = _viewer_daemon(tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0))
+    daemon = _viewer_daemon(
+        tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0)
+    )
     loop = asyncio.get_event_loop()
     vs = daemon._start_viewer(loop)
     assert vs is not None
@@ -2571,14 +2751,18 @@ async def test_start_viewer_port_in_use_returns_none(tmp_path: Path, caplog):
 
 async def test_start_viewer_token_idempotent_across_calls(tmp_path: Path):
     # 两次 _start_viewer（同 token path）→ 同一个 token（ensure_token 幂等，不重新生成）。
-    daemon = _viewer_daemon(tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0))
+    daemon = _viewer_daemon(
+        tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0)
+    )
     loop = asyncio.get_event_loop()
     vs1 = daemon._start_viewer(loop)
     assert vs1 is not None
     token1 = daemon._viewer_token_path.read_text(encoding="utf-8").strip()
     vs1.stop()
     # 第二次（新端口，避免 TIME_WAIT）：重新构造 daemon 复用同一 token 文件
-    daemon2 = _viewer_daemon(tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0))
+    daemon2 = _viewer_daemon(
+        tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0)
+    )
     daemon2._viewer_token_path = daemon._viewer_token_path
     vs2 = daemon2._start_viewer(loop)
     assert vs2 is not None
