@@ -1,6 +1,5 @@
 package dev.sopho.fdx.client.ui
 
-import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
@@ -14,17 +13,13 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import dev.sopho.fdx.client.network.TreeEntry
+import androidx.lifecycle.viewmodel.compose.viewModel
 import dev.sopho.fdx.client.network.ViewerClient
 
 /**
- * 文件树页：调 [ViewerClient.tree] 显示 project 的文件列表（扁平）。
+ * 文件树页：数据在 [TreeViewModel]（随目的地存活），返回时复用缓存不重拉。
  *
  * 点击文件暂不跳转。
  */
@@ -34,26 +29,20 @@ fun TreeScreen(
     projectName: String,
     modifier: Modifier = Modifier,
 ) {
-    var entries by remember { mutableStateOf<List<TreeEntry>?>(null) }
-    var error by remember { mutableStateOf<String?>(null) }
+    val vm: TreeViewModel = viewModel { TreeViewModel(projectName) }
+    LaunchedEffect(client) { vm.start(client) }
 
-    LaunchedEffect(projectName) {
-        runCatching { client.tree(projectName).entries }
-            .onSuccess { entries = it }
-            .onFailure {
-                Log.e("TreeScreen", "failed to load tree", it)
-                error = it.message
-            }
-    }
+    val entries = vm.entries
+    val error = vm.error
 
     Column(modifier = modifier.fillMaxSize().background(MaterialTheme.colorScheme.surface).padding(16.dp)) {
         Text(projectName, style = MaterialTheme.typography.titleLarge)
         when {
             error != null -> Text("❌ $error")
             entries == null -> CircularProgressIndicator(modifier = Modifier.padding(top = 16.dp))
-            entries!!.isEmpty() -> Text("（空）", modifier = Modifier.padding(top = 16.dp))
+            entries.isEmpty() -> Text("（空）", modifier = Modifier.padding(top = 16.dp))
             else -> LazyColumn(modifier = Modifier.fillMaxSize()) {
-                items(entries!!) { entry ->
+                items(entries) { entry ->
                     Column(modifier = Modifier.padding(vertical = 8.dp)) {
                         Text(
                             entry.path,
