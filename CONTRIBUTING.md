@@ -1,6 +1,45 @@
 # 贡献约定
 
-本仓库为个人项目，但也接受自动化 agent（如 ZCode）和未来的协作者提交。本文件固化已形成的代码约定，让每个提交者（人或 agent）在动手前就知道标准，而不是撞墙后才发现。
+本仓库为个人项目，但也接受自动化 agent（如 ZCode）和未来的协作者提交。本文件固化已形成的协作约定，让每个提交者（人或 agent）在动手前就知道标准，而不是撞墙后才发现。
+
+## Git 协作约定
+
+开 PR 前先读本节。仓库 GitHub 设置已锁死合并方式；不写下来只能撞墙后才发现。
+
+### 合并策略
+
+- **只用 merge commit**（`Merge pull request #N from …`）。仓库设置：`allow_squash_merge = false`、`allow_rebase_merge = false`——squash / rebase 合并会被拒，不要再试。
+- PR 上的多个 commit **保留原样**，不要求压成单 commit；历史应可见完整迭代。
+
+### 分支命名
+
+按类型前缀命名（默认从最新 `main` 拉出；大型 feature 的后续切片可从其父 feature 分支拉出）：
+
+| 前缀 | 用途 | 示例 |
+|------|------|------|
+| `feat/<scope>` | 新功能 | `feat/android-navigation` |
+| `fix/<scope>` | bug 修复 | `fix/android-zt-toggle-animation` |
+| `refactor/<scope>` | 重构 | `refactor/atomic-write` |
+| `docs/<scope>` | 文档 | `docs/viewer-config-example` |
+| `test/<scope>` | 测试 | `test/android-jvm-scaffold` |
+| `style/<scope>` | 风格清理 | `style/android-comment-cleanup` |
+| `perf/<scope>` | 性能 | `perf/android-viewerclient-reuse` |
+
+### Commit message
+
+采用 [Angular 提交信息规范](https://github.com/angular/angular/blob/main/CONTRIBUTING.md#commit)，描述以中文为主（与现有历史一致）：
+
+- 格式：`<type>(<scope>): <subject>`
+- `type` 取 Angular 集合：`build` / `ci` / `docs` / `feat` / `fix` / `perf` / `refactor` / `style` / `test`（本仓历史里偶见的 `chore` 视为与 `build`/`ci` 同类运维提交，新提交优先用上表）
+- 示例：`feat(android): 导航框架`、`docs(config): 补 [viewer] 段`
+- issue 关联写在 **PR body**（`Closes #N` / `Refs #N`），不要塞进代码注释（见下方「注释规范」）。
+
+### PR 流程
+
+- **默认**从最新 `main` 开分支，PR **base = `main`**。
+- **大型 feature / 叠罗汉 PR**：后续切片以**父分支**为 base（合入父 feature，而不是直接合进 `main`）；父分支最终再合 `main`。在 PR 描述里写清依赖（例如「基于 #N / `feat/…`」），避免审阅者按「一律 base=main」误合。
+- 标题或 body 带 `(closes #N)` / `(refs #N)`（或 PR body 里的 `Closes #N` / `Refs #N`）。
+- 写代码遵循 **[on-write](https://github.com/WSQS/agent-skills/tree/master/skills/on-write)**（单一结果、最小 diff）；提交 / 合入前按 **[on-submit](https://github.com/WSQS/agent-skills/tree/master/skills/on-submit)** 自检（一致性、必要性、无 drive-by）。技能集仓库：[WSQS/agent-skills](https://github.com/WSQS/agent-skills)。
 
 ## 注释规范
 
