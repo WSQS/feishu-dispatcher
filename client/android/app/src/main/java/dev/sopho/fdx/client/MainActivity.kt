@@ -14,6 +14,7 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
 import dev.sopho.fdx.client.data.ConnectionStore
 import dev.sopho.fdx.client.ui.ConfigScreen
+import dev.sopho.fdx.client.ui.FileContentScreen
 import dev.sopho.fdx.client.ui.ProjectListScreen
 import dev.sopho.fdx.client.ui.TreeScreen
 import dev.sopho.fdx.client.ui.theme.FdxViewerTheme
@@ -25,8 +26,9 @@ import kotlinx.serialization.Serializable
  * - [Config]：配置/连接页（栈底，根屏）。
  * - [ProjectList]：项目列表（连接成功后进入）。
  * - [Tree]：某项目的文件树（点项目进入，带 projectName）。
+ * - [FileContent]：文件内容（点树里文件进入，带 projectName + path）。
  *
- * 后续加 FileContent / Diff 屏时，在这里加一个子类即可。
+ * 后续加 Diff 屏时，在这里加一个子类即可。
  */
 sealed class Destination {
     @Serializable
@@ -37,6 +39,9 @@ sealed class Destination {
 
     @Serializable
     data class Tree(val projectName: String) : Destination()
+
+    @Serializable
+    data class FileContent(val projectName: String, val path: String) : Destination()
 }
 
 class MainActivity : ComponentActivity() {
@@ -91,7 +96,28 @@ class MainActivity : ComponentActivity() {
                                 // 同 ProjectList：重建后无连接则退回。
                                 LaunchedEffect(Unit) { navController.popBackStack() }
                             } else {
-                                TreeScreen(client = c, projectName = route.projectName)
+                                TreeScreen(
+                                    client = c,
+                                    projectName = route.projectName,
+                                    onFileClick = { path ->
+                                        navController.navigate(
+                                            Destination.FileContent(route.projectName, path),
+                                        ) { launchSingleTop = true }
+                                    },
+                                )
+                            }
+                        }
+                        composable<Destination.FileContent> { entry ->
+                            val route = entry.toRoute<Destination.FileContent>()
+                            val c = connVm.client
+                            if (c == null) {
+                                LaunchedEffect(Unit) { navController.popBackStack() }
+                            } else {
+                                FileContentScreen(
+                                    client = c,
+                                    projectName = route.projectName,
+                                    path = route.path,
+                                )
                             }
                         }
                     }

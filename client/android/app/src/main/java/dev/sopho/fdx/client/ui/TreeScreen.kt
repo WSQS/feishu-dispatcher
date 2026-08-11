@@ -21,13 +21,14 @@ import dev.sopho.fdx.client.network.ViewerClient
 /**
  * 文件树页：数据在 [TreeViewModel]（随目的地存活），返回时复用缓存不重拉。
  *
- * 点击文件暂不跳转。
+ * 点击文件经 [onFileClick] 打开内容页。
  */
 @Composable
 fun TreeScreen(
     client: ViewerClient,
     projectName: String,
     modifier: Modifier = Modifier,
+    onFileClick: ((String) -> Unit)? = null,
 ) {
     val vm: TreeViewModel = viewModel { TreeViewModel(projectName) }
     LaunchedEffect(client) { vm.start(client) }
@@ -47,7 +48,7 @@ fun TreeScreen(
                         Text(
                             entry.path,
                             style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.clickable { /* TODO: open file content */ },
+                            modifier = Modifier.clickable { onFileClick?.invoke(entry.path) },
                         )
                         Text(
                             "${entry.size} bytes",

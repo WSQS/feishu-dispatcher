@@ -1,0 +1,77 @@
+package dev.sopho.fdx.client.ui
+
+import io.ktor.client.engine.mock.MockEngine
+import io.ktor.client.engine.mock.respond
+import io.ktor.http.HttpStatusCode
+import io.ktor.http.headersOf
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
+
+class FileContentViewModelTest {
+    private val okJson =
+        """{"path":"a.txt","rev":"work","binary":false,"content":"hello"}"""
+    private val binaryJson =
+        """{"path":"a.bin","rev":"work","binary":true,"content":""}"""
+    private val jsonHeaders = headersOf("Content-Type", "application/json")
+
+    @Test
+    fun `start_twice_sends_only_one_request`() = runVmTest {
+        var calls = 0
+        val engine = MockEngine { _ ->
+            calls++
+            respond(okJson, HttpStatusCode.OK, jsonHeaders)
+        }
+        val vm = FileContentViewModel("proj", "a.txt")
+        val client = mockClient(engine)
+
+        vm.start(client)
+        runUntilIdle()
+        vm.start(client)
+        runUntilIdle()
+
+        assertEquals(1, calls)
+        assertNotNull(vm.file)
+        assertNull(vm.error)
+    }
+
+    @Test
+    fun `start_success_sets_file`() = runVmTest {
+        val engine = MockEngine { respond(okJson, HttpStatusCode.OK, jsonHeaders) }
+        val vm = FileContentViewModel("proj", "a.txt")
+
+        vm.start(mockClient(engine))
+        runUntilIdle()
+
+        assertEquals("hello", vm.file?.content)
+        assertEquals(false, vm.file?.binary)
+        assertNull(vm.error)
+    }
+
+    @Test
+    fun `start_binary_sets_binary_flag`() = runVmTest {
+        val engine = MockEngine { respond(binaryJson, HttpStatusCode.OK, jsonHeaders) }
+        val vm = FileContentViewModel("proj", "a.bin")
+
+        vm.start(mockClient(engine))
+        runUntilIdle()
+
+        assertTrue(vm.file?.binary == true)
+        assertEquals("", vm.file?.content)
+        assertNull(vm.error)
+    }
+
+    @Test
+    fun `start_failure_sets_error_keeps_file_null`() = runVmTest {
+        val engine = MockEngine { respond("", HttpStatusCode.InternalServerError) }
+        val vm = FileContentViewModel("proj", "a.txt")
+
+        vm.start(mockClient(engine))
+        runUntilIdle()
+
+        assertNull(vm.file)
+        assertNotNull(vm.error)
+    }
+}
