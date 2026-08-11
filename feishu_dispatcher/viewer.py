@@ -40,6 +40,8 @@ RouteHandler = Callable[[dict, dict], Awaitable[tuple[int, dict]]]
 
 #: 单个请求在主 loop 上处理的最长等待（store 读/git 调用都该很快）
 _DISPATCH_TIMEOUT = 30.0
+#: 单个文件预览的内容上限，避免 daemon 与移动端为大文件分配过多内存
+_MAX_FILE_BYTES = 1_000_000
 
 
 class ViewerServer:
@@ -181,7 +183,10 @@ async def file(ctx: dict, request: dict) -> tuple[int, dict]:
         return 400, {"error": str(exc)}
     if not resolved.is_file():
         return 404, {"error": f"not a file: {rel}"}
-    data = resolved.read_bytes()
+    with resolved.open("rb") as stream:
+        data = stream.read(_MAX_FILE_BYTES + 1)
+    if len(data) > _MAX_FILE_BYTES:
+        return 413, {"error": f"file too large (max {_MAX_FILE_BYTES} bytes)"}
     # 空文件当文本；含 NUL 或 UTF-8 解不开 → binary
     if data and (b"\x00" in data[:8192]):
         return 200, {"path": rel, "rev": rev, "binary": True, "content": ""}

@@ -15,6 +15,7 @@ import urllib.request
 from feishu_dispatcher import __version__
 from feishu_dispatcher.config import Project
 from feishu_dispatcher.viewer import (
+    _MAX_FILE_BYTES,
     ViewerServer,
     file as viewer_file,
     health,
@@ -250,6 +251,33 @@ async def test_file_binary_flag():
         assert status == 200
         assert payload["binary"] is True
         assert payload["content"] == ""
+    finally:
+        vs.stop()
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_file_rejects_oversized_content():
+    import shutil
+    from pathlib import Path
+    from urllib.parse import quote
+
+    ws = Path(__file__).parent / "_ws_file_large"
+    ws.mkdir(exist_ok=True)
+    (ws / "large.txt").write_bytes(b"x" * (_MAX_FILE_BYTES + 1))
+    fake = {"demo": Project(name="demo", path=ws)}
+    vs = ViewerServer(
+        "tok-view",
+        routes={("GET", "/api/projects/{name}/file"): viewer_file},
+        host="127.0.0.1",
+        port=0,
+        ctx={"all_projects": lambda: fake},
+    )
+    vs.start()
+    try:
+        url = vs.base_url + "/api/projects/demo/file?path=" + quote("large.txt")
+        status, payload = await asyncio.to_thread(_get, url, "tok-view")
+        assert status == 413
+        assert payload == {"error": f"file too large (max {_MAX_FILE_BYTES} bytes)"}
     finally:
         vs.stop()
         shutil.rmtree(ws, ignore_errors=True)
