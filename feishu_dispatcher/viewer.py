@@ -158,7 +158,7 @@ async def tree(ctx: dict, request: dict) -> tuple[int, dict]:
         dirs[:] = [d for d in dirs if d not in ignore]
         for f in fnames:
             full = root / f
-            entries.append({"path": str(full.relative_to(ws)), "type": "file", "size": full.stat().st_size})
+            entries.append({"path": full.relative_to(ws).as_posix(), "type": "file", "size": full.stat().st_size})
     entries.sort(key=lambda x: x["path"])
     return 200, {"entries": entries}
 
