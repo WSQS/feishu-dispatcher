@@ -27,8 +27,6 @@ import kotlinx.serialization.Serializable
  * - [ProjectList]：项目列表（连接成功后进入）。
  * - [Tree]：某项目的文件树（点项目进入，带 projectName）。
  * - [FileContent]：文件内容（点树里文件进入，带 projectName + path）。
- *
- * 后续加 Diff 屏时，在这里加一个子类即可。
  */
 sealed class Destination {
     @Serializable

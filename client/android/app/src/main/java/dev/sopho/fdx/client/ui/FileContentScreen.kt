@@ -21,7 +21,7 @@ import dev.sopho.fdx.client.network.ViewerClient
 /**
  * 文件内容页：数据在 [FileContentViewModel]（随目的地存活），返回时复用缓存不重拉。
  *
- * 语法高亮留给后续（决策 Q6：可在安卓端做）；v1 等宽纯文本 + 横竖滚动。
+ * 内容以等宽纯文本展示，并支持横竖滚动。
  */
 @Composable
 fun FileContentScreen(
