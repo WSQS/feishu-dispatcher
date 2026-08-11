@@ -83,6 +83,7 @@ class ViewerClient(
             val r = http.get {
                 url.takeFrom(URLBuilder(baseUrl).apply { pathSegments = listOf("api", "health") }.build())
                 bearerAuth(token)
+                expectSuccess = true
             }.body<HealthResponse>()
             Log.i(TAG, "health: ${(System.nanoTime() - t) / 1_000_000}ms")
             r
@@ -99,6 +100,7 @@ class ViewerClient(
             val r = http.get {
                 url.takeFrom(URLBuilder(baseUrl).apply { pathSegments = listOf("api", "projects") }.build())
                 bearerAuth(token)
+                expectSuccess = true
             }.body<ListProjectsResponse>()
             Log.i(TAG, "projects: ${(System.nanoTime() - t) / 1_000_000}ms (${r.items.size} items)")
             r
@@ -117,6 +119,7 @@ class ViewerClient(
                     URLBuilder(baseUrl).apply { pathSegments = listOf("api", "projects", projectName, "tree") }.build(),
                 )
                 bearerAuth(token)
+                expectSuccess = true
             }.body<TreeResponse>()
             Log.i(TAG, "tree: ${(System.nanoTime() - t) / 1_000_000}ms (${r.entries.size} files)")
             r
