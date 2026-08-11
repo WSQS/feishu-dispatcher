@@ -7,6 +7,7 @@ import io.ktor.client.call.body
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.plugins.expectSuccess
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.get
 import io.ktor.http.URLBuilder
@@ -42,6 +43,15 @@ data class TreeEntry(val path: String, val type: String, val size: Long)
 /** /api/projects/{name}/tree 的响应体。 */
 @Serializable
 data class TreeResponse(val entries: List<TreeEntry>)
+
+/** /api/projects/{name}/file 的响应体。 */
+@Serializable
+data class FileResponse(
+    val path: String,
+    val rev: String,
+    val binary: Boolean,
+    val content: String,
+)
 
 /**
  * 连 daemon viewer 的客户端。封装 [baseUrl] + [token]，按 [useZerotier] 选 engine：
@@ -115,6 +125,30 @@ class ViewerClient(
             throw ViewerException.from(e)
         }
     }
+
+    /** GET /api/projects/{name}/file?path=&rev=work —— 读文件内容。失败抛 [ViewerException]。 */
+    suspend fun file(projectName: String, path: String, rev: String = "work"): FileResponse =
+        withContext(Dispatchers.IO) {
+            val t = System.nanoTime()
+            try {
+                val r = http.get {
+                    url.takeFrom(
+                        URLBuilder(baseUrl).apply {
+                            pathSegments = listOf("api", "projects", projectName, "file")
+                            parameters.append("path", path)
+                            parameters.append("rev", rev)
+                        }.build(),
+                    )
+                    bearerAuth(token)
+                    expectSuccess = true
+                }.body<FileResponse>()
+                Log.i(TAG, "file: ${(System.nanoTime() - t) / 1_000_000}ms ($path binary=${r.binary})")
+                r
+            } catch (e: Exception) {
+                Log.w(TAG, "file: failed in ${(System.nanoTime() - t) / 1_000_000}ms", e)
+                throw ViewerException.from(e)
+            }
+        }
 
     override fun close() = http.close()
 

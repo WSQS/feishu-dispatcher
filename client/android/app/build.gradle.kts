@@ -37,6 +37,7 @@ android {
             // JVM 单测里 android.util.Log 等框架类是空 stub，默认会抛 RuntimeException("Not mocked")；
             // 让它们返回默认值（Log.i/w 返回 0），不阻断业务逻辑测试。
             isReturnDefaultValues = true
+            isIncludeAndroidResources = true
         }
     }
 }
@@ -82,4 +83,9 @@ dependencies {
     testImplementation("io.ktor:ktor-client-mock:3.0.3")
     // 协程测试与 Ktor 3.0.3 依赖的 kotlinx-coroutines 1.9.0 对齐
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.9.0")
+    // Compose UI 行为测试跑在 JVM：AndroidX Test 统一 runner + Robolectric Android runtime
+    testImplementation("androidx.compose.ui:ui-test-junit4")
+    testImplementation("androidx.test.ext:junit:1.3.0")
+    testImplementation("org.robolectric:robolectric:4.16")
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
 }
