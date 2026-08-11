@@ -14,7 +14,13 @@ import urllib.request
 
 from feishu_dispatcher import __version__
 from feishu_dispatcher.config import Project
-from feishu_dispatcher.viewer import ViewerServer, health, list_projects, tree as viewer_tree
+from feishu_dispatcher.viewer import (
+    ViewerServer,
+    file as viewer_file,
+    health,
+    list_projects,
+    tree as viewer_tree,
+)
 
 
 def _get(url: str, token: str | None) -> tuple[int, dict]:
@@ -159,3 +165,91 @@ async def test_tree_unknown_project_404():
         assert status == 404
     finally:
         vs.stop()
+
+
+async def test_file_reads_text():
+    import shutil
+    from pathlib import Path
+    from urllib.parse import quote
+
+    ws = Path(__file__).parent / "_ws_file"
+    ws.mkdir(exist_ok=True)
+    # write_bytes 避免 Windows 文本模式把 \n 写成 \r\n
+    (ws / "hello.py").write_bytes(b"print('hi')\n")
+    fake = {"demo": Project(name="demo", path=ws)}
+    vs = ViewerServer(
+        "tok-view",
+        routes={("GET", "/api/projects/{name}/file"): viewer_file},
+        host="127.0.0.1",
+        port=0,
+        ctx={"all_projects": lambda: fake},
+    )
+    vs.start()
+    try:
+        url = vs.base_url + "/api/projects/demo/file?path=" + quote("hello.py")
+        status, payload = await asyncio.to_thread(_get, url, "tok-view")
+        assert status == 200
+        assert payload == {
+            "path": "hello.py",
+            "rev": "work",
+            "binary": False,
+            "content": "print('hi')\n",
+        }
+    finally:
+        vs.stop()
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_file_rejects_path_traversal():
+    import shutil
+    from pathlib import Path
+    from urllib.parse import quote
+
+    ws = Path(__file__).parent / "_ws_file_trav"
+    ws.mkdir(exist_ok=True)
+    (ws / "ok.txt").write_text("x", encoding="utf-8")
+    fake = {"demo": Project(name="demo", path=ws)}
+    vs = ViewerServer(
+        "tok-view",
+        routes={("GET", "/api/projects/{name}/file"): viewer_file},
+        host="127.0.0.1",
+        port=0,
+        ctx={"all_projects": lambda: fake},
+    )
+    vs.start()
+    try:
+        for bad in ("../ok.txt", "/etc/passwd"):
+            url = vs.base_url + "/api/projects/demo/file?path=" + quote(bad)
+            status, _ = await asyncio.to_thread(_get, url, "tok-view")
+            assert status == 400, bad
+    finally:
+        vs.stop()
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_file_binary_flag():
+    import shutil
+    from pathlib import Path
+    from urllib.parse import quote
+
+    ws = Path(__file__).parent / "_ws_file_bin"
+    ws.mkdir(exist_ok=True)
+    (ws / "blob.bin").write_bytes(b"\x00\x01\x02\xff")
+    fake = {"demo": Project(name="demo", path=ws)}
+    vs = ViewerServer(
+        "tok-view",
+        routes={("GET", "/api/projects/{name}/file"): viewer_file},
+        host="127.0.0.1",
+        port=0,
+        ctx={"all_projects": lambda: fake},
+    )
+    vs.start()
+    try:
+        url = vs.base_url + "/api/projects/demo/file?path=" + quote("blob.bin")
+        status, payload = await asyncio.to_thread(_get, url, "tok-view")
+        assert status == 200
+        assert payload["binary"] is True
+        assert payload["content"] == ""
+    finally:
+        vs.stop()
+        shutil.rmtree(ws, ignore_errors=True)

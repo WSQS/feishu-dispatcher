@@ -26,8 +26,10 @@ from collections.abc import Awaitable, Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs
 
-from feishu_dispatcher import __version__
 from pathlib import Path
+
+from feishu_dispatcher import __version__
+from feishu_dispatcher._paths import PathTraversalError, resolve_under_root
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +159,37 @@ async def tree(ctx: dict, request: dict) -> tuple[int, dict]:
             entries.append({"path": str(full.relative_to(ws)), "type": "file", "size": full.stat().st_size})
     entries.sort(key=lambda x: x["path"])
     return 200, {"entries": entries}
+
+
+async def file(ctx: dict, request: dict) -> tuple[int, dict]:
+    """``GET /api/projects/{name}/file?path=&rev=work``：读工作区文件内容。
+
+    返回 ``{path, rev, binary, content}``。``binary=true`` 时 ``content`` 为空串（客户端
+    提示不可预览）；文本按 UTF-8 解码，失败亦当 binary。路径过 ``resolve_under_root``。
+    """
+    name = request["segments"]["name"]
+    rel = request["query"].get("path", "")
+    rev = request["query"].get("rev", "work")
+    if rev != "work":
+        return 400, {"error": f"unsupported rev: {rev} (v1 仅 work)"}
+    ws = _resolve_workspace(ctx, name)
+    if isinstance(ws, tuple):
+        return ws
+    try:
+        resolved = resolve_under_root(ws, rel)
+    except PathTraversalError as exc:
+        return 400, {"error": str(exc)}
+    if not resolved.is_file():
+        return 404, {"error": f"not a file: {rel}"}
+    data = resolved.read_bytes()
+    # 空文件当文本；含 NUL 或 UTF-8 解不开 → binary
+    if data and (b"\x00" in data[:8192]):
+        return 200, {"path": rel, "rev": rev, "binary": True, "content": ""}
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return 200, {"path": rel, "rev": rev, "binary": True, "content": ""}
+    return 200, {"path": rel, "rev": rev, "binary": False, "content": text}
 
 
 def _resolve_workspace(ctx: dict, name: str) -> "Path | tuple[int, dict]":
