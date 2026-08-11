@@ -1,23 +1,21 @@
 # feishu-dispatcher viewer（Android 客户端）
 
 移动端查看器 App：手机经私有网络（局域网 / Tailscale / ZeroTier）连 daemon 的 viewer
-服务，查看 agent 在 workspace 干活时的文件树 / 文件内容 / 代码 diff。
+服务，查看 agent 在 workspace 干活时的文件树和文件内容。
 
 > 这是 [feishu-dispatcher](../../..) 的安卓客户端部分，位于仓库 `client/android/`。
 > 服务端 viewer 见 `feishu_dispatcher/viewer.py`。整体设计见 wayfinder map #103。
 
 ## 状态
 
-骨架阶段（#121）：空 Compose Activity 能编译能装。后续里程碑：
-
-- 网络层（Ktor + `/api/health`）— #122
-- 配置页 + DataStore — #123
-- 整合 + zerotier 真机验证 — #125
+已实现 viewer 地址与 token 配置、普通 HTTP / ZeroTier 连接、项目列表、文件树和
+只读文件内容预览。文本文件以等宽字体展示；二进制文件显示不可预览提示，超过 1 MB
+的文件由服务端拒绝预览。
 
 ## 技术栈
 
 - Kotlin + Jetpack Compose
-- Gradle 8.9 + AGP 8.7.3
+- Gradle 8.13 + AGP 8.7.3
 - minSdk 26 / targetSdk 36
 
 ## 构建
@@ -43,4 +41,4 @@ JAVA_HOME=/usr/lib/jvm/java-17-openjdk ./gradlew assembleDebug
 ~/Android/Sdk/platform-tools/adb install app/build/outputs/apk/debug/app-debug.apk
 ```
 
-启动 App 显示 "feishu-dispatcher viewer" 文本（骨架阶段；UI 后续 child 补）。
+启动 App 后配置 viewer 地址与 token；连接成功后可依次进入项目列表、文件树和文件内容页。
