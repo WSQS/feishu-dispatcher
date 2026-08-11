@@ -32,7 +32,7 @@ def test_dotdot_escaping_root_rejected(tmp_path: Path):
 
 def test_absolute_path_rejected(tmp_path: Path):
     with pytest.raises(PathTraversalError, match="绝对路径"):
-        resolve_under_root(tmp_path, "/etc/passwd")
+        resolve_under_root(tmp_path, str(tmp_path / "file.txt"))
 
 
 def test_empty_rejected(tmp_path: Path):
