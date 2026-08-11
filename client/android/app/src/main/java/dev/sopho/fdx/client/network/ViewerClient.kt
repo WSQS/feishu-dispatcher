@@ -7,6 +7,7 @@ import io.ktor.client.call.body
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.engine.okhttp.OkHttp
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.plugins.expectSuccess
 import io.ktor.client.request.bearerAuth
 import io.ktor.client.request.get
 import io.ktor.http.URLBuilder
@@ -139,6 +140,7 @@ class ViewerClient(
                         }.build(),
                     )
                     bearerAuth(token)
+                    expectSuccess = true
                 }.body<FileResponse>()
                 Log.i(TAG, "file: ${(System.nanoTime() - t) / 1_000_000}ms ($path binary=${r.binary})")
                 r

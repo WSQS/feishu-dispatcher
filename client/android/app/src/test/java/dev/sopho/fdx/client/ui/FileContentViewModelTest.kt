@@ -72,6 +72,6 @@ class FileContentViewModelTest {
         runUntilIdle()
 
         assertNull(vm.file)
-        assertNotNull(vm.error)
+        assertEquals("HTTP 500", vm.error)
     }
 }
