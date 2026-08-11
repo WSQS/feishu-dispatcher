@@ -56,6 +56,11 @@ def test_symlink_escape_rejected(tmp_path: Path):
 def test_symlink_into_root_allowed(tmp_path: Path):
     # 软链指向 workspace 内部 → resolve 仍在根内 → 放行
     (tmp_path / "real.txt").write_text("x")
-    (tmp_path / "link.txt").symlink_to(tmp_path / "real.txt")
+    try:
+        (tmp_path / "link.txt").symlink_to(tmp_path / "real.txt")
+    except OSError as exc:
+        if os.name == "nt" and exc.winerror == 1314:
+            pytest.skip("Windows 当前用户无创建符号链接权限")
+        raise
     p = resolve_under_root(tmp_path, "link.txt")
     assert p.is_relative_to(tmp_path.resolve())
