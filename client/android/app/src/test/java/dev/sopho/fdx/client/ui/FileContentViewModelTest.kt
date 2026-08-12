@@ -51,6 +51,20 @@ class FileContentViewModelTest {
     }
 
     @Test
+    fun `start_success_splits_content_into_lines`() = runVmTest {
+        val multiLineJson =
+            """{"path":"a.txt","rev":"work","binary":false,"content":"l1\nl2\nl3\n"}"""
+        val engine = MockEngine { respond(multiLineJson, HttpStatusCode.OK, jsonHeaders) }
+        val vm = FileContentViewModel("proj", "a.txt")
+
+        vm.start(mockClient(engine))
+        runUntilIdle()
+
+        // 尾随换行保留一个空行（表示文件末尾换行）
+        assertEquals(listOf("l1", "l2", "l3", ""), vm.lines)
+    }
+
+    @Test
     fun `start_binary_sets_binary_flag`() = runVmTest {
         val engine = MockEngine { respond(binaryJson, HttpStatusCode.OK, jsonHeaders) }
         val vm = FileContentViewModel("proj", "a.bin")

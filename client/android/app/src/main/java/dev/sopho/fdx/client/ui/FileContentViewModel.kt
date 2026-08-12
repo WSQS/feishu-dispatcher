@@ -19,6 +19,9 @@ class FileContentViewModel(
 ) : ViewModel() {
     var file by mutableStateOf<FileResponse?>(null)
         private set
+    /** content 拆分一次的结果（渲染用），避免每次重组重复 split。 */
+    var lines by mutableStateOf<List<String>?>(null)
+        private set
     var error by mutableStateOf<String?>(null)
         private set
     private var started = false
@@ -28,7 +31,10 @@ class FileContentViewModel(
         started = true
         viewModelScope.launch {
             runCatching { client.file(projectName, path) }
-                .onSuccess { file = it }
+                .onSuccess {
+                    file = it
+                    lines = it.content.split("\n")
+                }
                 .onFailure {
                     Log.e("FileContent", "failed to load file", it)
                     error = it.message
