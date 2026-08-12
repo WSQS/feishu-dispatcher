@@ -1,12 +1,12 @@
 package dev.sopho.fdx.client.ui
 
 import androidx.compose.foundation.background
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
@@ -21,7 +21,7 @@ import dev.sopho.fdx.client.network.ViewerClient
 /**
  * 文件内容页：数据在 [FileContentViewModel]（随目的地存活），返回时复用缓存不重拉。
  *
- * 内容以等宽纯文本展示，并支持横竖滚动。
+ * 内容按行渲染（LazyColumn 虚拟化，长行自动换行），大文件只布局可见行。
  */
 @Composable
 fun FileContentScreen(
@@ -51,15 +51,20 @@ fun FileContentScreen(
                 modifier = Modifier.padding(top = 16.dp),
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            else -> Text(
-                file.content.ifEmpty { "（空文件）" },
-                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-                modifier = Modifier
-                    .padding(top = 16.dp)
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .horizontalScroll(rememberScrollState()),
+            file.content.isEmpty() -> Text(
+                "（空文件）",
+                modifier = Modifier.padding(top = 16.dp),
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            else -> LazyColumn(modifier = Modifier.fillMaxSize().padding(top = 8.dp)) {
+                items(vm.lines.orEmpty()) { line ->
+                    Text(
+                        line,
+                        style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                }
+            }
         }
     }
 }
