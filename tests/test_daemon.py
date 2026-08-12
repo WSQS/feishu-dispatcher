@@ -2463,16 +2463,24 @@ async def test_launch_then_kill_real_subprocess(tmp_path: Path):
 
 async def test_launch_threads_agent_env_into_spawn():
     # [agents.<名>].env 声明的追加环境变量应进到该 agent 的 AcpAgent spawn.env
-    # （codex 靠 CODEX_PATH 复用全局 codex）。无控制面时不叠 bg 身份 env。
+    # （codex 靠 CODEX_PATH 复用全局 codex，并可显式选择初始权限模式）。
+    # 无控制面时不叠 bg 身份 env。
     cfg = Config(
         app_id="a",
         app_secret="b",
         chat_id="oc_1",
-        agents={"codex": ["codex-acp"]},
-        agent_env={"codex": {"CODEX_PATH": "codex"}},
+        agents={"codex-full-access": ["codex-acp"]},
+        agent_env={
+            "codex-full-access": {
+                "CODEX_PATH": "codex",
+                "INITIAL_AGENT_MODE": "agent-full-access",
+            }
+        },
         projects={
             "demo": Project(
-                name="demo", path=Path("C:/tmp/demo"), default_agent="codex"
+                name="demo",
+                path=Path("C:/tmp/demo"),
+                default_agent="codex-full-access",
             )
         },
         throttle_window=0.01,
@@ -2494,6 +2502,7 @@ async def test_launch_threads_agent_env_into_spawn():
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
     assert created[0].spawn.env.get("CODEX_PATH") == "codex"
+    assert created[0].spawn.env.get("INITIAL_AGENT_MODE") == "agent-full-access"
     await daemon._shutdown()
 
 
