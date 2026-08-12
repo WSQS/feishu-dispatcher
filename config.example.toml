@@ -80,9 +80,9 @@ throttle_window = 0.5
 #   在 agent 话题内发 /done     = 标记该任务完成并归档（done）
 
 [agents]
-# agent 名 -> ACP 启动命令（argv 数组），均经 ACP 协议控制、本地实测握手通过。
+# agent 名 -> ACP 启动命令（argv 数组），均经 ACP 协议控制。
 # Windows 上必须用 npm 装的 .cmd shim（copilot.cmd / opencode.cmd），
-# daemon 会自动补 .cmd 后缀。
+# daemon 会自动补 .cmd 后缀；源码形式的 ZCode bridge 见 docs/zcode-backend.md。
 # - copilot：需先 `copilot` 登录过 GitHub 账号。
 # - opencode：需 opencode 侧配好 provider/凭据（`opencode providers`），
 #   用其默认模型；acp 模式无需额外 model 参数。
@@ -101,6 +101,11 @@ throttle_window = 0.5
 #   配好自定义 provider/model，如 deepseek 等 OpenAI 兼容端点）。**Windows 注意**：适配器
 #   自带的那份 codex 常缺原生二进制（@openai/codex-win32-x64 可选依赖装不上），所以用下面的
 #   表形式给它设 CODEX_PATH 指向本机全局 codex（`npm i -g @openai/codex`）——见 [agents.codex]。
+# - zcode：ZCode 无原生 ACP，经非官方社区项目 tizerluo/zcode-open-bridge 接入。
+#   bridge 当前标为 experimental；需先安装并登录 ZCode，再把其
+#   packages/acp-bridge/zcode-acp-bridge 暴露为同名命令。详见 docs/zcode-backend.md。
+#   bridge 默认 mode=yolo（文件修改/命令执行不再二次确认），下面显式写出该设置；
+#   可改为 build 收紧，但旧版 ZCode 可能卡在权限确认，改后务必先跑冒烟。
 copilot = ["copilot", "--acp"]
 opencode = ["opencode", "acp"]
 claude = ["claude-agent-acp"]
@@ -111,6 +116,10 @@ cline = ["cline", "--acp"]
 [agents.codex]
 command = ["codex-acp"]
 env = { CODEX_PATH = "codex" }   # 适配器对 CODEX_PATH 走 shell spawn，PATH 上的 `codex` 名即可
+
+[agents.zcode]
+command = ["zcode-acp-bridge"]
+env = { ZCODE_ACP_DEFAULT_MODE = "yolo" }
 
 # 在这里预置项目（内置、只读）。也可在群里运行时注册，不用改配置重启：
 #   /project add <名> <agent> <路径>   或对调度器 LLM 说「注册一个项目…」

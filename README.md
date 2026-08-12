@@ -2,7 +2,7 @@
 
 > 在飞书群里发一句话，本地 daemon 就帮你把活派给 coding agent；agent 的输出实时回到飞书话题，你随时在话题里接着指挥它。
 
-一个**个人用**的 coding agent 调度器。你人不在电脑前，也能用飞书（手机 / 网页 / 客户端都行）给本地的 Copilot、OpenCode、Claude Code、Cline、Codex 派任务、看进度、下指令。任务在你自己的机器上跑，代码和凭据都不出本地。
+一个**个人用**的 coding agent 调度器。你人不在电脑前，也能用飞书（手机 / 网页 / 客户端都行）给本地的 Copilot、OpenCode、Claude Code、Cline、Codex、ZCode 派任务、看进度、下指令。任务在你自己的机器上跑，代码和凭据都不出本地。
 
 ## 它是怎么工作的
 
@@ -45,7 +45,7 @@ agent 边干边把输出流式发回飞书 —— 每个任务一个独立「话
 
 ## 支持的 agent 后端
 
-都通过 ACP 协议（Agent Client Protocol）控制，本地实测握手 / 流式 / 会话恢复均通过，可按项目分别指定：
+都通过 ACP 协议（Agent Client Protocol）控制，可按项目分别指定。ZCode 经标为 experimental 的社区 bridge 接入；其余后端已本地实测握手 / 流式 / 会话恢复：
 
 | 后端 | 启动命令 | 前置 |
 |---|---|---|
@@ -54,6 +54,7 @@ agent 边干边把输出流式发回飞书 —— 每个任务一个独立「话
 | **Claude Code** | `claude-agent-acp` | 装社区适配器 + `claude` 已登录（详见 [docs/claude-code-backend.md](docs/claude-code-backend.md)） |
 | **Cline** | `cline --acp` | `cline` v3.0.47+ 且 `cline auth` 登录 |
 | **Codex CLI** | `codex-acp` | 装社区适配器 + `codex login`（Windows 需设 `CODEX_PATH` 指向全局 codex，详见 [config.example.toml](config.example.toml)） |
+| **ZCode** | `zcode-acp-bridge` | 装非官方 [zcode-open-bridge](https://github.com/tizerluo/zcode-open-bridge) + ZCode 已登录（详见 [docs/zcode-backend.md](docs/zcode-backend.md)） |
 
 ## 快速开始
 
@@ -86,10 +87,11 @@ uv sync                                  # 装依赖
 - **[使用手册 docs/usage.md](docs/usage.md)** — 装好之后怎么用（命令全集 + FAQ）
 - **[配置指南 docs/setup.md](docs/setup.md)** — 从零把飞书应用 + daemon 跑起来
 - [Claude Code 后端接入 docs/claude-code-backend.md](docs/claude-code-backend.md)
+- [ZCode 后端接入 docs/zcode-backend.md](docs/zcode-backend.md)
 - [设计方案 docs/design.md](docs/design.md)（架构与决策，偏开发者）
 
 ## 状态
 
-已在真实飞书环境验证可用。当前能力：ACP 流式输出实时回话题、话题内继续指挥、多后端（Copilot / OpenCode / Claude Code / Cline / Codex）、会话跨重启恢复、空闲自动挂起省资源、自然语言派发（调度器 LLM）、后台长任务跑完自动唤回 agent。下一步方向：多 agent 并发的 worktree 隔离。
+核心链路已在真实飞书环境验证可用。当前能力：ACP 流式输出实时回话题、话题内继续指挥、多后端（Copilot / OpenCode / Claude Code / Cline / Codex / ZCode；ZCode 经 experimental bridge，待有环境真机验证）、会话跨重启恢复、空闲自动挂起省资源、自然语言派发（调度器 LLM）、后台长任务跑完自动唤回 agent。下一步方向：多 agent 并发的 worktree 隔离。
 
 想深入实现细节，看 [docs/design.md](docs/design.md)。

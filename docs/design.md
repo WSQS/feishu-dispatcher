@@ -196,6 +196,10 @@ config 同目录 `sessions.json`；话题回复到达而无活跃 agent 时，da
 避免旧对话灌进新卡片）；`/stop` 删记录，agent 未配置/加载失败则明确提示重开（不再
 静默忽略）。已用 opencode 实测跨进程恢复通过。
 
+恢复入口会按 initialize 能力通告选具体方法：默认使用 `session/load`；若后端明确
+`loadSession=false` 且声明 `sessionCapabilities.resume`，则使用 `session/resume`
+（ZCode bridge）。本节其余 `load_session` 表述是现有后端与历史实现的简称。
+
 **（历史）问题背景**：重启后所有 agent 会话曾会丢失。两个原因叠加：
 1. `_Daemon._sessions` 是纯内存 dict（`daemon.py`），零持久化 —— 重启即忘记
    thread→session 的全部映射。

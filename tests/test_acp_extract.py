@@ -9,7 +9,7 @@ from acp import (
     update_tool_call,
 )
 from acp.connection import StreamDirection
-from acp.schema import ToolCallLocation
+from acp.schema import AgentCapabilities, ToolCallLocation
 
 import asyncio
 import logging
@@ -28,6 +28,7 @@ from feishu_dispatcher.acp_client import (
     _extract_tool_detail,
     _extract_usage_tokens,
     _proc_tree_pids,
+    _uses_resume_session,
 )
 
 
@@ -508,6 +509,24 @@ def test_proc_tree_pids_ignores_ppid_cycle():
 # --- 握手/会话恢复超时 (AcpAgent.start, #94) --------------------------- #
 
 
+def test_resume_only_capability_uses_session_resume():
+    caps = AgentCapabilities.model_validate(
+        {"loadSession": False, "sessionCapabilities": {"resume": {}}}
+    )
+    assert _uses_resume_session(caps)
+
+
+def test_load_session_capability_keeps_legacy_restore():
+    caps = AgentCapabilities.model_validate(
+        {"loadSession": True, "sessionCapabilities": {"resume": {}}}
+    )
+    assert not _uses_resume_session(caps)
+
+
+def test_missing_restore_capabilities_keeps_legacy_restore():
+    assert not _uses_resume_session(NS())
+
+
 def test_start_timeout_normalizes_nonpositive():
     # <=0 归一化为 None（不超时）；正值保留
     assert _agent(start_timeout=0)._start_timeout is None
@@ -554,3 +573,38 @@ async def test_start_raises_timeout_when_load_session_hangs(monkeypatch):
     agent = _agent(start_timeout=0.1, resume="sess-1")
     with pytest.raises(TimeoutError, match="load_session"):
         await agent.start()
+
+
+async def test_start_uses_resume_session_for_resume_only_agent(monkeypatch):
+    import feishu_dispatcher.acp_client as mod
+
+    class _FakeTransport:
+        async def __aenter__(self):
+            return (object(), object(), NS(stderr=None))
+
+        async def __aexit__(self, *a):
+            return False
+
+    class _FakeConn:
+        def __init__(self):
+            self.resume_calls = []
+
+        async def initialize(self, **_k):
+            capabilities = AgentCapabilities.model_validate(
+                {"loadSession": False, "sessionCapabilities": {"resume": {}}}
+            )
+            return NS(agent_info="resume-only", agent_capabilities=capabilities)
+
+        async def resume_session(self, **kwargs):
+            self.resume_calls.append(kwargs)
+            return NS(config_options=[])
+
+    conn = _FakeConn()
+    monkeypatch.setattr(mod, "spawn_stdio_transport", lambda *a, **k: _FakeTransport())
+    monkeypatch.setattr(mod.acp, "connect_to_agent", lambda *a, **k: conn)
+
+    agent = _agent(start_timeout=1, resume="sess-1")
+    await agent.start()
+
+    assert conn.resume_calls == [{"cwd": ".", "session_id": "sess-1"}]
+    assert agent.session_id == "sess-1"

@@ -12,13 +12,14 @@
 
 ## 前置环境
 
-本机装好 [`uv`](https://docs.astral.sh/uv/)，以及至少一个 coding agent CLI（npm 全局）——都经 ACP 协议控制、本地实测握手/流式/会话恢复通过：
+本机装好 [`uv`](https://docs.astral.sh/uv/)，以及至少一个 coding agent CLI——都经 ACP 协议控制。除标为 experimental 的 ZCode 社区 bridge 外，其余后端已本地实测握手/流式/会话恢复：
 
 - **Copilot CLI**：`copilot` 已登录过 GitHub 账号。冒烟 `uv run python scripts/smoke_acp.py`。
 - **OpenCode**：`opencode` 已配好 provider/凭据（`opencode providers`）。冒烟 `uv run python scripts/smoke_opencode.py`。
 - **Claude Code**：无原生 ACP，经社区适配器接入——`npm i -g @agentclientprotocol/claude-agent-acp` + `claude` 已登录。详见 [claude-code-backend.md](claude-code-backend.md)，冒烟 `uv run python scripts/smoke_claude.py`。
 - **Cline**：`cline` v3.0.47+ 原生带 `--acp`，`cline auth` 登录某 provider。冒烟 `uv run python scripts/smoke_cline.py`。
 - **Codex CLI**：无原生 ACP，经社区适配器接入——`npm i -g @agentclientprotocol/codex-acp` + `codex login`（或在 `~/.codex/config.toml` 配好自定义 provider/model，如 deepseek 等 OpenAI 兼容端点）。**Windows 注意**：适配器自带的 codex 常缺原生二进制，需用 `[agents.codex]` 表形式设 `CODEX_PATH` 指向本机全局 codex（`npm i -g @openai/codex`）——见 [config.example.toml](../config.example.toml)。冒烟 `uv run python scripts/smoke_codex.py`。
+- **ZCode**：无原生 ACP，经非官方 [zcode-open-bridge](https://github.com/tizerluo/zcode-open-bridge) 接入；先安装并登录 ZCode，再配置 bridge。它当前标为 experimental，且默认 `mode=yolo`。完整安装、安全边界与冒烟见 [zcode-backend.md](zcode-backend.md)。
 
 在 `config.toml` 的 `[[projects]]` 里用 `default_agent` 指定每个项目由哪个 agent 处理（agent 名须在 `[agents]` 里配过）。
 

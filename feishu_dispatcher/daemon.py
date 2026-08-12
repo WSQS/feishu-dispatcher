@@ -901,7 +901,7 @@ class _Daemon:
     ) -> _AgentSession:
         """按 Task 建 session、接线 on_output、入队首条 prompt、启动 worker。
 
-        ``resume_session_id`` 非 None 时 agent 用 load_session 恢复（惰性重连）。
+        ``resume_session_id`` 非 None 时 agent 按后端能力恢复会话（惰性重连）。
         ``first_prompt=None`` 时只把 agent 拉起来在线（不跑首轮），用于 resume_task。
         """
         sess = _AgentSession(
