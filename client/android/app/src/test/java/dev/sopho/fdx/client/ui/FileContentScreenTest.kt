@@ -93,6 +93,31 @@ class FileContentScreenTest {
         }
     }
 
+    @Test
+    fun `line_numbers_rendered_for_each_line`() {
+        val engine = MockEngine {
+            respond(
+                """{"path":"a.txt","rev":"work","binary":false,"content":"hello\nworld"}""",
+                HttpStatusCode.OK,
+                jsonHeaders,
+            )
+        }
+        val client = mockClient(engine)
+
+        try {
+            composeRule.setContent {
+                FileContentScreen(client = client, projectName = "proj", path = "a.txt")
+            }
+
+            waitForText("1")
+            waitForText("2")
+            composeRule.onNodeWithText("1").assertIsDisplayed()
+            composeRule.onNodeWithText("2").assertIsDisplayed()
+        } finally {
+            client.close()
+        }
+    }
+
     private fun waitForText(text: String) {
         composeRule.waitUntil(timeoutMillis = 5_000) {
             composeRule.onAllNodes(hasText(text)).fetchSemanticsNodes().isNotEmpty()
