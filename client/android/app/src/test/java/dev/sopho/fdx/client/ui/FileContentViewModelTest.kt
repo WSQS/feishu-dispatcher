@@ -65,6 +65,21 @@ class FileContentViewModelTest {
     }
 
     @Test
+    fun `start_crlf_content_normalizes_line_endings`() = runVmTest {
+        // JSON 里 \r\n 是字面反斜杠，kotlinx 解析成真实 CRLF
+        val crlfJson =
+            """{"path":"a.txt","rev":"work","binary":false,"content":"l1\r\nl2\r\n"}"""
+        val engine = MockEngine { respond(crlfJson, HttpStatusCode.OK, jsonHeaders) }
+        val vm = FileContentViewModel("proj", "a.txt")
+
+        vm.start(mockClient(engine))
+        runUntilIdle()
+
+        // 行尾无残留 \r
+        assertEquals(listOf("l1", "l2", ""), vm.lines)
+    }
+
+    @Test
     fun `start_binary_sets_binary_flag`() = runVmTest {
         val engine = MockEngine { respond(binaryJson, HttpStatusCode.OK, jsonHeaders) }
         val vm = FileContentViewModel("proj", "a.bin")

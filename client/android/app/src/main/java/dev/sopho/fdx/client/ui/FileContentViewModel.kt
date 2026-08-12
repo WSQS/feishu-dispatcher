@@ -33,7 +33,8 @@ class FileContentViewModel(
             runCatching { client.file(projectName, path) }
                 .onSuccess {
                     file = it
-                    lines = it.content.split("\n")
+                    // CRLF 文件先归一，避免行尾残留 \r 影响渲染
+                    lines = it.content.replace("\r\n", "\n").split("\n")
                 }
                 .onFailure {
                     Log.e("FileContent", "failed to load file", it)
