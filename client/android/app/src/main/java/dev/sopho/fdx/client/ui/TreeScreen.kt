@@ -4,6 +4,7 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -11,6 +12,7 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.ui.Modifier
@@ -44,11 +46,16 @@ fun TreeScreen(
             entries.isEmpty() -> Text("（空）", modifier = Modifier.padding(top = 16.dp))
             else -> LazyColumn(modifier = Modifier.fillMaxSize()) {
                 items(entries) { entry ->
-                    Column(modifier = Modifier.padding(vertical = 8.dp)) {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { onFileClick?.invoke(entry.path) }
+                            .minimumInteractiveComponentSize()
+                            .padding(vertical = 8.dp),
+                    ) {
                         Text(
                             entry.path,
                             style = MaterialTheme.typography.bodyMedium,
-                            modifier = Modifier.clickable { onFileClick?.invoke(entry.path) },
                         )
                         Text(
                             "${entry.size} bytes",
