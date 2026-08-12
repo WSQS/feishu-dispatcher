@@ -7,6 +7,10 @@
 前置：对应 agent 已可用（opencode 需配好 provider；claude 需装 claude-agent-acp
 适配器且已登录，见 docs/claude-code-backend.md；codex 需装 codex-acp 适配器且已
 codex login；zcode 见 docs/zcode-backend.md）。
+
+ZCode 说明：截至 2026-08-12，上游 bridge 能成功调用 ``session/resume``，但在
+ZCode 3.7.3 / CLI 0.16.1 冷恢复后没有补回 runtime model，随后 prompt 会失败；
+该脚本可用于确认所安装 bridge 是否已修复。详见 docs/zcode-backend.md。
 """
 
 from __future__ import annotations

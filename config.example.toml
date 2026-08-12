@@ -104,6 +104,8 @@ throttle_window = 0.5
 # - zcode：ZCode 无原生 ACP，经非官方社区项目 tizerluo/zcode-open-bridge 接入。
 #   bridge 当前标为 experimental；需先安装并登录 ZCode，再把其
 #   packages/acp-bridge/zcode-acp-bridge 暴露为同名命令。详见 docs/zcode-backend.md。
+#   ZCode 3.7.3 / CLI 0.16.1 已实测新会话和流式可用；当前上游 bridge 跨进程恢复后
+#   未补回 runtime model，下一轮 prompt 会失败。依赖恢复前先看文档里的兼容状态。
 #   bridge 默认 mode=yolo（文件修改/命令执行不再二次确认），下面显式写出该设置；
 #   可改为 build 收紧，但旧版 ZCode 可能卡在权限确认，改后务必先跑冒烟。
 copilot = ["copilot", "--acp"]

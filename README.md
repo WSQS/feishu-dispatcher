@@ -45,7 +45,10 @@ agent 边干边把输出流式发回飞书 —— 每个任务一个独立「话
 
 ## 支持的 agent 后端
 
-都通过 ACP 协议（Agent Client Protocol）控制，可按项目分别指定。ZCode 经标为 experimental 的社区 bridge 接入；其余后端已本地实测握手 / 流式 / 会话恢复：
+都通过 ACP 协议（Agent Client Protocol）控制，可按项目分别指定。ZCode 经标为
+experimental 的社区 bridge 接入，已真机验证握手、新会话和流式输出；当前上游 bridge
+的跨进程恢复仍有兼容限制，详见 [ZCode 接入文档](docs/zcode-backend.md)。其余后端已
+本地实测握手 / 流式 / 会话恢复：
 
 | 后端 | 启动命令 | 前置 |
 |---|---|---|
@@ -92,6 +95,6 @@ uv sync                                  # 装依赖
 
 ## 状态
 
-核心链路已在真实飞书环境验证可用。当前能力：ACP 流式输出实时回话题、话题内继续指挥、多后端（Copilot / OpenCode / Claude Code / Cline / Codex / ZCode；ZCode 经 experimental bridge，待有环境真机验证）、会话跨重启恢复、空闲自动挂起省资源、自然语言派发（调度器 LLM）、后台长任务跑完自动唤回 agent。下一步方向：多 agent 并发的 worktree 隔离。
+核心链路已在真实飞书环境验证可用。当前能力：ACP 流式输出实时回话题、话题内继续指挥、多后端（Copilot / OpenCode / Claude Code / Cline / Codex / ZCode；ZCode 经 experimental bridge，新会话与流式已真机验证，跨进程恢复见已知限制）、会话跨重启恢复、空闲自动挂起省资源、自然语言派发（调度器 LLM）、后台长任务跑完自动唤回 agent。下一步方向：多 agent 并发的 worktree 隔离。
 
 想深入实现细节，看 [docs/design.md](docs/design.md)。
