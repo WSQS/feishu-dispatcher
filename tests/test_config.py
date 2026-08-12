@@ -1,3 +1,4 @@
+import tomllib
 from pathlib import Path
 
 import pytest
@@ -276,6 +277,21 @@ def test_agent_table_form_parses_command_and_env(tmp_path: Path):
     )
     assert cfg.agents == {"copilot": ["copilot", "--acp"], "codex": ["codex-acp"]}
     assert cfg.agent_env == {"codex": {"CODEX_PATH": "codex"}}
+
+
+def test_config_example_has_explicit_codex_full_access_profile():
+    config_path = Path(__file__).resolve().parents[1] / "config.example.toml"
+    with config_path.open("rb") as config_file:
+        agents = tomllib.load(config_file)["agents"]
+
+    assert agents["codex"]["env"] == {"CODEX_PATH": "codex"}
+    assert agents["codex-full-access"] == {
+        "command": ["codex-acp"],
+        "env": {
+            "CODEX_PATH": "codex",
+            "INITIAL_AGENT_MODE": "agent-full-access",
+        },
+    }
 
 
 def test_agent_table_form_without_env_has_no_agent_env(tmp_path: Path):

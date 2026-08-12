@@ -18,9 +18,29 @@
 - **OpenCode**：`opencode` 已配好 provider/凭据（`opencode providers`）。冒烟 `uv run python scripts/smoke_opencode.py`。
 - **Claude Code**：无原生 ACP，经社区适配器接入——`npm i -g @agentclientprotocol/claude-agent-acp` + `claude` 已登录。详见 [claude-code-backend.md](claude-code-backend.md)，冒烟 `uv run python scripts/smoke_claude.py`。
 - **Cline**：`cline` v3.0.47+ 原生带 `--acp`，`cline auth` 登录某 provider。冒烟 `uv run python scripts/smoke_cline.py`。
-- **Codex CLI**：无原生 ACP，经社区适配器接入——`npm i -g @agentclientprotocol/codex-acp` + `codex login`（或在 `~/.codex/config.toml` 配好自定义 provider/model，如 deepseek 等 OpenAI 兼容端点）。**Windows 注意**：适配器自带的 codex 常缺原生二进制，需用 `[agents.codex]` 表形式设 `CODEX_PATH` 指向本机全局 codex（`npm i -g @openai/codex`）——见 [config.example.toml](../config.example.toml)。冒烟 `uv run python scripts/smoke_codex.py`。
+- **Codex CLI**：无原生 ACP，经社区适配器接入——`npm i -g @agentclientprotocol/codex-acp` + `codex login`（或在 `~/.codex/config.toml` 配好自定义 provider/model，如 deepseek 等 OpenAI 兼容端点）。**Windows 注意**：适配器自带的 codex 常缺原生二进制，需用 `[agents.codex]` 表形式设 `CODEX_PATH` 指向本机全局 codex（`npm i -g @openai/codex`）——见 [config.example.toml](../config.example.toml)。普通任务使用默认受限 profile；review/subagent 任务见下节。冒烟 `uv run python scripts/smoke_codex.py`。
 
 在 `config.toml` 的 `[[projects]]` 里用 `default_agent` 指定每个项目由哪个 agent 处理（agent 名须在 `[agents]` 里配过）。
+
+### Codex review / subagent 权限
+
+`codex-acp` 默认使用 `INITIAL_AGENT_MODE=agent`：按需审批、`workspace-write` 沙箱且禁止网络。普通 coding 任务应保留这个安全默认；但实测 Codex 的 `/review`、`/review-commit` 和 subagent 类任务可能在该沙箱中永久等待，既没有流式事件，也不会返回本轮结果。
+
+需要这些能力时，单独配置一个 full-access profile，而不是放宽普通 `codex`：
+
+```toml
+[agents.codex-full-access]
+command = ["codex-acp"]
+env = { CODEX_PATH = "codex", INITIAL_AGENT_MODE = "agent-full-access" }
+```
+
+运行时显式选择它：
+
+```text
+/run <项目名> <任务描述> --agent codex-full-access
+```
+
+> **安全警告**：`agent-full-access` 等价于 `approval=never` + `danger-full-access`。Codex 可以联网、运行命令并修改工作区外文件，且不会经过逐次权限审批。只对可信仓库和可信任务使用，不建议将它设为项目的 `default_agent`。
 
 ## 获取代码
 

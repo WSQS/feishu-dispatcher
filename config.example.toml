@@ -96,7 +96,9 @@ throttle_window = 0.5
 #   ["cline", "--acp", "-P", "sapaicore"]。注意 cline 只上报占位模型名「cline」
 #   （类似 copilot 不暴露具体模型），卡片 footer / `/model` 显示会不全，不影响运行。
 # - codex：OpenAI Codex CLI 无原生 ACP，经社区适配器 @agentclientprotocol/codex-acp
-#   接入（实测握手/流式/load_session 通过，模型名/切换都正常显示）。前置：
+#   接入（实测握手/流式/load_session 通过，模型名/切换都正常显示）。默认 mode=agent：
+#   workspace-write、按需审批、禁止网络，适合普通任务；review/subagent 任务见下面的
+#   codex-full-access 独立 profile。前置：
 #   `npm i -g @agentclientprotocol/codex-acp` + `codex login`（或在 ~/.codex/config.toml
 #   配好自定义 provider/model，如 deepseek 等 OpenAI 兼容端点）。**Windows 注意**：适配器
 #   自带的那份 codex 常缺原生二进制（@openai/codex-win32-x64 可选依赖装不上），所以用下面的
@@ -107,10 +109,18 @@ claude = ["claude-agent-acp"]
 cline = ["cline", "--acp"]
 
 # 需要给某个后端追加环境变量时，用表形式代替简写数组：command = argv、env = 追加的环境变量
-# （SDK 白名单之外的显式追加项，会透传给该 agent 子进程）。codex 靠它复用全局 codex：
+# （SDK 白名单之外的显式追加项，会透传给该 agent 子进程）。普通 codex 靠它复用全局 codex：
 [agents.codex]
 command = ["codex-acp"]
 env = { CODEX_PATH = "codex" }   # 适配器对 CODEX_PATH 走 shell spawn，PATH 上的 `codex` 名即可
+
+# Codex 的 /review、/review-commit 与 subagent 在默认 workspace-write 沙箱中可能永久挂起。
+# 需要这类能力时显式选择：`/run <项目> <任务> --agent codex-full-access`。
+# 警告：该 mode 等价于 approval=never + danger-full-access，可联网并修改工作区外文件；
+# 仅用于可信项目/任务，不建议设成项目 default_agent。
+[agents.codex-full-access]
+command = ["codex-acp"]
+env = { CODEX_PATH = "codex", INITIAL_AGENT_MODE = "agent-full-access" }
 
 # 在这里预置项目（内置、只读）。也可在群里运行时注册，不用改配置重启：
 #   /project add <名> <agent> <路径>   或对调度器 LLM 说「注册一个项目…」
