@@ -14,7 +14,7 @@ daemon 跑起来之后，日常怎么用。第一次配置见 [setup.md](setup.m
 顺带几个词：
 - **项目（Project）**：一个代码仓库 + 用哪个 agent 处理，在配置或 `/project add` 里登记。
 - **任务（Task）**：一次 `/run` 就是一个任务，有短 id（`t1`、`t2`…），daemon 落盘记着它，重启也不丢。
-- **Agent 后端**：真正干活的 coding CLI（Copilot / OpenCode / Claude Code / Cline / Codex）。
+- **Agent 后端**：真正干活的 coding CLI（Copilot / OpenCode / Claude Code / Cline / Codex / ZCode）。
 
 ## 两种派发方式
 
@@ -124,7 +124,7 @@ daemon 崩了 / 升级 / 重开机之后，**不用重新 `/run`**：直接在�
 默认 `stream_mode = "card"` 是**原地更新一张卡片**，不刷屏。飞书同群 5 QPS 由令牌桶（`feishu_qps`）兜底，多 agent 并发时汇总限速；撞到 429 HTTP 层会自动退避重试。
 
 **模型显示为空 / 切不了模型？**
-不是所有后端都暴露模型名——OpenCode 会上报具体模型，Copilot / Cline 只报占位名，`/model` 会提示该后端不支持切换。这是后端能力差异，不是 bug。
+不是所有后端都暴露标准 ACP 模型配置——OpenCode 会上报具体模型，Copilot / Cline / ZCode bridge 不提供可切换模型列表，`/model` 会提示该后端不支持切换。这是后端能力差异，不是 bug。
 
 **任务状态里的 `failed` 是死了吗？**
 不是。`failed` = 某一轮出异常"卡住等恢复"，会话多半还在。话题里再回复一句就会尝试恢复；真的会话过期了才会停在 `failed` 并提示重开。
@@ -137,3 +137,4 @@ daemon 崩了 / 升级 / 重开机之后，**不用重新 `/run`**：直接在�
 - 从零配置：[setup.md](setup.md)
 - 架构与设计决策（偏开发者）：[design.md](design.md)
 - Claude Code 后端接入细节：[claude-code-backend.md](claude-code-backend.md)
+- ZCode 后端接入细节：[zcode-backend.md](zcode-backend.md)

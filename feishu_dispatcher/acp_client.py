@@ -29,8 +29,8 @@ logger = logging.getLogger(__name__)
 #: ACP 协议版本（当前 SDK 与 Copilot/OpenCode 实测握手成功值）
 _PROTOCOL_VERSION = 1
 
-#: 握手（initialize + new/load_session）整体超时秒数默认值（#94）。后端卡在
-#: load_session 时快速失败而非永久冻结；<=0/None = 不超时。可经 config 覆盖。
+#: 握手（initialize + new/load/resume session）整体超时秒数默认值（#94）。后端卡在
+#: 会话恢复时快速失败而非永久冻结；<=0/None = 不超时。可经 config 覆盖。
 _DEFAULT_START_TIMEOUT = 120.0
 
 OnOutput = Callable[[str], Awaitable[None]]
@@ -90,8 +90,8 @@ class _ClientImpl:
         return self._usage_used
 
     def set_suppress(self, on: bool) -> None:
-        """抑制输出转发。恢复会话时 load_session 会重放历史 session/update，
-        这些历史已在旧话题里、不该灌进新卡片，故 load 期间抑制。"""
+        """抑制输出转发。恢复会话时后端可能重放历史 session/update，
+        这些历史已在旧话题里、不该灌进新卡片，故恢复期间抑制。"""
         self._suppress = on
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
@@ -105,7 +105,7 @@ class _ClientImpl:
             if isinstance(used, int) and used >= 0:
                 self._usage_used = used
         # 审计（A）：tool_call 是离散的「做了什么」事件，旁路存一份进 task。
-        # 放在 suppress 之后，load_session 重放的历史动作不会被重复记录。
+        # 放在 suppress 之后，恢复时重放的历史动作不会被重复记录。
         if self._cb.on_action is not None:
             action = _extract_action(update)
             if action is not None:
@@ -220,7 +220,7 @@ def _extract_usage_tokens(response: Any) -> int | None:
 
 
 def _find_model_option(response: Any) -> Any:
-    """从 new_session/load_session 响应的 config_options 里找「模型」select，无则 None。
+    """从 session 创建/恢复响应的 config_options 里找「模型」select，无则 None。
 
     opencode/claude 把模型建成 ``config_options`` 里 ``id``/``category`` == "model" 的
     select；copilot 无此项（只有 mode/agent/allow_all）——协议本身不暴露模型。
@@ -249,6 +249,19 @@ def _extract_model_options(response: Any) -> list[str]:
         for o in (getattr(opt, "options", None) or [])
         if (v := getattr(o, "value", ""))
     ]
+
+
+def _uses_resume_session(capabilities: Any) -> bool:
+    """后端只支持新版 ``session/resume`` 时选它恢复已有会话。
+
+    现有后端主要走旧的 ``session/load``。只有 agent 明确不支持 ``loadSession``、
+    同时在 ``sessionCapabilities`` 声明 ``resume`` 时才切换；两种能力都未声明时
+    仍保留旧路径，兼容能力通告不完整的后端。
+    """
+    if getattr(capabilities, "load_session", False):
+        return False
+    session_capabilities = getattr(capabilities, "session_capabilities", None)
+    return getattr(session_capabilities, "resume", None) is not None
 
 
 #: 工具行里命令/路径细节的单行截断上限（卡片一行可读即可）
@@ -544,7 +557,7 @@ class AcpAgent:
         self._spawn = spawn
         self._on_output = on_output
         self._on_action = on_action
-        #: 非 None 则恢复该 ACP 会话（load_session）而非新建（new_session）
+        #: 非 None 则按能力恢复该 ACP 会话，而非新建（new_session）
         self._resume_session_id = resume_session_id
         #: 握手/会话恢复超时秒数；<=0 归一化为 None（不超时）
         self._start_timeout: float | None = (
@@ -608,7 +621,7 @@ class AcpAgent:
     async def _await_start(self, coro: Awaitable[Any], what: str) -> Any:
         """带超时地 await 握手/会话调用；超时抛 TimeoutError 供 worker 快速失败（#94）。
 
-        后端卡在 ``initialize`` / ``load_session`` 时，无超时会让 ``start()`` 永久挂起、
+        后端卡在 ``initialize`` / 会话恢复时，无超时会让 ``start()`` 永久挂起、
         worker 冻结、静默不回复（真机踩过）。超时后 ``start()`` 抛错 → worker 标 failed
         （可恢复）+ 通知 + aclose（顺带 #92 清进程）。``_start_timeout`` 为 None 则不超时。
         """
@@ -625,7 +638,7 @@ class AcpAgent:
         每个实例只允许启动一次：进程与 session 跨 turn 存活（上下文
         保留在 session 里），重复 start 会泄漏旧进程，直接报错。
 
-        握手（initialize + new/load_session）带整体超时（``start_timeout``，#94），
+        握手（initialize + new/load/resume session）带整体超时（``start_timeout``，#94），
         后端卡死时抛 TimeoutError 而非永久挂起。
         """
         if self._conn is not None:
@@ -685,15 +698,24 @@ class AcpAgent:
         )
 
         if self._resume_session_id is not None:
-            # 恢复已有会话。load_session 期间 agent 会重放历史 session/update，
+            # 恢复已有会话。恢复期间 agent 可能重放历史 session/update，
             # 抑制转发避免旧对话灌进新卡片（历史已在旧飞书话题里）。
             self._client_impl.set_suppress(True)
             try:
-                resp = await self._await_start(
-                    self._conn.load_session(
+                use_resume = _uses_resume_session(init_resp.agent_capabilities)
+                restore = (
+                    self._conn.resume_session(
                         cwd=self._spawn.cwd, session_id=self._resume_session_id
-                    ),
-                    "load_session",
+                    )
+                    if use_resume
+                    else self._conn.load_session(
+                        cwd=self._spawn.cwd, session_id=self._resume_session_id
+                    )
+                )
+                restore_method = "resume_session" if use_resume else "load_session"
+                resp = await self._await_start(
+                    restore,
+                    restore_method,
                 )
             finally:
                 self._client_impl.set_suppress(False)
