@@ -276,6 +276,40 @@ def test_with_tokens_appends_to_footer():
     assert _with_tokens("", 3210) == "~3.2k tok"  # 空 footer 不带前导分隔
 
 
+def test_card_footer_modes():
+    # 四种具名模式的字符串拼接（纯函数）。字段缺失不补分隔。
+    from feishu_dispatcher.daemon import _card_footer
+
+    kw = dict(task_id="t18", project="SuFei", model="glm-5")
+    assert _card_footer("model", **kw) == "模型：glm-5"
+    assert _card_footer("task", **kw) == "[t18] SuFei"
+    assert _card_footer("model+task", **kw) == "[t18] SuFei · 模型：glm-5"
+    assert _card_footer("none", **kw) == ""
+
+
+def test_card_footer_missing_fields_no_padding():
+    # 字段缺失：不补空分隔；mode 仍决定显哪部分。
+    from feishu_dispatcher.daemon import _card_footer
+
+    # 无模型 → model 模式空、model+task 只剩 task 段
+    assert _card_footer("model", task_id="t1", project="p", model="") == ""
+    assert (
+        _card_footer("model+task", task_id="t1", project="p", model="") == "[t1] p"
+    )
+    # 无 task_id/project → task 模式空
+    assert _card_footer("task", task_id="", project="", model="m") == ""
+
+
+def test_card_footer_issue_tag_appended():
+    # issue_tag（forge 绑定）作为独立后缀，不随模式开关；主内容空时单独显。
+    from feishu_dispatcher.daemon import _card_footer
+
+    kw = dict(task_id="t1", project="p", model="m", issue_tag="#42")
+    assert _card_footer("model", **kw) == "模型：m · #42"
+    assert _card_footer("none", **kw) == "#42"
+    assert _card_footer("none", task_id="t1", project="p", model="m") == ""
+
+
 async def test_run_dispatches_and_streams_output():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo do stuff"))
@@ -710,8 +744,7 @@ async def test_card_mode_footer_shows_token_usage():
     all_cards = bridge.card_replies + bridge.card_patches
     last_card = all_cards[-1][1]
     foot = last_card["body"]["elements"][-1]["content"]
-    # footer = 项目 · 模型 · token 用量（#53）
-    assert "demo" in foot
+    # footer = 模型 · token 用量；默认 model 模式不含项目名
     assert "ns-deepseek/deepseek-v4-pro" in foot
     assert "~3.2k tok" in foot
 
@@ -1419,14 +1452,19 @@ async def test_no_model_agent_leaves_blank():
     await daemon._shutdown()
 
 
-async def test_card_footer_shows_project_and_model():
-    # #44：卡片 footer 与模型同一行显示项目名，滚到任意卡片都可辨这条话题的归属
+async def test_card_footer_model_plus_task_shows_both():
+    # 默认 model 模式只显模型；切到 model+task 才把 [task_id] 项目名与模型同行。
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(
         store=store, agent_cls=ModelAgent, stream_mode="card"
     )
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    # /footer model+task 热切换（本会话有效，下一轮起 footer 含项目名 + 模型）
+    await daemon._handle_message(thread_msg("/footer model+task", mid="om_f"))
+    await daemon._handle_message(thread_msg("more", mid="om_t2"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 2)
+
     all_cards = bridge.card_replies + bridge.card_patches
     # footer（notation 小字 markdown 元素）里项目名与模型同行
     assert any(
@@ -1442,18 +1480,33 @@ async def test_card_footer_shows_project_and_model():
     await daemon._shutdown()
 
 
-async def test_card_footer_project_only_when_no_model():
-    # 无模型（似 copilot）：footer 仍显示项目名（不带「模型：」）
+async def test_card_footer_task_mode_shows_project_when_no_model():
+    # 默认 model 模式 + 无模型 → footer 空；切到 task 模式才显 [task_id] 项目名。
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store, stream_mode="card")
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
     all_cards = bridge.card_replies + bridge.card_patches
+    # 默认 model 模式 + 无模型：footer 空，不该出现项目名
+    assert not any(
+        any(
+            el.get("tag") == "markdown"
+            and el.get("text_size") == "notation"
+            and "demo" in el.get("content", "")
+            for el in card["body"]["elements"]
+        )
+        for _, card in all_cards
+    )
+    # /footer task 热切换 → 下一轮 footer 含 [t1] demo
+    await daemon._handle_message(thread_msg("/footer task", mid="om_f"))
+    await daemon._handle_message(thread_msg("more", mid="om_t2"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 2)
+    all_cards = bridge.card_replies + bridge.card_patches
     assert any(
         any(
             el.get("tag") == "markdown"
             and el.get("text_size") == "notation"
-            and el.get("content", "") == "demo"
+            and "[t1] demo" in el.get("content", "")
             for el in card["body"]["elements"]
         )
         for _, card in all_cards
@@ -1543,6 +1596,54 @@ async def test_model_command_unsupported_agent():
     await daemon._handle_message(thread_msg("/model glm-5", mid="om_m"))
     assert created[0].set_model_calls == []
     assert any("不支持切换模型" in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+# ---------------------------------------------------------------------- #
+# 话题内 /footer：热切换卡片底栏模式（不写配置，本次会话有效）
+# ---------------------------------------------------------------------- #
+
+
+async def _run_for_footer(store):
+    daemon, bridge, created = make_daemon(store=store, agent_cls=ModelAgent)
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    return daemon, bridge, created
+
+
+def _sess_of(daemon, root="om_root1"):
+    return daemon._sessions[root]
+
+
+async def test_footer_command_lists_current_and_modes():
+    store = TaskStore(None)
+    daemon, bridge, created = await _run_for_footer(store)
+    await daemon._handle_message(thread_msg("/footer", mid="om_f"))
+    reply = "\n".join(bridge.texts("om_root1"))
+    # 默认 model 模式；列出全部四种具名模式
+    assert "当前底栏模式：model" in reply
+    assert "model+task" in reply and "none" in reply
+    await daemon._shutdown()
+
+
+async def test_footer_command_switches_for_session():
+    store = TaskStore(None)
+    daemon, bridge, created = await _run_for_footer(store)
+    sess = _sess_of(daemon)
+    assert sess.footer_mode == ""  # 初始无覆盖（用配置默认）
+    await daemon._handle_message(thread_msg("/footer task", mid="om_f"))
+    assert sess.footer_mode == "task"  # 覆盖落到 session（不写配置）
+    assert any("已切换底栏为 task" in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+async def test_footer_command_rejects_unknown():
+    store = TaskStore(None)
+    daemon, bridge, created = await _run_for_footer(store)
+    sess = _sess_of(daemon)
+    await daemon._handle_message(thread_msg("/footer bogus", mid="om_f"))
+    assert sess.footer_mode == ""  # 非法参数不改覆盖
+    assert any("未知底栏模式" in t for t in bridge.texts("om_root1"))
     await daemon._shutdown()
 
 
@@ -1868,7 +1969,7 @@ async def test_sched_list_forge_all_skipped_is_explicit(monkeypatch):
     assert "未能获取任何仓库" in out
 
 
-# ------------------------- Task 绑定 issue 作 brief（#63） ------------------------- #
+# ------------------------- Task 绑定 issue 作 brief ------------------------- #
 
 
 def test_issue_tag_extracts_number():

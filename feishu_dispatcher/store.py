@@ -143,7 +143,7 @@ class Task:
     model: str = ""
     #: turn 异常时的诊断（异常类型 + 片段），供 /task /agents / 恢复判断；正常时空
     error_message: str = ""
-    #: 关联的 forge issue URL（派活时锚定的意图/brief，#63）；空 = 未绑定。
+    #: 关联的 forge issue URL（派活时锚定的意图/brief）；空 = 未绑定。
     #: 单字段、控制平面拥有；PR 不存这里（经 forge 的 Closes #N 反查）。
     issue_url: str = ""
 
