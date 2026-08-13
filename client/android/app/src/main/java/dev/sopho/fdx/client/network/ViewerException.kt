@@ -16,6 +16,9 @@ class ViewerException(
         /** 401/403 —— token 错。 */
         AUTH,
 
+        /** 404 —— 资源不存在（如展开的目录已被删除）。 */
+        NOT_FOUND,
+
         /** 其它 HTTP 错误状态 / 协议解析问题。 */
         PROTOCOL,
     }
@@ -24,6 +27,7 @@ class ViewerException(
         fun from(e: Throwable): ViewerException = when (e) {
             is ResponseException -> when (e.response.status.value) {
                 401, 403 -> ViewerException(Kind.AUTH, "鉴权失败（token 错？）", e)
+                404 -> ViewerException(Kind.NOT_FOUND, "资源不存在", e)
                 else -> ViewerException(Kind.PROTOCOL, "HTTP ${e.response.status.value}", e)
             }
             is UnknownHostException ->
