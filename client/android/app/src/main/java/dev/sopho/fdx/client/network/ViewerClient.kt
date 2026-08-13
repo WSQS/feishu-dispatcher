@@ -44,6 +44,14 @@ data class TreeEntry(val path: String, val type: String, val size: Long)
 @Serializable
 data class TreeResponse(val entries: List<TreeEntry>)
 
+/** /api/projects/{name}/tree/children 返回的单个直接子项（目录或文件，无 size）。 */
+@Serializable
+data class TreeChildrenEntry(val name: String, val path: String, val type: String)
+
+/** /api/projects/{name}/tree/children 的响应体。 */
+@Serializable
+data class TreeChildrenResponse(val path: String, val entries: List<TreeChildrenEntry>)
+
 /** /api/projects/{name}/file 的响应体。 */
 @Serializable
 data class FileResponse(
@@ -128,6 +136,30 @@ class ViewerClient(
             throw ViewerException.from(e)
         }
     }
+
+    /** GET /api/projects/{name}/tree/children?path= —— 列指定目录的直接子项（按目录加载）。
+     *  [path] 是 workspace 相对路径，空串 = 根目录（必填，缺省仍带上 `path=`）。失败抛 [ViewerException]。 */
+    suspend fun treeChildren(projectName: String, path: String): TreeChildrenResponse =
+        withContext(Dispatchers.IO) {
+            val t = System.nanoTime()
+            try {
+                val r = http.get {
+                    url.takeFrom(
+                        URLBuilder(baseUrl).apply {
+                            pathSegments = listOf("api", "projects", projectName, "tree", "children")
+                            parameters.append("path", path)
+                        }.build(),
+                    )
+                    bearerAuth(token)
+                    expectSuccess = true
+                }.body<TreeChildrenResponse>()
+                Log.i(TAG, "treeChildren: ${(System.nanoTime() - t) / 1_000_000}ms ($path ${r.entries.size} items)")
+                r
+            } catch (e: Exception) {
+                Log.w(TAG, "treeChildren: failed in ${(System.nanoTime() - t) / 1_000_000}ms", e)
+                throw ViewerException.from(e)
+            }
+        }
 
     /** GET /api/projects/{name}/file?path=&rev=work —— 读文件内容。失败抛 [ViewerException]。 */
     suspend fun file(projectName: String, path: String, rev: String = "work"): FileResponse =
