@@ -213,6 +213,7 @@ def test_minimal_config(tmp_path: Path):
     assert cfg.throttle_window == 0.5
     assert cfg.stream_mode == "card"
     assert cfg.agent_start_timeout == 120.0  # #94
+    assert cfg.turn_stall_timeout == 900.0  # #208
 
 
 def test_feishu_qps_parsed(tmp_path: Path):
@@ -231,6 +232,15 @@ def test_agent_start_timeout_parsed(tmp_path: Path):
         encoding="utf-8",
     )
     assert Config.load(cfg_file).agent_start_timeout == 45.0
+
+
+def test_turn_stall_timeout_parsed(tmp_path: Path):
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        'app_id = "a"\napp_secret = "b"\nchat_id = "oc_1"\nturn_stall_timeout = 600\n',
+        encoding="utf-8",
+    )
+    assert Config.load(cfg_file).turn_stall_timeout == 600.0
 
 
 def test_stream_mode_validation(tmp_path: Path):

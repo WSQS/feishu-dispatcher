@@ -116,6 +116,10 @@ class Config:
     #: 握手/load_session 时快速失败（标 failed 可恢复 + 通知）而非永久冻结、静默不回复。
     #: <=0 = 关闭（不建议）。默认 120s，足够冷启动/大会话恢复，又兜住无限卡死。
     agent_start_timeout: float = 120.0
+    #: 在途 turn「无进展」超时秒数（#208 / #45）：距最近一次 session_update 超过此值则
+    #: cancel + 标 failed（可恢复）。按无进展而非总耗时，避免误杀正常长任务。<=0 = 关闭。
+    #: 默认 900s（15 分钟）。
+    turn_stall_timeout: float = 900.0
     #: 流式输出模式：card=原地更新卡片（默认），text=每批发新消息（兜底）
     stream_mode: str = "card"
     #: 调度器 LLM（P2）；None = 不启用（自然语言消息回退到「用法」提示）。= 当前激活 profile
@@ -246,6 +250,7 @@ class Config:
             idle_timeout=float(data.get("idle_timeout", 1800.0)),
             bg_job_timeout=float(data.get("bg_job_timeout", 0.0)),
             agent_start_timeout=float(data.get("agent_start_timeout", 120.0)),
+            turn_stall_timeout=float(data.get("turn_stall_timeout", 900.0)),
             stream_mode=stream_mode,
             llm=llm,
             llm_profiles=llm_profiles,

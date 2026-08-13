@@ -889,6 +889,7 @@ class _Daemon:
             on_action=on_action,
             resume_session_id=resume_session_id,
             start_timeout=self.cfg.agent_start_timeout,
+            stall_timeout=self.cfg.turn_stall_timeout,
         )
 
     def _launch(
@@ -1087,8 +1088,38 @@ class _Daemon:
                     stop_reason = await sess.agent.prompt(prompt)
                     await channel.flush()
                     if stop_reason == "cancelled":
-                        # 本轮被 /stop 中途取消：不当作正常完成（不 ✅、不计 turn、
-                        # 不发完成通知）。卡片置停止态；随后循环取到 None 哨兵即终止。
+                        # 无进展看门狗 cancel（#208）：与用户 /cancel 区分——标 failed
+                        # （可恢复）并结束 worker，话题回复可 load_session 接回。
+                        if getattr(sess.agent, "stalled", False):
+                            stall = self.cfg.turn_stall_timeout
+                            err = _clip(
+                                f"turn stalled: no session_update for >{stall:g}s",
+                                _ERROR_MSG_MAX,
+                            )
+                            self.store.update(
+                                sess.task_id, status="failed", error_message=err
+                            )
+                            try:
+                                await channel.set_status("error")
+                            except Exception:
+                                logger.debug(
+                                    "set_status error 失败（忽略）", exc_info=True
+                                )
+                            await self._safe_reply(
+                                root,
+                                f"❌ 本轮无进展超时，已暂停：{err}\n"
+                                "在话题回复即尝试恢复（load_session 接回上下文），"
+                                "或 `/stop` 结束。",
+                            )
+                            await self._notify_main(
+                                f"❌ {sess.project_name} 本轮无进展超时，已暂停"
+                                "（在其话题回复即尝试恢复）。"
+                            )
+                            logger.warning("任务 %s 本轮无进展超时", sess.task_id)
+                            break
+                        # 本轮被 /stop·/cancel 中途取消：不当作正常完成（不 ✅、不计
+                        # turn、不发完成通知）。卡片置停止态；/stop 随后取到 None 终止，
+                        # /cancel 则回 idle 待命。
                         await channel.set_status("stopped")
                         self.store.update(sess.task_id, status="idle")
                         logger.info("任务 %s 本轮被取消", sess.task_id)
