@@ -45,7 +45,7 @@ def resolve_under_root(workspace: Path, requested: str) -> Path:
 
 
 def resolve_tree_path(workspace: Path, path: str) -> Path:
-    """按 /tree/children 的语法（#293）校验请求 ``path`` 并解析为 workspace 内的安全目录路径。
+    """按 /tree/children 的语法校验请求 ``path`` 并解析为 workspace 内的安全目录路径。
 
     - ``path`` 为空串 → workspace 根（唯一合法的根表示）。
     - 语法：由 ``/`` 连接的一个或多个普通段，每段非空、不等于 ``.`` / ``..``、
@@ -53,7 +53,7 @@ def resolve_tree_path(workspace: Path, path: str) -> Path:
     - 绝对路径 / 经 symlink 逃逸 workspace → 沿用 :func:`resolve_under_root` 拒绝。
 
     只做语法 + 安全解析，**不做存在性检查**——不存在 / 是文件 / 无权限等语义
-    （#297 E5）由扫描器 / HTTP 层决定，不在此处伪装。
+    由扫描器 / HTTP 层决定，不在此处伪装。
     """
     if path == "":
         return workspace.resolve()

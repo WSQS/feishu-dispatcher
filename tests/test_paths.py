@@ -70,7 +70,7 @@ def test_symlink_into_root_allowed(tmp_path: Path):
     assert p.is_relative_to(tmp_path.resolve())
 
 
-# ---- /tree/children 的路径语法（#293）---- #
+# ---- /tree/children 的路径语法 ---- #
 
 
 def test_tree_root_resolves_to_workspace(tmp_path: Path):
