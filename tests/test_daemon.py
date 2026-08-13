@@ -1301,6 +1301,37 @@ async def test_get_task_includes_action_log():
     await daemon._shutdown()
 
 
+async def test_tool_call_update_marks_action_status():
+    # tool_call_update（completed/failed）按 tool_call_id 回填到已记录动作上
+    class UpdateAgent(FakeAgent):
+        async def prompt(self, text: str) -> None:
+            self.prompts.append(text)
+            if self.on_action is not None:
+                await self.on_action(
+                    {"kind": "edit", "title": "Editing a.py", "tool_call_id": "tc1"}
+                )
+                await self.on_action(
+                    {"kind": "execute", "title": "pytest", "tool_call_id": "tc2"}
+                )
+                # 完成状态更新（按 id 关联），不新增条目、只回填 status
+                await self.on_action({"tool_call_id": "tc1", "status": "completed"})
+                await self.on_action({"tool_call_id": "tc2", "status": "failed"})
+            await self.on_output(f"echo:{text}")
+
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store, agent_cls=UpdateAgent)
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: store.get("t1") and len(store.get("t1").actions) == 2)
+    actions = store.get("t1").actions
+    # 两条起始动作（update 不新增条目）
+    assert actions[0]["tool_call_id"] == "tc1"
+    assert actions[1]["tool_call_id"] == "tc2"
+    # status 按 id 回填
+    assert actions[0]["status"] == "completed"
+    assert actions[1]["status"] == "failed"
+    await daemon._shutdown()
+
+
 async def test_task_command_shows_detail_and_actions():
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store, agent_cls=ActionAgent)
