@@ -93,6 +93,7 @@ _THREAD_USAGE = (
     "• `/done`  归档该任务（标记完成）\n"
     "• `/model [名]`  查看 / 切换模型\n"
     "• `/raw <指令>`  把 <指令> 原样发给 agent（如 `/raw /model` 让 agent 自己执行 /model）\n"
+    "• `!<命令>`  让 agent 直接执行终端命令（如 `!git log` → 跑 git log 并汇报结果）\n"
     "• `/help`  显示本说明\n"
     "（`/run`、`/agents`、`/task` 等控制台命令请回到群主线发送）"
 )
@@ -1206,6 +1207,14 @@ class _Daemon:
                 )
                 return
             forward_raw = True
+        # !<命令>：话题内直接执行终端命令。剥掉 ! 后给 agent 包成「请执行…并汇报」的
+        # 意图，再走普通转发路径（区别于 /raw 的逐字直传——! 语义是跑命令并拿结果）。
+        # 空 !（!、!   ）静默忽略，不回噪声；仅话题内有效，root ! 不在此处理。
+        if text.startswith("!"):
+            cmd = text[1:].strip()
+            if not cmd:
+                return  # 空 !：忽略（不回复、不入队）
+            text = f"请执行命令并汇报结果：{cmd}"
         sess = self._sessions.get(thread_root)
         if sess is None:
             # 无活跃 agent：尝试从持久化记录恢复（惰性重连），或明确提示——
