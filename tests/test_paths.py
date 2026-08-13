@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from feishu_dispatcher._paths import PathTraversalError, resolve_under_root
+from feishu_dispatcher._paths import (
+    PathTraversalError,
+    resolve_tree_path,
+    resolve_under_root,
+)
 
 
 def test_normal_subpath_resolves_under_root(tmp_path: Path):
@@ -64,3 +68,59 @@ def test_symlink_into_root_allowed(tmp_path: Path):
         raise
     p = resolve_under_root(tmp_path, "link.txt")
     assert p.is_relative_to(tmp_path.resolve())
+
+
+# ---- /tree/children 的路径语法（#293）---- #
+
+
+def test_tree_root_resolves_to_workspace(tmp_path: Path):
+    assert resolve_tree_path(tmp_path, "") == tmp_path.resolve()
+
+
+def test_tree_normal_subdir_resolves(tmp_path: Path):
+    (tmp_path / "src" / "main").mkdir(parents=True)
+    p = resolve_tree_path(tmp_path, "src/main")
+    assert p == (tmp_path / "src" / "main").resolve()
+    assert p.is_relative_to(tmp_path.resolve())
+
+
+def test_tree_backslash_rejected(tmp_path: Path):
+    with pytest.raises(PathTraversalError, match="反斜杠"):
+        resolve_tree_path(tmp_path, "src\\main")
+
+
+def test_tree_dot_segment_rejected(tmp_path: Path):
+    with pytest.raises(PathTraversalError, match="语法"):
+        resolve_tree_path(tmp_path, "./src")
+
+
+def test_tree_dotdot_segment_rejected(tmp_path: Path):
+    with pytest.raises(PathTraversalError, match="语法"):
+        resolve_tree_path(tmp_path, "a/../b")
+
+
+def test_tree_trailing_slash_rejected(tmp_path: Path):
+    with pytest.raises(PathTraversalError, match="语法"):
+        resolve_tree_path(tmp_path, "src/")
+
+
+def test_tree_leading_slash_rejected(tmp_path: Path):
+    with pytest.raises(PathTraversalError, match="语法"):
+        resolve_tree_path(tmp_path, "/src")
+
+
+def test_tree_double_slash_rejected(tmp_path: Path):
+    with pytest.raises(PathTraversalError, match="语法"):
+        resolve_tree_path(tmp_path, "src//a")
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX 软链测试")
+def test_tree_symlink_escape_rejected(tmp_path: Path):
+    outside = tmp_path.parent / "outside_secret"
+    outside.write_text("secret")
+    try:
+        (tmp_path / "evil").symlink_to(outside)
+        with pytest.raises(PathTraversalError, match="逃出"):
+            resolve_tree_path(tmp_path, "evil")
+    finally:
+        outside.unlink(missing_ok=True)
