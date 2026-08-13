@@ -42,3 +42,26 @@ def resolve_under_root(workspace: Path, requested: str) -> Path:
             f"path 逃出 workspace 根: {requested} → {resolved}（根: {root}）"
         ) from e
     return resolved
+
+
+def resolve_tree_path(workspace: Path, path: str) -> Path:
+    """按 /tree/children 的语法校验请求 ``path`` 并解析为 workspace 内的安全目录路径。
+
+    - ``path`` 为空串 → workspace 根（唯一合法的根表示）。
+    - 语法：由 ``/`` 连接的一个或多个普通段，每段非空、不等于 ``.`` / ``..``、
+      不含 ``\\``。不符合 → :class:`PathTraversalError`（HTTP 层返 400）。
+    - 绝对路径 / 经 symlink 逃逸 workspace → 沿用 :func:`resolve_under_root` 拒绝。
+
+    只做语法 + 安全解析，**不做存在性检查**——不存在 / 是文件 / 无权限等语义
+    由扫描器 / HTTP 层决定，不在此处伪装。
+    """
+    if path == "":
+        return workspace.resolve()
+    if "\\" in path:
+        raise PathTraversalError(f"path 含反斜杠（仅接受 / 分隔）: {path!r}")
+    segments = path.split("/")
+    if any(seg in ("", ".", "..") for seg in segments):
+        raise PathTraversalError(
+            f"path 不符合目录语法（空段 / . / .. 不允许）: {path!r}"
+        )
+    return resolve_under_root(workspace, path)
