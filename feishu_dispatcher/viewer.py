@@ -29,7 +29,7 @@ from urllib.parse import parse_qs
 from pathlib import Path
 
 from feishu_dispatcher import __version__
-from feishu_dispatcher._paths import PathTraversalError, resolve_under_root
+from feishu_dispatcher._paths import PathTraversalError, resolve_tree_path, resolve_under_root
 
 logger = logging.getLogger(__name__)
 
@@ -161,6 +161,38 @@ async def tree(ctx: dict, request: dict) -> tuple[int, dict]:
             entries.append({"path": full.relative_to(ws).as_posix(), "type": "file", "size": full.stat().st_size})
     entries.sort(key=lambda x: x["path"])
     return 200, {"entries": entries}
+
+
+async def tree_children(ctx: dict, request: dict) -> tuple[int, dict]:
+    """``GET /api/projects/{name}/tree/children?path=``：列指定目录的直接子项（按目录加载）。
+
+    经 ``ctx["scan_executor"]`` 在 worker 线程跑，不占主 loop。``path`` 是必填 query 键，
+    空串 = workspace 根。错误：语法/逃逸 → 400，不存在 → 404，是文件 → 400，无权限 → 403。
+    """
+    name = request["segments"]["name"]
+    ws = _resolve_workspace(ctx, name)
+    if isinstance(ws, tuple):
+        return ws
+    query = request["query"]
+    if "path" not in query:
+        return 400, {"error": "missing path parameter"}
+    path = query["path"]
+    try:
+        dir_path = resolve_tree_path(ws, path)
+    except PathTraversalError as exc:
+        return 400, {"error": str(exc)}
+    executor = ctx.get("scan_executor")
+    if executor is None:
+        return 500, {"error": "scan_executor not in ctx"}
+    try:
+        entries = await executor.run(dir_path, path)
+    except FileNotFoundError:
+        return 404, {"error": f"not found: {path}"}
+    except NotADirectoryError:
+        return 400, {"error": f"not a directory: {path}"}
+    except PermissionError:
+        return 403, {"error": f"permission denied: {path}"}
+    return 200, {"path": path, "entries": entries}
 
 
 async def file(ctx: dict, request: dict) -> tuple[int, dict]:

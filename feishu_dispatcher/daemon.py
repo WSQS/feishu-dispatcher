@@ -38,9 +38,10 @@ from .scheduler import (
     run_tool_loop,
 )
 from .store import Job, JobStore, ModelStore, ProjectStore, Task, TaskStore
+from ._scan_executor import ScanExecutor
 from ._viewer_token import ensure_token
 from .viewer import ViewerServer, health as viewer_health, list_projects as viewer_list_projects
-from .viewer import file as viewer_file, tree as viewer_tree
+from .viewer import file as viewer_file, tree as viewer_tree, tree_children as viewer_tree_children
 
 logger = logging.getLogger(__name__)
 
@@ -332,6 +333,8 @@ class _Daemon:
     _control: "ControlServer | None" = None
     #: 移动端查看器（只读 HTTP，给手机）；run() 里按 cfg.viewer.enabled 启动，否则 None。
     _viewer: "ViewerServer | None" = None
+    #: 查看器的有界扫描执行服务；_start_viewer 里创建、_shutdown 里关闭（线程池非 daemon）。
+    _scan_executor: ScanExecutor | None = None
     #: 后台任务身份表：token → task_id（启 agent 时登记，关 session 时清）。#68
     _bg_tokens: dict[str, str] = field(default_factory=dict)
     #: 后台任务 watcher 的强引用（asyncio 只持弱引用，不存会被 GC）。#68
@@ -421,18 +424,23 @@ class _Daemon:
             "移动端查看器 token（已存 viewer.token，重启不变；填进手机 App）: %s", token
         )
         try:
+            self._scan_executor = ScanExecutor()
             vs = ViewerServer(
                 token,
                 routes={
                     ("GET", "/api/health"): viewer_health,
                     ("GET", "/api/projects"): viewer_list_projects,
                     ("GET", "/api/projects/{name}/tree"): viewer_tree,
+                    ("GET", "/api/projects/{name}/tree/children"): viewer_tree_children,
                     ("GET", "/api/projects/{name}/file"): viewer_file,
                 },
                 host=v.bind,
                 port=v.port,
                 main_loop=loop,
-                ctx={"all_projects": self._all_projects},
+                ctx={
+                    "all_projects": self._all_projects,
+                    "scan_executor": self._scan_executor,
+                },
             )
             vs.start()
             return vs
@@ -2128,3 +2136,9 @@ class _Daemon:
             except Exception:
                 logger.exception("agent worker 退出异常")
         self._sessions.clear()
+        if self._scan_executor is not None:
+            try:
+                await self._scan_executor.aclose()
+            except Exception:
+                logger.warning("扫描执行服务关闭失败，忽略", exc_info=True)
+            self._scan_executor = None

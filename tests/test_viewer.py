@@ -13,6 +13,7 @@ import urllib.error
 import urllib.request
 
 from feishu_dispatcher import __version__
+from feishu_dispatcher._scan_executor import ScanExecutor
 from feishu_dispatcher.config import Project
 from feishu_dispatcher.viewer import (
     _MAX_FILE_BYTES,
@@ -21,6 +22,7 @@ from feishu_dispatcher.viewer import (
     health,
     list_projects,
     tree as viewer_tree,
+    tree_children as viewer_tree_children,
 )
 
 
@@ -41,6 +43,20 @@ async def _make_server(token: str = "tok-view", routes=None) -> ViewerServer:
     vs = ViewerServer(token, routes, host="127.0.0.1", port=0)
     vs.start()
     return vs
+
+
+def _children_server(ws, *, scan_executor=None) -> tuple[ViewerServer, ScanExecutor]:
+    """构造带 /tree/children 路由 + 注入 scan_executor 的 ViewerServer。返回 (vs, executor)。"""
+    executor = scan_executor if scan_executor is not None else ScanExecutor()
+    fake = {"demo": Project(name="demo", path=ws)}
+    vs = ViewerServer(
+        "tok-view",
+        routes={("GET", "/api/projects/{name}/tree/children"): viewer_tree_children},
+        host="127.0.0.1",
+        port=0,
+        ctx={"all_projects": lambda: fake, "scan_executor": executor},
+    )
+    return vs, executor
 
 
 async def test_health_returns_version():
@@ -280,4 +296,204 @@ async def test_file_rejects_oversized_content():
         assert payload == {"error": f"file too large (max {_MAX_FILE_BYTES} bytes)"}
     finally:
         vs.stop()
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+# ---- /tree/children 接口（按目录加载）---- #
+
+
+async def test_tree_children_lists_direct_children():
+    import shutil
+    from pathlib import Path
+
+    ws = Path(__file__).parent / "_ws_children"
+    ws.mkdir(exist_ok=True)
+    (ws / "main.py").write_text("x")
+    (ws / "src").mkdir()
+    (ws / "src" / "util.py").write_text("y")  # 间接子项，不应出现在根
+    vs, ex = _children_server(ws)
+    vs.start()
+    try:
+        status, payload = await asyncio.to_thread(
+            _get, vs.base_url + "/api/projects/demo/tree/children?path=", "tok-view"
+        )
+        assert status == 200
+        assert payload == {
+            "path": "",
+            "entries": [
+                {"name": "src", "path": "src", "type": "directory"},
+                {"name": "main.py", "path": "main.py", "type": "file"},
+            ],
+        }
+    finally:
+        vs.stop()
+        await ex.aclose()
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_tree_children_nested_prefix():
+    import shutil
+    from pathlib import Path
+    from urllib.parse import quote
+
+    ws = Path(__file__).parent / "_ws_children_nested"
+    ws.mkdir(exist_ok=True)
+    (ws / "src").mkdir()
+    (ws / "src" / "util.py").write_text("y")
+    vs, ex = _children_server(ws)
+    vs.start()
+    try:
+        url = vs.base_url + "/api/projects/demo/tree/children?path=" + quote("src")
+        status, payload = await asyncio.to_thread(_get, url, "tok-view")
+        assert status == 200
+        assert payload == {
+            "path": "src",
+            "entries": [{"name": "util.py", "path": "src/util.py", "type": "file"}],
+        }
+    finally:
+        vs.stop()
+        await ex.aclose()
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_tree_children_missing_path_400():
+    import shutil
+    from pathlib import Path
+
+    ws = Path(__file__).parent / "_ws_children_missing"
+    ws.mkdir(exist_ok=True)
+    vs, ex = _children_server(ws)
+    vs.start()
+    try:
+        status, payload = await asyncio.to_thread(
+            _get, vs.base_url + "/api/projects/demo/tree/children", "tok-view"
+        )
+        assert status == 400
+        assert payload == {"error": "missing path parameter"}
+    finally:
+        vs.stop()
+        await ex.aclose()
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_tree_children_invalid_path_400():
+    import shutil
+    from pathlib import Path
+    from urllib.parse import quote
+
+    ws = Path(__file__).parent / "_ws_children_bad"
+    ws.mkdir(exist_ok=True)
+    vs, ex = _children_server(ws)
+    vs.start()
+    try:
+        for bad in ("../x", "a/../b", "src\\x", "src/"):
+            url = vs.base_url + "/api/projects/demo/tree/children?path=" + quote(bad)
+            status, _ = await asyncio.to_thread(_get, url, "tok-view")
+            assert status == 400, bad
+    finally:
+        vs.stop()
+        await ex.aclose()
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_tree_children_not_found_404():
+    import shutil
+    from pathlib import Path
+
+    ws = Path(__file__).parent / "_ws_children_nf"
+    ws.mkdir(exist_ok=True)
+    vs, ex = _children_server(ws)
+    vs.start()
+    try:
+        status, payload = await asyncio.to_thread(
+            _get, vs.base_url + "/api/projects/demo/tree/children?path=no-such", "tok-view"
+        )
+        assert status == 404
+        assert payload == {"error": "not found: no-such"}
+    finally:
+        vs.stop()
+        await ex.aclose()
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_tree_children_not_a_directory_400():
+    import shutil
+    from pathlib import Path
+
+    ws = Path(__file__).parent / "_ws_children_file"
+    ws.mkdir(exist_ok=True)
+    (ws / "f.txt").write_text("x")
+    vs, ex = _children_server(ws)
+    vs.start()
+    try:
+        status, payload = await asyncio.to_thread(
+            _get, vs.base_url + "/api/projects/demo/tree/children?path=f.txt", "tok-view"
+        )
+        assert status == 400
+        assert payload == {"error": "not a directory: f.txt"}
+    finally:
+        vs.stop()
+        await ex.aclose()
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_tree_children_permission_403():
+    import shutil
+    from pathlib import Path
+
+    def deny_scan(dir_path: Path, rel_path: str) -> list[dict]:
+        raise PermissionError("denied")
+
+    ws = Path(__file__).parent / "_ws_children_perm"
+    ws.mkdir(exist_ok=True)
+    vs, ex = _children_server(ws, scan_executor=ScanExecutor(scan=deny_scan))
+    vs.start()
+    try:
+        status, payload = await asyncio.to_thread(
+            _get, vs.base_url + "/api/projects/demo/tree/children?path=", "tok-view"
+        )
+        assert status == 403
+        assert payload == {"error": "permission denied: "}
+    finally:
+        vs.stop()
+        await ex.aclose()
+        shutil.rmtree(ws, ignore_errors=True)
+
+
+async def test_tree_children_scan_does_not_block_main_loop():
+    import shutil
+    import threading
+    import time
+    from pathlib import Path
+
+    started = threading.Event()
+
+    def slow_scan(dir_path: Path, rel_path: str) -> list[dict]:
+        started.set()
+        time.sleep(0.3)
+        return []
+
+    ws = Path(__file__).parent / "_ws_hb"
+    ws.mkdir(exist_ok=True)
+    ex = ScanExecutor(scan=slow_scan)
+    ctx = {
+        "all_projects": lambda: {"demo": Project(name="demo", path=ws)},
+        "scan_executor": ex,
+    }
+    request = {
+        "segments": {"name": "demo"},
+        "query": {"path": ""},
+        "path": "/api/projects/demo/tree/children",
+    }
+    try:
+        task = asyncio.create_task(viewer_tree_children(ctx, request))
+        await asyncio.to_thread(started.wait, 5)  # 等扫描真正在 worker 线程启动
+        t0 = time.perf_counter()
+        status, _ = await health(ctx, {})
+        dt = time.perf_counter() - t0
+        assert status == 200
+        assert dt < 0.1  # 慢扫描期间主 loop 未被阻塞，health 立即可响应
+        await task
+    finally:
+        await ex.aclose()
         shutil.rmtree(ws, ignore_errors=True)
