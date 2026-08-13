@@ -784,6 +784,74 @@ async def test_run_creates_task():
     await daemon._shutdown()
 
 
+async def test_adopt_creates_idle_task_without_launching():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/adopt demo ext_ses_abc"))
+    t = store.by_thread("om_root1")
+    assert t is not None
+    assert t.session_id == "ext_ses_abc"
+    assert t.status == "idle"
+    assert t.adopted is True
+    assert t.project_name == "demo"
+    assert t.agent_label == "copilot"
+    assert created == []  # 不启 agent
+    assert "om_root1" not in daemon._sessions
+    assert any("接管" in text for text in bridge.texts("om_root1"))
+    # /task 标注外部接管
+    await daemon._handle_message(root_msg(f"/task {t.task_id}", mid="om_taskq"))
+    assert any("外部接管" in text for text in bridge.texts("om_taskq"))
+    info = daemon._sched_get_task(t.task_id)
+    assert info is not None and info["adopted"] is True
+    await daemon._shutdown()
+
+
+async def test_adopt_usage_on_missing_args():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/adopt demo"))
+    assert created == []
+    assert any("/adopt" in text for text in bridge.texts("om_root1"))
+
+
+async def test_adopt_unknown_project():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(root_msg("/adopt nope ses1"))
+    assert created == []
+    assert any("未知项目" in text for text in bridge.texts("om_root1"))
+
+
+async def test_adopt_thread_reply_loads_external_session():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/adopt demo ext_ses_xyz"))
+    assert store.by_thread("om_root1").session_id == "ext_ses_xyz"
+    assert created == []
+    await daemon._handle_message(thread_msg("继续改", root="om_root1", mid="om_a1"))
+    await wait_until(lambda: created and created[0].prompts == ["继续改"])
+    assert created[0].resume_session_id == "ext_ses_xyz"
+    assert created[0].start_count == 1
+    assert any("恢复" in text for text in bridge.texts("om_root1"))
+    await wait_until(lambda: store.by_thread("om_root1").status == "idle")
+    assert store.by_thread("om_root1").adopted is True
+    await daemon._shutdown()
+
+
+async def test_adopt_load_failure_marks_failed_no_half_broken():
+    """load_session 失败：明确报错、不留半吊子运行态；Task 停在 failed。"""
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store, agent_cls=StartupFailAgent)
+    await daemon._handle_message(root_msg("/adopt demo ext_bad"))
+    await daemon._handle_message(thread_msg("试一下", root="om_root1", mid="om_f1"))
+    await wait_until(lambda: store.by_thread("om_root1").status == "failed")
+    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    assert created and created[0].resume_session_id == "ext_bad"
+    assert any("恢复失败" in text for text in bridge.texts("om_root1"))
+    task = store.by_thread("om_root1")
+    assert task.error_message  # 诊断留下
+    assert task.session_id == "ext_bad"  # 外部 id 保留，可再试
+    await daemon._shutdown()
+
+
 async def test_recovery_after_restart_uses_load_session():
     store = TaskStore(None)  # 内存 store 跨两个 daemon 实例共享 = 模拟重启
     d1, b1, c1 = make_daemon(store=store)
