@@ -3,8 +3,13 @@
 package dev.sopho.fdx.client.tree
 
 import dev.sopho.fdx.client.network.TreeChildrenEntry
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -51,6 +56,18 @@ class TreeLoaderTest {
     }
 
     @Test
+    fun `inline_dispatcher_registers_job_before_completion`() = runTest {
+        val loader = TreeLoader(CoroutineScope(coroutineContext + Dispatchers.Unconfined)) {
+            listOf(file("root.txt", "root.txt"))
+        }
+
+        loader.start()
+
+        assertEquals(listOf("root.txt"), loader.state.value.visibleRows().map { it.path })
+        assertFalse(loader.state.value.directories.getValue(ROOT_PATH).loading)
+    }
+
+    @Test
     fun `expand_cold_directory_shows_loading_then_applies_children`() = runTest {
         val gate = CompletableDeferred<Unit>()
         val requested = mutableListOf<String>()
@@ -87,10 +104,16 @@ class TreeLoaderTest {
     @Test
     fun `collapse_cancels_inflight_load_and_discards_response`() = runTest {
         val gate = CompletableDeferred<Unit>()
+        val cancellationObserved = CompletableDeferred<Unit>()
         val loader = TreeLoader(this) { path ->
             if (path == "a") {
-                gate.await()
-                listOf(file("a/x.txt", "a/x.txt"))
+                try {
+                    gate.await()
+                    listOf(file("a/x.txt", "a/x.txt"))
+                } catch (e: CancellationException) {
+                    cancellationObserved.complete(Unit)
+                    throw e
+                }
             } else {
                 listOf(dir("a", "a"))
             }
@@ -103,6 +126,7 @@ class TreeLoaderTest {
         loader.toggle("a")
         runCurrent()
         assertFalse("a" in loader.state.value.expandedPaths)
+        assertTrue(cancellationObserved.isCompleted)
 
         gate.complete(Unit)
         runCurrent()
@@ -197,10 +221,17 @@ class TreeLoaderTest {
     @Test
     fun `close_cancels_inflight_and_discards_late_response`() = runTest {
         val gate = CompletableDeferred<Unit>()
+        val cancellationObserved = CompletableDeferred<Unit>()
         val loader = TreeLoader(this) { path ->
             if (path == ROOT_PATH) {
-                withContext(NonCancellable) { gate.await() }
-                listOf(file("late.txt", "late.txt"))
+                try {
+                    withContext(NonCancellable) { gate.await() }
+                    currentCoroutineContext().ensureActive()
+                    listOf(file("late.txt", "late.txt"))
+                } catch (e: CancellationException) {
+                    cancellationObserved.complete(Unit)
+                    throw e
+                }
             } else {
                 emptyList()
             }
@@ -211,6 +242,7 @@ class TreeLoaderTest {
         loader.close()
         gate.complete(Unit)
         runCurrent()
+        assertTrue(cancellationObserved.isCompleted)
 
         val root = loader.state.value.directories.getValue(ROOT_PATH)
         assertTrue(root.entries.isEmpty())
