@@ -3,6 +3,7 @@ package dev.sopho.fdx.client.tree
 import dev.sopho.fdx.client.network.TreeChildrenEntry
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -23,63 +24,90 @@ class TreeLoader(
     private val _state = MutableStateFlow(TreeState())
     val state: StateFlow<TreeState> = _state.asStateFlow()
 
+    private val trackingLock = Any()
     private val activeLoads = mutableMapOf<String, Job>()
     private val generations = mutableMapOf<String, Long>()
     private var started = false
+    private var closed = false
 
     /** 进入页面：只加载根目录；重复调用不产生第二次请求。 */
     fun start() {
-        if (started) return
-        started = true
-        _state.update { it.setLoading(ROOT_PATH, true) }
-        load(ROOT_PATH)
+        val job = synchronized(trackingLock) {
+            if (started || closed) return
+            started = true
+            _state.update { it.setLoading(ROOT_PATH, true) }
+            registerLoad(ROOT_PATH)
+        }
+        job?.start()
     }
 
     /** 展开/折叠目录：冷目录展开触发加载；折叠取消在途请求并使其响应失效。 */
     fun toggle(path: String) {
-        val after = _state.updateAndGet { it.toggle(path) }
-        if (path !in after.expandedPaths) {
-            cancelLoad(path)
-        } else if (after.directories[path]?.loading == true) {
-            load(path)
+        var jobToCancel: Job? = null
+        val jobToStart = synchronized(trackingLock) {
+            if (closed) return
+            val after = _state.updateAndGet { it.toggle(path) }
+            if (path !in after.expandedPaths) {
+                jobToCancel = unregisterLoad(path)
+                null
+            } else if (after.directories[path]?.loading == true) {
+                registerLoad(path)
+            } else {
+                null
+            }
         }
+        jobToCancel?.cancel()
+        jobToStart?.start()
     }
 
     /** 离开页面：取消全部在途加载，并让迟到响应失效。 */
     fun close() {
-        started = true
-        activeLoads.keys.toList().forEach { cancelLoad(it) }
+        val jobs = synchronized(trackingLock) {
+            if (closed) return
+            closed = true
+            started = true
+            activeLoads.keys.forEach { path ->
+                generations[path] = (generations[path] ?: 0L) + 1
+            }
+            activeLoads.values.toList().also { activeLoads.clear() }
+        }
+        jobs.forEach { it.cancel() }
     }
 
-    private fun load(path: String) {
-        if (activeLoads.containsKey(path)) return
+    /** 必须在 [trackingLock] 内调用；返回的 lazy job 由调用方在离开锁后启动。 */
+    private fun registerLoad(path: String): Job? {
+        if (activeLoads.containsKey(path)) return null
         val gen = generations[path] ?: 0L
-        lateinit var job: Job
-        job = scope.launch {
+        val job = scope.launch(start = CoroutineStart.LAZY) {
             try {
                 val entries = loadChildren(path)
-                if (isCurrent(path, gen)) {
-                    _state.update { it.setChildren(path, entries) }
-                }
+                updateIfCurrent(path, gen) { it.setChildren(path, entries) }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                if (isCurrent(path, gen)) {
-                    _state.update { it.setError(path, e.message ?: e.javaClass.simpleName) }
+                updateIfCurrent(path, gen) {
+                    it.setError(path, e.message ?: e.javaClass.simpleName)
                 }
-            } finally {
-                if (activeLoads[path] === job) activeLoads.remove(path)
             }
         }
         activeLoads[path] = job
-        if (job.isCompleted && activeLoads[path] === job) activeLoads.remove(path)
+        job.invokeOnCompletion {
+            synchronized(trackingLock) {
+                if (activeLoads[path] === job) activeLoads.remove(path)
+            }
+        }
+        return job
     }
 
-    private fun cancelLoad(path: String) {
+    /** 必须在 [trackingLock] 内调用。 */
+    private fun unregisterLoad(path: String): Job? {
         generations[path] = (generations[path] ?: 0L) + 1
-        activeLoads.remove(path)?.cancel()
+        return activeLoads.remove(path)
     }
 
-    private fun isCurrent(path: String, gen: Long): Boolean =
-        (generations[path] ?: 0L) == gen
+    private inline fun updateIfCurrent(path: String, gen: Long, update: (TreeState) -> TreeState) {
+        synchronized(trackingLock) {
+            if ((generations[path] ?: 0L) == gen) _state.update(update)
+        }
+    }
 }
