@@ -1,6 +1,6 @@
 """build_card 单元测试（卡片 JSON 2.0）。"""
 
-from feishu_dispatcher.card import build_card
+from feishu_dispatcher.card import build_card, build_markdown_card
 
 
 def _body(card):
@@ -69,3 +69,26 @@ def test_build_card_config():
     card = build_card("test", "running", "body")
     assert card["config"]["update_multi"] is True
     assert card["config"]["wide_screen_mode"] is True
+
+
+# build_markdown_card：调度器主线回复用的无标题 markdown 卡片
+
+
+def test_build_markdown_card_is_v2_no_header():
+    card = build_markdown_card("| ID | 项目 |\n|----|------|")
+    assert card["schema"] == "2.0"
+    assert "header" not in card  # 对话回复不该带彩色标题栏
+    assert "elements" in card["body"]
+
+
+def test_build_markdown_card_renders_body_as_markdown():
+    text = "| ID | 项目 |\n|----|------|\n| t9 | SuFei |"
+    card = build_markdown_card(text)
+    elems = card["body"]["elements"]
+    assert len(elems) == 1
+    assert elems[0]["tag"] == "markdown"
+    assert elems[0]["content"] == text
+
+
+def test_build_markdown_card_empty_body_placeholder():
+    assert build_markdown_card("")["body"]["elements"][0]["content"] == "…"

@@ -7,6 +7,7 @@ from pathlib import Path
 from feishu_dispatcher.scheduler import (
     LLMResponse,
     SchedulerMemory,
+    SYSTEM_PROMPT,
     ToolCall,
     build_scheduler_tools,
     run_tool_loop,
@@ -82,6 +83,19 @@ def _tools(
         get_forge=get_forge or _get_forge,
         list_models=list_models or _list_models,
     )
+
+
+def test_system_prompt_prescribes_markdown_output_format():
+    """调度器回复按 markdown 渲染，prompt 必须明确输出格式约束。
+
+    只断言关键约束存在（表格/分组/简洁/代码块），不锁死措辞——给后续微调留余地。
+    """
+    assert "输出格式" in SYSTEM_PROMPT
+    assert "markdown" in SYSTEM_PROMPT.lower()
+    # 多任务用表格、按状态分组、单任务简洁、错误用代码块
+    assert "表格" in SYSTEM_PROMPT
+    assert "分组" in SYSTEM_PROMPT
+    assert "代码块" in SYSTEM_PROMPT
 
 
 async def test_returns_text_when_no_tool_calls():

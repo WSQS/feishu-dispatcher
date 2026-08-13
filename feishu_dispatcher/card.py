@@ -35,3 +35,17 @@ def build_card(title: str, status: str, body: str, footer: str = "") -> dict:
         },
         "body": {"elements": elements},
     }
+
+
+def build_markdown_card(text: str) -> dict:
+    """构造一张**无标题**的 interactive card，body 为单个 markdown 组件。
+
+    用于调度器主线回复：card 2.0 的 markdown 组件支持表格/列表/代码块等全部标准
+    markdown（见 :func:`build_card` 注释），而 ``msg_type=text`` / ``post`` 都不
+    支持表格。不带 header，避免给每条对话回复都加一个彩色标题栏。
+    """
+    return {
+        "schema": "2.0",
+        "config": {"update_multi": True, "wide_screen_mode": True},
+        "body": {"elements": [{"tag": "markdown", "content": text or "…"}]},
+    }
