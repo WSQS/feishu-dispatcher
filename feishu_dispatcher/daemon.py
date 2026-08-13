@@ -235,6 +235,17 @@ _BG_GUIDANCE = (
     "输出继续：成功就推进下一步，失败/超时就用输出诊断并修复。"
 )
 
+#: spawn 时注入的开工简报：告诉 agent 长任务用 `fdx bg run`，避免它用
+#: `notifyOnExit` 苦等、阻塞当轮。仅新会话首轮前缀；恢复（load_session）不重复注入。
+#: 简短明确：何时用 / 发起后行为 / 边界（快命令别塞 bg）。
+_AGENT_BRIEF = (
+    "【后台任务简报】长时间命令（训练 / build / 大编译 / 完整测试集）一律用 "
+    "`fdx bg run -- <命令>`（如 `fdx bg run -- python train.py`，需要 shell 特性"
+    '请 `bash -c "..."` 包裹）。发起后**当轮立即释放**，不必等待也不必轮询；'
+    "job 跑完 daemon 会自动把你唤回**同一个任务**继续（带退出码与输出尾部）。"
+    "短命令（ls / git status / 快速单测 / 单文件编译）**不要**塞进 bg——直接跑即可。"
+)
+
 
 @dataclass
 class _BgBatch:
@@ -947,6 +958,10 @@ class _Daemon:
             resume_session_id=resume_session_id,
         )
         if first_prompt is not None:
+            # 新会话首轮前缀后台任务简报；恢复（resume_session_id）不重复注入——
+            # 恢复的首轮是接续/bg 完成批次，agent 已有 fdx 上下文。
+            if resume_session_id is None:
+                first_prompt = f"{_AGENT_BRIEF}\n\n{first_prompt}"
             sess.enqueue(first_prompt)
         self._sessions[task.thread_root_id] = sess
         sess.worker = asyncio.create_task(

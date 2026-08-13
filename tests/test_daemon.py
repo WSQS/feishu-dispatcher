@@ -12,10 +12,20 @@ import urllib.request
 from pathlib import Path
 
 from feishu_dispatcher.config import Config, LLMSettings, Project, ViewerConfig
-from feishu_dispatcher.daemon import _Daemon
+from feishu_dispatcher.daemon import _AGENT_BRIEF, _Daemon
 from feishu_dispatcher.feishu import IncomingMessage
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
 from feishu_dispatcher.store import ProjectStore, TaskStore
+
+
+#: spawn 简报前缀（_launch 新会话首轮注入）；FakeAgent 记录 prompt 时剥掉它，
+#: 让现有「任务文本是否送达」的断言不被简报干扰。
+_BRIEF_PREFIX = _AGENT_BRIEF + "\n\n"
+
+
+def _strip_brief(text: str) -> str:
+    """剥掉 spawn 简报前缀（仅首轮新会话 prompt 才有；恢复/bg 完成批次无此前缀）。"""
+    return text[len(_BRIEF_PREFIX) :] if text.startswith(_BRIEF_PREFIX) else text
 
 
 class FakeBridge:
@@ -75,7 +85,11 @@ class FakeAgent:
         self.on_output = on_output
         self.on_action = on_action
         self.resume_session_id = resume_session_id
+        # raw_prompts：agent 实际收到的完整 prompt（含 spawn 简报）。
+        # prompts：剥掉简报前缀后的版本——现有断言关心「任务文本是否送达」，
+        # 不该被简报干扰；简报注入本身由专门的测试用 raw_prompts 验证。
         self.prompts: list[str] = []
+        self.raw_prompts: list[str] = []
         self.start_count = 0
         self.closed = False
         self.session_id = resume_session_id
@@ -92,10 +106,16 @@ class FakeAgent:
             self.session_id = f"fake_sid_{id(self)}"
 
     async def prompt(self, text: str) -> str:
-        self.prompts.append(text)
-        self.last_message = f"reply:{text}"
-        await self.on_output(f"echo:{text}")
+        self._record_prompt(text)
+        body = _strip_brief(text)
+        self.last_message = f"reply:{body}"
+        await self.on_output(f"echo:{body}")
         return "end_turn"
+
+    def _record_prompt(self, text: str) -> None:
+        """记录一轮 prompt：raw 为完整文本，prompts 为剥掉简报前缀的版本。"""
+        self.raw_prompts.append(text)
+        self.prompts.append(_strip_brief(text))
 
     async def cancel(self) -> None:
         self.cancel_calls += 1
@@ -118,11 +138,12 @@ class FailUnlessResumedAgent(FakeAgent):
     有值）的新实例成功——用于验证 failed → load_session 接回。"""
 
     async def prompt(self, text: str) -> str:
-        self.prompts.append(text)
+        self._record_prompt(text)
+        body = _strip_brief(text)
         if self.resume_session_id is None:
             raise RuntimeError("boom")
-        self.last_message = f"reply:{text}"
-        await self.on_output(f"echo:{text}")
+        self.last_message = f"reply:{body}"
+        await self.on_output(f"echo:{body}")
         return "end_turn"
 
 
@@ -140,7 +161,7 @@ class CancelableAgent(FakeAgent):
         self._cancelled = asyncio.Event()
 
     async def prompt(self, text: str) -> str:
-        self.prompts.append(text)
+        self._record_prompt(text)
         self.in_prompt.set()
         await self._cancelled.wait()
         self.in_prompt.clear()
@@ -180,12 +201,13 @@ class GatedAgent(FakeAgent):
         self._first = True
 
     async def prompt(self, text: str) -> str:
-        self.prompts.append(text)
+        self._record_prompt(text)
+        body = _strip_brief(text)
         if self._first:
             self._first = False
             await self.gate.wait()
-        self.last_message = f"reply:{text}"
-        await self.on_output(f"echo:{text}")
+        self.last_message = f"reply:{body}"
+        await self.on_output(f"echo:{body}")
         return "end_turn"
 
 
@@ -784,6 +806,31 @@ async def test_run_creates_task():
     await daemon._shutdown()
 
 
+async def test_spawn_prepends_bg_brief_on_new_session_only():
+    """新会话首轮 prompt 前缀 `fdx bg run` 简报；恢复（load_session）不重复注入。"""
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo 训练模型"))
+    await wait_until(lambda: created and created[0].raw_prompts)
+    # 新会话首轮：完整 prompt 以简报起头、含任务文本；剥前缀后只剩任务文本。
+    assert created[0].raw_prompts[0].startswith(_AGENT_BRIEF)
+    assert "训练模型" in created[0].raw_prompts[0]
+    assert "fdx bg run" in created[0].raw_prompts[0]
+    assert created[0].prompts[0] == "训练模型"
+    saved_sid = created[0].session_id
+    await daemon._shutdown()
+
+    # 重启后话题回复 → load_session 恢复：恢复轮 prompt 不带简报前缀。
+    daemon2, _bridge2, created2 = make_daemon(store=store)
+    await daemon2._handle_message(thread_msg("接着跑", root="om_root1", mid="om_t2"))
+    await wait_until(lambda: created2 and created2[0].raw_prompts)
+    assert created2[0].resume_session_id == saved_sid
+    resumed = created2[0].raw_prompts[0]
+    assert not resumed.startswith(_AGENT_BRIEF)
+    assert resumed == "接着跑"
+    await daemon2._shutdown()
+
+
 async def test_recovery_after_restart_uses_load_session():
     store = TaskStore(None)  # 内存 store 跨两个 daemon 实例共享 = 模拟重启
     d1, b1, c1 = make_daemon(store=store)
@@ -1257,11 +1304,12 @@ class ActionAgent(FakeAgent):
     """每个 prompt 回合先发两个 tool_call 审计动作，再 echo。"""
 
     async def prompt(self, text: str) -> None:
-        self.prompts.append(text)
+        self._record_prompt(text)
+        body = _strip_brief(text)
         if self.on_action is not None:
-            await self.on_action({"kind": "edit", "title": f"Editing {text}.py"})
+            await self.on_action({"kind": "edit", "title": f"Editing {body}.py"})
             await self.on_action({"kind": "execute", "title": "pytest"})
-        await self.on_output(f"echo:{text}")
+        await self.on_output(f"echo:{body}")
 
 
 async def test_tool_call_actions_logged_to_task_with_turn():
