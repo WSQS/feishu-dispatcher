@@ -90,6 +90,4 @@ uv sync                                  # 装依赖
 
 ## 状态
 
-已在真实飞书环境验证可用。当前能力：ACP 流式输出实时回话题、话题内继续指挥、多后端（Copilot / OpenCode / Claude Code / Cline / Codex）、会话跨重启恢复、空闲自动挂起省资源、自然语言派发（调度器 LLM）、后台长任务跑完自动唤回 agent。下一步方向：多 agent 并发的 worktree 隔离。
-
-想深入实现细节，看 [架构 map（GitHub issue）](https://github.com/WSQS/feishu-dispatcher/issues/331)。
+核心链路已在真实飞书环境稳定使用；进展与计划看 [GitHub issues](https://github.com/WSQS/feishu-dispatcher/issues)。想深入实现细节，看 [架构 map](https://github.com/WSQS/feishu-dispatcher/issues/331)。

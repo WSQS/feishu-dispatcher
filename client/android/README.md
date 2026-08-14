@@ -6,11 +6,11 @@
 > 这是 [feishu-dispatcher](../../..) 的安卓客户端部分，位于仓库 `client/android/`。
 > 服务端 viewer 见 `feishu_dispatcher/viewer.py`。整体设计见 wayfinder map #103。
 
-## 状态
+## 功能
 
-已实现 viewer 地址与 token 配置、普通 HTTP / ZeroTier 连接、项目列表、文件树和
-只读文件内容预览。文本文件以等宽字体展示；二进制文件显示不可预览提示，超过 1 MB
-的文件由服务端拒绝预览。
+配置 viewer 地址与 token 后，经普通 HTTP / ZeroTier 连接 daemon 的 viewer 服务，
+浏览项目列表、文件树与只读文件内容。文本文件以等宽字体展示；二进制文件显示不可
+预览提示，超过 1 MB 的文件由服务端拒绝预览。
 
 ## 技术栈
 
