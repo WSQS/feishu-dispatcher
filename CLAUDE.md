@@ -66,4 +66,4 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - WS 线程死亡由 daemon 30s 看门狗自动重启；agent 子进程 stderr 有后台 drain（防管道满卡死）。
 - **待办 / backlog**：可执行任务条目统一走 **GitHub issues**（`gh issue list`，按 `size:` / `area:` label 分类）；设计决策记录也收敛到 issue——架构总览/概念模型/基础决策与暂缓、否决的 rationale 在架构 map #331，具体决策的裁定现场是对应 issue/PR。**不要**在本文件另起任务清单或决策清单（避免与 issues 漂移）。大块方向：同项目 worktree 隔离（#37）、权限审批 B（#20）。
 - **动手前先开 issue（工作流约束）**：任何要修复/实现的**独立**问题，在开始改动前先 `gh issue create` 记录（打好 `size:`/`area:` label），再开分支写修复，PR 里 `Closes #N` 闭环——不要先写代码、事后再补 issue。同一 PR 范围内顺手带的琐碎修正（如改个错字）不必单独开 issue。
-- **记录归档约定（#296）**：issue 即决策记录、PR 即实现记录、测试即可执行契约；仓库文档只留四类例外——用户操作、部署运维、对外跨仓库 API、脱离 GitHub 仍须长期保留的知识（本文件的 agent 操作指引即属此类）。不把决策写进 docs，不在文档里留实现过程记录。
+- **记录归档约定（#296）**：issue 即决策记录、PR 即实现记录、测试即可执行契约；仓库文档只留四类例外——用户操作、部署运维、对外跨仓库 API、脱离 GitHub 仍须长期保留的知识（本文件的 agent 操作指引即属此类）。不把决策写进 docs，不在文档里留实现过程记录。详见 CONTRIBUTING「记录与文档约定」（权威来源）。
