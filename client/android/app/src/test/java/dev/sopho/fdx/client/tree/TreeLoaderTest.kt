@@ -219,6 +219,44 @@ class TreeLoaderTest {
     }
 
     @Test
+    fun `retry_failed_directory_reloads_without_collapsing`() = runTest {
+        val requested = mutableListOf<String>()
+        var aRequests = 0
+        val loader = TreeLoader(this) { path ->
+            requested += path
+            if (path == "a") {
+                if (aRequests++ == 0) throw RuntimeException("boom")
+                listOf(file("a/x.txt", "a/x.txt"))
+            } else {
+                listOf(dir("a", "a"), file("b.txt", "b.txt"))
+            }
+        }
+
+        loader.start()
+        runCurrent()
+        loader.toggle("a")
+        runCurrent()
+
+        assertEquals("boom", loader.state.value.directories.getValue("a").error)
+        assertTrue("a" in loader.state.value.expandedPaths)
+        assertTrue(loader.state.value.visibleRows().any { it.path == "b.txt" })
+
+        loader.retry("a")
+        assertTrue(loader.state.value.directories.getValue("a").loading)
+        assertNull(loader.state.value.directories.getValue("a").error)
+        runCurrent()
+
+        assertEquals(listOf("", "a", "a"), requested)
+        assertEquals(listOf("a", "a/x.txt", "b.txt"), loader.state.value.visibleRows().map { it.path })
+        assertFalse(loader.state.value.directories.getValue("a").loading)
+        assertNull(loader.state.value.directories.getValue("a").error)
+
+        loader.retry("a")
+        runCurrent()
+        assertEquals(listOf("", "a", "a"), requested)
+    }
+
+    @Test
     fun `close_cancels_inflight_and_discards_late_response`() = runTest {
         val gate = CompletableDeferred<Unit>()
         val cancellationObserved = CompletableDeferred<Unit>()

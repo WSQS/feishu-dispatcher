@@ -6,56 +6,103 @@ import io.ktor.http.HttpStatusCode
 import io.ktor.http.headersOf
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class TreeViewModelTest {
-    private val okJson = """{"entries":[{"path":"a.txt","type":"file","size":10}]}"""
     private val jsonHeaders = headersOf("Content-Type", "application/json")
+    private val rootJson =
+        """{"path":"","entries":[{"name":"src","path":"src","type":"directory"},{"name":"README.md","path":"README.md","type":"file"}]}"""
+    private val srcJson =
+        """{"path":"src","entries":[{"name":"Main.kt","path":"src/Main.kt","type":"file"}]}"""
 
     @Test
-    fun `start_twice_sends_only_one_request`() = runVmTest {
-        var calls = 0
-        val engine = MockEngine { _ ->
-            calls++
-            respond(okJson, HttpStatusCode.OK, jsonHeaders)
+    fun `creation requests only root children`() = runVmTest {
+        val requested = mutableListOf<String>()
+        val engine = MockEngine { request ->
+            requested += request.url.parameters["path"] ?: "<missing>"
+            assertEquals("/api/projects/proj/tree/children", request.url.encodedPath)
+            respond(rootJson, HttpStatusCode.OK, jsonHeaders)
         }
-        val vm = TreeViewModel("proj")
         val client = mockClient(engine)
 
-        vm.start(client)
-        runUntilIdle()
-        vm.start(client) // started 守卫：第二次应跳过
-        runUntilIdle()
+        try {
+            val vm = TreeViewModel("proj", client)
+            runUntilIdle()
 
-        assertEquals(1, calls)
-        assertNotNull(vm.entries)
-        assertNull(vm.error)
+            assertEquals(listOf(""), requested)
+            assertEquals(listOf("src", "README.md"), vm.state.value.visibleRows().map { it.path })
+            assertFalse(vm.state.value.directories.getValue("").loading)
+        } finally {
+            client.close()
+        }
     }
 
     @Test
-    fun `start_success_sets_entries`() = runVmTest {
-        val engine = MockEngine { respond(okJson, HttpStatusCode.OK, jsonHeaders) }
-        val vm = TreeViewModel("proj")
+    fun `toggle loads only selected cold directory`() = runVmTest {
+        val requested = mutableListOf<String>()
+        val engine = MockEngine { request ->
+            val path = request.url.parameters["path"] ?: "<missing>"
+            requested += path
+            respond(if (path.isEmpty()) rootJson else srcJson, HttpStatusCode.OK, jsonHeaders)
+        }
+        val client = mockClient(engine)
 
-        vm.start(mockClient(engine))
-        runUntilIdle()
+        try {
+            val vm = TreeViewModel("proj", client)
+            runUntilIdle()
+            vm.toggle("src")
+            runUntilIdle()
 
-        assertEquals(1, vm.entries?.size)
-        assertEquals("a.txt", vm.entries?.get(0)?.path)
-        assertEquals(10L, vm.entries?.get(0)?.size)
-        assertNull(vm.error)
+            assertEquals(listOf("", "src"), requested)
+            assertEquals(
+                listOf("src", "src/Main.kt", "README.md"),
+                vm.state.value.visibleRows().map { it.path },
+            )
+            assertTrue("src" in vm.state.value.expandedPaths)
+        } finally {
+            client.close()
+        }
     }
 
     @Test
-    fun `start_failure_sets_error_keeps_data_null`() = runVmTest {
-        val engine = MockEngine { respond("", HttpStatusCode.InternalServerError) }
-        val vm = TreeViewModel("proj")
+    fun `retry reloads only failed directory and keeps other rows`() = runVmTest {
+        val requested = mutableListOf<String>()
+        var srcCalls = 0
+        val engine = MockEngine { request ->
+            val path = request.url.parameters["path"] ?: "<missing>"
+            requested += path
+            when {
+                path.isEmpty() -> respond(rootJson, HttpStatusCode.OK, jsonHeaders)
+                srcCalls++ == 0 -> respond("boom", HttpStatusCode.InternalServerError)
+                else -> respond(srcJson, HttpStatusCode.OK, jsonHeaders)
+            }
+        }
+        val client = mockClient(engine)
 
-        vm.start(mockClient(engine))
-        runUntilIdle()
+        try {
+            val vm = TreeViewModel("proj", client)
+            runUntilIdle()
+            vm.toggle("src")
+            runUntilIdle()
 
-        assertNull(vm.entries)
-        assertNotNull(vm.error)
+            assertNotNull(vm.state.value.directories.getValue("src").error)
+            assertTrue(vm.state.value.visibleRows().any { it.path == "README.md" })
+
+            vm.retry("src")
+            assertTrue(vm.state.value.directories.getValue("src").loading)
+            runUntilIdle()
+
+            assertEquals(listOf("", "src", "src"), requested)
+            assertNull(vm.state.value.directories.getValue("src").error)
+            assertEquals(
+                listOf("src", "src/Main.kt", "README.md"),
+                vm.state.value.visibleRows().map { it.path },
+            )
+        } finally {
+            client.close()
+        }
     }
 }
