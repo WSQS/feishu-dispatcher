@@ -60,6 +60,22 @@ class TreeLoader(
         jobToStart?.start()
     }
 
+    /** 重试已展开且加载失败的目录；保留已有子项，只刷新该目录。 */
+    fun retry(path: String) {
+        var jobToCancel: Job? = null
+        val jobToStart = synchronized(trackingLock) {
+            if (closed) return
+            val current = _state.value
+            val directory = current.directories[path] ?: return
+            if (path !in current.expandedPaths || directory.loading || directory.error == null) return
+            jobToCancel = unregisterLoad(path)
+            _state.update { it.setLoading(path, true) }
+            registerLoad(path)
+        }
+        jobToCancel?.cancel()
+        jobToStart?.start()
+    }
+
     /** 离开页面：取消全部在途加载，并让迟到响应失效。 */
     fun close() {
         val jobs = synchronized(trackingLock) {

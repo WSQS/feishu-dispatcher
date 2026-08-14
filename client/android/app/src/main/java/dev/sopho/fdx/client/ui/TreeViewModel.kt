@@ -1,35 +1,33 @@
 package dev.sopho.fdx.client.ui
 
-import android.util.Log
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import dev.sopho.fdx.client.network.TreeEntry
 import dev.sopho.fdx.client.network.ViewerClient
-import kotlinx.coroutines.launch
+import dev.sopho.fdx.client.tree.TreeLoader
+import dev.sopho.fdx.client.tree.TreeState
+import kotlinx.coroutines.flow.StateFlow
 
 /**
- * 文件树数据：随目的地（NavBackStackEntry）存活，返回时复用缓存不重拉。
+ * 文件树数据：随目的地（NavBackStackEntry）存活，按访问目录加载并在返回时复用已访问状态。
  */
-class TreeViewModel(private val projectName: String) : ViewModel() {
-    var entries by mutableStateOf<List<TreeEntry>?>(null)
-        private set
-    var error by mutableStateOf<String?>(null)
-        private set
-    private var started = false
+class TreeViewModel(
+    projectName: String,
+    client: ViewerClient,
+) : ViewModel() {
+    private val loader = TreeLoader(viewModelScope) { path ->
+        client.treeChildren(projectName, path).entries
+    }
+    val state: StateFlow<TreeState> = loader.state
 
-    fun start(client: ViewerClient) {
-        if (started) return
-        started = true
-        viewModelScope.launch {
-            runCatching { client.tree(projectName).entries }
-                .onSuccess { entries = it }
-                .onFailure {
-                    Log.e("TreeScreen", "failed to load tree", it)
-                    error = it.message
-                }
-        }
+    init {
+        loader.start()
+    }
+
+    fun toggle(path: String) = loader.toggle(path)
+
+    fun retry(path: String) = loader.retry(path)
+
+    override fun onCleared() {
+        loader.close()
     }
 }
