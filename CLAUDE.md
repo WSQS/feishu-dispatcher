@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目状态
 
-核心链路已实现并经真实飞书环境验证（ACP 流式回话题、话题内指挥、后台任务、调度器 LLM 派发）；P1 多 agent 并发 + worktree 隔离仍是开放方向（#37）。权威架构来源是 GitHub 上 pinned 的架构 map issue（`docs/design.md` 已按 #296 废除）——架构级变更先更新该 map。文档统一用中文。
+核心链路已实现并经真实飞书环境验证（ACP 流式回话题、话题内指挥、后台任务、调度器 LLM 派发）；P1 多 agent 并发 + worktree 隔离仍是开放方向（#37）。权威架构来源是 GitHub 上 pinned 的架构 map issue（原 `docs/design.md` 已废除）——架构级变更先更新该 map。文档统一用中文。
 
 ## 项目是什么
 
@@ -66,4 +66,4 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - WS 线程死亡由 daemon 30s 看门狗自动重启；agent 子进程 stderr 有后台 drain（防管道满卡死）。
 - **待办 / backlog**：可执行任务条目统一走 **GitHub issues**（`gh issue list`，按 `size:` / `area:` label 分类）；设计决策记录也收敛到 issue——架构总览/概念模型/基础决策与暂缓、否决的 rationale 在架构 map（pinned issue），具体决策的裁定现场是对应 issue/PR。**不要**在本文件另起任务清单或决策清单（避免与 issues 漂移）。大块方向：同项目 worktree 隔离（#37）、权限审批 B（#20）。
 - **动手前先开 issue（工作流约束）**：任何要修复/实现的**独立**问题，在开始改动前先 `gh issue create` 记录（打好 `size:`/`area:` label），再开分支写修复，PR 里 `Closes #N` 闭环——不要先写代码、事后再补 issue。同一 PR 范围内顺手带的琐碎修正（如改个错字）不必单独开 issue。
-- **记录归档约定（#296）**：issue 即决策记录、PR 即实现记录、测试即可执行契约；仓库文档只留四类例外——用户操作、部署运维、对外跨仓库 API、脱离 GitHub 仍须长期保留的知识（本文件的 agent 操作指引即属此类）。不把决策写进 docs，不在文档里留实现过程记录。详见 CONTRIBUTING「记录与文档约定」（权威来源）。
+- **记录归档约定**：issue 即决策记录、PR 即实现记录、测试即可执行契约；仓库文档只留四类例外——用户操作、部署运维、对外跨仓库 API、脱离 GitHub 仍须长期保留的知识（本文件的 agent 操作指引即属此类）。不把决策写进 docs，不在文档里留实现过程记录。详见 CONTRIBUTING「记录与文档约定」（权威来源）。
