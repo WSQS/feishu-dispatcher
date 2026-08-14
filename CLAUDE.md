@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目状态
 
-核心链路已实现并经真实飞书环境验证（ACP 流式回话题、话题内指挥、后台任务、调度器 LLM 派发）；P1 多 agent 并发 + worktree 隔离仍是开放方向（#37）。权威架构来源是 GitHub 上 pinned 的架构 map issue（原 `docs/design.md` 已废除）——架构级变更先更新该 map。文档统一用中文。
+核心链路已实现并经真实飞书环境验证（ACP 流式回话题、话题内指挥、后台任务、调度器 LLM 派发）；P1 多 agent 并发 + worktree 隔离仍是开放方向。权威架构来源是 GitHub 上 pinned 的架构 map issue（原 `docs/design.md` 已废除）——架构级变更先更新该 map。文档统一用中文。
 
 ## 项目是什么
 
@@ -59,11 +59,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 - **lark-oapi 在 Windows + Defender 下会崩**：`import lark_oapi` eager import 57 个 API namespace 触发 access violation（0xC0000005）。已用 `_lark_compat.py` 空壳 shim 绕开，实际只加载 `ws.pb`（protobuf）+ `ws.const`，事件 JSON 全部手写 dict 解析。**改飞书相关代码务必保持 `__init__.py` 里 `_lark_compat` 最先 import**。
 - **feishu.py 不走 `lark.ws.Client`**（其依赖链会触发上述崩溃），自实现 WS 长连接。frame/ACK/ping/合包语义**必须对照官方参考实现** `.venv/Lib/site-packages/lark_oapi/ws/client.py`：ACK 成功 `{"code": 200}` 失败 500 + `biz_rt` 头；ping 间隔服务端可下发（endpoint 发现响应 / pong payload 的 `PingInterval`）；合包缓存 5s TTL。
-- **飞书限频**：同群全部机器人共享 5 QPS（全应用 50/s）。**出站令牌桶**（`feishu.py` 的 `_RateLimiter`，`_im_post`/`_im_patch` 发送前 `acquire`，`[config] feishu_qps` 默认 5、`<=0` 关闭）把多 agent 汇总 QPS 压在限额下——故 `max_agents` 默认已提到 7（#36）。HTTP 层另带 Retry（429/5xx，尊重 Retry-After）当兜底。**当前是全局桶**（不分 chat，个人多为单群够用）；严格 per-chat 桶 + 同项目 worktree 隔离见 #37。
+- **飞书限频**：同群全部机器人共享 5 QPS（全应用 50/s）。**出站令牌桶**（`feishu.py` 的 `_RateLimiter`，`_im_post`/`_im_patch` 发送前 `acquire`，`[config] feishu_qps` 默认 5、`<=0` 关闭）把多 agent 汇总 QPS 压在限额下——故 `max_agents` 默认已提到 7（#36）。HTTP 层另带 Retry（429/5xx，尊重 Retry-After）当兜底。**当前是全局桶**（不分 chat，个人多为单群够用）；严格 per-chat 桶与同项目 worktree 隔离属后续开放方向。
 - **安全默认**：`chat_id` 必填（空则拒绝启动，发现模式用 `--discover`）；`sender_whitelist` 建议配置；`/run` 并发上限 `max_agents`。
 - **单实例锁（#81）**：`start` 时对状态目录下 `daemon.lock` 加 OS 文件锁（`singleinstance.py`，Windows `msvcrt`/POSIX `fcntl`，进程退出含被杀由 OS 自动释放；Windows 锁高偏移哨兵字节让文件头 pid 仍可被竞争者读出报错）。已有实例在跑则第二个 `start` 直接报错中止——杜绝多 daemon 共用 `tasks.json`/WS 互相踩坏台账（曾出过 task_id 复用、话题台账被覆盖）。re-exec 前显式放锁。**配套**：`_shutdown` 关控制面用 `asyncio.wait_for(asyncio.to_thread(control.stop), _CONTROL_STOP_TIMEOUT=5s)`——挪到 worker 线程跑（主 loop 继续转、解与在途控制面请求的死锁）+ 超时兜底，保证 reboot 能干净杀掉旧进程、不再叠僵尸。`store.create()` 铸号自愈：`max(seq, 现有最大 id)+1`，即便 seq 被回退也不复用已有 id。
 - **Windows agent 进程树兜底清理（#92）**：cursor-agent 在 Windows 经 `cmd.exe→powershell→node` 两层 shim 启动，而 ACP SDK 的 `spawn_stdio_transport` 收尾只 `terminate` 直接子进程 cmd.exe（`TerminateProcess` 不递归、cursor 的 node 又不因 stdin EOF 退出）——`powershell+node` 后代泄漏（真机堆过 18 个僵尸、~1.2GB）。`AcpAgent.aclose()` 里 `_reap_process_tree()` 兜底：`close_session`+`conn.close()` 后、SDK `__aexit__` 前，趁进程树还活着用 Toolhelp 快照（`_win_snapshot_ppids`）算出整棵树（`_proc_tree_pids`，纯函数可单测）并按 pid 直杀（`_win_reap_pids`=`os.kill`→`TerminateProcess`）。仅 Windows 生效（POSIX 无此 shim 链）；真机验证 `scripts/smoke_proc_tree_kill.py`。
 - WS 线程死亡由 daemon 30s 看门狗自动重启；agent 子进程 stderr 有后台 drain（防管道满卡死）。
-- **待办 / backlog**：可执行任务条目统一走 **GitHub issues**（`gh issue list`，按 `size:` / `area:` label 分类）；设计决策记录也收敛到 issue——架构总览/概念模型/基础决策与暂缓、否决的 rationale 在架构 map（pinned issue），具体决策的裁定现场是对应 issue/PR。**不要**在本文件另起任务清单或决策清单（避免与 issues 漂移）。大块方向：同项目 worktree 隔离（#37）、权限审批 B（#20）。
+- **待办 / backlog**：可执行任务条目统一走 **GitHub issues**（`gh issue list`，按 `size:` / `area:` label 分类）；设计决策记录也收敛到 issue——架构总览/概念模型/基础决策与暂缓、否决的 rationale 在架构 map（pinned issue），具体决策的裁定现场是对应 issue/PR。**不要**在本文件另起任务清单或决策清单（避免与 issues 漂移）。大块方向：同项目 worktree 隔离、权限审批 B。
 - **动手前先开 issue（工作流约束）**：任何要修复/实现的**独立**问题，在开始改动前先 `gh issue create` 记录（打好 `size:`/`area:` label），再开分支写修复，PR 里 `Closes #N` 闭环——不要先写代码、事后再补 issue。同一 PR 范围内顺手带的琐碎修正（如改个错字）不必单独开 issue。
 - **记录归档约定**：issue 即决策记录、PR 即实现记录、测试即可执行契约；仓库文档只留四类例外——用户操作、部署运维、对外跨仓库 API、脱离 GitHub 仍须长期保留的知识（本文件的 agent 操作指引即属此类）。不把决策写进 docs，不在文档里留实现过程记录。详见 CONTRIBUTING「记录与文档约定」（权威来源）。
