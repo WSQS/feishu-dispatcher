@@ -86,10 +86,10 @@ uv sync                                  # 装依赖
 - **[使用手册 docs/usage.md](docs/usage.md)** — 装好之后怎么用（命令全集 + FAQ）
 - **[配置指南 docs/setup.md](docs/setup.md)** — 从零把飞书应用 + daemon 跑起来
 - [Claude Code 后端接入 docs/claude-code-backend.md](docs/claude-code-backend.md)
-- [设计方案 docs/design.md](docs/design.md)（架构与决策，偏开发者）
+- [架构与核心决策（GitHub 架构 map）](https://github.com/WSQS/feishu-dispatcher/issues/331)（偏开发者）
 
 ## 状态
 
 已在真实飞书环境验证可用。当前能力：ACP 流式输出实时回话题、话题内继续指挥、多后端（Copilot / OpenCode / Claude Code / Cline / Codex）、会话跨重启恢复、空闲自动挂起省资源、自然语言派发（调度器 LLM）、后台长任务跑完自动唤回 agent。下一步方向：多 agent 并发的 worktree 隔离。
 
-想深入实现细节，看 [docs/design.md](docs/design.md)。
+想深入实现细节，看 [架构 map（GitHub issue）](https://github.com/WSQS/feishu-dispatcher/issues/331)。
