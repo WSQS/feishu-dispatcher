@@ -135,5 +135,5 @@ daemon 崩了 / 升级 / 重开机之后，**不用重新 `/run`**：直接在�
 ## 还想了解更多
 
 - 从零配置：[setup.md](setup.md)
-- 架构与设计决策（偏开发者）：[design.md](design.md)
+- 架构与设计决策（偏开发者）：[GitHub 架构 map](https://github.com/WSQS/feishu-dispatcher/issues/331)
 - Claude Code 后端接入细节：[claude-code-backend.md](claude-code-backend.md)

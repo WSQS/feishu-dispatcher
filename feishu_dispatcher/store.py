@@ -1,4 +1,4 @@
-"""任务台账持久化：Task 是 daemon 拥有的核心实体（概念模型见 docs/design.md）。
+"""任务台账持久化：Task 是 daemon 拥有的核心实体。
 
 一个 Task = 派发在某项目上的一个工作单元，持有它的 session_id（agent 侧记忆）、
 thread_root_id（飞书话题）、workspace（工作目录）。落盘到 tasks.json，按 `task_id`
