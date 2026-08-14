@@ -80,7 +80,7 @@ throttle_window = 0.5
 #   在 agent 话题内发 /done     = 标记该任务完成并归档（done）
 
 [agents]
-# agent 名 -> ACP 启动命令（argv 数组），均经 ACP 协议控制、本地实测握手通过。
+# agent 名 -> ACP 启动命令（argv 数组），均经 ACP 协议控制。
 # Windows 上必须用 npm 装的 .cmd shim（copilot.cmd / opencode.cmd），
 # daemon 会自动补 .cmd 后缀。
 # - copilot：需先 `copilot` 登录过 GitHub 账号。
@@ -89,14 +89,14 @@ throttle_window = 0.5
 # - claude：Claude Code 无原生 ACP，经社区适配器接入（bin=claude-agent-acp）。
 #   前置：`npm i -g @agentclientprotocol/claude-agent-acp` + `claude` 已登录
 #   （`claude auth login`，Pro/Max 订阅额度即可；或设 ANTHROPIC_API_KEY 走 API 计费）。
-#   详见 docs/claude-code-backend.md（含实测的握手/流式/load_session 结果）。
-# - cline：Cline CLI 原生带 --acp（v3.0.47+ 实测握手/流式/load_session 通过）。
+#   详见 docs/claude-code-backend.md（安装、鉴权与后端能力）。
+# - cline：Cline CLI 原生带 --acp（v3.0.47+）。
 #   前置：`npm i -g cline` + `cline auth` 登录某 provider（默认 provider=cline 走其
 #   托管网关）。想固定用别的 provider/model 就在 argv 里带 -P/-m，例如
 #   ["cline", "--acp", "-P", "sapaicore"]。注意 cline 只上报占位模型名「cline」
 #   （类似 copilot 不暴露具体模型），卡片 footer / `/model` 显示会不全，不影响运行。
 # - codex：OpenAI Codex CLI 无原生 ACP，经社区适配器 @agentclientprotocol/codex-acp
-#   接入（实测握手/流式/load_session 通过，模型名/切换都正常显示）。默认 mode=agent：
+#   接入（模型名显示/切换正常）。默认 mode=agent：
 #   workspace-write、按需审批、禁止网络，适合普通任务；review/subagent 任务见下面的
 #   codex-full-access 独立 profile。前置：
 #   `npm i -g @agentclientprotocol/codex-acp` + `codex login`（或在 ~/.codex/config.toml
