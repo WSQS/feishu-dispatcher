@@ -123,6 +123,56 @@ def test_failed_is_resumable_not_terminal_and_error_persists(tmp_path: Path):
     assert s2.get("t1").error_message == "RuntimeError: boom"
 
 
+def test_agent_history_default_empty_and_persists(tmp_path: Path):
+    # 新 Task 的 agent_history 默认空；update 后落盘并读回。
+    p = tmp_path / "tasks.json"
+    s1 = TaskStore(p)
+    make(s1, thread="om_1")
+    assert s1.get("t1").agent_history == []  # 默认空
+    entry = {"from_agent": "copilot", "agent_label": "opencode", "switched_at": 1.5}
+    s1.update("t1", agent_label="opencode", agent_history=[entry])
+    s2 = TaskStore(p)  # 重载
+    assert s2.get("t1").agent_label == "opencode"
+    assert s2.get("t1").agent_history == [entry]
+
+
+def test_agent_history_backward_compat_missing_field(tmp_path: Path):
+    # 向后兼容：老 tasks.json 无 agent_history 键 → 加载时落默认 []，不崩。
+    import json
+
+    p = tmp_path / "tasks.json"
+    legacy = {
+        "seq": 1,
+        "tasks": {
+            "t1": {
+                "task_id": "t1",
+                "project_name": "demo",
+                "agent_label": "copilot",
+                "description": "老任务",
+                "status": "idle",
+                "session_id": "ses_old",
+                "thread_root_id": "om_1",
+                "workspace": "/x",
+                "turns": 1,
+                "created_at": 0.0,
+                "updated_at": 0.0,
+                "actions": [],
+                "last_output": "",
+                "model": "",
+                "error_message": "",
+                "issue_url": "",
+                # 故意不带 agent_history
+            }
+        },
+    }
+    p.write_text(json.dumps(legacy), encoding="utf-8")
+    s = TaskStore(p)
+    t = s.get("t1")
+    assert t is not None
+    assert t.agent_history == []  # 缺键 → 默认，不 KeyError
+    assert t.agent_label == "copilot"
+
+
 def test_failed_not_pruned(tmp_path: Path):
     # failed 不进历史修剪（同 suspended，可恢复态不清）
     s = TaskStore(None, keep_terminal=1)

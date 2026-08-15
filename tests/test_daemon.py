@@ -276,6 +276,82 @@ def test_with_tokens_appends_to_footer():
     assert _with_tokens("", 3210) == "~3.2k tok"  # 空 footer 不带前导分隔
 
 
+def test_build_agent_handoff_includes_state_without_diff():
+    # 纯函数：无 git diff 时仍把 from/to、项目、任务描述、上一轮回复交给新 agent。
+    from feishu_dispatcher.daemon import _build_agent_handoff
+    from feishu_dispatcher.store import Task
+
+    task = Task(
+        task_id="t1",
+        project_name="demo",
+        agent_label="opencode",
+        description="重构调度器",
+        status="idle",
+        last_output="已重构 scheduler.py",
+    )
+    out = _build_agent_handoff(
+        from_agent="copilot", to_agent="opencode", task=task, diff=""
+    )
+    assert "copilot" in out and "opencode" in out  # from/to 标注
+    assert "demo" in out and "重构调度器" in out  # 项目 + 任务描述
+    assert "已重构 scheduler.py" in out  # last_output
+    assert "git diff" not in out  # 无 diff 段被省略
+
+
+def test_build_agent_handoff_includes_diff_when_present():
+    from feishu_dispatcher.daemon import _build_agent_handoff
+    from feishu_dispatcher.store import Task
+
+    task = Task(
+        task_id="t1",
+        project_name="demo",
+        agent_label="opencode",
+        description="做 X",
+        status="idle",
+    )
+    out = _build_agent_handoff(
+        from_agent="copilot", to_agent="opencode", task=task, diff="@@ -1 +1 @@\n-old\n+new"
+    )
+    assert "git diff" in out
+    assert "@@ -1 +1 @@" in out  # diff 内容进交接 prompt
+
+
+async def test_capture_workspace_diff_on_tmp_repo(tmp_path):
+    # 在临时 git 仓造一个改动，验证 _capture_workspace_diff 抓到 diff；非 git/无改动
+    # 路径返回空串（不崩、不拖累切换）。
+    import subprocess
+
+    from feishu_dispatcher.daemon import _capture_workspace_diff
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(
+        ["git", "config", "user.email", "t@t"], cwd=tmp_path, check=True
+    )
+    subprocess.run(["git", "config", "user.name", "t"], cwd=tmp_path, check=True)
+    (tmp_path / "a.txt").write_text("hello", encoding="utf-8")
+    subprocess.run(["git", "add", "a.txt"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "init"], cwd=tmp_path, check=True)
+    # 制造一个已跟踪文件的改动 + 一个未跟踪文件
+    (tmp_path / "a.txt").write_text("hello world", encoding="utf-8")
+    (tmp_path / "b.txt").write_text("untracked", encoding="utf-8")
+
+    diff = await _capture_workspace_diff(str(tmp_path))
+    assert "hello world" in diff  # diff 内容
+    assert "b.txt" in diff  # 未跟踪文件出现在 status --short 段
+
+    # 无改动 → 空串
+    subprocess.run(["git", "checkout", "-q", "--", "a.txt"], cwd=tmp_path, check=True)
+    (tmp_path / "b.txt").unlink()
+    empty = await _capture_workspace_diff(str(tmp_path))
+    assert empty == ""
+
+    # 非 git 目录 → 空串（不抛）
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as nonrepo:
+        assert await _capture_workspace_diff(nonrepo) == ""
+
+
 async def test_run_dispatches_and_streams_output():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo do stuff"))
@@ -1543,6 +1619,130 @@ async def test_model_command_unsupported_agent():
     await daemon._handle_message(thread_msg("/model glm-5", mid="om_m"))
     assert created[0].set_model_calls == []
     assert any("不支持切换模型" in t for t in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+# ---------------------------------------------------------------------- #
+# 话题内 /agent：跨后端切换（无状态切换 + git diff 摘要交接）
+# ---------------------------------------------------------------------- #
+
+
+async def _run_for_agent_switch(store):
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: created and created[0].prompts == ["build"])
+    await wait_until(lambda: not daemon._sessions["om_root1"].turn_in_flight)
+    return daemon, bridge, created
+
+
+async def test_agent_command_lists_available_and_current():
+    store = TaskStore(None)
+    daemon, bridge, created = await _run_for_agent_switch(store)
+    await daemon._handle_message(thread_msg("/agent", mid="om_a"))
+    reply = "\n".join(bridge.texts("om_root1"))
+    # make_daemon 配置了 copilot + opencode 两个后端；首任是项目默认 copilot
+    assert "当前 agent：copilot" in reply
+    assert "opencode" in reply and "copilot" in reply
+    assert created[0].prompts == ["build"]  # 列表命令不入队、不切
+    await daemon._shutdown()
+
+
+async def test_agent_command_rejects_unknown():
+    store = TaskStore(None)
+    daemon, bridge, created = await _run_for_agent_switch(store)
+    await daemon._handle_message(thread_msg("/agent nope", mid="om_a"))
+    reply = "\n".join(bridge.texts("om_root1"))
+    assert "未知 agent 'nope'" in reply
+    assert store.get("t1").agent_label == "copilot"  # 台账未动
+    assert len(created) == 1  # 没起新 agent
+    await daemon._shutdown()
+
+
+async def test_agent_command_same_agent_is_noop():
+    store = TaskStore(None)
+    daemon, bridge, created = await _run_for_agent_switch(store)
+    await daemon._handle_message(thread_msg("/agent copilot", mid="om_a"))
+    assert any("当前已是 copilot，无需切换" in t for t in bridge.texts("om_root1"))
+    assert len(created) == 1  # 没起新 agent
+    await daemon._shutdown()
+
+
+async def test_agent_switch_closes_old_starts_new_with_handoff():
+    # 切换核心：关旧 agent、起新 agent、把交接摘要作为新 agent 首条 prompt；
+    # 台账 agent_label 更新、agent_history 记轨迹。
+    store = TaskStore(None)
+    daemon, bridge, created = await _run_for_agent_switch(store)
+    await daemon._handle_message(thread_msg("/agent opencode", mid="om_a"))
+    # 新 agent（created[1]）拿到交接摘要作为首轮（含任务描述 + from/to 提示）
+    await wait_until(lambda: len(created) >= 2 and created[1].prompts)
+    assert len(created) == 2
+    handoff = created[1].prompts[0]
+    assert "copilot" in handoff and "opencode" in handoff  # from/to 标注
+    assert "build" in handoff  # 任务描述进了交接
+    # 旧 agent 被关（worker cancel → finally _close_session）
+    await wait_until(lambda: created[0].closed)
+    # 台账：agent_label 切到 opencode，agent_history 记一条
+    t = store.get("t1")
+    assert t.agent_label == "opencode"
+    assert len(t.agent_history) == 1
+    assert t.agent_history[0]["from_agent"] == "copilot"
+    assert t.agent_history[0]["agent_label"] == "opencode"
+    assert any("已切换到 opencode" in s for s in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+async def test_agent_switch_rolls_back_on_new_agent_startup_failure():
+    # 新 agent 启动失败 → 回滚台账（保持旧 agent_label、不写 agent_history），报错。
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store, agent_cls=FakeAgent)
+    # 让「第二个被创建的」agent（切换目标）启动失败；第一个（/run 起）正常。
+    original = daemon._make_agent
+    call_count = {"n": 0}
+
+    def factory(spawn, on_output, on_action=None, *, resume_session_id=None):
+        call_count["n"] += 1
+        if call_count["n"] == 2:
+            return StartupFailAgent(
+                spawn, on_output, on_action, resume_session_id=resume_session_id
+            )
+        return original(spawn, on_output, on_action, resume_session_id=resume_session_id)
+
+    daemon._make_agent = factory  # type: ignore[method-assign]
+    await daemon._handle_message(root_msg("/run demo build"))
+    await wait_until(lambda: created and created[0].prompts == ["build"])
+    await wait_until(lambda: not daemon._sessions["om_root1"].turn_in_flight)
+    saved_sid = store.get("t1").session_id
+
+    await daemon._handle_message(thread_msg("/agent opencode", mid="om_a"))
+    # 切换目标 agent 启动失败 → 回滚
+    await wait_until(lambda: len(created) >= 2)
+    t = store.get("t1")
+    assert t.agent_label == "copilot"  # 回滚回旧后端
+    assert t.agent_history == []  # 不记切换轨迹
+    assert any("切换到 opencode 失败，已回退" in s for s in bridge.texts("om_root1"))
+    # 回滚尝试用旧 session_id load_session 接回旧 agent（resume_session_id 命中）
+    assert any(getattr(a, "resume_session_id", None) == saved_sid for a in created[1:])
+    await daemon._shutdown()
+
+
+async def test_agent_command_documented_in_thread_usage():
+    # _THREAD_USAGE 必须提到 /agent（命令随新增同步维护）
+    from feishu_dispatcher.daemon import _THREAD_USAGE
+
+    assert "/agent" in _THREAD_USAGE
+
+
+async def test_task_command_shows_agent_history_trail():
+    # /task 展示切换轨迹：首任 + 每次 /agent 切换的目标
+    store = TaskStore(None)
+    daemon, bridge, created = await _run_for_agent_switch(store)
+    await daemon._handle_message(thread_msg("/agent opencode", mid="om_a"))
+    await wait_until(lambda: len(created) >= 2 and created[1].prompts)
+    await daemon._handle_message(root_msg("/task t1", mid="om_q"))
+    reply = "\n".join(bridge.texts("om_q"))
+    assert "切换轨迹" in reply
+    assert "首任：copilot" in reply  # 取自首条 from_agent
+    assert "切换到 opencode" in reply
     await daemon._shutdown()
 
 
