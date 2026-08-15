@@ -11,6 +11,7 @@ from feishu_dispatcher._paths import (
     PathTraversalError,
     resolve_tree_path,
     resolve_under_root,
+    validate_tree_path,
 )
 
 
@@ -71,6 +72,17 @@ def test_symlink_into_root_allowed(tmp_path: Path):
 
 
 # ---- /tree/children 的路径语法 ---- #
+
+
+def test_tree_path_lexical_validator_accepts_virtual_path():
+    # 不访问文件系统：diff-tree 可校验尚未 materialize 的目录字符串。
+    validate_tree_path("deleted/nested")
+    validate_tree_path("")
+
+
+def test_tree_path_lexical_validator_rejects_dotdot():
+    with pytest.raises(PathTraversalError, match="语法"):
+        validate_tree_path("a/../b")
 
 
 def test_tree_root_resolves_to_workspace(tmp_path: Path):

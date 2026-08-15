@@ -44,6 +44,24 @@ def resolve_under_root(workspace: Path, requested: str) -> Path:
     return resolved
 
 
+def validate_tree_path(path: str) -> None:
+    """校验 ``/tree/children`` 家族接口的 workspace 相对 POSIX path 语法。
+
+    空串是唯一合法的根表示；非根由 ``/`` 连接的普通段组成，不接受空段、
+    ``.`` / ``..`` 或反斜杠。只做词法校验，不访问文件系统，供普通文件树与
+    diff-tree 虚拟目录共同复用。
+    """
+    if path == "":
+        return
+    if "\\" in path:
+        raise PathTraversalError(f"path 含反斜杠（仅接受 / 分隔）: {path!r}")
+    segments = path.split("/")
+    if any(seg in ("", ".", "..") for seg in segments):
+        raise PathTraversalError(
+            f"path 不符合目录语法（空段 / . / .. 不允许）: {path!r}"
+        )
+
+
 def resolve_tree_path(workspace: Path, path: str) -> Path:
     """按 /tree/children 的语法校验请求 ``path`` 并解析为 workspace 内的安全目录路径。
 
@@ -55,13 +73,7 @@ def resolve_tree_path(workspace: Path, path: str) -> Path:
     只做语法 + 安全解析，**不做存在性检查**——不存在 / 是文件 / 无权限等语义
     由扫描器 / HTTP 层决定，不在此处伪装。
     """
+    validate_tree_path(path)
     if path == "":
         return workspace.resolve()
-    if "\\" in path:
-        raise PathTraversalError(f"path 含反斜杠（仅接受 / 分隔）: {path!r}")
-    segments = path.split("/")
-    if any(seg in ("", ".", "..") for seg in segments):
-        raise PathTraversalError(
-            f"path 不符合目录语法（空段 / . / .. 不允许）: {path!r}"
-        )
     return resolve_under_root(workspace, path)

@@ -29,7 +29,18 @@ from urllib.parse import parse_qs
 from pathlib import Path
 
 from feishu_dispatcher import __version__
-from feishu_dispatcher._paths import PathTraversalError, resolve_tree_path, resolve_under_root
+from feishu_dispatcher._git_executor import GitTreeBusyError, GitTreeRequestTimeout
+from feishu_dispatcher._git_tree import (
+    GitTreeCommandTimeout,
+    GitTreeError,
+    NotGitWorkspaceError,
+)
+from feishu_dispatcher._paths import (
+    PathTraversalError,
+    resolve_tree_path,
+    resolve_under_root,
+    validate_tree_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -192,6 +203,40 @@ async def tree_children(ctx: dict, request: dict) -> tuple[int, dict]:
         return 400, {"error": f"not a directory: {path}"}
     except PermissionError:
         return 403, {"error": f"permission denied: {path}"}
+    return 200, {"path": path, "entries": entries}
+
+
+async def diff_tree_children(ctx: dict, request: dict) -> tuple[int, dict]:
+    """``GET /api/projects/{name}/diff/tree/children?path=``：列当前侧变更树直接子项。
+
+    响应与 ``/tree/children`` 同形，不含 status / old_path；deleted 旧路径不进入本 landing。
+    Git 收集经 ``ctx["git_tree_executor"]`` 放到有界 worker，不占 daemon 主 loop。
+    """
+    name = request["segments"]["name"]
+    ws = _resolve_workspace(ctx, name)
+    if isinstance(ws, tuple):
+        return ws
+    query = request["query"]
+    if "path" not in query:
+        return 400, {"error": "missing path parameter"}
+    path = query["path"]
+    try:
+        validate_tree_path(path)
+    except PathTraversalError as exc:
+        return 400, {"error": str(exc)}
+    executor = ctx.get("git_tree_executor")
+    if executor is None:
+        return 500, {"error": "git_tree_executor not in ctx"}
+    try:
+        entries = await executor.run(ws, path)
+    except FileNotFoundError:
+        return 404, {"error": f"not found in diff tree: {path}"}
+    except NotGitWorkspaceError as exc:
+        return 409, {"error": str(exc)}
+    except (GitTreeBusyError, GitTreeRequestTimeout, GitTreeCommandTimeout) as exc:
+        return 503, {"error": str(exc)}
+    except GitTreeError as exc:
+        return 500, {"error": str(exc)}
     return 200, {"path": path, "entries": entries}
 
 

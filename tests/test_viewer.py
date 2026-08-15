@@ -13,11 +13,14 @@ import urllib.error
 import urllib.request
 
 from feishu_dispatcher import __version__
+from feishu_dispatcher._git_executor import GitTreeExecutor
+from feishu_dispatcher._git_tree import NotGitWorkspaceError
 from feishu_dispatcher._scan_executor import ScanExecutor
 from feishu_dispatcher.config import Project
 from feishu_dispatcher.viewer import (
     _MAX_FILE_BYTES,
     ViewerServer,
+    diff_tree_children as viewer_diff_tree_children,
     file as viewer_file,
     health,
     list_projects,
@@ -55,6 +58,25 @@ def _children_server(ws, *, scan_executor=None) -> tuple[ViewerServer, ScanExecu
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: fake, "scan_executor": executor},
+    )
+    return vs, executor
+
+
+def _diff_children_server(ws, *, collect) -> tuple[ViewerServer, GitTreeExecutor]:
+    """构造当前侧 diff-tree 路由；collector 可注入以固定 HTTP 行为。"""
+    executor = GitTreeExecutor(collect=collect)
+    fake = {"demo": Project(name="demo", path=ws)}
+    vs = ViewerServer(
+        "tok-view",
+        routes={
+            (
+                "GET",
+                "/api/projects/{name}/diff/tree/children",
+            ): viewer_diff_tree_children
+        },
+        host="127.0.0.1",
+        port=0,
+        ctx={"all_projects": lambda: fake, "git_tree_executor": executor},
     )
     return vs, executor
 
@@ -497,3 +519,131 @@ async def test_tree_children_scan_does_not_block_main_loop():
     finally:
         await ex.aclose()
         shutil.rmtree(ws, ignore_errors=True)
+
+
+# ---- /diff/tree/children 接口（当前侧、无状态子集）---- #
+
+
+async def test_diff_tree_children_returns_same_shape_as_file_tree(tmp_path):
+    def collect(_workspace, rel_path):
+        assert rel_path == "src"
+        return [
+            {"name": "api", "path": "src/api", "type": "directory"},
+            {"name": "app.py", "path": "src/app.py", "type": "file"},
+        ]
+
+    vs, ex = _diff_children_server(tmp_path, collect=collect)
+    vs.start()
+    try:
+        status, payload = await asyncio.to_thread(
+            _get,
+            vs.base_url + "/api/projects/demo/diff/tree/children?path=src",
+            "tok-view",
+        )
+        assert status == 200
+        assert payload == {
+            "path": "src",
+            "entries": [
+                {"name": "api", "path": "src/api", "type": "directory"},
+                {"name": "app.py", "path": "src/app.py", "type": "file"},
+            ],
+        }
+    finally:
+        vs.stop()
+        await ex.aclose()
+
+
+async def test_diff_tree_children_validates_path_before_git(tmp_path):
+    calls = 0
+
+    def collect(_workspace, _rel_path):
+        nonlocal calls
+        calls += 1
+        return []
+
+    vs, ex = _diff_children_server(tmp_path, collect=collect)
+    vs.start()
+    try:
+        missing, _ = await asyncio.to_thread(
+            _get,
+            vs.base_url + "/api/projects/demo/diff/tree/children",
+            "tok-view",
+        )
+        invalid, _ = await asyncio.to_thread(
+            _get,
+            vs.base_url + "/api/projects/demo/diff/tree/children?path=a%2F..%2Fb",
+            "tok-view",
+        )
+        assert missing == 400
+        assert invalid == 400
+        assert calls == 0
+    finally:
+        vs.stop()
+        await ex.aclose()
+
+
+async def test_diff_tree_children_maps_not_found_and_non_git(tmp_path):
+    def missing(_workspace, _rel_path):
+        raise FileNotFoundError
+
+    vs, ex = _diff_children_server(tmp_path, collect=missing)
+    vs.start()
+    try:
+        status, _ = await asyncio.to_thread(
+            _get,
+            vs.base_url + "/api/projects/demo/diff/tree/children?path=gone",
+            "tok-view",
+        )
+        assert status == 404
+    finally:
+        vs.stop()
+        await ex.aclose()
+
+    def non_git(_workspace, _rel_path):
+        raise NotGitWorkspaceError("project 不是带工作区的 Git repository")
+
+    vs, ex = _diff_children_server(tmp_path, collect=non_git)
+    vs.start()
+    try:
+        status, _ = await asyncio.to_thread(
+            _get,
+            vs.base_url + "/api/projects/demo/diff/tree/children?path=",
+            "tok-view",
+        )
+        assert status == 409
+    finally:
+        vs.stop()
+        await ex.aclose()
+
+
+async def test_diff_tree_git_work_does_not_block_main_loop(tmp_path):
+    import threading
+    import time
+
+    started = threading.Event()
+
+    def slow_collect(_workspace, _rel_path):
+        started.set()
+        time.sleep(0.2)
+        return []
+
+    ex = GitTreeExecutor(collect=slow_collect)
+    ctx = {
+        "all_projects": lambda: {"demo": Project(name="demo", path=tmp_path)},
+        "git_tree_executor": ex,
+    }
+    request = {
+        "segments": {"name": "demo"},
+        "query": {"path": ""},
+        "path": "/api/projects/demo/diff/tree/children",
+    }
+    try:
+        task = asyncio.create_task(viewer_diff_tree_children(ctx, request))
+        await asyncio.to_thread(started.wait, 5)
+        t0 = time.perf_counter()
+        status, _ = await health(ctx, {})
+        assert status == 200
+        assert time.perf_counter() - t0 < 0.1
+        assert await task == (200, {"path": "", "entries": []})
+    finally:
+        await ex.aclose()

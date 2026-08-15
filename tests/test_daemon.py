@@ -2548,6 +2548,8 @@ async def test_start_viewer_launches_server_and_persists_token(tmp_path: Path):
     loop = asyncio.get_event_loop()
     vs = daemon._start_viewer(loop)
     assert vs is not None
+    assert daemon._git_tree_executor is not None
+    assert ("GET", "/api/projects/{name}/diff/tree/children") in vs._routes
     try:
         # token 落到注入的 _viewer_token_path，内容 == 用来请求的那个
         token = daemon._viewer_token_path.read_text(encoding="utf-8").strip()
