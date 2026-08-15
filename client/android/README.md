@@ -4,7 +4,7 @@
 服务，查看 agent 在 workspace 干活时的文件树和文件内容。
 
 > 这是 [feishu-dispatcher](../../..) 的安卓客户端部分，位于仓库 `client/android/`。
-> 服务端 viewer 见 `feishu_dispatcher/viewer.py`。整体设计见 wayfinder map #103。
+> 服务端 viewer 见 `feishu_dispatcher/viewer.py`。整体设计见仓库 Issues 中的 viewer 设计 map。
 
 ## 功能
 

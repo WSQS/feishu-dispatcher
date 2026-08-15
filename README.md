@@ -86,8 +86,8 @@ uv sync                                  # 装依赖
 - **[使用手册 docs/usage.md](docs/usage.md)** — 装好之后怎么用（命令全集 + FAQ）
 - **[配置指南 docs/setup.md](docs/setup.md)** — 从零把飞书应用 + daemon 跑起来
 - [Claude Code 后端接入 docs/claude-code-backend.md](docs/claude-code-backend.md)
-- [架构与核心决策（GitHub 架构 map）](https://github.com/WSQS/feishu-dispatcher/issues/331)（偏开发者）
+- [架构与核心决策（Issues 页 pinned 的架构 map）](https://github.com/WSQS/feishu-dispatcher/issues)（偏开发者）
 
 ## 状态
 
-核心链路已在真实飞书环境稳定使用；进展与计划看 [GitHub issues](https://github.com/WSQS/feishu-dispatcher/issues)。想深入实现细节，看 [架构 map](https://github.com/WSQS/feishu-dispatcher/issues/331)。
+核心链路已在真实飞书环境稳定使用；进展与计划看 [GitHub issues](https://github.com/WSQS/feishu-dispatcher/issues)。想深入实现细节，看 Issues 页 pinned 的[架构 map](https://github.com/WSQS/feishu-dispatcher/issues)。
