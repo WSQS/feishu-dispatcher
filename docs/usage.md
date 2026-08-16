@@ -14,7 +14,7 @@ daemon 跑起来之后，日常怎么用。第一次配置见 [setup.md](setup.m
 顺带几个词：
 - **项目（Project）**：一个代码仓库 + 用哪个 agent 处理，在配置或 `/project add` 里登记。
 - **任务（Task）**：一次 `/run` 就是一个任务，有短 id（`t1`、`t2`…），daemon 落盘记着它，重启也不丢。
-- **Agent 后端**：真正干活的 coding CLI（Copilot / OpenCode / Claude Code / Cline / Codex）。
+- **Agent 后端**：真正干活的 coding CLI（Copilot / OpenCode / Claude Code / Cline / Codex / WorkBuddy）。
 
 ## 两种派发方式
 

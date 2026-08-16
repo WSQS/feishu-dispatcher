@@ -294,6 +294,16 @@ def test_config_example_has_explicit_codex_full_access_profile():
     }
 
 
+def test_config_example_has_workbuddy():
+    # WorkBuddy（CodeBuddy）简写数组形式：`codebuddy --acp`（原生 ACP）；凭据/provider
+    # 配在 ~/.codebuddy/models.json + settings.json，daemon 无需注入 env。
+    config_path = Path(__file__).resolve().parents[1] / "config.example.toml"
+    with config_path.open("rb") as config_file:
+        agents = tomllib.load(config_file)["agents"]
+
+    assert agents["workbuddy"] == ["codebuddy", "--acp"]
+
+
 def test_agent_table_form_without_env_has_no_agent_env(tmp_path: Path):
     # 表形式但没写 env：argv 正常解析，agent_env 不留空条目。
     cfg = _agents_cfg(

@@ -103,10 +103,18 @@ throttle_window = 0.5
 #   配好自定义 provider/model，如 deepseek 等 OpenAI 兼容端点）。**Windows 注意**：适配器
 #   自带的那份 codex 常缺原生二进制（@openai/codex-win32-x64 可选依赖装不上），所以用下面的
 #   表形式给它设 CODEX_PATH 指向本机全局 codex（`npm i -g @openai/codex`）——见 [agents.codex]。
+# - workbuddy：WorkBuddy（CodeBuddy Code，腾讯）CLI 原生带 `--acp`（v2.x），无需社区适配器。
+#   前置：`npm install -g @tencent-ai/codebuddy-code`（提供 codebuddy 命令；国际版包名，
+#   国内版是 @tencent/codebuddy-code）。这行简写对两种凭据方式通用（provider 配在 codebuddy
+#   自己的文件里、不写进本文件）：① 云端登录——`codebuddy` 交互里 `/login` 即可；② 接 DeepSeek
+#   免登录——`~/.codebuddy/models.json` 配模型（OpenAI 兼容格式、apiKey=${CODEBUDDY_API_KEY}），
+#   key 放 `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_API_KEY`（注释态占位，勿写进本文件）、
+#   `model` 设默认模型。实测握手/流式/load_session 全通、上报当前模型 deepseek-v4-pro。
 copilot = ["copilot", "--acp"]
 opencode = ["opencode", "acp"]
 claude = ["claude-agent-acp"]
 cline = ["cline", "--acp"]
+workbuddy = ["codebuddy", "--acp"]
 
 # 需要给某个后端追加环境变量时，用表形式代替简写数组：command = argv、env = 追加的环境变量
 # （SDK 白名单之外的显式追加项，会透传给该 agent 子进程）。普通 codex 靠它复用全局 codex：

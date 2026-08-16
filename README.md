@@ -2,7 +2,7 @@
 
 > 在飞书群里发一句话，本地 daemon 就帮你把活派给 coding agent；agent 的输出实时回到飞书话题，你随时在话题里接着指挥它。
 
-一个**个人用**的 coding agent 调度器。你人不在电脑前，也能用飞书（手机 / 网页 / 客户端都行）给本地的 Copilot、OpenCode、Claude Code、Cline、Codex 派任务、看进度、下指令。任务在你自己的机器上跑，代码和凭据都不出本地。
+一个**个人用**的 coding agent 调度器。你人不在电脑前，也能用飞书（手机 / 网页 / 客户端都行）给本地的 Copilot、OpenCode、Claude Code、Cline、Codex、WorkBuddy 派任务、看进度、下指令。任务在你自己的机器上跑，代码和凭据都不出本地。
 
 ## 它是怎么工作的
 
@@ -54,6 +54,7 @@ agent 边干边把输出流式发回飞书 —— 每个任务一个独立「话
 | **Claude Code** | `claude-agent-acp` | 装社区适配器 + `claude` 已登录（详见 [docs/claude-code-backend.md](docs/claude-code-backend.md)） |
 | **Cline** | `cline --acp` | `cline` v3.0.47+ 且 `cline auth` 登录 |
 | **Codex CLI** | `codex-acp` | 装社区适配器 + `codex login`（Windows 需设 `CODEX_PATH` 指向全局 codex，详见 [config.example.toml](config.example.toml)） |
+| **WorkBuddy（CodeBuddy）** | `codebuddy --acp` | `npm install -g @tencent-ai/codebuddy-code` + 接 DeepSeek（`~/.codebuddy/models.json` + `settings.json`，见 [config.example.toml](config.example.toml)） |
 
 ## 快速开始
 
