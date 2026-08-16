@@ -11,8 +11,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import pytest
+
 from feishu_dispatcher.config import Config, LLMSettings, Project, ViewerConfig
-from feishu_dispatcher.daemon import _Daemon
+from feishu_dispatcher.daemon import _AgentSession, _CurrentRunnerRegistry, _Daemon
 from feishu_dispatcher.feishu import IncomingMessage
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
 from feishu_dispatcher.store import ProjectStore, TaskStore
@@ -129,6 +131,20 @@ class FailUnlessResumedAgent(FakeAgent):
 class StartupFailAgent(FakeAgent):
     async def start(self) -> None:
         raise RuntimeError("startup boom")
+
+
+class BlockingStartAgent(FakeAgent):
+    """start() 永久阻塞（直到被取消），让 worker 停在启动段、进不了主循环——
+    用于复现启动段被 _shutdown cancel 时 registry 槽位悬空的旧 bug。"""
+
+    def __init__(self, *a, **k) -> None:
+        super().__init__(*a, **k)
+        self.started = asyncio.Event()
+
+    async def start(self) -> None:
+        self.started.set()
+        # 永远不返回：_shutdown cancel 时 CancelledError 冒出，worker 进不了主循环。
+        await asyncio.Event().wait()
 
 
 class CancelableAgent(FakeAgent):
@@ -259,6 +275,39 @@ async def wait_until(cond, timeout: float = 2.0) -> None:
     await asyncio.wait_for(_poll(), timeout)
 
 
+def current_runner(daemon: _Daemon, thread: str = "om_root1"):
+    task = daemon.store.by_thread(thread)
+    return daemon._runners.get_for_task(task.task_id) if task is not None else None
+
+
+def test_current_runner_registry_rejects_occupied_slot():
+    registry = _CurrentRunnerRegistry()
+    runner_a = _AgentSession("thread-a", "demo", "copilot", task_id="t1")
+    runner_b = _AgentSession("thread-b", "demo", "copilot", task_id="t1")
+
+    registry.register("t1", runner_a)
+
+    assert registry.get_for_task("t1") is runner_a
+    assert registry.is_current("t1", runner_a)
+    assert registry.count() == 1
+    assert registry.values() == [runner_a]
+    with pytest.raises(RuntimeError, match="已有 current runner"):
+        registry.register("t1", runner_b)
+
+
+def test_current_runner_registry_remove_is_expected_current_and_repeatable():
+    registry = _CurrentRunnerRegistry()
+    runner_a = _AgentSession("thread-a", "demo", "copilot", task_id="t1")
+    runner_b = _AgentSession("thread-b", "demo", "copilot", task_id="t1")
+    registry.register("t1", runner_a)
+
+    assert not registry.remove_if_current("t1", runner_b)
+    assert registry.get_for_task("t1") is runner_a
+    assert registry.remove_if_current("t1", runner_a)
+    assert not registry.remove_if_current("t1", runner_a)
+    assert registry.get_for_task("t1") is None
+
+
 def test_fmt_tokens_scales_units():
     from feishu_dispatcher.daemon import _fmt_tokens
 
@@ -312,6 +361,38 @@ async def test_run_unknown_agent_errors_no_spawn():
     assert daemon.store.by_thread("om_root1") is None
 
 
+async def test_old_runner_repeated_cleanup_does_not_remove_replacement():
+    daemon, _, _ = make_daemon()
+    runner_a = _AgentSession("thread-a", "demo", "copilot", task_id="t1")
+    runner_b = _AgentSession("thread-b", "demo", "copilot", task_id="t1")
+    agent_a = FakeAgent(None, lambda text: None)
+    runner_a.agent = agent_a
+    daemon._runners.register("t1", runner_a)
+    assert daemon._runners.remove_if_current("t1", runner_a)
+    daemon._runners.register("t1", runner_b)
+
+    await daemon._close_session(runner_a)
+    await daemon._close_session(runner_a)
+
+    assert daemon._runners.get_for_task("t1") is runner_b
+    assert agent_a.closed
+    assert runner_a.agent is None
+
+
+async def test_thread_reply_routes_through_task_id_to_current_runner():
+    daemon, _, created = make_daemon()
+    await daemon._handle_message(root_msg("/run demo first task"))
+    await wait_until(lambda: created and created[0].prompts == ["first task"])
+    runner = current_runner(daemon)
+    runner.thread_root_id = "not-the-route-key"
+
+    await daemon._handle_message(thread_msg("second task"))
+
+    await wait_until(lambda: created[0].prompts == ["first task", "second task"])
+    assert current_runner(daemon) is runner
+    await daemon._shutdown()
+
+
 async def test_thread_reply_reuses_same_agent_without_restart():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo first task"))
@@ -335,7 +416,7 @@ async def test_stop_command_closes_agent_and_removes_session():
 
     await daemon._handle_message(thread_msg("/stop"))
     await wait_until(lambda: created[0].closed)
-    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    await wait_until(lambda: current_runner(daemon) is None)
     assert any("🛑" in t for t in bridge.texts("om_root1"))
 
 
@@ -349,7 +430,7 @@ async def test_stop_cancels_in_flight_turn():
     await wait_until(lambda: created[0].cancel_calls == 1)
     # 取消后 agent 收尾关闭、session 移除、任务标 stopped
     await wait_until(lambda: created[0].closed)
-    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    await wait_until(lambda: current_runner(daemon) is None)
     assert any("🛑" in t for t in bridge.texts("om_root1"))
     assert daemon.store.by_thread("om_root1").status == "stopped"
 
@@ -359,7 +440,7 @@ async def test_stop_when_idle_does_not_cancel():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
-    await wait_until(lambda: not daemon._sessions["om_root1"].turn_in_flight)
+    await wait_until(lambda: not current_runner(daemon).turn_in_flight)
     await daemon._handle_message(thread_msg("/stop"))
     await wait_until(lambda: created[0].closed)
     assert created[0].cancel_calls == 0
@@ -371,10 +452,10 @@ async def test_cancel_stops_turn_but_keeps_agent():
     await wait_until(lambda: created and created[0].in_prompt.is_set())
     await daemon._handle_message(thread_msg("/cancel"))
     await wait_until(lambda: created[0].cancel_calls == 1)
-    await wait_until(lambda: not daemon._sessions["om_root1"].turn_in_flight)
+    await wait_until(lambda: not current_runner(daemon).turn_in_flight)
     # agent 保留：未关闭、session 还在、任务回 idle（非 stopped）
     assert not created[0].closed
-    assert "om_root1" in daemon._sessions
+    assert current_runner(daemon) is not None
     await wait_until(lambda: daemon.store.by_thread("om_root1").status == "idle")
     assert any("已取消当前轮" in t for t in bridge.texts("om_root1"))
     await daemon._shutdown()
@@ -389,7 +470,7 @@ async def test_cancel_with_input_runs_new_turn():
     # 取消后新输入作为下一轮被拾起执行（FIFO），agent 仍存活
     await wait_until(lambda: created[0].prompts == ["task", "do this instead"])
     assert not created[0].closed
-    assert "om_root1" in daemon._sessions
+    assert current_runner(daemon) is not None
     await daemon._shutdown()
 
 
@@ -397,7 +478,7 @@ async def test_cancel_when_idle_reports_nothing_to_cancel():
     daemon, bridge, created = make_daemon()  # FakeAgent（回合秒完）
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
-    await wait_until(lambda: not daemon._sessions["om_root1"].turn_in_flight)
+    await wait_until(lambda: not current_runner(daemon).turn_in_flight)
     await daemon._handle_message(thread_msg("/cancel"))
     assert created[0].cancel_calls == 0
     assert any("没有在跑的轮" in t for t in bridge.texts("om_root1"))
@@ -462,7 +543,7 @@ async def test_raw_forwards_stop_literally_keeps_agent():
     await daemon._handle_message(thread_msg("/raw /stop", mid="om_raw2"))
     await wait_until(lambda: created[0].prompts == ["task", "/stop"])
     assert not created[0].closed
-    assert "om_root1" in daemon._sessions
+    assert current_runner(daemon) is not None
     await daemon._shutdown()
 
 
@@ -487,11 +568,31 @@ async def test_duplicate_message_id_spawns_only_once():
     assert len(created) == 1
 
 
+async def test_replaced_runner_late_completion_does_not_overwrite_current_state():
+    daemon, _, created = make_daemon(agent_cls=GatedAgent)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    runner_a = current_runner(daemon)
+    runner_b = _AgentSession("thread-b", "demo", "copilot", task_id="t1")
+    assert daemon._runners.remove_if_current("t1", runner_a)
+    daemon._runners.register("t1", runner_b)
+    daemon.store.update("t1", status="starting")
+
+    created[0].gate.set()
+    await wait_until(lambda: created[0].closed)
+
+    task = daemon.store.get("t1")
+    assert task.status == "starting"
+    assert task.turns == 0
+    assert daemon._runners.get_for_task("t1") is runner_b
+    await daemon._close_session(runner_b)
+
+
 async def test_agent_error_reports_and_closes_session():
     daemon, bridge, created = make_daemon(agent_cls=FailingAgent)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: any("❌" in t for t in bridge.texts("om_root1")))
-    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    await wait_until(lambda: current_runner(daemon) is None)
     assert created[0].closed
 
 
@@ -514,7 +615,22 @@ async def test_shutdown_cancels_workers_and_stops_bridge():
 
     await daemon._shutdown()
     assert bridge.stopped
-    assert daemon._sessions == {}
+    assert daemon._runners.count() == 0
+    assert created[0].closed
+
+
+async def test_shutdown_reaps_runner_cancelled_during_startup():
+    """minor-1：worker 卡在启动段（start() 未返回）时被 _shutdown cancel，CancelledError
+    不经过主循环的 finally(_close_session)，registry 槽位会悬空；_shutdown 兜底清理把它
+    收掉（槽位清空 + agent 关闭），不泄漏进程/名额。"""
+    daemon, bridge, created = make_daemon(agent_cls=BlockingStartAgent)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].started.is_set())
+    assert daemon._runners.count() == 1  # worker 已登记、停在 start()
+
+    await daemon._shutdown()
+
+    assert daemon._runners.count() == 0
     assert created[0].closed
 
 
@@ -586,7 +702,7 @@ def make_daemon_with_limit(
 
 async def test_max_agents_limit_blocks_excess_spawns():
     # 用一个「不会自己结束」的 agent 占住 session 槽位：
-    # FakeAgent.prompt 返回即可，但 session 仍存活在 _sessions 里
+    # FakeAgent.prompt 返回即可，但 session 仍存活在 current-runner registry 里
     daemon, bridge, created = make_daemon_with_limit(max_agents=1)
     await daemon._handle_message(root_msg("/run demo task1", mid="om_r1"))
     await wait_until(lambda: created and created[0].prompts == ["task1"])
@@ -734,7 +850,7 @@ async def test_card_mode_agent_error_sets_error_status():
     daemon, bridge, created = make_daemon(agent_cls=FailingAgent, stream_mode="card")
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: any("❌" in t for t in bridge.texts("om_root1")))
-    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    await wait_until(lambda: current_runner(daemon) is None)
     assert created[0].closed
 
 
@@ -745,7 +861,7 @@ async def test_card_mode_stop_command_closes_agent():
 
     await daemon._handle_message(thread_msg("/stop"))
     await wait_until(lambda: created[0].closed)
-    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    await wait_until(lambda: current_runner(daemon) is None)
     assert any("🛑" in t for t in bridge.texts("om_root1"))
 
 
@@ -784,22 +900,25 @@ async def test_run_creates_task():
     await daemon._shutdown()
 
 
-async def test_recovery_after_restart_uses_load_session():
-    store = TaskStore(None)  # 内存 store 跨两个 daemon 实例共享 = 模拟重启
-    d1, b1, c1 = make_daemon(store=store)
+async def test_recovery_after_restart_uses_file_task_store(tmp_path: Path):
+    store_path = tmp_path / "tasks.json"
+    store1 = TaskStore(store_path)
+    d1, _, _ = make_daemon(store=store1)
     await d1._handle_message(root_msg("/run demo task1"))
     await wait_until(
-        lambda: store.by_thread("om_root1") and store.by_thread("om_root1").session_id
+        lambda: store1.by_thread("om_root1") and store1.by_thread("om_root1").session_id
     )
-    saved_sid = store.by_thread("om_root1").session_id
-    await d1._shutdown()  # 服务停止；任务标记 suspended、记录保留
-    assert store.by_thread("om_root1").status == "suspended"
+    saved_sid = store1.by_thread("om_root1").session_id
+    await d1._shutdown()
+    assert store1.by_thread("om_root1").status == "suspended"
 
-    d2, b2, c2 = make_daemon(store=store)
-    assert d2._sessions == {}
+    store2 = TaskStore(store_path)
+    d2, b2, c2 = make_daemon(store=store2)
+    assert d2._runners.count() == 0
     await d2._handle_message(thread_msg("follow up", root="om_root1", mid="om_t2"))
     await wait_until(lambda: c2 and c2[0].prompts == ["follow up"])
     assert c2[0].resume_session_id == saved_sid
+    assert current_runner(d2).task_id == store2.by_thread("om_root1").task_id
     assert c2[0].start_count == 1
     assert any("恢复" in t for t in b2.texts("om_root1"))
     await d2._shutdown()
@@ -875,7 +994,7 @@ async def test_idle_timeout_suspends_but_keeps_record_recoverable():
     saved_sid = created[0].session_id
     # 空闲超时 → 挂起：关进程、腾名额、但任务留存为 suspended
     await wait_until(lambda: any("💤" in t for t in bridge.texts("om_root1")))
-    await wait_until(lambda: "om_root1" not in daemon._sessions)  # 名额已释放
+    await wait_until(lambda: current_runner(daemon) is None)  # 名额已释放
     assert created[0].closed
     await wait_until(lambda: store.by_thread("om_root1").status == "suspended")
 
@@ -892,7 +1011,7 @@ async def test_idle_timeout_zero_disables_suspend():
     await wait_until(lambda: any("✅" in t for t in bridge.texts("om_root1")))
     # 关闭自动挂起：跑完后 session 仍存活
     await asyncio.sleep(0.15)
-    assert "om_root1" in daemon._sessions
+    assert current_runner(daemon) is not None
     assert not created[0].closed
     await daemon._shutdown()
 
@@ -1009,7 +1128,7 @@ async def test_agent_error_pauses_recoverable_notifies_main_line():
     await daemon._handle_message(root_msg("/run demo task"))
     # turn 异常 → 主线通知「已暂停」，session 关闭腾名额
     await wait_until(lambda: any("❌" in t and "暂停" in t for _, t in bridge.roots))
-    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    await wait_until(lambda: current_runner(daemon) is None)
     # 关键：failed 是可恢复态（非终止），且记下诊断
     task = daemon.store.by_thread("om_root1")
     assert task.status == "failed"
@@ -1022,7 +1141,7 @@ async def test_failed_task_resumes_on_thread_reply():
     await daemon._handle_message(root_msg("/run demo task"))
     # 第一轮异常 → failed（有 session），worker 关闭
     await wait_until(lambda: daemon.store.by_thread("om_root1").status == "failed")
-    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    await wait_until(lambda: current_runner(daemon) is None)
     assert daemon.store.by_thread("om_root1").session_id  # turn 失败时 session 已建
     # 话题回复 → load_session 恢复（起第二个 agent，带 resume_session_id）→ 成功
     await daemon._handle_message(thread_msg("再试一次"))
@@ -1041,7 +1160,7 @@ async def test_startup_failure_stays_unresumable_guides_to_run():
     daemon, bridge, created = make_daemon(agent_cls=StartupFailAgent)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: daemon.store.by_thread("om_root1").status == "failed")
-    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    await wait_until(lambda: current_runner(daemon) is None)
     task = daemon.store.by_thread("om_root1")
     assert not task.session_id  # startup 失败没建会话
     # 话题回复 → 尝试恢复但无 session → 挡回 /run（不丢人，只是没得恢复）
@@ -1170,7 +1289,7 @@ async def test_mark_done_active_archives_and_closes_agent():
     out = await daemon._sched_mark_done("t1")
     assert "done" in out
     await wait_until(lambda: store.get("t1").status == "done")
-    await wait_until(lambda: "om_root1" not in daemon._sessions)
+    await wait_until(lambda: current_runner(daemon) is None)
     assert created[0].closed
     assert any("归档" in t for t in bridge.texts("om_root1"))
     await daemon._shutdown()
@@ -1992,7 +2111,7 @@ async def test_models_refresh_command_boots_throwaway_agent():
     await daemon._handle_message(root_msg("/models refresh copilot"))
     assert "zhipuai/glm-5" in daemon.model_store.get("copilot")
     assert created and created[-1].closed  # 一次性 agent 已关闭
-    assert daemon._sessions == {}  # 没占用 session 名额
+    assert daemon._runners.count() == 0  # 没占用 session 名额
 
 
 # ---------------------------------------------------------------------- #
@@ -2188,7 +2307,7 @@ async def test_bg_completions_merge_into_single_batch_and_one_turn():
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
     agent = created[0]
-    sess = daemon._sessions["om_root1"]
+    sess = current_runner(daemon)
     assert sess.turn_in_flight  # 首轮卡在 gate 上
     j1 = daemon.job_store.create(task_id="t1", command=["a"], cwd="c")
     daemon.job_store.update(j1.job_id, exit_code=0, finished_at=time.time())
@@ -2215,7 +2334,7 @@ async def test_normal_reply_between_bg_completions_prevents_merge():
     daemon, bridge, created = make_daemon(GatedAgent, store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
-    sess = daemon._sessions["om_root1"]
+    sess = current_runner(daemon)
     j1 = daemon.job_store.create(task_id="t1", command=["a"], cwd="c")
     await daemon._deliver_bg_result(daemon.job_store.get(j1.job_id), 0)
     batch1 = sess.pending_bg
@@ -2237,7 +2356,7 @@ async def test_stop_drops_pending_bg_batch():
     daemon, bridge, created = make_daemon(CancelableAgent, store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await created[0].in_prompt.wait()  # 首轮在途
-    sess = daemon._sessions["om_root1"]
+    sess = current_runner(daemon)
     j1 = daemon.job_store.create(task_id="t1", command=["a"], cwd="c")
     daemon.job_store.update(j1.job_id, exit_code=0, finished_at=time.time())
     await daemon._deliver_bg_result(daemon.job_store.get(j1.job_id), 0)
