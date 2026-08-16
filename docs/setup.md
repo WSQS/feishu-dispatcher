@@ -19,6 +19,7 @@
 - **Claude Code**：无原生 ACP，经社区适配器接入——`npm i -g @agentclientprotocol/claude-agent-acp` + `claude` 已登录。详见 [claude-code-backend.md](claude-code-backend.md)，冒烟 `uv run python scripts/smoke_claude.py`。
 - **Cline**：`cline` v3.0.47+ 原生带 `--acp`，`cline auth` 登录某 provider。冒烟 `uv run python scripts/smoke_cline.py`。
 - **Codex CLI**：无原生 ACP，经社区适配器接入——`npm i -g @agentclientprotocol/codex-acp` + `codex login`（或在 `~/.codex/config.toml` 配好自定义 provider/model，如 deepseek 等 OpenAI 兼容端点）。**Windows 注意**：适配器自带的 codex 常缺原生二进制，需用 `[agents.codex]` 表形式设 `CODEX_PATH` 指向本机全局 codex（`npm i -g @openai/codex`）——见 [config.example.toml](../config.example.toml)。普通任务使用默认受限 profile；review/subagent 任务见下节。冒烟 `uv run python scripts/smoke_codex.py`。
+- **WorkBuddy（CodeBuddy）**：`npm install -g @tencent-ai/codebuddy-code`（国际版，国内版是 `@tencent/codebuddy-code`）。CLI 原生带 `--acp`，无需社区适配器。接 DeepSeek 免云端登录：`~/.codebuddy/models.json` 配 DeepSeek（OpenAI 兼容格式，apiKey=`${CODEBUDDY_API_KEY}`），key 放 `~/.codebuddy/settings.json` 的 `env.CODEBUDDY_API_KEY`（**该 env 名是 ACP 免登录的 BYO-key 信号，不能叫 DEEPSEEK_API_KEY**）、`model` 设默认模型（见 [config.example.toml](../config.example.toml)）。冒烟 `uv run python scripts/smoke_workbuddy.py`。
 
 在 `config.toml` 的 `[[projects]]` 里用 `default_agent` 指定每个项目由哪个 agent 处理（agent 名须在 `[agents]` 里配过）。
 
