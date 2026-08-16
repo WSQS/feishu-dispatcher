@@ -11,8 +11,10 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+import pytest
+
 from feishu_dispatcher.config import Config, LLMSettings, Project, ViewerConfig
-from feishu_dispatcher.daemon import _Daemon
+from feishu_dispatcher.daemon import _AgentSession, _CurrentRunnerRegistry, _Daemon
 from feishu_dispatcher.feishu import IncomingMessage
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
 from feishu_dispatcher.store import ProjectStore, TaskStore
@@ -129,6 +131,20 @@ class FailUnlessResumedAgent(FakeAgent):
 class StartupFailAgent(FakeAgent):
     async def start(self) -> None:
         raise RuntimeError("startup boom")
+
+
+class BlockingStartAgent(FakeAgent):
+    """start() 永久阻塞（直到被取消），让 worker 停在启动段、进不了主循环——
+    用于复现启动段被 _shutdown cancel 时 registry 槽位悬空的旧 bug。"""
+
+    def __init__(self, *a, **k) -> None:
+        super().__init__(*a, **k)
+        self.started = asyncio.Event()
+
+    async def start(self) -> None:
+        self.started.set()
+        # 永远不返回：_shutdown cancel 时 CancelledError 冒出，worker 进不了主循环。
+        await asyncio.Event().wait()
 
 
 class CancelableAgent(FakeAgent):
@@ -261,7 +277,35 @@ async def wait_until(cond, timeout: float = 2.0) -> None:
 
 def current_runner(daemon: _Daemon, thread: str = "om_root1"):
     task = daemon.store.by_thread(thread)
-    return daemon._sessions.get(task.task_id) if task is not None else None
+    return daemon._runners.get_for_task(task.task_id) if task is not None else None
+
+
+def test_current_runner_registry_rejects_occupied_slot():
+    registry = _CurrentRunnerRegistry()
+    runner_a = _AgentSession("thread-a", "demo", "copilot", task_id="t1")
+    runner_b = _AgentSession("thread-b", "demo", "copilot", task_id="t1")
+
+    registry.register("t1", runner_a)
+
+    assert registry.get_for_task("t1") is runner_a
+    assert registry.is_current("t1", runner_a)
+    assert registry.count() == 1
+    assert registry.values() == [runner_a]
+    with pytest.raises(RuntimeError, match="已有 current runner"):
+        registry.register("t1", runner_b)
+
+
+def test_current_runner_registry_remove_is_expected_current_and_repeatable():
+    registry = _CurrentRunnerRegistry()
+    runner_a = _AgentSession("thread-a", "demo", "copilot", task_id="t1")
+    runner_b = _AgentSession("thread-b", "demo", "copilot", task_id="t1")
+    registry.register("t1", runner_a)
+
+    assert not registry.remove_if_current("t1", runner_b)
+    assert registry.get_for_task("t1") is runner_a
+    assert registry.remove_if_current("t1", runner_a)
+    assert not registry.remove_if_current("t1", runner_a)
+    assert registry.get_for_task("t1") is None
 
 
 def test_fmt_tokens_scales_units():
@@ -315,6 +359,24 @@ async def test_run_unknown_agent_errors_no_spawn():
     assert any("未知 agent" in t for m, t in bridge.plain if m == "om_root1")
     assert created == []  # 未知 agent 直接报错，不启动
     assert daemon.store.by_thread("om_root1") is None
+
+
+async def test_old_runner_repeated_cleanup_does_not_remove_replacement():
+    daemon, _, _ = make_daemon()
+    runner_a = _AgentSession("thread-a", "demo", "copilot", task_id="t1")
+    runner_b = _AgentSession("thread-b", "demo", "copilot", task_id="t1")
+    agent_a = FakeAgent(None, lambda text: None)
+    runner_a.agent = agent_a
+    daemon._runners.register("t1", runner_a)
+    assert daemon._runners.remove_if_current("t1", runner_a)
+    daemon._runners.register("t1", runner_b)
+
+    await daemon._close_session(runner_a)
+    await daemon._close_session(runner_a)
+
+    assert daemon._runners.get_for_task("t1") is runner_b
+    assert agent_a.closed
+    assert runner_a.agent is None
 
 
 async def test_thread_reply_routes_through_task_id_to_current_runner():
@@ -506,6 +568,26 @@ async def test_duplicate_message_id_spawns_only_once():
     assert len(created) == 1
 
 
+async def test_replaced_runner_late_completion_does_not_overwrite_current_state():
+    daemon, _, created = make_daemon(agent_cls=GatedAgent)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    runner_a = current_runner(daemon)
+    runner_b = _AgentSession("thread-b", "demo", "copilot", task_id="t1")
+    assert daemon._runners.remove_if_current("t1", runner_a)
+    daemon._runners.register("t1", runner_b)
+    daemon.store.update("t1", status="starting")
+
+    created[0].gate.set()
+    await wait_until(lambda: created[0].closed)
+
+    task = daemon.store.get("t1")
+    assert task.status == "starting"
+    assert task.turns == 0
+    assert daemon._runners.get_for_task("t1") is runner_b
+    await daemon._close_session(runner_b)
+
+
 async def test_agent_error_reports_and_closes_session():
     daemon, bridge, created = make_daemon(agent_cls=FailingAgent)
     await daemon._handle_message(root_msg("/run demo task"))
@@ -533,7 +615,22 @@ async def test_shutdown_cancels_workers_and_stops_bridge():
 
     await daemon._shutdown()
     assert bridge.stopped
-    assert daemon._sessions == {}
+    assert daemon._runners.count() == 0
+    assert created[0].closed
+
+
+async def test_shutdown_reaps_runner_cancelled_during_startup():
+    """minor-1：worker 卡在启动段（start() 未返回）时被 _shutdown cancel，CancelledError
+    不经过主循环的 finally(_close_session)，registry 槽位会悬空；_shutdown 兜底清理把它
+    收掉（槽位清空 + agent 关闭），不泄漏进程/名额。"""
+    daemon, bridge, created = make_daemon(agent_cls=BlockingStartAgent)
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].started.is_set())
+    assert daemon._runners.count() == 1  # worker 已登记、停在 start()
+
+    await daemon._shutdown()
+
+    assert daemon._runners.count() == 0
     assert created[0].closed
 
 
@@ -605,7 +702,7 @@ def make_daemon_with_limit(
 
 async def test_max_agents_limit_blocks_excess_spawns():
     # 用一个「不会自己结束」的 agent 占住 session 槽位：
-    # FakeAgent.prompt 返回即可，但 session 仍存活在 _sessions 里
+    # FakeAgent.prompt 返回即可，但 session 仍存活在 current-runner registry 里
     daemon, bridge, created = make_daemon_with_limit(max_agents=1)
     await daemon._handle_message(root_msg("/run demo task1", mid="om_r1"))
     await wait_until(lambda: created and created[0].prompts == ["task1"])
@@ -817,7 +914,7 @@ async def test_recovery_after_restart_uses_file_task_store(tmp_path: Path):
 
     store2 = TaskStore(store_path)
     d2, b2, c2 = make_daemon(store=store2)
-    assert d2._sessions == {}
+    assert d2._runners.count() == 0
     await d2._handle_message(thread_msg("follow up", root="om_root1", mid="om_t2"))
     await wait_until(lambda: c2 and c2[0].prompts == ["follow up"])
     assert c2[0].resume_session_id == saved_sid
@@ -2014,7 +2111,7 @@ async def test_models_refresh_command_boots_throwaway_agent():
     await daemon._handle_message(root_msg("/models refresh copilot"))
     assert "zhipuai/glm-5" in daemon.model_store.get("copilot")
     assert created and created[-1].closed  # 一次性 agent 已关闭
-    assert daemon._sessions == {}  # 没占用 session 名额
+    assert daemon._runners.count() == 0  # 没占用 session 名额
 
 
 # ---------------------------------------------------------------------- #

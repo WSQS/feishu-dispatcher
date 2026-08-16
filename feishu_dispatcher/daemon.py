@@ -305,6 +305,36 @@ class _AgentSession:
         self.queue.put_nowait(None)
 
 
+class _CurrentRunnerRegistry:
+    """Task 的单活 current-runner 槽位；task_id 只是 lookup key。"""
+
+    def __init__(self) -> None:
+        self._by_task: dict[str, _AgentSession] = {}
+
+    def get_for_task(self, task_id: str) -> _AgentSession | None:
+        return self._by_task.get(task_id)
+
+    def register(self, task_id: str, runner: _AgentSession) -> None:
+        if task_id in self._by_task:
+            raise RuntimeError(f"task {task_id} 已有 current runner")
+        self._by_task[task_id] = runner
+
+    def is_current(self, task_id: str, runner: _AgentSession) -> bool:
+        return self._by_task.get(task_id) is runner
+
+    def remove_if_current(self, task_id: str, runner: _AgentSession) -> bool:
+        if not self.is_current(task_id, runner):
+            return False
+        del self._by_task[task_id]
+        return True
+
+    def values(self) -> list[_AgentSession]:
+        return list(self._by_task.values())
+
+    def count(self) -> int:
+        return len(self._by_task)
+
+
 @dataclass
 class _Daemon:
     cfg: Config
@@ -327,8 +357,8 @@ class _Daemon:
         default_factory=lambda: SchedulerMemory(None)
     )
     _bridge: FeishuBridge | None = None
-    #: 运行态 _AgentSession，按 task_id 索引；Thread 只经 Task 路由到这里。
-    _sessions: dict[str, _AgentSession] = field(default_factory=dict)
+    #: 每个 Task 的单活 current runner；Thread 只经 Task 路由到这里。
+    _runners: _CurrentRunnerRegistry = field(default_factory=_CurrentRunnerRegistry)
     _seen_message_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
     #: 本地控制面（agent CLI 入口）；run() 里启动，测试构造 _Daemon 时为 None（不起 HTTP）
     _control: "ControlServer | None" = None
@@ -764,7 +794,7 @@ class _Daemon:
     async def _refresh_models(self, backend: str) -> tuple[bool, str]:
         """临时起一个该 backend 的一次性 agent、读 available_models 后关掉，刷新缓存。
 
-        不进 ``_sessions``——不占 max_agents。返回 (是否成功, 人读结果串)。
+        不进 current-runner registry——不占 max_agents。返回 (是否成功, 人读结果串)。
         """
         argv = self.cfg.agents.get(backend)
         if not argv:
@@ -856,14 +886,17 @@ class _Daemon:
 
         thread_root = msg.message_id
         existing = self.store.by_thread(thread_root)
-        if existing is not None and existing.task_id in self._sessions:
+        if (
+            existing is not None
+            and self._runners.get_for_task(existing.task_id) is not None
+        ):
             logger.info("根消息 %s 已有 agent session，忽略重复 spawn", thread_root)
             return
 
         # R11：并发上限检查。check 与 _launch 的登记之间不能有 await，否则两条
         # 并发 /run 会都通过检查再各自登记，突破上限（TOCTOU）。故先原子地
         # 检查+登记，再发「🚀」提示。
-        if len(self._sessions) >= self.cfg.max_agents:
+        if self._runners.count() >= self.cfg.max_agents:
             await self._reply_user(
                 msg.message_id,
                 f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，请先 `/stop` 一个。",
@@ -925,12 +958,17 @@ class _Daemon:
         )
 
         async def on_output(text: str) -> None:
-            if sess.current_channel is not None:
+            if (
+                self._runners.is_current(sess.task_id, sess)
+                and sess.current_channel is not None
+            ):
                 sess.current_channel.feed(text)
 
         async def on_action(action: dict) -> None:
-            # 审计（A）：把 agent 的 tool_call 记进 Task，标上「进行中的回合号」
-            # （= 已完成回合数 + 1，回合结束时 worker 才递增 turns）。
+            # 审计（A）：只有 current runner 能把 tool_call 记进 Task；旧代 runner
+            # 的迟到 callback 仍可收尾自身资源，但不能再代表 Task 写当前运行态。
+            if not self._runners.is_current(sess.task_id, sess):
+                return
             cur = self.store.get(sess.task_id)
             turn = (cur.turns if cur else 0) + 1
             self.store.add_action(sess.task_id, {"turn": turn, **action})
@@ -958,7 +996,7 @@ class _Daemon:
         )
         if first_prompt is not None:
             sess.enqueue(first_prompt)
-        self._sessions[task.task_id] = sess
+        self._runners.register(task.task_id, sess)
         sess.worker = asyncio.create_task(
             self._agent_worker(sess), name=f"agent-{task.task_id}"
         )
@@ -989,14 +1027,19 @@ class _Daemon:
             await sess.agent.start()
         except Exception as exc:
             logger.exception("agent 启动失败")
-            err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
-            self.store.update(sess.task_id, status="failed", error_message=err)
-            if sess.resumed:
-                await self._safe_reply(
-                    root, "❌ 会话恢复失败（可能已在 agent 侧过期）。发送 `/run` 重开。"
-                )
-            else:
-                await self._safe_reply(root, f"❌ agent 启动失败: {str(exc)[:200]}")
+            if self._runners.is_current(sess.task_id, sess):
+                err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
+                self.store.update(sess.task_id, status="failed", error_message=err)
+                if sess.resumed:
+                    await self._safe_reply(
+                        root,
+                        "❌ 会话恢复失败（可能已在 agent 侧过期）。发送 `/run` 重开。",
+                    )
+                else:
+                    await self._safe_reply(root, f"❌ agent 启动失败: {str(exc)[:200]}")
+            await self._close_session(sess)
+            return
+        if not self._runners.is_current(sess.task_id, sess):
             await self._close_session(sess)
             return
         # 启动成功：把 session_id + 模型落进 Task 并置 idle（供重启后 load_session 恢复）
@@ -1029,6 +1072,9 @@ class _Daemon:
                 pinned,
                 reported or "默认",
             )
+        if not self._runners.is_current(sess.task_id, sess):
+            await self._close_session(sess)
+            return
         self.store.update(
             sess.task_id,
             session_id=sess.agent.session_id or "",
@@ -1050,14 +1096,19 @@ class _Daemon:
                 try:
                     prompt = await asyncio.wait_for(sess.queue.get(), timeout=timeout)
                 except asyncio.TimeoutError:
+                    if not self._runners.is_current(sess.task_id, sess):
+                        break
                     self.store.update(sess.task_id, status="suspended")
                     await self._safe_reply(
                         root,
                         "💤 空闲超时，已挂起该 agent（在本话题回复即自动恢复）。",
                     )
-                    await self._notify_main(
-                        f"💤 {sess.project_name} 已空闲挂起（在其话题回复即自动恢复）。"
-                    )
+                    if self._runners.is_current(sess.task_id, sess):
+                        await self._notify_main(
+                            f"💤 {sess.project_name} 已空闲挂起（在其话题回复即自动恢复）。"
+                        )
+                    break
+                if not self._runners.is_current(sess.task_id, sess):
                     break
                 if prompt is None:
                     status = sess.terminate_status  # stopped(/stop) 或 done(/done)
@@ -1096,10 +1147,14 @@ class _Daemon:
                 try:
                     stop_reason = await sess.agent.prompt(prompt)
                     await channel.flush()
+                    if not self._runners.is_current(sess.task_id, sess):
+                        break
                     if stop_reason == "cancelled":
                         # 本轮被 /stop 中途取消：不当作正常完成（不 ✅、不计 turn、
                         # 不发完成通知）。卡片置停止态；随后循环取到 None 哨兵即终止。
                         await channel.set_status("stopped")
+                        if not self._runners.is_current(sess.task_id, sess):
+                            break
                         self.store.update(sess.task_id, status="idle")
                         logger.info("任务 %s 本轮被取消", sess.task_id)
                         continue
@@ -1109,6 +1164,8 @@ class _Daemon:
                     if tokens is not None and hasattr(channel, "set_footer"):
                         channel.set_footer(_with_tokens(footer, tokens))
                     await channel.set_status("done")
+                    if not self._runners.is_current(sess.task_id, sess):
+                        break
                     # 落 last_output：本轮 agent 的收尾回复（截断），供 get_task/通知摘要
                     last_output = _clip(sess.agent.last_message, _LAST_OUTPUT_MAX)
                     cur = self.store.get(sess.task_id)
@@ -1130,7 +1187,10 @@ class _Daemon:
                         root, "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）"
                     )
                     # 完成且已闲下来（无排队）→ 推一条主线通知（带收尾摘要），免得挨个点话题
-                    if sess.queue.empty():
+                    if (
+                        self._runners.is_current(sess.task_id, sess)
+                        and sess.queue.empty()
+                    ):
                         note = f"🔔 {sess.project_name} 完成第 {turns} 轮"
                         snippet = _one_line(last_output, 80)
                         if snippet:
@@ -1142,21 +1202,24 @@ class _Daemon:
                 except Exception as exc:
                     logger.exception("agent 执行异常")
                     err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
-                    # failed 不再是终止态：本轮失败但 session 已建，多半能 load_session
-                    # 接回——标 failed（可恢复），话题回复即尝试恢复，而非逼用户重开丢上下文。
-                    self.store.update(sess.task_id, status="failed", error_message=err)
                     try:
                         await channel.set_status("error")
                     except Exception:
                         logger.debug("set_status error 失败（忽略）", exc_info=True)
-                    await self._safe_reply(
-                        root,
-                        f"❌ 本轮异常，已暂停：{err}\n"
-                        "在话题回复即尝试恢复（load_session 接回上下文），或 `/stop` 结束。",
-                    )
-                    await self._notify_main(
-                        f"❌ {sess.project_name} 本轮异常，已暂停（在其话题回复即尝试恢复）。"
-                    )
+                    if self._runners.is_current(sess.task_id, sess):
+                        # failed 不再是终止态：本轮失败但 session 已建，多半能 load_session
+                        # 接回——标 failed（可恢复），话题回复即尝试恢复，而非逼用户重开丢上下文。
+                        self.store.update(
+                            sess.task_id, status="failed", error_message=err
+                        )
+                        await self._safe_reply(
+                            root,
+                            f"❌ 本轮异常，已暂停：{err}\n"
+                            "在话题回复即尝试恢复（load_session 接回上下文），或 `/stop` 结束。",
+                        )
+                        await self._notify_main(
+                            f"❌ {sess.project_name} 本轮异常，已暂停（在其话题回复即尝试恢复）。"
+                        )
                     break
                 finally:
                     sess.turn_in_flight = False
@@ -1168,18 +1231,23 @@ class _Daemon:
             await self._close_session(sess)
 
     async def _close_session(self, sess: _AgentSession) -> None:
-        """收尾一个 session：出注册表、清空输出通道、关 agent 进程。"""
-        self._sessions.pop(sess.task_id, None)
+        """收尾 runner：仅按 identity 移除自身槽位，但始终关闭自身资源。"""
+        self._runners.remove_if_current(sess.task_id, sess)
         if sess.bg_token:  # 作废该 session 的后台任务 token（#68）
             self._bg_tokens.pop(sess.bg_token, None)
-        if sess.current_channel is not None:
+            sess.bg_token = ""
+        channel = sess.current_channel
+        sess.current_channel = None
+        if channel is not None:
             try:
-                await sess.current_channel.aclose()
+                await channel.aclose()
             except Exception:
                 logger.debug("channel aclose 异常（忽略）", exc_info=True)
-        if sess.agent is not None:
+        agent = sess.agent
+        sess.agent = None
+        if agent is not None:
             try:
-                await sess.agent.aclose()
+                await agent.aclose()
             except Exception:
                 logger.debug("agent aclose 异常（忽略）", exc_info=True)
 
@@ -1217,15 +1285,15 @@ class _Daemon:
                 return
             forward_raw = True
         task = self.store.by_thread(thread_root)
-        sess = self._sessions.get(task.task_id) if task is not None else None
+        sess = self._runners.get_for_task(task.task_id) if task is not None else None
         if sess is None:
-            # 无活跃 agent：尝试从持久化记录恢复（惰性重连），或明确提示——
-            # 不再静默忽略（那是重启后老话题回复石沉大海的根源）。
+            # Thread 只负责路由到 Task；无 current runner 时再按 Task 恢复或明确提示。
             await self._recover_or_notify(
                 thread_root or msg.message_id,
                 thread_root,
                 text,
                 forward_raw=forward_raw,
+                task=task,
             )
             return
         if not text:
@@ -1312,7 +1380,12 @@ class _Daemon:
             await agent.set_model(arg)
         except Exception as exc:
             logger.exception("切换模型失败 task=%s model=%s", sess.task_id, arg)
-            await self._safe_reply(reply_target, f"❌ 切换模型失败：{str(exc)[:200]}")
+            if self._runners.is_current(sess.task_id, sess):
+                await self._safe_reply(
+                    reply_target, f"❌ 切换模型失败：{str(exc)[:200]}"
+                )
+            return
+        if not self._runners.is_current(sess.task_id, sess):
             return
         self.store.update(sess.task_id, model=arg)
         logger.info("任务 %s 切换模型 → %s", sess.task_id, arg)
@@ -1325,13 +1398,14 @@ class _Daemon:
         text: str,
         *,
         forward_raw: bool = False,
+        task: Task | None = None,
     ) -> None:
         """话题无活跃 agent：能恢复的 Task 就 load_session 惰性重连，否则明确提示。
 
         ``forward_raw``（来自 ``/raw <文本>``）时跳过 ``/stop``/``/done`` 解释——恢复
         agent 后把 <文本> 当普通首轮转发，即使它恰好是 ``/stop`` 也不误当停止命令。
         """
-        task = self.store.by_thread(thread_root)
+        task = task or self.store.by_thread(thread_root)
         if task is None:
             await self._safe_reply(
                 reply_target,
@@ -1369,6 +1443,8 @@ class _Daemon:
         保证并发下不突破 max_agents（TOCTOU，同 _spawn_for_root）。调用点务必也别
         在 check 与本调用之间插入 await。
         """
+        if self._runners.get_for_task(task.task_id) is not None:
+            return False, f"任务 [{task.task_id}] 已在运行，无需恢复。"
         agent_argv = self.cfg.agents.get(task.agent_label)
         if not agent_argv or not task.session_id:
             self.store.update(task.task_id, status="failed")
@@ -1376,7 +1452,7 @@ class _Daemon:
             return False, (
                 f"⚠️ 无法恢复任务 [{task.task_id}]（{why}）。发送 `/run` 重开。"
             )
-        if len(self._sessions) >= self.cfg.max_agents:
+        if self._runners.count() >= self.cfg.max_agents:
             return False, (
                 f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，无法恢复。"
                 "请先 `/stop` 一个再试。"
@@ -1398,7 +1474,7 @@ class _Daemon:
         task = self.store.get(task_id)
         if task is None:
             return False
-        sess = self._sessions.get(task.task_id)
+        sess = self._runners.get_for_task(task.task_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             sess.terminate_status = status
             sess.terminate()  # 丢弃未处理 bg 批次 + 入队 None（#79，与 /stop 同机制）
@@ -1619,7 +1695,7 @@ class _Daemon:
             "status": t.status,
             "turns": t.turns,
             "has_session": bool(t.session_id),
-            "active": t.task_id in self._sessions,
+            "active": self._runners.get_for_task(t.task_id) is not None,
             "model": t.model,  # agent 当前模型（copilot 不暴露则为空）
             "issue_url": t.issue_url,  # 关联的 issue（#63）；空 = 未绑定
             "created_at": t.created_at,
@@ -1635,7 +1711,7 @@ class _Daemon:
         task = self.store.get(task_id)
         if task is None:
             return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
-        sess = self._sessions.get(task.task_id)
+        sess = self._runners.get_for_task(task.task_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             sess.enqueue(message)
             logger.info(
@@ -1668,7 +1744,7 @@ class _Daemon:
         task = self.store.get(task_id)
         if task is None:
             return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
-        sess = self._sessions.get(task.task_id)
+        sess = self._runners.get_for_task(task.task_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             return f"任务 [{task_id}] 已在运行，无需恢复。"
         ok, why = self._try_resume(task, first_prompt=None)
@@ -1715,14 +1791,14 @@ class _Daemon:
             cached = self.model_store.get(agent_label)
             if cached and model not in cached:
                 model_note = f"（注意：{model} 不在 {agent_label} 已知模型 {cached} 里，将尝试下发）"
-        # issue fetch 放在并发上限检查之前：它只读 forge、不碰 _sessions，避免加宽
+        # issue fetch 放在并发上限检查之前：它只读 forge、不碰 current-runner registry，避免加宽
         # 「检查 → _launch 登记」之间的 TOCTOU 窗口。
         brief, issue_url, note = task, "", ""
         if issue and issue > 0:
             brief, issue_url, note = await self._compose_issue_brief(
                 project, task, issue
             )
-        if len(self._sessions) >= self.cfg.max_agents:
+        if self._runners.count() >= self.cfg.max_agents:
             return f"已达并发上限 {self.cfg.max_agents}，请先 `/stop` 一个再派发。"
         assert self._bridge is not None
         # 每个派发新建一个话题根消息，agent 输出流进该话题
@@ -2026,7 +2102,7 @@ class _Daemon:
             return
         # 先把「结果」发到话题（可见），再驱动 agent 接续
         await self._safe_reply(task.thread_root_id, self._bg_result_message(job, rc))
-        sess = self._sessions.get(task.task_id)
+        sess = self._runners.get_for_task(task.task_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             # check-set 之间无 await：单线程原子，并发完成的 job 不会漏合并/重复入队。
             if sess.pending_bg is not None:
@@ -2120,13 +2196,13 @@ class _Daemon:
         if self._bridge is not None:
             self._bridge.stop()
         # 把仍活跃的任务标记为 suspended，让重启后台账状态准确（且可 load_session 恢复）
-        for sess in list(self._sessions.values()):
+        for sess in self._runners.values():
             task = self.store.get(sess.task_id)
             if task is not None and not task.is_terminal:
                 self.store.update(sess.task_id, status="suspended")
         workers = [
             s.worker
-            for s in list(self._sessions.values())
+            for s in self._runners.values()
             if s.worker is not None and not s.worker.done()
         ]
         for w in workers:
@@ -2138,7 +2214,13 @@ class _Daemon:
                 pass
             except Exception:
                 logger.exception("agent worker 退出异常")
-        self._sessions.clear()
+        # 兜底：worker 的 finally(_close_session) 只包住主循环；启动段（agent.start /
+        # set_model / 就绪回复）被 cancel 时 CancelledError 直接冒出、不走 finally，
+        # registry 槽位悬空。这里把仍残留的 runner 逐个走同一关闭路径清掉——
+        # _close_session 幂等（remove_if_current 按 identity、agent 只 aclose 一次），
+        # 不会与已正常收尾的 worker 重复关闭。
+        for sess in self._runners.values():
+            await self._close_session(sess)
         if self._scan_executor is not None:
             try:
                 await self._scan_executor.aclose()
