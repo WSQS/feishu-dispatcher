@@ -6,6 +6,7 @@ from pathlib import Path
 
 from feishu_dispatcher.scheduler import (
     LLMResponse,
+    SYSTEM_PROMPT,
     SchedulerMemory,
     ToolCall,
     build_scheduler_tools,
@@ -468,6 +469,18 @@ async def test_history_is_included_in_messages():
     assert msgs[1] == {"role": "user", "content": "上一句"}
     assert msgs[2] == {"role": "assistant", "content": "上一答"}
     assert msgs[-1] == {"role": "user", "content": "这一句"}
+
+
+def test_system_prompt_distinguishes_spawn_attach_operate():
+    """回归 #355：system prompt 明确「新建 vs 附着 vs 操作已有」三分类。
+
+    用户已给 session_id、要把外部已有会话接进来时该选 attach_session 而非
+    spawn_agent——后者会另起新会话、丢掉原上下文（本票动机）。
+    """
+    assert "区分「新建任务」「附着外部会话」「操作已有任务」" in SYSTEM_PROMPT
+    assert "attach_session(project, session_id" in SYSTEM_PROMPT
+    assert "别对它 spawn_agent" in SYSTEM_PROMPT
+    assert "绝不要为已有任务重复 spawn 新 agent" in SYSTEM_PROMPT
 
 
 def test_memory_in_memory_roundtrip():
