@@ -956,12 +956,11 @@ class _Daemon:
         )
 
     async def _attach_for_root(self, msg: IncomingMessage, arg: str) -> None:
-        """解析 ``/attach <项目> <agent> <session_id> [描述...]``：先探测会话可恢复，
-        再建 Task + 新飞书话题并 load_session 拉起。
+        """解析 ``/attach <项目> <agent> <session_id> [描述...]`` 并附着外部会话。
 
-        无锁 MVP：不探测原 CLI 是否已退出——假定原会话已停止；会话交接锁机制另行立项。
-        单次 /attach 约 2× load_session 成本（先探测一次、拉起再恢复一次）——慢后端
-        （如 Claude 冷启动 ~15–18s）耗时约为两次冷启动，属预期。
+        参数解析后交给共用底层 :meth:`_attach_task`；按返回结果决定回复目标：
+        成功不额外回（worker 会发附着摘要）；未建话题的失败回原消息；已建话题的
+        罕见竞态失败回新话题。
         """
         usage = "格式：`/attach <项目名> <agent> <session_id> [描述...]`"
         parts = arg.split(maxsplit=3)
@@ -975,52 +974,80 @@ class _Daemon:
         if not project_name or not agent_in or not session_id:
             await self._reply_user(msg.message_id, usage)
             return
+        task, root, message = await self._attach_task(
+            project_name, agent_in, session_id, user_desc
+        )
+        if task is not None:
+            return  # 成功：新话题的附着摘要由 worker 发
+        if root:
+            await self._safe_reply(root, message)
+        else:
+            await self._reply_user(msg.message_id, message)
 
+    async def _attach_task(
+        self,
+        project_name: str,
+        agent: str,
+        session_id: str,
+        description: str = "",
+    ) -> tuple["Task | None", str, str]:
+        """附着外部会话为新 Task 的共用底层（``/attach`` 与 ``attach_session`` 工具都调它）。
+
+        流程：校验→去重→先 load_session 探测→建 Task + 新飞书话题→``_launch(resume)``
+        （附着摘要由 worker 就绪后发）。``agent`` 非空则覆盖项目 default_agent（须在
+        ``[agents]``），空则用项目默认——``attach_session`` 的 agent 可选正依赖此语义。
+
+        返回 ``(task, thread_root_id, message)``：
+        - ``task`` 非 None = 成功建 Task 并拉起（message 为成功摘要）；
+        - ``task`` 为 None 且 ``thread_root_id`` 非空 = 已建话题但终查超限的罕见竞态失败；
+        - ``task`` 为 None 且 ``thread_root_id`` 为空 = 未建话题的失败（校验/去重/探测/预查）。
+
+        无锁 MVP：不探测原 CLI 是否已退出——假定原会话已停止；会话交接锁机制另行立项。
+        单次附着约 2× load_session 成本（先探测一次、拉起再恢复一次）——慢后端
+        （如 Claude 冷启动 ~15–18s）耗时约为两次冷启动，属预期。
+        """
         project = self._resolve_project(project_name)
         if project is None:
             known = ", ".join(self._all_projects()) or "(无)"
-            await self._reply_user(
-                msg.message_id, f"未知项目 '{project_name}'。已知项目: {known}"
-            )
-            return
-        agent_label, agent_argv, err = self._resolve_agent(project, agent_in)
+            return None, "", f"未知项目 '{project_name}'。已知项目: {known}"
+        agent_label, agent_argv, err = self._resolve_agent(project, agent)
         if agent_argv is None:
-            await self._reply_user(msg.message_id, err)
-            return
+            return None, "", err
 
         # 重复附着：同 (agent, session_id) 已有 Task → 拒绝并引导到已有 task。
         existing = self.store.by_agent_session(agent_label, session_id)
         if existing is not None:
-            await self._reply_user(
-                msg.message_id,
-                f"⚠️ 该会话已由任务 [{existing.task_id}] 附着（agent={agent_label}）。"
-                "请回到其话题继续，勿重复附着。",
+            return (
+                None,
+                "",
+                (
+                    f"⚠️ 该会话已由任务 [{existing.task_id}] 附着（agent={agent_label}）。"
+                    "请回到其话题继续，勿重复附着。"
+                ),
             )
-            return
 
         # 先探测：同步 load_session 确认该 backend + cwd 能恢复此 session；失败不落 Task。
         ok, why = await self._probe_attach(
             agent_label, agent_argv, str(project.path), session_id
         )
         if not ok:
-            await self._reply_user(msg.message_id, why)
-            return
+            return None, "", why
 
         # 并发上限双保险（同 /run 的 TOCTOU 防护）：
         #  ① 先查——超限直接回原消息、**不建新话题**（避免孤儿话题）。
         if self._runners.count() >= self.cfg.max_agents:
-            await self._reply_user(
-                msg.message_id,
+            return (
+                None,
+                "",
                 f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，请先 `/stop` 一个。",
             )
-            return
         # 新话题（send_root_message 开新话题拿 thread_root_id），header = 固定摘要 + 截断
         # session_id + 可选描述。
         assert self._bridge is not None
         sid = _short_sid(session_id)
         header = f"🔗 {agent_label} · {project_name}\n附着外部会话: {sid}"
-        if user_desc:
-            header += f"\n说明: {user_desc}"
+        if description:
+            header += f"\n说明: {description}"
         root = await asyncio.to_thread(
             self._bridge.send_root_message, self.cfg.chat_id, header
         )
@@ -1028,19 +1055,19 @@ class _Daemon:
         # 终查与 create+_launch 之间**无 await**，守住「check→launch 无 await」不变量。
         # 终查超限属罕见竞态：话题已建，就地提示并放弃，不落 Task。
         if self._runners.count() >= self.cfg.max_agents:
-            await self._safe_reply(
+            return (
+                None,
                 root,
                 f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，附着未完成。"
                 "请先 `/stop` 一个再试。",
             )
-            return
-        description = f"附着外部会话 {agent_label}/{sid}"
-        if user_desc:
-            description += f" — {user_desc}"
+        task_desc = f"附着外部会话 {agent_label}/{sid}"
+        if description:
+            task_desc += f" — {description}"
         new_task = self.store.create(
             project_name=project_name,
             agent_label=agent_label,
-            description=description,
+            description=task_desc,
             thread_root_id=root,
             workspace=str(project.path),
             session_id=session_id,
@@ -1052,6 +1079,11 @@ class _Daemon:
             first_prompt=None,
             resume_session_id=session_id,
             attached=True,
+        )
+        return (
+            new_task,
+            root,
+            f"已附着外部会话 {agent_label}/{sid} 为任务 [{new_task.task_id}]。",
         )
 
     async def _probe_attach(
@@ -1782,6 +1814,7 @@ class _Daemon:
             mark_done=self._sched_mark_done,
             register_project=self._sched_register_project,
             unregister_project=self._sched_unregister_project,
+            attach_session=self._sched_attach_session,
             list_forge=self._sched_list_forge,
             get_forge=self._sched_get_forge,
             list_models=self._sched_list_models,
@@ -1962,6 +1995,23 @@ class _Daemon:
         if not self._finish_task(task_id, "done"):
             return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
         return f"已把任务 [{task_id}] 标记为完成（done）。"
+
+    async def _sched_attach_session(
+        self,
+        project_name: str,
+        session_id: str,
+        agent: str = "",
+        description: str = "",
+    ) -> str:
+        """attach_session 工具：附着 daemon 外部的 agent 会话为新 Task（与 /attach 共用底层）。
+
+        ``agent`` 可选：非空则覆盖项目 default_agent（须在 [agents]），空则用默认。
+        仅新建；重复 (agent, session_id) 由底层 :meth:`_attach_task` 去重拒绝。
+        """
+        _task, _root, message = await self._attach_task(
+            project_name, agent, session_id, description
+        )
+        return message
 
     async def _sched_spawn_agent(
         self,

@@ -298,6 +298,7 @@ def build_scheduler_tools(
     mark_done: Callable[[str], Awaitable[str]],
     register_project: Callable[[str, str, str], Awaitable[str]],
     unregister_project: Callable[[str], Awaitable[str]],
+    attach_session: Callable[[str, str, str, str], Awaitable[str]],
     list_forge: Callable[[str, str, int], Awaitable[str]],
     get_forge: Callable[[str, str, int], Awaitable[str]],
     list_models: Callable[[str], dict[str, Any]],
@@ -320,6 +321,15 @@ def build_scheduler_tools(
         if not name:
             return "参数不足：name 必填。"
         return await unregister_project(name)
+
+    async def _attach_session(args: dict[str, Any]) -> str:
+        project = str(args.get("project", "")).strip()
+        session_id = str(args.get("session_id", "")).strip()
+        agent = str(args.get("agent", "")).strip()  # 可选：覆盖项目 default_agent
+        description = str(args.get("description", "")).strip()  # 可选：会话/任务说明
+        if not project or not session_id:
+            return "参数不足：project 和 session_id 都必填。"
+        return await attach_session(project, session_id, agent, description)
 
     async def _spawn_agent(args: dict[str, Any]) -> str:
         project = str(args.get("project", "")).strip()
@@ -465,6 +475,39 @@ def build_scheduler_tools(
                 "required": ["project", "task"],
             },
             handler=_spawn_agent,
+        ),
+        ToolSpec(
+            name="attach_session",
+            description=(
+                "把 daemon 外部的一个 agent 会话（session_id）附着为指定项目下的**新**"
+                "任务：先 load_session 探测该会话可恢复、成功才建任务并开新飞书话题接回"
+                "上下文（附着后继续原会话，不跑首轮）。用于把用户已在别处跑（且已停止）的"
+                "会话接进本项目继续。重复附着同一 (agent, session_id) 会被拒绝。可选 "
+                "agent 覆盖项目默认 agent（如用户说「用 claude 附着」），不填用项目默认。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "已注册的项目名"},
+                    "session_id": {
+                        "type": "string",
+                        "description": "要附着的外部 agent 会话 id（用户须提供）",
+                    },
+                    "agent": {
+                        "type": "string",
+                        "description": (
+                            "可选：附着用哪个 agent（如 copilot/opencode/claude，须已配置）；"
+                            "不填则用项目的默认 agent"
+                        ),
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "可选：会话/任务的简短说明",
+                    },
+                },
+                "required": ["project", "session_id"],
+            },
+            handler=_attach_session,
         ),
         ToolSpec(
             name="list_tasks",

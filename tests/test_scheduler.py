@@ -37,6 +37,7 @@ def _tools(
     done=None,
     register=None,
     unregister=None,
+    attach=None,
     list_forge=None,
     get_forge=None,
     list_models=None,
@@ -59,6 +60,9 @@ def _tools(
     async def _unregister(name):
         return f"已删除 {name}"
 
+    async def _attach(project, session_id, agent="", description=""):
+        return f"已附着 {project}/{session_id}"
+
     async def _list_forge(project, state, limit):
         return f"forge-list {project or '*'} {state} {limit}"
 
@@ -78,6 +82,7 @@ def _tools(
         mark_done=done or _done,
         register_project=register or _register,
         unregister_project=unregister or _unregister,
+        attach_session=attach or _attach,
         list_forge=list_forge or _list_forge,
         get_forge=get_forge or _get_forge,
         list_models=list_models or _list_models,
@@ -269,6 +274,46 @@ def test_spawn_agent_schema_exposes_model():
     assert "model" not in spawn_tool.parameters.get("required", [])  # 可选，非必填
 
 
+def test_attach_session_schema_shape():
+    """attach_session schema：project/session_id 必填，agent/description 可选。"""
+    attach = next(t for t in _tools() if t.name == "attach_session")
+    props = attach.parameters["properties"]
+    assert set(attach.parameters.get("required", [])) == {"project", "session_id"}
+    assert props["project"]["type"] == "string"
+    assert props["session_id"]["type"] == "string"
+    assert props["agent"]["type"] == "string"
+    assert "agent" not in attach.parameters.get("required", [])
+    assert props["description"]["type"] == "string"
+    assert "description" not in attach.parameters.get("required", [])
+
+
+async def test_attach_session_validates_and_dispatches():
+    attached: list[tuple] = []
+
+    async def attach(project, session_id, agent="", description=""):
+        attached.append((project, session_id, agent, description))
+        return f"已附着 {project}/{session_id}"
+
+    tools = _tools(attach=attach)
+    at = _tool(tools, "attach_session")
+    assert "参数不足" in await at.handler({"project": "demo"})  # 缺 session_id
+    assert "参数不足" in await at.handler({"session_id": "sid1"})  # 缺 project
+    # agent/description 缺省 → 传空串（由 daemon 侧用默认）
+    out = await at.handler({"project": "demo", "session_id": "sid1"})
+    assert out == "已附着 demo/sid1"
+    assert attached == [("demo", "sid1", "", "")]
+    # agent 覆盖 + description 透传
+    await at.handler(
+        {
+            "project": "demo",
+            "session_id": "sid2",
+            "agent": "claude",
+            "description": "继续",
+        }
+    )
+    assert attached[-1] == ("demo", "sid2", "claude", "继续")
+
+
 def _tool(tools, name):
     return next(t for t in tools if t.name == name)
 
@@ -351,6 +396,7 @@ def test_new_tools_are_exposed():
     assert names == {
         "list_projects",
         "spawn_agent",
+        "attach_session",
         "list_tasks",
         "get_task",
         "send_to_task",
