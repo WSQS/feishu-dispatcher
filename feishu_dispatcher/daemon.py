@@ -327,6 +327,7 @@ class _Daemon:
         default_factory=lambda: SchedulerMemory(None)
     )
     _bridge: FeishuBridge | None = None
+    #: 运行态 _AgentSession，按 task_id 索引；Thread 只经 Task 路由到这里。
     _sessions: dict[str, _AgentSession] = field(default_factory=dict)
     _seen_message_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
     #: 本地控制面（agent CLI 入口）；run() 里启动，测试构造 _Daemon 时为 None（不起 HTTP）
@@ -854,7 +855,8 @@ class _Daemon:
             return
 
         thread_root = msg.message_id
-        if thread_root in self._sessions:
+        existing = self.store.by_thread(thread_root)
+        if existing is not None and existing.task_id in self._sessions:
             logger.info("根消息 %s 已有 agent session，忽略重复 spawn", thread_root)
             return
 
@@ -956,7 +958,7 @@ class _Daemon:
         )
         if first_prompt is not None:
             sess.enqueue(first_prompt)
-        self._sessions[task.thread_root_id] = sess
+        self._sessions[task.task_id] = sess
         sess.worker = asyncio.create_task(
             self._agent_worker(sess), name=f"agent-{task.task_id}"
         )
@@ -1167,7 +1169,7 @@ class _Daemon:
 
     async def _close_session(self, sess: _AgentSession) -> None:
         """收尾一个 session：出注册表、清空输出通道、关 agent 进程。"""
-        self._sessions.pop(sess.thread_root_id, None)
+        self._sessions.pop(sess.task_id, None)
         if sess.bg_token:  # 作废该 session 的后台任务 token（#68）
             self._bg_tokens.pop(sess.bg_token, None)
         if sess.current_channel is not None:
@@ -1214,7 +1216,8 @@ class _Daemon:
                 )
                 return
             forward_raw = True
-        sess = self._sessions.get(thread_root)
+        task = self.store.by_thread(thread_root)
+        sess = self._sessions.get(task.task_id) if task is not None else None
         if sess is None:
             # 无活跃 agent：尝试从持久化记录恢复（惰性重连），或明确提示——
             # 不再静默忽略（那是重启后老话题回复石沉大海的根源）。
@@ -1395,7 +1398,7 @@ class _Daemon:
         task = self.store.get(task_id)
         if task is None:
             return False
-        sess = self._sessions.get(task.thread_root_id)
+        sess = self._sessions.get(task.task_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             sess.terminate_status = status
             sess.terminate()  # 丢弃未处理 bg 批次 + 入队 None（#79，与 /stop 同机制）
@@ -1616,7 +1619,7 @@ class _Daemon:
             "status": t.status,
             "turns": t.turns,
             "has_session": bool(t.session_id),
-            "active": t.thread_root_id in self._sessions,
+            "active": t.task_id in self._sessions,
             "model": t.model,  # agent 当前模型（copilot 不暴露则为空）
             "issue_url": t.issue_url,  # 关联的 issue（#63）；空 = 未绑定
             "created_at": t.created_at,
@@ -1632,7 +1635,7 @@ class _Daemon:
         task = self.store.get(task_id)
         if task is None:
             return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
-        sess = self._sessions.get(task.thread_root_id)
+        sess = self._sessions.get(task.task_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             sess.enqueue(message)
             logger.info(
@@ -1665,7 +1668,7 @@ class _Daemon:
         task = self.store.get(task_id)
         if task is None:
             return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
-        sess = self._sessions.get(task.thread_root_id)
+        sess = self._sessions.get(task.task_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             return f"任务 [{task_id}] 已在运行，无需恢复。"
         ok, why = self._try_resume(task, first_prompt=None)
@@ -2023,7 +2026,7 @@ class _Daemon:
             return
         # 先把「结果」发到话题（可见），再驱动 agent 接续
         await self._safe_reply(task.thread_root_id, self._bg_result_message(job, rc))
-        sess = self._sessions.get(task.thread_root_id)
+        sess = self._sessions.get(task.task_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             # check-set 之间无 await：单线程原子，并发完成的 job 不会漏合并/重复入队。
             if sess.pending_bg is not None:
