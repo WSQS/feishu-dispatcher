@@ -133,6 +133,22 @@ class StartupFailAgent(FakeAgent):
         raise RuntimeError("startup boom")
 
 
+class LoadSessionUnsupportedAgent(FakeAgent):
+    """start() 抛 JSON-RPC -32601（backend 不支持 load_session），模拟 /attach 探测失败。"""
+
+    async def start(self) -> None:
+        from acp.exceptions import RequestError
+
+        raise RequestError.method_not_found("load_session")
+
+
+class SessionExpiredAgent(FakeAgent):
+    """start() 抛「session 无效」，模拟 /attach 探测到过期/损坏 session。"""
+
+    async def start(self) -> None:
+        raise RuntimeError("session not found")
+
+
 class BlockingStartAgent(FakeAgent):
     """start() 永久阻塞（直到被取消），让 worker 停在启动段、进不了主循环——
     用于复现启动段被 _shutdown cancel 时 registry 槽位悬空的旧 bug。"""
@@ -1686,6 +1702,196 @@ async def test_load_session_replay_does_not_log_actions():
     impl.set_suppress(False)
     await impl.session_update("s1", start_tool_call("tc2", "Editing y.py", kind="edit"))
     assert [a["title"] for a in logged] == ["Editing y.py"]
+
+
+# ---------------------------------------------------------------------- #
+# /attach：附着 daemon 外部的 agent 会话为新 Task
+# ---------------------------------------------------------------------- #
+
+
+def test_short_sid_truncates():
+    from feishu_dispatcher.daemon import _short_sid
+
+    assert _short_sid("abc") == "abc"
+    assert _short_sid("a" * 20) == "a" * 16 + "…"
+    assert _short_sid("") == ""
+
+
+def test_attach_probe_error_distinguishes_causes():
+    from acp.exceptions import RequestError
+
+    from feishu_dispatcher.daemon import _attach_probe_error
+
+    unsupported = _attach_probe_error(RequestError.method_not_found("load_session"))
+    assert "不支持 load_session" in unsupported
+    expired = _attach_probe_error(RuntimeError("session not found"))
+    assert "无法恢复该外部 session" in expired
+    timeout = _attach_probe_error(TimeoutError("agent load_session 超时"))
+    assert "超时" in timeout and "不支持" not in timeout
+
+
+async def test_attach_creates_task_and_resumes_external_session():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(
+        root_msg("/attach demo opencode ext_sid_1 继续之前的活", mid="om_att")
+    )
+    # 新话题经 send_root_message 开（root != /attach 消息 id）
+    root = "om_newroot_1"
+    await wait_until(lambda: store.by_thread(root) is not None)
+    await wait_until(lambda: len(created) == 2)  # 探针 + 拉起各一个 agent
+    await wait_until(lambda: any("已附着外部会话" in t for t in bridge.texts(root)))
+
+    t = store.by_thread(root)
+    assert t.origin == "attach"
+    assert t.session_id == "ext_sid_1"
+    assert t.agent_label == "opencode"
+    assert t.project_name == "demo"
+    assert "附着外部会话 opencode/ext_sid_1" in t.description
+    assert "继续之前的活" in t.description
+    # 探针：resume_session_id 探测 + 已关闭（进程树清理）
+    assert created[0].resume_session_id == "ext_sid_1"
+    assert created[0].closed
+    # 拉起：复用 load_session 路径（resume_session_id 触发历史抑制）、不跑首轮
+    assert created[1].resume_session_id == "ext_sid_1"
+    assert created[1].prompts == []
+    assert not created[1].closed
+    # 新话题 header 含固定摘要 + 截断 session_id + 可选描述
+    assert bridge.roots and "附着外部会话" in bridge.roots[0][1]
+    assert "ext_sid_1" in bridge.roots[0][1]
+    await daemon._shutdown()
+
+
+async def test_attach_backend_unsupported_leaves_no_task():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(
+        store=store, agent_cls=LoadSessionUnsupportedAgent
+    )
+    await daemon._handle_message(
+        root_msg("/attach demo opencode ext_sid_1", mid="om_att")
+    )
+    assert store.all() == []  # 探测失败不落 Task
+    assert any("不支持 load_session" in t for m, t in bridge.plain if m == "om_att")
+    assert len(created) == 1  # 只有探针，无拉起
+    assert created[0].closed
+
+
+async def test_attach_invalid_session_leaves_no_task():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store, agent_cls=SessionExpiredAgent)
+    await daemon._handle_message(
+        root_msg("/attach demo opencode ext_sid_1", mid="om_att")
+    )
+    assert store.all() == []
+    assert any("无法恢复该外部 session" in t for m, t in bridge.plain if m == "om_att")
+    assert len(created) == 1
+    assert created[0].closed
+
+
+async def test_attach_duplicate_rejected_and_guides_to_existing():
+    store = TaskStore(None)
+    # 已有一个同 (agent, session_id) 的附着任务
+    store.create(
+        project_name="demo",
+        agent_label="opencode",
+        description="附着外部会话 opencode/ext_sid_1",
+        thread_root_id="om_old",
+        workspace="C:/tmp/demo",
+        session_id="ext_sid_1",
+        origin="attach",
+    )
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(
+        root_msg("/attach demo opencode ext_sid_1", mid="om_dup")
+    )
+    assert any("已由任务 [t1] 附着" in t for m, t in bridge.plain if m == "om_dup")
+    assert len(created) == 0  # 去重在探测前，不起探针
+    assert len(store.all()) == 1  # 未新增任务
+
+
+async def test_attach_unknown_project_or_agent_errors_no_probe():
+    daemon, bridge, created = make_daemon()
+    await daemon._handle_message(
+        root_msg("/attach nope opencode ext_sid_1", mid="om_p")
+    )
+    assert any("未知项目" in t for m, t in bridge.plain if m == "om_p")
+    await daemon._handle_message(root_msg("/attach demo nope ext_sid_1", mid="om_a"))
+    assert any("未知 agent" in t for m, t in bridge.plain if m == "om_a")
+    assert created == []  # 校验失败，不起探针
+
+
+async def test_attach_respects_max_agents_replies_to_original_no_orphan_thread():
+    # 已达上限时：回原消息、不建新话题（send_root_message 不被调用）、不落 Task。
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon_with_limit(max_agents=1, store=store)
+    await daemon._handle_message(root_msg("/run demo task1", mid="om_r1"))
+    await wait_until(lambda: created and created[0].prompts == ["task1"])
+    await daemon._handle_message(
+        root_msg("/attach demo opencode ext_sid_1", mid="om_att")
+    )
+    assert any("上限" in t for m, t in bridge.plain if m == "om_att")  # 回原消息
+    assert bridge.roots == []  # 没开新话题（无孤儿话题）
+    assert len(store.all()) == 1  # 只有 /run 的任务，没建 attach Task
+    await daemon._shutdown()
+
+
+async def test_attach_launch_failure_reports_attach_error():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store, agent_cls=StartupFailAgent)
+    task = store.create(
+        project_name="demo",
+        agent_label="opencode",
+        description="附着外部会话 opencode/ext_sid_1",
+        thread_root_id="om_root1",
+        workspace="C:/tmp/demo",
+        session_id="ext_sid_1",
+        origin="attach",
+    )
+    daemon._launch(
+        task,
+        ["opencode", "acp"],
+        first_prompt=None,
+        resume_session_id="ext_sid_1",
+        attached=True,
+    )
+    await wait_until(lambda: any("附着失败" in t for t in bridge.texts("om_root1")))
+    assert store.get("t1").status == "failed"  # 启动失败 → failed（可恢复）
+    await daemon._shutdown()
+
+
+async def test_attach_after_restart_recovers_via_load_session(tmp_path: Path):
+    store_path = tmp_path / "tasks.json"
+    store1 = TaskStore(store_path)
+    d1, b1, c1 = make_daemon(store=store1)
+    await d1._handle_message(root_msg("/attach demo opencode ext_sid_1", mid="om_att"))
+    root = "om_newroot_1"
+    await wait_until(lambda: store1.by_thread(root) is not None)
+    await wait_until(lambda: len(c1) == 2)
+    saved_sid = store1.by_thread(root).session_id
+    assert saved_sid == "ext_sid_1"
+    assert store1.by_thread(root).origin == "attach"
+    await d1._shutdown()
+    assert store1.by_thread(root).status == "suspended"
+
+    # 新 daemon（共享台账）→ 话题回复 → 普通 load_session 恢复（走「已恢复」而非「附着」）
+    store2 = TaskStore(store_path)
+    d2, b2, c2 = make_daemon(store=store2)
+    await d2._handle_message(thread_msg("继续", root=root, mid="om_t2"))
+    await wait_until(lambda: c2 and c2[0].prompts == ["继续"])
+    assert c2[0].resume_session_id == "ext_sid_1"
+    assert any("已恢复" in t for t in b2.texts(root))
+    await d2._shutdown()
+
+
+async def test_run_still_works_after_attach_feature():
+    # 回归保护：/run 新会话路径不受 /attach 影响（origin 仍为 spawn）
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    await daemon._handle_message(root_msg("/run demo do stuff"))
+    await wait_until(lambda: created and created[0].prompts == ["do stuff"])
+    await wait_until(lambda: store.by_thread("om_root1") is not None)
+    assert store.by_thread("om_root1").origin == "spawn"
+    await daemon._shutdown()
 
 
 # ---------------------------------------------------------------------- #

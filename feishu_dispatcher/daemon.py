@@ -59,6 +59,7 @@ _PROJECT_CMD = "/project"  # root：/project 列出，/project add|remove 增删
 _MODELS_CMD = "/models"  # root：/models 列缓存，/models refresh [agent] 主动刷新
 _LLM_CMD = "/llm"  # root：/llm 列出调度器 LLM profile，/llm <名> 运行时切换（#74）
 _REBOOT_CMD = "/reboot"  # root：重启整个 daemon 进程（cli.py re-exec）
+_ATTACH_CMD = "/attach"  # root：附着 daemon 外部的 agent 会话为新 Task
 _HELP_CMDS = ("/help", "/?", "/usage")  # root 与话题内通用
 
 #: 环境变量：re-exec 重启时置位，新进程据此发「已重启」回执
@@ -73,6 +74,8 @@ _CONTROL_STOP_TIMEOUT = 5.0
 _USAGE = (
     "用法：\n"
     "• `/run <项目名> <任务描述> [--agent <名>]`  派发任务给 agent（可选覆盖默认 agent）\n"
+    "• `/attach <项目名> <agent> <session_id> [描述]`  附着外部 agent 会话为新任务"
+    "（假定原会话已停止）\n"
     "• `/agents`  列出活跃 + 历史任务\n"
     "• `/task <任务id>`  查看某任务详情与动作日志\n"
     "• `/project`  列出项目；`/project add <名> <agent> <路径>` 注册，`/project remove <名>` 删除\n"
@@ -115,6 +118,36 @@ def _one_line(text: str, limit: int) -> str:
     """压成一行（合并所有空白）再截断，用于主线通知里的摘要片段。"""
     s = " ".join((text or "").split())
     return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _short_sid(session_id: str, limit: int = 16) -> str:
+    """session_id 截断展示：不完整暴露，防日志/卡片/摘要泄露。"""
+    s = (session_id or "").strip()
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _attach_probe_error(exc: Exception) -> str:
+    """把 load_session 探测失败转成人读错误，**尽力**区分三种原因。
+
+    - 超时：``_await_start`` 抛 ``TimeoutError``（``start_timeout`` 兜底）。
+    - backend 不支持：ACP SDK 对 ``load_session`` 收到 JSON-RPC ``-32601 Method
+      not found`` 时抛 ``RequestError(code=-32601, data={"method": ...})``。
+    - 其余失败（参数错、session 过期/损坏、backend 拒绝）统一归为「session 无效或
+      过期」，附异常片段供用户自查。
+    """
+    msg = str(exc)
+    if isinstance(exc, TimeoutError):
+        return "❌ 恢复外部 session 超时（backend 卡住或会话过大）。未创建任何任务。"
+    code = getattr(exc, "code", None)
+    if code == -32601 or "method not found" in msg.lower():
+        return (
+            "❌ 该 agent backend 不支持 load_session（无法恢复外部会话），无法附着。"
+            "请换用支持会话恢复的 backend。"
+        )
+    return (
+        f"❌ 无法恢复该外部 session（可能无效或已过期）：{_clip(msg, 120)}\n"
+        "未创建任何任务。请确认 session_id 与该 agent、项目 cwd 匹配。"
+    )
 
 
 def _fmt_tokens(n: int) -> str:
@@ -265,6 +298,9 @@ class _AgentSession:
     cwd: str = ""
     #: 是否由 load_session 恢复而来（影响启动失败时的提示文案）
     resumed: bool = False
+    #: 是否由 /attach 附着外部会话而来（= Task.origin == "attach"）；
+    #: 影响启动成功/失败的提示文案（区别于普通恢复的「已恢复」）。
+    attached: bool = False
     #: 关联的 forge issue URL（= Task.issue_url，#63）；供 footer/展示标归属，空 = 未绑定
     issue_url: str = ""
     #: agent 实例（先建 session、再建 agent，故允许 None）
@@ -543,6 +579,8 @@ class _Daemon:
         text = msg.text.strip()
         if text.startswith(_DISPATCH_PREFIX):
             await self._spawn_for_root(msg, text[len(_DISPATCH_PREFIX) :].strip())
+        elif text == _ATTACH_CMD or text.startswith(_ATTACH_CMD + " "):
+            await self._attach_for_root(msg, text[len(_ATTACH_CMD) :].strip())
         elif text.startswith(_TASK_PREFIX):
             await self._show_task(msg, text[len(_TASK_PREFIX) :].strip())
         elif text == _LIST_CMD:
@@ -917,6 +955,146 @@ class _Daemon:
             f"{project_name}…\n任务: {task}",
         )
 
+    async def _attach_for_root(self, msg: IncomingMessage, arg: str) -> None:
+        """解析 ``/attach <项目> <agent> <session_id> [描述...]``：先探测会话可恢复，
+        再建 Task + 新飞书话题并 load_session 拉起。
+
+        无锁 MVP：不探测原 CLI 是否已退出——假定原会话已停止；会话交接锁机制另行立项。
+        单次 /attach 约 2× load_session 成本（先探测一次、拉起再恢复一次）——慢后端
+        （如 Claude 冷启动 ~15–18s）耗时约为两次冷启动，属预期。
+        """
+        usage = "格式：`/attach <项目名> <agent> <session_id> [描述...]`"
+        parts = arg.split(maxsplit=3)
+        if len(parts) < 3:
+            await self._reply_user(msg.message_id, usage)
+            return
+        project_name = parts[0].strip()
+        agent_in = parts[1].strip()
+        session_id = parts[2].strip()
+        user_desc = parts[3].strip() if len(parts) > 3 else ""
+        if not project_name or not agent_in or not session_id:
+            await self._reply_user(msg.message_id, usage)
+            return
+
+        project = self._resolve_project(project_name)
+        if project is None:
+            known = ", ".join(self._all_projects()) or "(无)"
+            await self._reply_user(
+                msg.message_id, f"未知项目 '{project_name}'。已知项目: {known}"
+            )
+            return
+        agent_label, agent_argv, err = self._resolve_agent(project, agent_in)
+        if agent_argv is None:
+            await self._reply_user(msg.message_id, err)
+            return
+
+        # 重复附着：同 (agent, session_id) 已有 Task → 拒绝并引导到已有 task。
+        existing = self.store.by_agent_session(agent_label, session_id)
+        if existing is not None:
+            await self._reply_user(
+                msg.message_id,
+                f"⚠️ 该会话已由任务 [{existing.task_id}] 附着（agent={agent_label}）。"
+                "请回到其话题继续，勿重复附着。",
+            )
+            return
+
+        # 先探测：同步 load_session 确认该 backend + cwd 能恢复此 session；失败不落 Task。
+        ok, why = await self._probe_attach(
+            agent_label, agent_argv, str(project.path), session_id
+        )
+        if not ok:
+            await self._reply_user(msg.message_id, why)
+            return
+
+        # 并发上限双保险（同 /run 的 TOCTOU 防护）：
+        #  ① 先查——超限直接回原消息、**不建新话题**（避免孤儿话题）。
+        if self._runners.count() >= self.cfg.max_agents:
+            await self._reply_user(
+                msg.message_id,
+                f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，请先 `/stop` 一个。",
+            )
+            return
+        # 新话题（send_root_message 开新话题拿 thread_root_id），header = 固定摘要 + 截断
+        # session_id + 可选描述。
+        assert self._bridge is not None
+        sid = _short_sid(session_id)
+        header = f"🔗 {agent_label} · {project_name}\n附着外部会话: {sid}"
+        if user_desc:
+            header += f"\n说明: {user_desc}"
+        root = await asyncio.to_thread(
+            self._bridge.send_root_message, self.cfg.chat_id, header
+        )
+        #  ② 终查——send_root_message 是 await，其间别的并发附着/派发可能占走名额；
+        # 终查与 create+_launch 之间**无 await**，守住「check→launch 无 await」不变量。
+        # 终查超限属罕见竞态：话题已建，就地提示并放弃，不落 Task。
+        if self._runners.count() >= self.cfg.max_agents:
+            await self._safe_reply(
+                root,
+                f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，附着未完成。"
+                "请先 `/stop` 一个再试。",
+            )
+            return
+        description = f"附着外部会话 {agent_label}/{sid}"
+        if user_desc:
+            description += f" — {user_desc}"
+        new_task = self.store.create(
+            project_name=project_name,
+            agent_label=agent_label,
+            description=description,
+            thread_root_id=root,
+            workspace=str(project.path),
+            session_id=session_id,
+            origin="attach",
+        )
+        self._launch(
+            new_task,
+            agent_argv,
+            first_prompt=None,
+            resume_session_id=session_id,
+            attached=True,
+        )
+
+    async def _probe_attach(
+        self, agent_label: str, agent_argv: list[str], cwd: str, session_id: str
+    ) -> tuple[bool, str]:
+        """同步 load_session 探测：确认外部 session 可恢复才允许建 Task。
+
+        起一个一次性 ``AcpAgent(resume_session_id=...)`` 走 load_session（成功即证明该
+        backend + cwd 能恢复此 session），随后 aclose 探针（含 Windows 进程树清理）。
+        探测失败返回 (False, 人读原因)，调用方据此拒绝、不落任何 Task。capability 判定 =
+        尝试失败即报错，不做静态标志/动态探测。
+        """
+
+        async def _noop_out(_t: str) -> None:
+            pass
+
+        async def _noop_act(_a: dict) -> None:
+            pass
+
+        env = dict(self.cfg.agent_env.get(agent_label, {}))
+        agent = self._make_agent(
+            AgentSpawn(command=list(agent_argv), cwd=cwd, env=env),
+            _noop_out,
+            _noop_act,
+            resume_session_id=session_id,
+        )
+        try:
+            await agent.start()
+        except Exception as exc:  # noqa: BLE001 —— 探测失败归因尽力而为
+            # session_id 手滑是正常失败：只记人读摘要，不刷 traceback。
+            logger.info(
+                "attach 探测失败 agent=%s：%s",
+                agent_label,
+                _one_line(str(exc), 160),
+            )
+            return False, _attach_probe_error(exc)
+        finally:
+            try:
+                await agent.aclose()
+            except Exception:
+                logger.debug("attach 探针 aclose 异常（忽略）", exc_info=True)
+        return True, ""
+
     def _make_agent(
         self,
         spawn: AgentSpawn,
@@ -941,11 +1119,14 @@ class _Daemon:
         first_prompt: str | None,
         *,
         resume_session_id: str | None = None,
+        attached: bool = False,
     ) -> _AgentSession:
         """按 Task 建 session、接线 on_output、入队首条 prompt、启动 worker。
 
         ``resume_session_id`` 非 None 时 agent 用 load_session 恢复（惰性重连）。
         ``first_prompt=None`` 时只把 agent 拉起来在线（不跑首轮），用于 resume_task。
+        ``attached=True`` 仅由 ``/attach`` 的**首次**拉起置位——附着摘要文案；附着任务
+        事后经 ``_try_resume`` 恢复时仍走普通「已恢复」路径（attached 默认 False）。
         """
         sess = _AgentSession(
             thread_root_id=task.thread_root_id,
@@ -954,6 +1135,7 @@ class _Daemon:
             task_id=task.task_id,
             cwd=task.workspace,
             resumed=resume_session_id is not None,
+            attached=attached,
             issue_url=task.issue_url,
         )
 
@@ -1030,7 +1212,13 @@ class _Daemon:
             if self._runners.is_current(sess.task_id, sess):
                 err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
                 self.store.update(sess.task_id, status="failed", error_message=err)
-                if sess.resumed:
+                if sess.attached:
+                    await self._safe_reply(
+                        root,
+                        "❌ 附着失败（session 无法恢复或已过期）。"
+                        "请确认后重试，或发送 `/run` 新开。",
+                    )
+                elif sess.resumed:
                     await self._safe_reply(
                         root,
                         "❌ 会话恢复失败（可能已在 agent 侧过期）。发送 `/run` 重开。",
@@ -1081,11 +1269,22 @@ class _Daemon:
             status="idle",
             model=model,
         )
-        base = (
-            "♻️ 已恢复会话，继续执行…" if sess.resumed else "▶️ agent 已就绪，开始执行…"
-        )
-        if model:
-            base += f"（模型：{model}）"
+        if sess.attached:
+            # 附着摘要（区别于普通「已就绪」/「已恢复」文案）：说明来源 + 后续回复续接上下文
+            sid = _short_sid(sess.agent.session_id or "")
+            model_tail = f"，模型：{model}" if model else ""
+            base = (
+                f"🔗 已附着外部会话（agent={sess.agent_label}，session={sid}{model_tail}）。\n"
+                "后续回复将继续原上下文；可 `/stop` 结束、`/done` 归档。"
+            )
+        elif sess.resumed:
+            base = "♻️ 已恢复会话，继续执行…"
+            if model:
+                base += f"（模型：{model}）"
+        else:
+            base = "▶️ agent 已就绪，开始执行…"
+            if model:
+                base += f"（模型：{model}）"
         await self._safe_reply(root, base)
         try:
             while True:
@@ -1533,6 +1732,8 @@ class _Daemon:
         if t.model:
             head += f"\n模型: {t.model}"
         lines = [head, f"任务: {t.description}"]
+        if t.origin == "attach":
+            lines.append(f"来源: 附着外部会话（session: {_short_sid(t.session_id)}）")
         if t.issue_url:
             lines.append(f"issue: {t.issue_url}")
         if t.status == "failed" and t.error_message:
@@ -1695,6 +1896,7 @@ class _Daemon:
             "status": t.status,
             "turns": t.turns,
             "has_session": bool(t.session_id),
+            "origin": t.origin,  # 会话来源 spawn/attach
             "active": self._runners.get_for_task(t.task_id) is not None,
             "model": t.model,  # agent 当前模型（copilot 不暴露则为空）
             "issue_url": t.issue_url,  # 关联的 issue（#63）；空 = 未绑定
