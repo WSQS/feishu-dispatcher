@@ -294,6 +294,17 @@ def test_config_example_has_explicit_codex_full_access_profile():
     }
 
 
+def test_config_example_has_pi():
+    config_path = Path(__file__).resolve().parents[1] / "config.example.toml"
+    with config_path.open("rb") as config_file:
+        agents = tomllib.load(config_file)["agents"]
+
+    assert agents["pi"]["command"] == ["pi-acpinator"]
+    env = agents["pi"]["env"]
+    assert "PI_ACPINATOR_PI_BIN" in env
+    assert "PI_ACPINATOR_APPROVAL" in env
+
+
 def test_config_example_has_workbuddy():
     # WorkBuddy（CodeBuddy）简写数组形式：`codebuddy --acp`（原生 ACP）；凭据/provider
     # 配在 ~/.codebuddy/models.json + settings.json，daemon 无需注入 env。
@@ -333,8 +344,7 @@ def test_viewer_section_parses_full_values(tmp_path: Path):
     # 配置含 [viewer] enabled/bind/port → 正确解析成 ViewerConfig（#116）。
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(
-        _BASE
-        + '[viewer]\nenabled = true\nbind = "127.0.0.1"\nport = 8000\n',
+        _BASE + '[viewer]\nenabled = true\nbind = "127.0.0.1"\nport = 8000\n',
         encoding="utf-8",
     )
     cfg = Config.load(cfg_file)
@@ -351,7 +361,7 @@ def test_viewer_absent_means_none(tmp_path: Path):
 def test_viewer_section_defaults_when_fields_omitted(tmp_path: Path):
     # [viewer] 段存在但只写部分字段 → 缺省项用默认值（bind=0.0.0.0 / port=7321）。
     cfg_file = tmp_path / "config.toml"
-    cfg_file.write_text(_BASE + '[viewer]\nenabled = true\n', encoding="utf-8")
+    cfg_file.write_text(_BASE + "[viewer]\nenabled = true\n", encoding="utf-8")
     assert Config.load(cfg_file).viewer == ViewerConfig(enabled=True)
 
 
