@@ -119,6 +119,7 @@ _TASK_FIELDS = (
     "model",
     "error_message",
     "issue_url",
+    "origin",
 )
 
 
@@ -146,6 +147,9 @@ class Task:
     #: 关联的 forge issue URL（派活时锚定的意图/brief，#63）；空 = 未绑定。
     #: 单字段、控制平面拥有；PR 不存这里（经 forge 的 Closes #N 反查）。
     issue_url: str = ""
+    #: 会话来源：spawn = daemon 新建会话（/run、spawn_agent），attach = 附着外部会话
+    #: （/attach，#99）。旧 tasks.json 无此键时缺省为 spawn（向后兼容）。
+    origin: str = "spawn"
 
     @property
     def is_active(self) -> bool:
@@ -227,6 +231,19 @@ class TaskStore:
     def active(self) -> list[Task]:
         return [t for t in self._tasks.values() if t.is_active]
 
+    def by_agent_session(self, agent_label: str, session_id: str) -> Task | None:
+        """按 ``(agent, session_id)`` 组合查已附着的任务（/attach 去重，#99）。
+
+        二者**同时**匹配才算重复：不同 agent 的 session 命名空间互相独立，同名
+        session_id 跨 agent 不冲突。空值（无 agent 或无 session）视为不匹配。
+        """
+        if not agent_label or not session_id:
+            return None
+        for t in self._tasks.values():
+            if t.agent_label == agent_label and t.session_id == session_id:
+                return t
+        return None
+
     # ---- 写 ---- #
 
     def create(
@@ -241,6 +258,7 @@ class TaskStore:
         status: str = "starting",
         issue_url: str = "",
         model: str = "",
+        origin: str = "spawn",
     ) -> Task:
         # 铸号自愈守卫（#81）：不只信持久化的 seq——同时从现有 task id 推出下界，
         # 取两者较大再 +1。即使 seq 因故被回退/污染（多实例踩踏、手工改 tasks.json、
@@ -264,6 +282,7 @@ class TaskStore:
             updated_at=now,
             issue_url=issue_url,
             model=model,
+            origin=origin,
         )
         self._tasks[task.task_id] = task
         self._flush()

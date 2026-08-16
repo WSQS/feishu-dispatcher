@@ -447,3 +447,123 @@ def test_job_store_memory_mode_writes_nothing(tmp_path: Path):
     s = JobStore(None)
     s.create(task_id="t1", command=["x"], cwd="c")
     assert list(tmp_path.iterdir()) == []
+
+
+# ---------------------------------------------------------------------- #
+# Task.origin（spawn/attach）与 (agent, session_id) 查重（#99 前置）
+# ---------------------------------------------------------------------- #
+
+
+def test_task_origin_defaults_to_spawn():
+    s = TaskStore(None)
+    t = make(s, thread="om_1")
+    assert t.origin == "spawn"
+
+
+def test_task_create_with_origin_attach():
+    s = TaskStore(None)
+    t = s.create(
+        project_name="p",
+        agent_label="opencode",
+        description="附着",
+        thread_root_id="om_1",
+        workspace="C:/x",
+        session_id="ext_sid_1",
+        origin="attach",
+    )
+    assert t.origin == "attach"
+
+
+def test_task_origin_persists_and_reloads(tmp_path: Path):
+    p = tmp_path / "tasks.json"
+    s1 = TaskStore(p)
+    make(s1, thread="om_1")
+    s1.create(
+        project_name="p",
+        agent_label="opencode",
+        description="附着",
+        thread_root_id="om_2",
+        workspace="C:/x",
+        session_id="ext_sid_1",
+        origin="attach",
+    )
+    s2 = TaskStore(p)
+    assert s2.by_thread("om_1").origin == "spawn"
+    assert s2.by_thread("om_2").origin == "attach"
+
+
+def test_old_tasks_json_without_origin_reads_spawn(tmp_path: Path):
+    # 旧台账没有 origin 键：读入时缺省补 spawn（向后兼容）。
+    import json
+
+    p = tmp_path / "tasks.json"
+    payload = {
+        "seq": 1,
+        "tasks": {
+            "t1": {
+                "task_id": "t1",
+                "project_name": "demo",
+                "agent_label": "copilot",
+                "description": "旧任务",
+                "status": "suspended",
+                "session_id": "old_sid",
+                "thread_root_id": "om_1",
+                "workspace": "C:/x",
+                "turns": 3,
+                "created_at": 0.0,
+                "updated_at": 0.0,
+                "actions": [],
+                "last_output": "",
+                "model": "",
+                "error_message": "",
+                "issue_url": "",
+            }
+        },
+    }
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    s = TaskStore(p)
+    assert s.get("t1").origin == "spawn"  # 缺省补齐
+
+
+def test_by_agent_session_matches_agent_and_session():
+    s = TaskStore(None)
+    make(s, thread="om_1")
+    s.update("t1", session_id="sid_a", agent_label="copilot")
+    make(s, thread="om_2", project="other")
+    s.update("t2", session_id="sid_b", agent_label="opencode")
+    assert s.by_agent_session("copilot", "sid_a").task_id == "t1"
+    assert s.by_agent_session("opencode", "sid_b").task_id == "t2"
+    assert s.by_agent_session("copilot", "sid_b") is None  # agent 不匹配
+    assert s.by_agent_session("opencode", "sid_a") is None  # session 不匹配
+
+
+def test_by_agent_session_cross_agent_same_session_id_no_conflict():
+    # 跨 agent 同名 session_id 不冲突：不同 backend 的 session 命名空间独立。
+    s = TaskStore(None)
+    s.create(
+        project_name="p",
+        agent_label="copilot",
+        description="a",
+        thread_root_id="om_1",
+        workspace="C:/x",
+        session_id="shared_sid",
+    )
+    s.create(
+        project_name="p",
+        agent_label="opencode",
+        description="b",
+        thread_root_id="om_2",
+        workspace="C:/x",
+        session_id="shared_sid",
+    )
+    assert s.by_agent_session("copilot", "shared_sid").thread_root_id == "om_1"
+    assert s.by_agent_session("opencode", "shared_sid").thread_root_id == "om_2"
+
+
+def test_by_agent_session_empty_keys_never_match():
+    s = TaskStore(None)
+    make(s, thread="om_1")
+    s.update("t1", session_id="sid_a", agent_label="copilot")
+    assert s.by_agent_session("", "sid_a") is None
+    assert s.by_agent_session("copilot", "") is None
+    assert s.by_agent_session("", "") is None
