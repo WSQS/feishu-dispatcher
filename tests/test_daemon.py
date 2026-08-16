@@ -1895,6 +1895,113 @@ async def test_run_still_works_after_attach_feature():
 
 
 # ---------------------------------------------------------------------- #
+# attach_session 调度器工具（与 /attach 共用底层 _attach_task）
+# ---------------------------------------------------------------------- #
+
+
+async def test_sched_attach_session_creates_task_and_resumes_external_session():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    out = await daemon._sched_attach_session(
+        "demo", "ext_sid_1", agent="opencode", description="继续之前的活"
+    )
+    root = "om_newroot_1"
+    await wait_until(lambda: len(created) == 2)  # 探针 + 拉起各一个 agent
+    await wait_until(lambda: any("已附着外部会话" in t for t in bridge.texts(root)))
+
+    t = store.by_thread(root)
+    assert t is not None
+    assert t.origin == "attach"
+    assert t.session_id == "ext_sid_1"
+    assert t.agent_label == "opencode"
+    assert t.project_name == "demo"
+    assert "附着外部会话 opencode/ext_sid_1" in t.description
+    assert "继续之前的活" in t.description
+    # 工具返回给 LLM 的成功摘要带 task_id
+    assert "已附着外部会话 opencode/ext_sid_1 为任务 [t1]" in out
+    # 探针已关；拉起复用 load_session、不跑首轮
+    assert created[0].resume_session_id == "ext_sid_1"
+    assert created[0].closed
+    assert created[1].resume_session_id == "ext_sid_1"
+    assert created[1].prompts == []
+    await daemon._shutdown()
+
+
+async def test_sched_attach_session_uses_default_agent_when_omitted():
+    store = TaskStore(None)
+    daemon, bridge, _ = make_daemon(store=store)
+    out = await daemon._sched_attach_session("demo", "ext_sid_1")
+    root = "om_newroot_1"
+    await wait_until(lambda: store.by_thread(root) is not None)
+    t = store.by_thread(root)
+    assert t.agent_label == "copilot"  # demo 默认 copilot（agent 缺省）
+    assert t.origin == "attach"
+    assert "已附着外部会话 copilot/ext_sid_1" in out
+    await daemon._shutdown()
+
+
+async def test_sched_attach_session_unknown_project_or_agent_errors():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(store=store)
+    out_p = await daemon._sched_attach_session("nope", "ext_sid_1")
+    assert "未知项目" in out_p
+    out_a = await daemon._sched_attach_session("demo", "ext_sid_1", agent="nope")
+    assert "未知 agent" in out_a
+    assert created == []  # 校验失败不起探针
+    assert store.all() == []  # 不落 Task
+
+
+async def test_sched_attach_session_duplicate_rejected():
+    store = TaskStore(None)
+    store.create(
+        project_name="demo",
+        agent_label="opencode",
+        description="附着外部会话 opencode/ext_sid_1",
+        thread_root_id="om_old",
+        workspace="C:/tmp/demo",
+        session_id="ext_sid_1",
+        origin="attach",
+    )
+    daemon, bridge, created = make_daemon(store=store)
+    out = await daemon._sched_attach_session("demo", "ext_sid_1", agent="opencode")
+    assert "已由任务 [t1] 附着" in out
+    assert len(created) == 0  # 去重在探测前，不起探针
+    assert len(store.all()) == 1  # 未新增任务
+
+
+async def test_sched_attach_session_backend_unsupported_returns_error():
+    store = TaskStore(None)
+    daemon, bridge, created = make_daemon(
+        store=store, agent_cls=LoadSessionUnsupportedAgent
+    )
+    out = await daemon._sched_attach_session("demo", "ext_sid_1", agent="opencode")
+    assert "不支持 load_session" in out
+    assert store.all() == []  # 探测失败不落 Task
+    assert len(created) == 1  # 只有探针，无拉起
+    assert created[0].closed
+
+
+async def test_attach_session_and_attach_share_bottom_layer():
+    """attach_session 与 /attach 都走 _attach_task 共用底层（参数解析后同一条路）。"""
+    daemon, bridge, _ = make_daemon()
+    calls: list[tuple] = []
+
+    async def spy(project_name, agent, session_id, description=""):
+        calls.append((project_name, agent, session_id, description))
+        return None, "", "spied"
+
+    daemon._attach_task = spy  # type: ignore[method-assign]
+
+    await daemon._handle_message(root_msg("/attach demo opencode sid1", mid="om_a"))
+    assert calls == [("demo", "opencode", "sid1", "")]
+    calls.clear()
+    await daemon._sched_attach_session(
+        "demo", "sid2", agent="opencode", description="d"
+    )
+    assert calls == [("demo", "opencode", "sid2", "d")]
+
+
+# ---------------------------------------------------------------------- #
 # 项目注册：/project（列出）/ add / remove + register_project 工具
 # ---------------------------------------------------------------------- #
 
