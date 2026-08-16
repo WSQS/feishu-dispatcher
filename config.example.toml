@@ -122,6 +122,23 @@ env = { CODEX_PATH = "codex" }   # 适配器对 CODEX_PATH 走 shell spawn，PAT
 command = ["codex-acp"]
 env = { CODEX_PATH = "codex", INITIAL_AGENT_MODE = "agent-full-access" }
 
+# pi：earendil-works/pi（Node 版 coding agent，本机需 bash，如 Git Bash）。无原生 ACP，
+# 经社区适配器 pi-acpinator（Rust）接入。前置：
+#   `npm install -g --ignore-scripts @earendil-works/pi-coding-agent`（pi 命令）
+#   `cargo install pi-acpinator`（pi-acpinator 命令）
+# 模型凭据：DEEPSEEK_API_KEY（或用 `pi` 交互式 /login 存到 ~/.pi/agent/auth.json）。
+# **Windows 注意**：pi-acpinator 默认 spawn 裸 `pi`，在 Windows 上解析不到 npm 的
+# pi.cmd shim（Rust std spawn 不查 PATHEXT 的 .cmd），必须用 PI_ACPINATOR_PI_BIN
+# 指向它（裸 `pi.cmd` 在 PATH 上即可）。PI_ACPINATOR_APPROVAL="off" 关掉工具权限门
+# （与 daemon 的 request_permission 自动放行一致，P0）。
+[agents.pi]
+command = ["pi-acpinator"]
+
+[agents.pi.env]
+PI_ACPINATOR_PI_BIN = "pi.cmd"
+PI_ACPINATOR_APPROVAL = "off"
+# DEEPSEEK_API_KEY = "sk-..."   # 换成你的 DeepSeek key（或用 `pi` 交互式 /login 存到 ~/.pi/agent/auth.json）
+
 # 在这里预置项目（内置、只读）。也可在群里运行时注册，不用改配置重启：
 #   /project add <名> <agent> <路径>   或对调度器 LLM 说「注册一个项目…」
 # 每个项目用 default_agent 指定由哪个 agent 处理。
