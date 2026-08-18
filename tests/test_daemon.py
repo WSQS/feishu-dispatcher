@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+import feishu_dispatcher.daemon as daemon_module
 from feishu_dispatcher.config import Config, LLMSettings, Project, ViewerConfig
 from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.daemon import _AgentSession, _CurrentRunnerRegistry, _Daemon
@@ -262,13 +263,13 @@ def make_daemon(
         idle_timeout=idle_timeout,
         stream_mode=stream_mode,
     )
+    bridge = FakeBridge()
     daemon = _Daemon(
         cfg,
         store=store or TaskStore(None),
         project_store=project_store or ProjectStore(None),
+        _channel=bridge,
     )
-    bridge = FakeBridge()
-    daemon._channel = bridge  # 绕过 run()，直接注入
     created: list[FakeAgent] = []
 
     def factory(spawn, on_output, on_action=None, *, resume_session_id=None):
@@ -280,6 +281,103 @@ def make_daemon(
 
     daemon._make_agent = factory  # type: ignore[method-assign]
     return daemon, bridge, created
+
+
+@pytest.mark.asyncio
+async def test_run_builds_default_feishu_channel_and_injects_it(monkeypatch, tmp_path):
+    cfg = Config(
+        app_id="app-id",
+        app_secret="app-secret",
+        chat_id="oc-main",
+        feishu_qps=3.5,
+    )
+    constructed: dict[str, object] = {}
+
+    class FakeFeishuChannel(FakeBridge):
+        def __init__(
+            self,
+            *,
+            app_id: str,
+            app_secret: str,
+            main_loop,
+            chat_whitelist: str,
+            qps: float,
+        ) -> None:
+            super().__init__()
+            constructed.update(
+                app_id=app_id,
+                app_secret=app_secret,
+                main_loop=main_loop,
+                chat_whitelist=chat_whitelist,
+                qps=qps,
+            )
+
+    async def fake_daemon_run(self) -> None:
+        constructed["injected"] = self._channel
+
+    monkeypatch.setattr(daemon_module, "FeishuBridge", FakeFeishuChannel)
+    monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
+
+    reboot = await daemon_module.run(
+        cfg,
+        store_path=tmp_path / "sessions.json",
+    )
+
+    assert reboot is False
+    assert constructed["app_id"] == "app-id"
+    assert constructed["app_secret"] == "app-secret"
+    assert constructed["main_loop"] is asyncio.get_running_loop()
+    assert constructed["chat_whitelist"] == "oc-main"
+    assert constructed["qps"] == 3.5
+    assert isinstance(constructed["injected"], FakeFeishuChannel)
+
+
+@pytest.mark.asyncio
+async def test_run_uses_injected_channel_lifecycle(monkeypatch, tmp_path):
+    cfg = Config(app_id="a", app_secret="b", chat_id="oc-main")
+    controls = []
+
+    class FakeControlServer:
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.started = False
+            self.stopped = False
+            controls.append(self)
+
+        def start(self) -> None:
+            self.started = True
+
+        def stop(self) -> None:
+            self.stopped = True
+
+    class LifecycleChannel(FakeBridge):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started = False
+
+        def start(self, on_message) -> None:
+            self.started = True
+            self.on_message = on_message
+            daemon = on_message.__self__
+            assert daemon._stop_event is not None
+            daemon._stop_event.set()
+
+    channel = LifecycleChannel()
+    monkeypatch.setattr(daemon_module, "ControlServer", FakeControlServer)
+
+    reboot = await daemon_module.run(
+        cfg,
+        store_path=tmp_path / "sessions.json",
+        channel=channel,
+    )
+
+    assert reboot is False
+    assert channel.started
+    assert channel.stopped
+    assert isinstance(channel.on_message.__self__, _Daemon)
+    assert channel.on_message.__func__ is _Daemon._handle_message
+    assert len(controls) == 1
+    assert controls[0].started
+    assert controls[0].stopped
 
 
 def root_msg(text: str, mid: str = "om_root1") -> ChannelMessage:
