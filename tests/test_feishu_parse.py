@@ -8,6 +8,8 @@ import time
 
 from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.feishu import FeishuBridge, _RateLimiter
+from feishu_dispatcher.livecard import LiveCard
+from feishu_dispatcher.throttler import StreamThrottler
 
 
 def _event(
@@ -299,7 +301,7 @@ def test_channel_reply_text_selects_plain_or_threaded_reply(monkeypatch):
     ]
 
 
-def test_channel_card_methods_delegate_to_feishu_card_methods(monkeypatch):
+def test_feishu_card_methods_delegate_to_feishu_card_methods(monkeypatch):
     bridge = make_bridge()
     calls: list[tuple[str, str, dict]] = []
 
@@ -322,18 +324,54 @@ def test_channel_card_methods_delegate_to_feishu_card_methods(monkeypatch):
     ]
 
 
+def test_channel_open_output_uses_card_mode():
+    bridge = make_bridge(stream_mode="card")
+
+    output = bridge.open_output("om_root", "demo", footer="project")
+
+    assert isinstance(output, LiveCard)
+
+
+async def test_channel_open_output_uses_text_mode(monkeypatch):
+    bridge = make_bridge(stream_mode="text", throttle_window=60.0)
+    calls: list[tuple[str, str, bool]] = []
+
+    def reply_text(target_id: str, text: str, *, threaded: bool = False) -> str:
+        calls.append((target_id, text, threaded))
+        return "om_text"
+
+    monkeypatch.setattr(bridge, "reply_text", reply_text)
+    output = bridge.open_output("om_root", "demo")
+
+    assert isinstance(output, StreamThrottler)
+    output.feed("hello")
+    await output.flush()
+    await output.aclose()
+
+    assert calls == [("om_root", "hello", True)]
+
+
 # ---------------------------------------------------------------------- #
 # 分片合包
 # ---------------------------------------------------------------------- #
 
 
-def make_bridge() -> FeishuBridge:
+def make_bridge(
+    *, stream_mode: str = "card", throttle_window: float = 0.5
+) -> FeishuBridge:
     async def _noop(_msg):  # pragma: no cover
         pass
 
     loop = asyncio.new_event_loop()
     try:
-        return FeishuBridge(app_id="a", app_secret="b", main_loop=loop, on_event=_noop)
+        return FeishuBridge(
+            app_id="a",
+            app_secret="b",
+            main_loop=loop,
+            on_event=_noop,
+            stream_mode=stream_mode,
+            throttle_window=throttle_window,
+        )
     finally:
         loop.close()
 

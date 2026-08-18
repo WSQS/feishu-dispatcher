@@ -10,6 +10,8 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 
+from .channel import OutputStatus
+
 logger = logging.getLogger(__name__)
 
 Sink = Callable[[str], Awaitable[None]]
@@ -63,8 +65,12 @@ class StreamThrottler:
             await self._task
         await self._drain()
 
-    async def set_status(self, status: str) -> None:  # noqa: ARG002
-        """no-op：text 模式不需要卡片状态，仅为满足 OutputChannel 接口。"""
+    def set_footer(self, footer: str) -> None:  # noqa: ARG002
+        """no-op：追加文本模式没有固定 footer。"""
+        return None
+
+    async def set_status(self, status: OutputStatus) -> None:  # noqa: ARG002
+        """no-op：追加文本模式没有可更新状态。"""
         return None
 
     async def _run(self) -> None:

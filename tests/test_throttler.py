@@ -91,3 +91,14 @@ async def test_empty_feed_never_calls_sink():
     await asyncio.sleep(0.15)
     assert rec.batches == []
     await t.aclose()
+
+
+async def test_footer_and_status_are_noop():
+    rec = Recorder()
+    t = StreamThrottler(rec, window=60)
+
+    t.set_footer("demo · ~3.2k tok")
+    await t.set_status("done")
+    await t.aclose()
+
+    assert rec.batches == []

@@ -38,7 +38,7 @@ from lark_oapi.ws.const import (
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .channel import ChannelMessage, MessageHandler
+from .channel import ChannelMessage, MessageHandler, StreamingOutput
 
 # 延迟 import：event 模型属于 im.v1 namespace（单 ns，安全），但顶部 import
 # 会触发 lark_oapi/__init__；shim 必须先装好。调用方 import 顺序：
@@ -155,6 +155,7 @@ class FeishuBridge:
 
     - :meth:`start_background` 在后台线程启动 WebSocket 长连接
     - :meth:`send_root_message` / :meth:`reply_in_thread` 同步发送（HTTP）
+    - :meth:`open_output` 为 agent 回合创建流式输出呈现
     """
 
     def __init__(
@@ -167,6 +168,8 @@ class FeishuBridge:
         chat_whitelist: str = "",
         domain: str = _FEISHU_DOMAIN,
         qps: float = 5.0,
+        stream_mode: str = "card",
+        throttle_window: float = 0.5,
     ) -> None:
         self._app_id = app_id
         self._app_secret = app_secret
@@ -174,6 +177,8 @@ class FeishuBridge:
         self._on_event = on_event
         self._chat_whitelist = chat_whitelist
         self._domain = domain.rstrip("/")
+        self._stream_mode = stream_mode
+        self._throttle_window = throttle_window
         self._tenant_token: str = ""
         self._tenant_token_expires: float = 0.0
         # R14：共享 Session + 自动重试退避，防止飞书限流时丢消息
@@ -559,6 +564,26 @@ class FeishuBridge:
             },
         )
         return result["data"]["message_id"]
+
+    def open_output(
+        self,
+        target_id: str,
+        title: str,
+        *,
+        footer: str = "",
+    ) -> StreamingOutput:
+        """为一个 agent 回合创建对应的流式输出呈现。"""
+        if self._stream_mode == "card":
+            from .livecard import LiveCard
+
+            return LiveCard(self, target_id, title, footer=footer)
+
+        from .throttler import StreamThrottler
+
+        async def send_piece(piece: str) -> None:
+            await asyncio.to_thread(self.reply_text, target_id, piece, threaded=True)
+
+        return StreamThrottler(send_piece, window=self._throttle_window)
 
     def send_text(self, conversation_id: str, text: str) -> str:
         """向会话发送一条新的文本消息。"""

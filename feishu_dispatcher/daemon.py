@@ -27,7 +27,7 @@ from pathlib import Path
 
 from . import forge
 from .acp_client import AcpAgent, AgentSpawn, OnAction, OnOutput, _resolve_executable
-from .channel import Channel, ChannelMessage
+from .channel import Channel, ChannelMessage, StreamingOutput
 from .config import DEFAULT_CONFIG_PATH, Config, Project
 from .control import ControlServer
 from .feishu import FeishuBridge
@@ -265,6 +265,8 @@ async def run(
             main_loop=asyncio.get_running_loop(),
             chat_whitelist=cfg.chat_id,
             qps=cfg.feishu_qps,
+            stream_mode=cfg.stream_mode,
+            throttle_window=cfg.throttle_window,
         )
     daemon = _Daemon(
         cfg,
@@ -328,8 +330,8 @@ class _AgentSession:
     issue_url: str = ""
     #: agent 实例（先建 session、再建 agent，故允许 None）
     agent: "AcpAgent | None" = None
-    #: 当前回合的输出通道（card 或 text 模式）；回合间为 None
-    current_channel: "object | None" = None
+    #: 当前回合的流式输出呈现；回合间为 None
+    current_output: StreamingOutput | None = None
     #: prompt 队列；None 是关闭哨兵（/stop / /done / mark_done），_BgBatch 是后台完成批次
     queue: "asyncio.Queue[str | _BgBatch | None]" = field(default_factory=asyncio.Queue)
     #: 队尾未消费的后台任务批次（#79）；非 None ⟺ 队尾是可继续合并的 _BgBatch。
@@ -1194,9 +1196,9 @@ class _Daemon:
         async def on_output(text: str) -> None:
             if (
                 self._runners.is_current(sess.task_id, sess)
-                and sess.current_channel is not None
+                and sess.current_output is not None
             ):
-                sess.current_channel.feed(text)
+                sess.current_output.feed(text)
 
         async def on_action(action: dict) -> None:
             # 审计（A）：只有 current runner 能把 tool_call 记进 Task；旧代 runner
@@ -1235,24 +1237,6 @@ class _Daemon:
             self._agent_worker(sess), name=f"agent-{task.task_id}"
         )
         return sess
-
-    def _make_output(self, root: str, title: str, footer: str = ""):
-        """按 cfg.stream_mode 创建输出通道。
-
-        card 模式返回 LiveCard（原地更新卡片，``footer`` 固定显示在卡片最下方，
-        如「模型：X」），text 模式返回 StreamThrottler（每批发新消息，兜底）。
-        """
-        if self.cfg.stream_mode == "card":
-            from .livecard import LiveCard
-
-            return LiveCard(self._channel, root, title, footer=footer)
-        else:
-            from .throttler import StreamThrottler
-
-            return StreamThrottler(
-                sink=lambda piece: self._send_piece(root, piece),
-                window=self.cfg.throttle_window,
-            )
 
     async def _agent_worker(self, sess: _AgentSession) -> None:
         """一个 agent 的完整生命周期：启动 → 串行消费 prompt 队列 → 关闭。"""
@@ -1378,15 +1362,16 @@ class _Daemon:
                     prompt = prompt.render()
                 title = f"{sess.project_name} · {sess.agent_label}"
                 model = getattr(sess.agent, "model", "") or ""
-                # footer 与模型同一行显示项目名（#44）：滚到任意卡片都可辨归属
+                # footer 与模型同一行显示项目名（#44）：在任意输出单元都可辨归属
                 footer = sess.project_name
                 if model:
                     footer += f" · 模型：{model}"
                 issue_tag = _issue_tag(sess.issue_url)  # 绑定了 issue 则标 · #N（#63）
                 if issue_tag:
                     footer += f" · {issue_tag}"
-                channel = self._make_output(root, title, footer=footer)
-                sess.current_channel = channel
+                assert self._channel is not None
+                output = self._channel.open_output(root, title, footer=footer)
+                sess.current_output = output
                 self.store.update(sess.task_id, status="running")
                 logger.info(
                     "任务 %s 开始一轮（%s）: %.80s",
@@ -1397,13 +1382,13 @@ class _Daemon:
                 sess.turn_in_flight = True
                 try:
                     stop_reason = await sess.agent.prompt(prompt)
-                    await channel.flush()
+                    await output.flush()
                     if not self._runners.is_current(sess.task_id, sess):
                         break
                     if stop_reason == "cancelled":
                         # 本轮被 /stop 中途取消：不当作正常完成（不 ✅、不计 turn、
-                        # 不发完成通知）。卡片置停止态；随后循环取到 None 哨兵即终止。
-                        await channel.set_status("stopped")
+                        # 不发完成通知）。输出置停止态；随后循环取到 None 哨兵即终止。
+                        await output.set_status("stopped")
                         if not self._runners.is_current(sess.task_id, sess):
                             break
                         self.store.update(sess.task_id, status="idle")
@@ -1412,9 +1397,9 @@ class _Daemon:
                     # footer 追加本轮 token 用量（#53）：取不到就不显示、不报错。
                     # 只标脏，紧随的 set_status("done") 会把新 footer 一起 emit。
                     tokens = getattr(sess.agent, "last_usage_tokens", None)
-                    if tokens is not None and hasattr(channel, "set_footer"):
-                        channel.set_footer(_with_tokens(footer, tokens))
-                    await channel.set_status("done")
+                    if tokens is not None:
+                        output.set_footer(_with_tokens(footer, tokens))
+                    await output.set_status("done")
                     if not self._runners.is_current(sess.task_id, sess):
                         break
                     # 落 last_output：本轮 agent 的收尾回复（截断），供 get_task/通知摘要
@@ -1454,7 +1439,7 @@ class _Daemon:
                     logger.exception("agent 执行异常")
                     err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
                     try:
-                        await channel.set_status("error")
+                        await output.set_status("error")
                     except Exception:
                         logger.debug("set_status error 失败（忽略）", exc_info=True)
                     if self._runners.is_current(sess.task_id, sess):
@@ -1474,8 +1459,8 @@ class _Daemon:
                     break
                 finally:
                     sess.turn_in_flight = False
-                    await channel.aclose()
-                    sess.current_channel = None
+                    await output.aclose()
+                    sess.current_output = None
         except asyncio.CancelledError:
             logger.debug("agent worker 被取消 root=%s", root)
         finally:
@@ -1487,13 +1472,13 @@ class _Daemon:
         if sess.bg_token:  # 作废该 session 的后台任务 token（#68）
             self._bg_tokens.pop(sess.bg_token, None)
             sess.bg_token = ""
-        channel = sess.current_channel
-        sess.current_channel = None
-        if channel is not None:
+        output = sess.current_output
+        sess.current_output = None
+        if output is not None:
             try:
-                await channel.aclose()
+                await output.aclose()
             except Exception:
-                logger.debug("channel aclose 异常（忽略）", exc_info=True)
+                logger.debug("output aclose 异常（忽略）", exc_info=True)
         agent = sess.agent
         sess.agent = None
         if agent is not None:
@@ -2410,15 +2395,6 @@ class _Daemon:
     # ------------------------------------------------------------------ #
     # 发送辅助
     # ------------------------------------------------------------------ #
-
-    async def _send_piece(self, thread_root: str, piece: str) -> None:
-        """节流器 sink：把一段文本发到话题。HTTP 是阻塞调用，放线程池。"""
-        if not piece:
-            return
-        assert self._channel is not None
-        await asyncio.to_thread(
-            self._channel.reply_text, thread_root, piece, threaded=True
-        )
 
     async def _safe_reply(
         self, message_id: str, text: str, *, in_thread: bool = True
