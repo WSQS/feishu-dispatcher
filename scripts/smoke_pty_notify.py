@@ -120,7 +120,10 @@ async def main() -> int:
         )
 
         _PHASE = "idle-wait"
-        print("=== IDLE-WAIT 40s: watching raw updates of out-of-band turn ===", flush=True)
+        print(
+            "=== IDLE-WAIT 40s: watching raw updates of out-of-band turn ===",
+            flush=True,
+        )
         last_idle_seen = 0
         quiet_since: float | None = None
         for i in range(80):
@@ -141,7 +144,9 @@ async def main() -> int:
     # ---- 分析：原始 update 类型序列 ----
     idle = [(el, k) for (el, ph, k) in _updates if ph == "idle-wait"]
     print("\n" + "=" * 66, flush=True)
-    print("=== RESULT: out-of-band turn raw update sequence (idle-wait) ===", flush=True)
+    print(
+        "=== RESULT: out-of-band turn raw update sequence (idle-wait) ===", flush=True
+    )
     if not idle:
         print("  (none — 带外回合没冒出来)", flush=True)
     else:
@@ -149,8 +154,10 @@ async def main() -> int:
             print(f"  {el:6.2f}s  {k}", flush=True)
         first_el = idle[0][0]
         last_el = idle[-1][0]
-        print(f"\n  首条 {first_el}s → 末条 {last_el}s（跨度 {round(last_el - first_el, 2)}s）",
-              flush=True)
+        print(
+            f"\n  首条 {first_el}s → 末条 {last_el}s（跨度 {round(last_el - first_el, 2)}s）",
+            flush=True,
+        )
         print(f"  末条 update 类型 = {idle[-1][1]}", flush=True)
         # 末条之后我们又等了到 40s；若末条远早于 40s，说明其后确实静默
         types = [k for _, k in idle]
