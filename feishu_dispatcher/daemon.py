@@ -27,9 +27,10 @@ from pathlib import Path
 
 from . import forge
 from .acp_client import AcpAgent, AgentSpawn, OnAction, OnOutput, _resolve_executable
+from .channel import Channel, ChannelMessage
 from .config import DEFAULT_CONFIG_PATH, Config, Project
 from .control import ControlServer
-from .feishu import FeishuBridge, IncomingMessage
+from .feishu import FeishuBridge
 from .llm import build_llm_client
 from .scheduler import (
     LLMClient,
@@ -392,7 +393,7 @@ class _Daemon:
     _sched_memory: SchedulerMemory = field(
         default_factory=lambda: SchedulerMemory(None)
     )
-    _bridge: FeishuBridge | None = None
+    _channel: Channel | None = None
     #: 每个 Task 的单活 current runner；Thread 只经 Task 路由到这里。
     _runners: _CurrentRunnerRegistry = field(default_factory=_CurrentRunnerRegistry)
     _seen_message_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
@@ -422,11 +423,10 @@ class _Daemon:
         if self._llm is None:
             self._llm = build_llm_client(self.cfg.llm)
             self._llm_active = self.cfg.llm_active
-        self._bridge = FeishuBridge(
+        self._channel = FeishuBridge(
             app_id=self.cfg.app_id,
             app_secret=self.cfg.app_secret,
             main_loop=loop,
-            on_event=self._handle_message,
             chat_whitelist=self.cfg.chat_id,
             qps=self.cfg.feishu_qps,
         )
@@ -449,7 +449,7 @@ class _Daemon:
         # 飞书功能照常（决策 Q3=β）。token 未填则自动生成 + 持久化（决策 Q3/Q8）。
         if self.cfg.viewer and self.cfg.viewer.enabled:
             self._viewer = self._start_viewer(loop)
-        self._bridge.start_background()
+        self._channel.start(self._handle_message)
         logger.info(
             "feishu-dispatcher daemon 已启动（调度器 LLM: %s），等待飞书消息…",
             "on" if self._llm else "off",
@@ -459,7 +459,7 @@ class _Daemon:
             await self._notify_main("✅ daemon 已重启完成。")
         try:
             # R13：看门狗——最多等 30s 或直到 _stop_event 被 set（/reboot / 退出）；
-            # 超时则检查 WS 线程是否存活，死了 bridge.restart()。
+            # 超时则检查 WS 线程是否存活，死了 channel.restart()。
             while not self._stop_event.is_set():
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=30.0)
@@ -467,9 +467,9 @@ class _Daemon:
                     pass  # 正常：每 30s 醒来检查一次
                 if self._stop_event.is_set():
                     break
-                if not self._bridge.is_alive():
+                if not self._channel.is_alive():
                     logger.error("飞书 WS 线程已死亡，尝试重启…")
-                    self._bridge.restart()
+                    self._channel.restart()
         except (KeyboardInterrupt, asyncio.CancelledError):
             logger.info("收到退出信号，清理 agent…")
         finally:
@@ -535,10 +535,10 @@ class _Daemon:
             self._seen_message_ids.popitem(last=False)
         return False
 
-    async def _handle_message(self, msg: IncomingMessage) -> None:
+    async def _handle_message(self, msg: ChannelMessage) -> None:
         """所有飞书消息的入口（在主 event loop 上）。"""
-        if self.cfg.chat_id and msg.chat_id != self.cfg.chat_id:
-            logger.debug("忽略非目标群消息 chat_id=%s", msg.chat_id)
+        if self.cfg.chat_id and msg.conversation_id != self.cfg.chat_id:
+            logger.debug("忽略非目标群消息 chat_id=%s", msg.conversation_id)
             return
         # 忽略无发送者的系统消息
         if not msg.sender_id:
@@ -548,9 +548,9 @@ class _Daemon:
             return
         logger.info(
             "收到消息 chat=%s msg=%s thread_root=%s text=%r",
-            msg.chat_id,
+            msg.conversation_id,
             msg.message_id,
-            msg.thread_root_id,
+            msg.thread_id,
             msg.text,
         )
 
@@ -558,7 +558,7 @@ class _Daemon:
         if self.discover:
             logger.info(
                 "[discover] chat_id=%r sender_id=%r — 填入 config.toml 的 chat_id 即可",
-                msg.chat_id,
+                msg.conversation_id,
                 msg.sender_id,
             )
             return
@@ -572,7 +572,7 @@ class _Daemon:
             )
             return
 
-        if msg.thread_root_id:
+        if msg.thread_id:
             await self._forward_to_agent(msg)
             return
 
@@ -709,7 +709,7 @@ class _Daemon:
         )
         return "\n".join(lines)
 
-    async def _handle_project_cmd(self, msg: IncomingMessage, arg: str) -> None:
+    async def _handle_project_cmd(self, msg: ChannelMessage, arg: str) -> None:
         """root：``/project`` 列出、``/project add|remove`` 增删（对话/命令层）。"""
         if not arg:
             await self._reply_user(msg.message_id, self._format_project_list())
@@ -754,7 +754,7 @@ class _Daemon:
     # 调度器 LLM profile：/llm 列出 / 切换（#74，运行时换后端，不持久化）
     # ------------------------------------------------------------------ #
 
-    async def _handle_llm_cmd(self, msg: IncomingMessage, arg: str) -> None:
+    async def _handle_llm_cmd(self, msg: ChannelMessage, arg: str) -> None:
         """root：``/llm`` 列出 LLM profile、``/llm <名>`` 切换激活的（重建 client，下轮生效）。"""
         profiles = self.cfg.llm_profiles
         if not profiles:
@@ -795,7 +795,7 @@ class _Daemon:
     # 模型缓存：/models 列出 / refresh 主动刷新（#65）
     # ------------------------------------------------------------------ #
 
-    async def _handle_models_cmd(self, msg: IncomingMessage, arg: str) -> None:
+    async def _handle_models_cmd(self, msg: ChannelMessage, arg: str) -> None:
         """root：``/models`` 列缓存、``/models refresh [agent]`` 主动刷新。"""
         arg = arg.strip()
         if arg == "refresh" or arg.startswith("refresh "):
@@ -898,7 +898,7 @@ class _Daemon:
             )
         return label, argv, ""
 
-    async def _spawn_for_root(self, msg: IncomingMessage, body: str) -> None:
+    async def _spawn_for_root(self, msg: ChannelMessage, body: str) -> None:
         """解析 ``/run <project> <task> [--agent <name>]``，建 session 并启动 worker。"""
         usage = "格式：`/run <项目名> <任务描述> [--agent <agent>]`"
         parts = body.split(maxsplit=1)
@@ -955,7 +955,7 @@ class _Daemon:
             f"{project_name}…\n任务: {task}",
         )
 
-    async def _attach_for_root(self, msg: IncomingMessage, arg: str) -> None:
+    async def _attach_for_root(self, msg: ChannelMessage, arg: str) -> None:
         """解析 ``/attach <项目> <agent> <session_id> [描述...]`` 并附着外部会话。
 
         参数解析后交给共用底层 :meth:`_attach_task`；按返回结果决定回复目标：
@@ -1043,13 +1043,13 @@ class _Daemon:
             )
         # 新话题（send_root_message 开新话题拿 thread_root_id），header = 固定摘要 + 截断
         # session_id + 可选描述。
-        assert self._bridge is not None
+        assert self._channel is not None
         sid = _short_sid(session_id)
         header = f"🔗 {agent_label} · {project_name}\n附着外部会话: {sid}"
         if description:
             header += f"\n说明: {description}"
         root = await asyncio.to_thread(
-            self._bridge.send_root_message, self.cfg.chat_id, header
+            self._channel.send_text, self.cfg.chat_id, header
         )
         #  ② 终查——send_root_message 是 await，其间别的并发附着/派发可能占走名额；
         # 终查与 create+_launch 之间**无 await**，守住「check→launch 无 await」不变量。
@@ -1216,7 +1216,7 @@ class _Daemon:
         )
         return sess
 
-    def _make_channel(self, root: str, title: str, footer: str = ""):
+    def _make_output(self, root: str, title: str, footer: str = ""):
         """按 cfg.stream_mode 创建输出通道。
 
         card 模式返回 LiveCard（原地更新卡片，``footer`` 固定显示在卡片最下方，
@@ -1225,7 +1225,7 @@ class _Daemon:
         if self.cfg.stream_mode == "card":
             from .livecard import LiveCard
 
-            return LiveCard(self._bridge, root, title, footer=footer)
+            return LiveCard(self._channel, root, title, footer=footer)
         else:
             from .throttler import StreamThrottler
 
@@ -1365,7 +1365,7 @@ class _Daemon:
                 issue_tag = _issue_tag(sess.issue_url)  # 绑定了 issue 则标 · #N（#63）
                 if issue_tag:
                     footer += f" · {issue_tag}"
-                channel = self._make_channel(root, title, footer=footer)
+                channel = self._make_output(root, title, footer=footer)
                 sess.current_channel = channel
                 self.store.update(sess.task_id, status="running")
                 logger.info(
@@ -1493,9 +1493,9 @@ class _Daemon:
         except Exception:
             logger.exception("取消当前轮失败 task=%s", sess.task_id)
 
-    async def _forward_to_agent(self, msg: IncomingMessage) -> None:
+    async def _forward_to_agent(self, msg: ChannelMessage) -> None:
         """话题内回复 → 入队给对应 agent；agent 不在则尝试跨重启恢复。"""
-        thread_root = msg.thread_root_id or ""
+        thread_root = msg.thread_id or ""
         text = msg.text.strip()
         # /help 先于 session 检查：不依赖 agent 是否在线（挂起的话题里也能查用法），
         # 且绝不入队 / 触发恢复。
@@ -1713,7 +1713,7 @@ class _Daemon:
             self.store.update(task_id, status=status)
         return True
 
-    async def _list_agents(self, msg: IncomingMessage) -> None:
+    async def _list_agents(self, msg: ChannelMessage) -> None:
         tasks = self.store.all()
         # failed 虽算 is_active（可恢复），但单拉一段标注，别和在跑的混
         paused = [t for t in tasks if t.status == "failed"]
@@ -1749,7 +1749,7 @@ class _Daemon:
             msg.message_id, "\n\n".join(parts) if parts else "当前无任务。"
         )
 
-    async def _show_task(self, msg: IncomingMessage, task_id: str) -> None:
+    async def _show_task(self, msg: ChannelMessage, task_id: str) -> None:
         """`/task <id>`：任务详情 + 最近动作日志（审计 A 的人读入口，无需 LLM）。"""
         t = self.store.get(task_id)
         if t is None:
@@ -1784,7 +1784,7 @@ class _Daemon:
             lines.append("（暂无动作记录）")
         await self._reply_user(msg.message_id, "\n".join(lines))
 
-    async def _reboot(self, msg: IncomingMessage) -> None:
+    async def _reboot(self, msg: ChannelMessage) -> None:
         """`/reboot`：优雅关停后由 cli.py re-exec 重启整个 daemon 进程。
 
         先发回执再置位（之后 WS 会断）；活跃任务由 `_shutdown` 标 suspended、
@@ -1801,7 +1801,7 @@ class _Daemon:
     # P2：调度器 LLM（自然语言派发）
     # ------------------------------------------------------------------ #
 
-    async def _dispatch_nl(self, msg: IncomingMessage, text: str) -> None:
+    async def _dispatch_nl(self, msg: ChannelMessage, text: str) -> None:
         """自然语言 → 调度器 LLM 理解并调用工具派发（P2）。"""
         assert self._llm is not None
         tools = build_scheduler_tools(
@@ -2052,13 +2052,13 @@ class _Daemon:
             )
         if self._runners.count() >= self.cfg.max_agents:
             return f"已达并发上限 {self.cfg.max_agents}，请先 `/stop` 一个再派发。"
-        assert self._bridge is not None
+        assert self._channel is not None
         # 每个派发新建一个话题根消息，agent 输出流进该话题
         header = f"🚀 {agent_label} · {project_name}\n任务: {task}"
         if issue_url:
             header += f"\nissue: {issue_url}"
         root = await asyncio.to_thread(
-            self._bridge.send_root_message, self.cfg.chat_id, header
+            self._channel.send_text, self.cfg.chat_id, header
         )
         new_task = self.store.create(
             project_name=project_name,
@@ -2395,8 +2395,10 @@ class _Daemon:
         """节流器 sink：把一段文本发到话题。HTTP 是阻塞调用，放线程池。"""
         if not piece:
             return
-        assert self._bridge is not None
-        await asyncio.to_thread(self._bridge.reply_in_thread, thread_root, piece)
+        assert self._channel is not None
+        await asyncio.to_thread(
+            self._channel.reply_text, thread_root, piece, threaded=True
+        )
 
     async def _safe_reply(
         self, message_id: str, text: str, *, in_thread: bool = True
@@ -2406,10 +2408,14 @@ class _Daemon:
         ``in_thread=True``（默认）用于 agent 话题内的输出/状态；``in_thread=False``
         用于对用户对话/命令的普通回复——**不创建话题**（只有派发 agent 才建话题）。
         """
-        assert self._bridge is not None
-        fn = self._bridge.reply_in_thread if in_thread else self._bridge.reply
+        assert self._channel is not None
         try:
-            await asyncio.to_thread(fn, message_id, text)
+            await asyncio.to_thread(
+                self._channel.reply_text,
+                message_id,
+                text,
+                threaded=in_thread,
+            )
         except Exception:
             logger.exception("飞书发送失败 msg=%s", message_id)
 
@@ -2419,12 +2425,10 @@ class _Daemon:
 
     async def _notify_main(self, text: str) -> None:
         """向控制台主线推一条独立通知（不建话题）——agent 完成/出错/挂起时用。"""
-        if not self.cfg.chat_id or self._bridge is None:
+        if not self.cfg.chat_id or self._channel is None:
             return
         try:
-            await asyncio.to_thread(
-                self._bridge.send_root_message, self.cfg.chat_id, text
-            )
+            await asyncio.to_thread(self._channel.send_text, self.cfg.chat_id, text)
         except Exception:
             logger.exception("主线通知发送失败")
 
@@ -2445,8 +2449,8 @@ class _Daemon:
                 )
             except Exception:
                 logger.warning("控制面关闭失败，忽略", exc_info=True)
-        if self._bridge is not None:
-            self._bridge.stop()
+        if self._channel is not None:
+            self._channel.stop()
         # 把仍活跃的任务标记为 suspended，让重启后台账状态准确（且可 load_session 恢复）
         for sess in self._runners.values():
             task = self.store.get(sess.task_id)

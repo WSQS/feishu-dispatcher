@@ -22,8 +22,7 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Callable
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -38,6 +37,8 @@ from lark_oapi.ws.const import (
 )
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from .channel import ChannelMessage, MessageHandler
 
 # 延迟 import：event 模型属于 im.v1 namespace（单 ns，安全），但顶部 import
 # 会触发 lark_oapi/__init__；shim 必须先装好。调用方 import 顺序：
@@ -149,19 +150,6 @@ class _RateLimiter:
                 self._tokens -= 1.0
 
 
-@dataclass(frozen=True)
-class IncomingMessage:
-    """从飞书收到的、已规整的消息。"""
-
-    chat_id: str
-    message_id: str
-    #: 话题根 message_id；根消息本身时为 None。路由话题回复用它。
-    thread_root_id: str | None
-    text: str
-    chat_type: str
-    sender_id: str
-
-
 class FeishuBridge:
     """飞书双向通信封装。
 
@@ -174,7 +162,7 @@ class FeishuBridge:
         app_id: str,
         app_secret: str,
         main_loop: asyncio.AbstractEventLoop,
-        on_event: Callable[[IncomingMessage], Awaitable[None]],
+        on_event: MessageHandler | None = None,
         *,
         chat_whitelist: str = "",
         domain: str = _FEISHU_DOMAIN,
@@ -205,6 +193,11 @@ class FeishuBridge:
     # ------------------------------------------------------------------ #
     # 启动
     # ------------------------------------------------------------------ #
+
+    def start(self, on_message: MessageHandler) -> None:
+        """注册消息处理器并启动 WebSocket 长连接。"""
+        self._on_event = on_message
+        self.start_background()
 
     @staticmethod
     def _build_session() -> requests.Session:
@@ -437,15 +430,18 @@ class FeishuBridge:
         msg = self._parse_event_message(event)
         if msg is None:
             return
-        if self._chat_whitelist and msg.chat_id != self._chat_whitelist:
-            logger.debug("忽略非白名单群消息 chat_id=%s", msg.chat_id)
+        if self._chat_whitelist and msg.conversation_id != self._chat_whitelist:
+            logger.debug("忽略非白名单群消息 chat_id=%s", msg.conversation_id)
+            return
+        if self._on_event is None:
+            logger.warning("飞书消息处理器未注册，丢弃 message_id=%s", msg.message_id)
             return
         # 线程安全地交回主 loop
         fut = asyncio.run_coroutine_threadsafe(self._on_event(msg), self._main_loop)
         fut.add_done_callback(_log_future_exception)
 
     @staticmethod
-    def _parse_event_message(event: dict) -> IncomingMessage | None:
+    def _parse_event_message(event: dict) -> ChannelMessage | None:
         msg = event.get("message") or {}
         sender = event.get("sender") or {}
         message_id = msg.get("message_id", "")
@@ -503,12 +499,11 @@ class FeishuBridge:
             or sender_id_obj.get("union_id")
             or ""
         )
-        return IncomingMessage(
-            chat_id=msg.get("chat_id", ""),
+        return ChannelMessage(
+            conversation_id=msg.get("chat_id", ""),
             message_id=message_id,
-            thread_root_id=thread_root,
+            thread_id=thread_root,
             text=text,
-            chat_type=chat_type,
             sender_id=sender_id,
         )
 
@@ -565,6 +560,10 @@ class FeishuBridge:
         )
         return result["data"]["message_id"]
 
+    def send_text(self, conversation_id: str, text: str) -> str:
+        """向会话发送一条新的文本消息。"""
+        return self.send_root_message(conversation_id, text)
+
     def reply_in_thread(self, root_message_id: str, text: str) -> str:
         """在话题（root_message_id）内追加回复，返回 message_id。"""
         result = self._im_post(
@@ -593,6 +592,18 @@ class FeishuBridge:
         )
         return result["data"]["message_id"]
 
+    def reply_text(
+        self,
+        target_id: str,
+        text: str,
+        *,
+        threaded: bool = False,
+    ) -> str:
+        """回复文本，按 threaded 选择普通回复或话题回复。"""
+        if threaded:
+            return self.reply_in_thread(target_id, text)
+        return self.reply(target_id, text)
+
     def reply_card(self, root_message_id: str, card: dict) -> str:
         """在话题内发一张 interactive 卡片，返回新消息 message_id。"""
         result = self._im_post(
@@ -605,12 +616,20 @@ class FeishuBridge:
         )
         return result["data"]["message_id"]
 
+    def send_card(self, thread_id: str, card: dict) -> str:
+        """向话题发送一张结构化卡片。"""
+        return self.reply_card(thread_id, card)
+
     def patch_card(self, message_id: str, card: dict) -> None:
         """原地更新一张已发送的卡片。"""
         self._im_patch(
             f"/open-apis/im/v1/messages/{message_id}",
             {"content": json.dumps(card, ensure_ascii=False)},
         )
+
+    def update_card(self, message_id: str, card: dict) -> None:
+        """更新一张已发送的结构化卡片。"""
+        self.patch_card(message_id, card)
 
     def _im_patch(self, path: str, body: dict) -> dict:
         """PATCH 飞书 REST API（卡片原地更新）。照抄 _im_post 的 token/错误处理模式。"""

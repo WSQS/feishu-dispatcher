@@ -6,7 +6,8 @@ import asyncio
 import json
 import time
 
-from feishu_dispatcher.feishu import FeishuBridge, IncomingMessage, _RateLimiter
+from feishu_dispatcher.channel import ChannelMessage
+from feishu_dispatcher.feishu import FeishuBridge, _RateLimiter
 
 
 def _event(
@@ -36,12 +37,11 @@ def test_parse_root_message_has_no_thread_root():
     msg = FeishuBridge._parse_event_message(
         _event(message_id="om_root", root_id=None, content={"text": "hello"})
     )
-    assert msg == IncomingMessage(
-        chat_id="oc_chat1",
+    assert msg == ChannelMessage(
+        conversation_id="oc_chat1",
         message_id="om_root",
-        thread_root_id=None,
+        thread_id=None,
         text="hello",
-        chat_type="group",
         sender_id="ou_test",
     )
 
@@ -54,7 +54,7 @@ def test_parse_thread_reply_thread_root_is_root_id():
             content={"text": "agent plz do X"},
         )
     )
-    assert msg.thread_root_id == "om_root"
+    assert msg.thread_id == "om_root"
     assert msg.message_id == "om_reply"
 
 
@@ -62,7 +62,7 @@ def test_parse_message_where_root_id_equals_message_id_is_root():
     msg = FeishuBridge._parse_event_message(
         _event(message_id="om_root", root_id="om_root", content={"text": "x"})
     )
-    assert msg.thread_root_id is None
+    assert msg.thread_id is None
 
 
 def test_parse_non_text_message_returns_none_and_logs(caplog):
@@ -124,7 +124,7 @@ def test_parse_post_message_extracts_text():
     )
     assert msg is not None
     assert msg.text == "帮我改一下 这个文件\n加日志"  # 段落间换行、run 文本拼接
-    assert msg.thread_root_id == "om_root"
+    assert msg.thread_id == "om_root"
 
 
 def test_parse_post_direct_body_received_shape():
@@ -214,6 +214,112 @@ def test_rate_limiter_disabled_when_zero():
 def test_bridge_has_limiter_wired():
     bridge = make_bridge()
     assert bridge._limiter._rate == 5.0  # 默认 qps
+
+
+# ---------------------------------------------------------------------- #
+# Channel 接口映射
+# ---------------------------------------------------------------------- #
+
+
+def test_channel_start_registers_handler_before_starting(monkeypatch):
+    bridge = make_bridge()
+
+    async def handler(_msg):
+        pass
+
+    started: list[bool] = []
+
+    def start_background() -> None:
+        assert bridge._on_event is handler
+        started.append(True)
+
+    monkeypatch.setattr(bridge, "start_background", start_background)
+    bridge.start(handler)
+
+    assert started == [True]
+
+
+def test_channel_stop_cancels_websocket_task():
+    bridge = make_bridge()
+
+    class FakeTask:
+        cancelled = False
+
+        def cancel(self) -> None:
+            self.cancelled = True
+
+    class FakeLoop:
+        def call_soon_threadsafe(self, callback) -> None:
+            callback()
+
+    task = FakeTask()
+    bridge._ws_loop = FakeLoop()
+    bridge._ws_task = task
+
+    bridge.stop()
+
+    assert bridge._stopping.is_set()
+    assert task.cancelled
+
+
+def test_channel_send_text_delegates_to_root_message(monkeypatch):
+    bridge = make_bridge()
+    calls: list[tuple[str, str]] = []
+
+    def send_root_message(conversation_id: str, text: str) -> str:
+        calls.append((conversation_id, text))
+        return "om_root"
+
+    monkeypatch.setattr(bridge, "send_root_message", send_root_message)
+
+    assert bridge.send_text("oc_chat", "hello") == "om_root"
+    assert calls == [("oc_chat", "hello")]
+
+
+def test_channel_reply_text_selects_plain_or_threaded_reply(monkeypatch):
+    bridge = make_bridge()
+    calls: list[tuple[str, str, str]] = []
+
+    def reply(target_id: str, text: str) -> str:
+        calls.append(("plain", target_id, text))
+        return "om_plain"
+
+    def reply_in_thread(target_id: str, text: str) -> str:
+        calls.append(("threaded", target_id, text))
+        return "om_threaded"
+
+    monkeypatch.setattr(bridge, "reply", reply)
+    monkeypatch.setattr(bridge, "reply_in_thread", reply_in_thread)
+
+    assert bridge.reply_text("om_message", "plain") == "om_plain"
+    assert bridge.reply_text("om_root", "threaded", threaded=True) == "om_threaded"
+    assert calls == [
+        ("plain", "om_message", "plain"),
+        ("threaded", "om_root", "threaded"),
+    ]
+
+
+def test_channel_card_methods_delegate_to_feishu_card_methods(monkeypatch):
+    bridge = make_bridge()
+    calls: list[tuple[str, str, dict]] = []
+
+    def reply_card(thread_id: str, card: dict) -> str:
+        calls.append(("send", thread_id, card))
+        return "om_card"
+
+    def patch_card(message_id: str, card: dict) -> None:
+        calls.append(("update", message_id, card))
+
+    monkeypatch.setattr(bridge, "reply_card", reply_card)
+    monkeypatch.setattr(bridge, "patch_card", patch_card)
+    card = {"header": {"title": "status"}}
+
+    assert bridge.send_card("om_root", card) == "om_card"
+    bridge.update_card("om_card", card)
+    assert calls == [
+        ("send", "om_root", card),
+        ("update", "om_card", card),
+    ]
 
 
 # ---------------------------------------------------------------------- #
