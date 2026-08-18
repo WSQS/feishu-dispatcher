@@ -47,6 +47,10 @@ class Channel(Protocol):
 
     def restart(self) -> None: ...
 
+    def create_thread(self, conversation_id: str, initial_text: str) -> str:
+        """在指定会话中创建交互线程并返回线程标识。"""
+        ...
+
     def send_text(self, conversation_id: str, text: str) -> str: ...
 
     def reply_text(

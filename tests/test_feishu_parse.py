@@ -278,6 +278,20 @@ def test_channel_send_text_delegates_to_root_message(monkeypatch):
     assert calls == [("oc_chat", "hello")]
 
 
+def test_channel_create_thread_delegates_to_root_message(monkeypatch):
+    bridge = make_bridge()
+    calls: list[tuple[str, str]] = []
+
+    def send_root_message(conversation_id: str, initial_text: str) -> str:
+        calls.append((conversation_id, initial_text))
+        return "om_root"
+
+    monkeypatch.setattr(bridge, "send_root_message", send_root_message)
+
+    assert bridge.create_thread("oc_chat", "hello") == "om_root"
+    assert calls == [("oc_chat", "hello")]
+
+
 def test_channel_reply_text_selects_plain_or_threaded_reply(monkeypatch):
     bridge = make_bridge()
     calls: list[tuple[str, str, str]] = []

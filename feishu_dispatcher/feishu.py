@@ -154,7 +154,7 @@ class FeishuBridge:
     """飞书双向通信封装。
 
     - :meth:`start_background` 在后台线程启动 WebSocket 长连接
-    - :meth:`send_root_message` / :meth:`reply_in_thread` 同步发送（HTTP）
+    - :meth:`create_thread` / :meth:`reply_in_thread` 同步操作话题（HTTP）
     - :meth:`open_output` 为 agent 回合创建流式输出呈现
     """
 
@@ -584,6 +584,10 @@ class FeishuBridge:
             await asyncio.to_thread(self.reply_text, target_id, piece, threaded=True)
 
         return StreamThrottler(send_piece, window=self._throttle_window)
+
+    def create_thread(self, conversation_id: str, initial_text: str) -> str:
+        """在会话中发送根消息创建话题，返回根 message_id。"""
+        return self.send_root_message(conversation_id, initial_text)
 
     def send_text(self, conversation_id: str, text: str) -> str:
         """向会话发送一条新的文本消息。"""
