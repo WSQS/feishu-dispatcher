@@ -997,7 +997,11 @@ class _Daemon:
             await self._reply_user(msg.message_id, usage)
             return
         task, root, message = await self._attach_task(
-            project_name, agent_in, session_id, user_desc
+            project_name,
+            agent_in,
+            session_id,
+            user_desc,
+            conversation_id=msg.conversation_id,
         )
         if task is not None:
             return  # 成功：新话题的附着摘要由 worker 发
@@ -1012,6 +1016,8 @@ class _Daemon:
         agent: str,
         session_id: str,
         description: str = "",
+        *,
+        conversation_id: str,
     ) -> tuple["Task | None", str, str]:
         """附着外部会话为新 Task 的共用底层（``/attach`` 与 ``attach_session`` 工具都调它）。
 
@@ -1063,7 +1069,7 @@ class _Daemon:
                 "",
                 f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，请先 `/stop` 一个。",
             )
-        # 新话题（send_root_message 开新话题拿 thread_root_id），header = 固定摘要 + 截断
+        # 新话题（Channel.create_thread 开新话题拿 thread_root_id），header = 固定摘要 + 截断
         # session_id + 可选描述。
         assert self._channel is not None
         sid = _short_sid(session_id)
@@ -1071,9 +1077,9 @@ class _Daemon:
         if description:
             header += f"\n说明: {description}"
         root = await asyncio.to_thread(
-            self._channel.send_text, self.cfg.chat_id, header
+            self._channel.create_thread, conversation_id, header
         )
-        #  ② 终查——send_root_message 是 await，其间别的并发附着/派发可能占走名额；
+        #  ② 终查——create_thread 是 await，其间别的并发附着/派发可能占走名额；
         # 终查与 create+_launch 之间**无 await**，守住「check→launch 无 await」不变量。
         # 终查超限属罕见竞态：话题已建，就地提示并放弃，不落 Task。
         if self._runners.count() >= self.cfg.max_agents:
@@ -2014,7 +2020,11 @@ class _Daemon:
         仅新建；重复 (agent, session_id) 由底层 :meth:`_attach_task` 去重拒绝。
         """
         _task, _root, message = await self._attach_task(
-            project_name, agent, session_id, description
+            project_name,
+            agent,
+            session_id,
+            description,
+            conversation_id=self.cfg.chat_id,
         )
         return message
 
@@ -2063,7 +2073,7 @@ class _Daemon:
         if issue_url:
             header += f"\nissue: {issue_url}"
         root = await asyncio.to_thread(
-            self._channel.send_text, self.cfg.chat_id, header
+            self._channel.create_thread, self.cfg.chat_id, header
         )
         new_task = self.store.create(
             project_name=project_name,

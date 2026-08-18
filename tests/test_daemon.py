@@ -38,6 +38,7 @@ class FakeBridge:
         self.patch_card_errors: int = 0
 
         self.roots: list[tuple[str, str]] = []
+        self.created_threads: list[tuple[str, str]] = []
         self.plain: list[tuple[str, str]] = []  # reply_in_thread=False（不建话题）
 
     def start(self, on_message) -> None:
@@ -60,6 +61,10 @@ class FakeBridge:
 
     def send_text(self, conversation_id: str, text: str) -> str:
         return self.send_root_message(conversation_id, text)
+
+    def create_thread(self, conversation_id: str, initial_text: str) -> str:
+        self.created_threads.append((conversation_id, initial_text))
+        return self.send_root_message(conversation_id, initial_text)
 
     def reply_text(self, target_id: str, text: str, *, threaded: bool = False) -> str:
         if threaded:
@@ -406,9 +411,11 @@ async def test_run_uses_injected_channel_lifecycle(monkeypatch, tmp_path):
     assert controls[0].stopped
 
 
-def root_msg(text: str, mid: str = "om_root1") -> ChannelMessage:
+def root_msg(
+    text: str, mid: str = "om_root1", conversation_id: str = "oc_1"
+) -> ChannelMessage:
     return ChannelMessage(
-        conversation_id="oc_1",
+        conversation_id=conversation_id,
         message_id=mid,
         thread_id=None,
         text=text,
@@ -537,6 +544,10 @@ async def test_run_uses_text_only_channel_output_lifecycle():
 
         def restart(self) -> None:
             self.stopped = False
+
+        def create_thread(self, conversation_id: str, initial_text: str) -> str:
+            self.replies.append((conversation_id, initial_text, False))
+            return f"om_root_{len(self.replies)}"
 
         def send_text(self, conversation_id: str, text: str) -> str:
             self.replies.append((conversation_id, text, False))
@@ -1308,6 +1319,7 @@ async def test_nl_dispatch_spawns_agent_via_llm():
     await daemon._handle_message(root_msg("帮 demo 加个 dark mode", mid="om_nl"))
     await wait_until(lambda: created and created[0].prompts == ["加 dark mode"])
     assert bridge.roots  # agent 有自己的话题根消息
+    assert bridge.created_threads  # 调度器派发必须创建独立话题
     # LLM 对用户的回复是**普通回复、不建话题**（bug 修复：只有派 agent 才建话题）
     assert any(m == "om_nl" and "已给 demo 派发" in t for m, t in bridge.plain)
     # 用户的对话消息 om_nl 不应成为任何 agent 话题的根
@@ -1367,6 +1379,7 @@ async def test_agent_completion_notifies_main_line():
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: any("🔔" in t for _, t in bridge.roots))
     assert any("demo 完成" in t for _, t in bridge.roots)
+    assert bridge.created_threads == []  # /run 使用已有根消息，完成提示走普通文本
     await daemon._shutdown()
 
 
@@ -1967,7 +1980,7 @@ async def test_attach_creates_task_and_resumes_external_session():
     await daemon._handle_message(
         root_msg("/attach demo opencode ext_sid_1 继续之前的活", mid="om_att")
     )
-    # 新话题经 send_root_message 开（root != /attach 消息 id）
+    # 新话题经 create_thread 开（root != /attach 消息 id）
     root = "om_newroot_1"
     await wait_until(lambda: store.by_thread(root) is not None)
     await wait_until(lambda: len(created) == 2)  # 探针 + 拉起各一个 agent
@@ -1989,6 +2002,7 @@ async def test_attach_creates_task_and_resumes_external_session():
     assert not created[1].closed
     # 新话题 header 含固定摘要 + 截断 session_id + 可选描述
     assert bridge.roots and "附着外部会话" in bridge.roots[0][1]
+    assert bridge.created_threads == bridge.roots[:1]
     assert "ext_sid_1" in bridge.roots[0][1]
     await daemon._shutdown()
 
@@ -2052,7 +2066,7 @@ async def test_attach_unknown_project_or_agent_errors_no_probe():
 
 
 async def test_attach_respects_max_agents_replies_to_original_no_orphan_thread():
-    # 已达上限时：回原消息、不建新话题（send_root_message 不被调用）、不落 Task。
+    # 已达上限时：回原消息、不建新话题（create_thread 不被调用）、不落 Task。
     store = TaskStore(None)
     daemon, bridge, created = make_daemon_with_limit(max_agents=1, store=store)
     await daemon._handle_message(root_msg("/run demo task1", mid="om_r1"))
@@ -2217,19 +2231,26 @@ async def test_attach_session_and_attach_share_bottom_layer():
     daemon, bridge, _ = make_daemon()
     calls: list[tuple] = []
 
-    async def spy(project_name, agent, session_id, description=""):
-        calls.append((project_name, agent, session_id, description))
+    async def spy(project_name, agent, session_id, description="", *, conversation_id):
+        calls.append((project_name, agent, session_id, description, conversation_id))
         return None, "", "spied"
 
     daemon._attach_task = spy  # type: ignore[method-assign]
 
-    await daemon._handle_message(root_msg("/attach demo opencode sid1", mid="om_a"))
-    assert calls == [("demo", "opencode", "sid1", "")]
+    await daemon._attach_for_root(
+        root_msg(
+            "/attach demo opencode sid1",
+            mid="om_a",
+            conversation_id="oc_source",
+        ),
+        "demo opencode sid1",
+    )
+    assert calls == [("demo", "opencode", "sid1", "", "oc_source")]
     calls.clear()
     await daemon._sched_attach_session(
         "demo", "sid2", agent="opencode", description="d"
     )
-    assert calls == [("demo", "opencode", "sid2", "d")]
+    assert calls == [("demo", "opencode", "sid2", "d", "oc_1")]
 
 
 # ---------------------------------------------------------------------- #
