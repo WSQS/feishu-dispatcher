@@ -41,8 +41,16 @@ from .scheduler import (
 from .store import Job, JobStore, ModelStore, ProjectStore, Task, TaskStore
 from ._scan_executor import ScanExecutor
 from ._viewer_token import ensure_token
-from .viewer import ViewerServer, health as viewer_health, list_projects as viewer_list_projects
-from .viewer import file as viewer_file, tree as viewer_tree, tree_children as viewer_tree_children
+from .viewer import (
+    ViewerServer,
+    health as viewer_health,
+    list_projects as viewer_list_projects,
+)
+from .viewer import (
+    file as viewer_file,
+    tree as viewer_tree,
+    tree_children as viewer_tree_children,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -485,7 +493,9 @@ class _Daemon:
         """
         assert self.cfg.viewer is not None
         v = self.cfg.viewer
-        token_path = self._viewer_token_path or DEFAULT_CONFIG_PATH.parent / "viewer.token"
+        token_path = (
+            self._viewer_token_path or DEFAULT_CONFIG_PATH.parent / "viewer.token"
+        )
         token = ensure_token(token_path)
         logger.info(
             "移动端查看器 token（已存 viewer.token，重启不变；填进手机 App）: %s", token

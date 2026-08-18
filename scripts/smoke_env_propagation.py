@@ -16,7 +16,9 @@ import sys
 
 from feishu_dispatcher.acp_client import AcpAgent, AgentSpawn
 
-WORKDIR = r"C:\Users\wsqsy\AppData\Local\Temp\pty-smoke"  # 有现成 opencode.json（flash 模型）
+WORKDIR = (
+    r"C:\Users\wsqsy\AppData\Local\Temp\pty-smoke"  # 有现成 opencode.json（flash 模型）
+)
 MARKER = "t_probe_9F3X"
 
 logging.basicConfig(
@@ -63,7 +65,10 @@ async def main() -> int:
     joined = "".join(outputs)
     hit = MARKER in joined
     print("\n" + "=" * 60, flush=True)
-    print(f"=== env 透传到 agent 的 shell 命令? {'YES ✅' if hit else 'NO ❌'} ===", flush=True)
+    print(
+        f"=== env 透传到 agent 的 shell 命令? {'YES ✅' if hit else 'NO ❌'} ===",
+        flush=True,
+    )
     print(f"    (marker {MARKER!r} {'出现' if hit else '未出现'}在输出里)", flush=True)
     print("=" * 60, flush=True)
     return 0

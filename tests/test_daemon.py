@@ -2127,9 +2127,7 @@ async def test_project_register_rejects_middle_typo_with_siblings(tmp_path):
 async def test_project_register_rejects_completely_missing_root():
     # 完全不存在的盘符/根（祖先也不可达）→ 不抛异常，给出可读报错
     daemon, _, _ = make_daemon()
-    ok, msg = daemon._register_project(
-        "p", "copilot", "Z:/no/such/drive_xyz/deep"
-    )
+    ok, msg = daemon._register_project("p", "copilot", "Z:/no/such/drive_xyz/deep")
     assert ok is False
     assert "路径不存在" in msg
     assert daemon.project_store.get("p") is None
@@ -2995,7 +2993,9 @@ def _health_ok(base_url: str, token: str) -> bool:
 
 async def test_start_viewer_launches_server_and_persists_token(tmp_path: Path):
     # enabled=true → 返回 ViewerServer、真绑端口、/api/health 通、token 落 _viewer_token_path。
-    daemon = _viewer_daemon(tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0))
+    daemon = _viewer_daemon(
+        tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0)
+    )
     loop = asyncio.get_event_loop()
     vs = daemon._start_viewer(loop)
     assert vs is not None
@@ -3031,14 +3031,18 @@ async def test_start_viewer_port_in_use_returns_none(tmp_path: Path, caplog):
 
 async def test_start_viewer_token_idempotent_across_calls(tmp_path: Path):
     # 两次 _start_viewer（同 token path）→ 同一个 token（ensure_token 幂等，不重新生成）。
-    daemon = _viewer_daemon(tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0))
+    daemon = _viewer_daemon(
+        tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0)
+    )
     loop = asyncio.get_event_loop()
     vs1 = daemon._start_viewer(loop)
     assert vs1 is not None
     token1 = daemon._viewer_token_path.read_text(encoding="utf-8").strip()
     vs1.stop()
     # 第二次（新端口，避免 TIME_WAIT）：重新构造 daemon 复用同一 token 文件
-    daemon2 = _viewer_daemon(tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0))
+    daemon2 = _viewer_daemon(
+        tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0)
+    )
     daemon2._viewer_token_path = daemon._viewer_token_path
     vs2 = daemon2._start_viewer(loop)
     assert vs2 is not None

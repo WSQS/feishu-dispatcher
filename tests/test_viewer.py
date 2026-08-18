@@ -62,7 +62,9 @@ def _children_server(ws, *, scan_executor=None) -> tuple[ViewerServer, ScanExecu
 async def test_health_returns_version():
     vs = await _make_server()
     try:
-        status, payload = await asyncio.to_thread(_get, vs.base_url + "/api/health", "tok-view")
+        status, payload = await asyncio.to_thread(
+            _get, vs.base_url + "/api/health", "tok-view"
+        )
         assert status == 200
         assert payload == {"ok": True, "version": __version__}
     finally:
@@ -83,7 +85,9 @@ async def test_missing_or_invalid_token_rejected():
 async def test_unknown_route_404():
     vs = await _make_server()
     try:
-        status, payload = await asyncio.to_thread(_get, vs.base_url + "/api/missing", "tok-view")
+        status, payload = await asyncio.to_thread(
+            _get, vs.base_url + "/api/missing", "tok-view"
+        )
         assert status == 404
     finally:
         vs.stop()
@@ -95,7 +99,9 @@ async def test_handler_exception_becomes_500():
 
     vs = await _make_server(routes={("GET", "/api/x"): boom})
     try:
-        status, payload = await asyncio.to_thread(_get, vs.base_url + "/api/x", "tok-view")
+        status, payload = await asyncio.to_thread(
+            _get, vs.base_url + "/api/x", "tok-view"
+        )
         assert status == 500
         assert "kaboom" in payload.get("error", "")
     finally:
@@ -406,7 +412,9 @@ async def test_tree_children_not_found_404():
     vs.start()
     try:
         status, payload = await asyncio.to_thread(
-            _get, vs.base_url + "/api/projects/demo/tree/children?path=no-such", "tok-view"
+            _get,
+            vs.base_url + "/api/projects/demo/tree/children?path=no-such",
+            "tok-view",
         )
         assert status == 404
         assert payload == {"error": "not found: no-such"}
@@ -427,7 +435,9 @@ async def test_tree_children_not_a_directory_400():
     vs.start()
     try:
         status, payload = await asyncio.to_thread(
-            _get, vs.base_url + "/api/projects/demo/tree/children?path=f.txt", "tok-view"
+            _get,
+            vs.base_url + "/api/projects/demo/tree/children?path=f.txt",
+            "tok-view",
         )
         assert status == 400
         assert payload == {"error": "not a directory: f.txt"}

@@ -29,7 +29,11 @@ from urllib.parse import parse_qs
 from pathlib import Path
 
 from feishu_dispatcher import __version__
-from feishu_dispatcher._paths import PathTraversalError, resolve_tree_path, resolve_under_root
+from feishu_dispatcher._paths import (
+    PathTraversalError,
+    resolve_tree_path,
+    resolve_under_root,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +100,9 @@ class ViewerServer:
         except Exception:
             logger.debug("查看器 server_close 异常（忽略）", exc_info=True)
 
-    def dispatch(self, method: str, path: str, query: str, token: str) -> tuple[int, dict]:
+    def dispatch(
+        self, method: str, path: str, query: str, token: str
+    ) -> tuple[int, dict]:
         """鉴权 → 模板匹配路由 → marshal 到主 loop 执行 async handler。
 
         handler 是 async (ctx, request) -> (status, dict)。query 解析成 dict；
@@ -158,7 +164,13 @@ async def tree(ctx: dict, request: dict) -> tuple[int, dict]:
         dirs[:] = [d for d in dirs if d not in ignore]
         for f in fnames:
             full = root / f
-            entries.append({"path": full.relative_to(ws).as_posix(), "type": "file", "size": full.stat().st_size})
+            entries.append(
+                {
+                    "path": full.relative_to(ws).as_posix(),
+                    "type": "file",
+                    "size": full.stat().st_size,
+                }
+            )
     entries.sort(key=lambda x: x["path"])
     return 200, {"entries": entries}
 
