@@ -241,18 +241,31 @@ def _parse_agent_flag(text: str) -> tuple[str, str]:
 
 
 async def run(
-    cfg: Config, *, discover: bool = False, store_path: Path | None = None
+    cfg: Config,
+    *,
+    discover: bool = False,
+    store_path: Path | None = None,
+    channel: Channel | None = None,
 ) -> bool:
     """启动 daemon：飞书 WS 长连接 + agent 调度。阻塞直到收到退出信号。
 
     ``discover=True`` 时只打印收到消息的 chat_id，不执行任何命令
     （帮助用户发现群 id 后填进配置）。``store_path`` 是会话持久化文件
-    （默认 config 同目录的 sessions.json）。
+    （默认 config 同目录的 sessions.json）。``channel`` 未传时装配现有 Feishu
+    Channel；调用方也可注入其它实现。
 
     返回是否收到 ``/reboot``——cli.py 据此 re-exec 重启进程。
     """
     if store_path is None:
         store_path = DEFAULT_CONFIG_PATH.parent / "sessions.json"
+    if channel is None:
+        channel = FeishuBridge(
+            app_id=cfg.app_id,
+            app_secret=cfg.app_secret,
+            main_loop=asyncio.get_running_loop(),
+            chat_whitelist=cfg.chat_id,
+            qps=cfg.feishu_qps,
+        )
     daemon = _Daemon(
         cfg,
         discover=discover,
@@ -267,6 +280,7 @@ async def run(
             # [llm].memory_rounds 可配；未配 [llm] 时记忆不参与派发，取默认即可
             max_turns=cfg.llm.memory_rounds if cfg.llm else 12,
         ),
+        _channel=channel,
     )
     await daemon.run()
     return daemon._reboot_requested
@@ -401,6 +415,7 @@ class _Daemon:
     _sched_memory: SchedulerMemory = field(
         default_factory=lambda: SchedulerMemory(None)
     )
+    #: 由启动装配层注入；_Daemon 不负责选择或构造具体通道实现。
     _channel: Channel | None = None
     #: 每个 Task 的单活 current runner；Thread 只经 Task 路由到这里。
     _runners: _CurrentRunnerRegistry = field(default_factory=_CurrentRunnerRegistry)
@@ -428,16 +443,11 @@ class _Daemon:
 
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
+        if self._channel is None:
+            raise RuntimeError("Channel 未注入")
         if self._llm is None:
             self._llm = build_llm_client(self.cfg.llm)
             self._llm_active = self.cfg.llm_active
-        self._channel = FeishuBridge(
-            app_id=self.cfg.app_id,
-            app_secret=self.cfg.app_secret,
-            main_loop=loop,
-            chat_whitelist=self.cfg.chat_id,
-            qps=self.cfg.feishu_qps,
-        )
         self._stop_event = asyncio.Event()
         # 本地控制面（agent CLI → daemon）：127.0.0.1 + 一次性 token 鉴权（#68）。
         # 路由表可扩展，首个 endpoint 是后台任务 run。
