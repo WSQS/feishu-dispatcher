@@ -14,8 +14,8 @@ from pathlib import Path
 import pytest
 
 from feishu_dispatcher.config import Config, LLMSettings, Project, ViewerConfig
+from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.daemon import _AgentSession, _CurrentRunnerRegistry, _Daemon
-from feishu_dispatcher.feishu import IncomingMessage
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
 from feishu_dispatcher.store import ProjectStore, TaskStore
 
@@ -33,6 +33,15 @@ class FakeBridge:
         self.roots: list[tuple[str, str]] = []
         self.plain: list[tuple[str, str]] = []  # reply_in_thread=False（不建话题）
 
+    def start(self, on_message) -> None:
+        self.on_message = on_message
+
+    def is_alive(self) -> bool:
+        return not self.stopped
+
+    def restart(self) -> None:
+        self.stopped = False
+
     def reply_in_thread(self, root_message_id: str, text: str) -> str:
         self.replies.append((root_message_id, text))
         return f"om_reply_{len(self.replies)}"
@@ -41,6 +50,14 @@ class FakeBridge:
         self.replies.append((message_id, text))
         self.plain.append((message_id, text))
         return f"om_reply_{len(self.replies)}"
+
+    def send_text(self, conversation_id: str, text: str) -> str:
+        return self.send_root_message(conversation_id, text)
+
+    def reply_text(self, target_id: str, text: str, *, threaded: bool = False) -> str:
+        if threaded:
+            return self.reply_in_thread(target_id, text)
+        return self.reply(target_id, text)
 
     def send_root_message(self, chat_id: str, text: str) -> str:
         self.roots.append((chat_id, text))
@@ -61,6 +78,12 @@ class FakeBridge:
             raise RuntimeError("patch_card boom")
         self.card_patches.append((message_id, card))
         self.cards.append(card)
+
+    def send_card(self, thread_id: str, card: dict) -> str:
+        return self.reply_card(thread_id, card)
+
+    def update_card(self, message_id: str, card: dict) -> None:
+        self.patch_card(message_id, card)
 
     def stop(self) -> None:
         self.stopped = True
@@ -245,7 +268,7 @@ def make_daemon(
         project_store=project_store or ProjectStore(None),
     )
     bridge = FakeBridge()
-    daemon._bridge = bridge  # 绕过 run()，直接注入
+    daemon._channel = bridge  # 绕过 run()，直接注入
     created: list[FakeAgent] = []
 
     def factory(spawn, on_output, on_action=None, *, resume_session_id=None):
@@ -259,26 +282,22 @@ def make_daemon(
     return daemon, bridge, created
 
 
-def root_msg(text: str, mid: str = "om_root1") -> IncomingMessage:
-    return IncomingMessage(
-        chat_id="oc_1",
+def root_msg(text: str, mid: str = "om_root1") -> ChannelMessage:
+    return ChannelMessage(
+        conversation_id="oc_1",
         message_id=mid,
-        thread_root_id=None,
+        thread_id=None,
         text=text,
-        chat_type="group",
         sender_id="ou_user",
     )
 
 
-def thread_msg(
-    text: str, root: str = "om_root1", mid: str = "om_t1"
-) -> IncomingMessage:
-    return IncomingMessage(
-        chat_id="oc_1",
+def thread_msg(text: str, root: str = "om_root1", mid: str = "om_t1") -> ChannelMessage:
+    return ChannelMessage(
+        conversation_id="oc_1",
         message_id=mid,
-        thread_root_id=root,
+        thread_id=root,
         text=text,
-        chat_type="group",
         sender_id="ou_user",
     )
 
@@ -702,7 +721,7 @@ def make_daemon_with_limit(
     )
     daemon = _Daemon(cfg, store=store or TaskStore(None))
     bridge = FakeBridge()
-    daemon._bridge = bridge
+    daemon._channel = bridge
     created: list[FakeAgent] = []
 
     def factory(spawn, on_output, on_action=None, *, resume_session_id=None):
@@ -752,7 +771,7 @@ def make_daemon_with_whitelist(
     )
     daemon = _Daemon(cfg)
     bridge = FakeBridge()
-    daemon._bridge = bridge
+    daemon._channel = bridge
     created: list[FakeAgent] = []
     daemon._make_agent = (
         lambda spawn, on_output, on_action=None, *, resume_session_id=None: (  # noqa: E731
@@ -794,7 +813,7 @@ async def test_discover_mode_does_not_execute_commands():
     )
     daemon = _Daemon(cfg, discover=True)
     bridge = FakeBridge()
-    daemon._bridge = bridge
+    daemon._channel = bridge
     created: list[FakeAgent] = []
     daemon._make_agent = (
         lambda spawn, on_output, on_action=None, *, resume_session_id=None: (  # noqa: E731
@@ -2446,7 +2465,7 @@ def _daemon_with_llm_profiles() -> tuple[_Daemon, FakeBridge]:
     )
     daemon = _Daemon(cfg)
     bridge = FakeBridge()
-    daemon._bridge = bridge
+    daemon._channel = bridge
     daemon._llm_active = "deepseek"  # 模拟 run() 后状态（run() 未调用）
     return daemon, bridge
 
@@ -2920,7 +2939,7 @@ async def test_launch_threads_agent_env_into_spawn():
     )
     daemon = _Daemon(cfg, store=TaskStore(None), project_store=ProjectStore(None))
     bridge = FakeBridge()
-    daemon._bridge = bridge
+    daemon._channel = bridge
     created: list[FakeAgent] = []
 
     def factory(spawn, on_output, on_action=None, *, resume_session_id=None):

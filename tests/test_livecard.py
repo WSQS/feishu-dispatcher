@@ -1,4 +1,4 @@
-"""LiveCard 单元测试（用 FakeBridge 记录 reply_card/patch_card 调用）。"""
+"""LiveCard 单元测试（用 FakeBridge 记录卡片发送和更新）。"""
 
 import asyncio
 
@@ -24,6 +24,12 @@ class FakeBridge:
             self._patch_card_errors -= 1
             raise RuntimeError("patch_card boom")
         self.card_patches.append((message_id, card))
+
+    def send_card(self, thread_id: str, card: dict) -> str:
+        return self.reply_card(thread_id, card)
+
+    def update_card(self, message_id: str, card: dict) -> None:
+        self.patch_card(message_id, card)
 
 
 async def test_feed_then_flush_reply_card():

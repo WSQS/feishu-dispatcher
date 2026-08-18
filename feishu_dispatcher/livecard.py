@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from .card import build_card
 
 if TYPE_CHECKING:
-    from .feishu import FeishuBridge
+    from .channel import Channel
 
 logger = logging.getLogger(__name__)
 
@@ -25,14 +25,14 @@ class LiveCard:
 
     def __init__(
         self,
-        bridge: FeishuBridge,
+        channel: Channel,
         root_message_id: str,
         title: str,
         *,
         footer: str = "",
         window: float = 0.5,
     ) -> None:
-        self._bridge = bridge
+        self._channel = channel
         self._root_message_id = root_message_id
         self._title_base = title
         self._title = title
@@ -125,11 +125,11 @@ class LiveCard:
             card = build_card(self._title, self._status, self._body, self._footer)
             if self._card_msg_id is None:
                 self._card_msg_id = await asyncio.to_thread(
-                    self._bridge.reply_card, self._root_message_id, card
+                    self._channel.send_card, self._root_message_id, card
                 )
             else:
                 await asyncio.to_thread(
-                    self._bridge.patch_card, self._card_msg_id, card
+                    self._channel.update_card, self._card_msg_id, card
                 )
         except Exception:
             logger.warning("LiveCard emit 失败", exc_info=True)
@@ -155,6 +155,6 @@ class LiveCard:
             note = "⤵ 输出接下一条卡片"
             footer = f"{self._footer} · {note}" if self._footer else note
             card = build_card(title, self._status, body, footer)
-            await asyncio.to_thread(self._bridge.patch_card, card_msg_id, card)
+            await asyncio.to_thread(self._channel.update_card, card_msg_id, card)
         except Exception:
             logger.warning("roll footer patch 失败", exc_info=True)
