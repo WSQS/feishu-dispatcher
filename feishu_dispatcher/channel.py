@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 
 @dataclass(frozen=True)
@@ -19,6 +19,21 @@ class ChannelMessage:
 
 
 MessageHandler = Callable[[ChannelMessage], Awaitable[None]]
+OutputStatus = Literal["running", "done", "error", "stopped"]
+
+
+class StreamingOutput(Protocol):
+    """一个 agent 回合的流式输出呈现。"""
+
+    def feed(self, text: str) -> None: ...
+
+    def set_footer(self, footer: str) -> None: ...
+
+    async def flush(self) -> None: ...
+
+    async def set_status(self, status: OutputStatus) -> None: ...
+
+    async def aclose(self) -> None: ...
 
 
 class Channel(Protocol):
@@ -42,6 +57,10 @@ class Channel(Protocol):
         threaded: bool = False,
     ) -> str: ...
 
-    def send_card(self, thread_id: str, card: dict) -> str: ...
-
-    def update_card(self, message_id: str, card: dict) -> None: ...
+    def open_output(
+        self,
+        target_id: str,
+        title: str,
+        *,
+        footer: str = "",
+    ) -> StreamingOutput: ...

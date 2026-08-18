@@ -15,14 +15,20 @@ import pytest
 
 import feishu_dispatcher.daemon as daemon_module
 from feishu_dispatcher.config import Config, LLMSettings, Project, ViewerConfig
-from feishu_dispatcher.channel import ChannelMessage
+from feishu_dispatcher.channel import ChannelMessage, StreamingOutput
 from feishu_dispatcher.daemon import _AgentSession, _CurrentRunnerRegistry, _Daemon
+from feishu_dispatcher.livecard import LiveCard
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
 from feishu_dispatcher.store import ProjectStore, TaskStore
+from feishu_dispatcher.throttler import StreamThrottler
 
 
 class FakeBridge:
-    def __init__(self) -> None:
+    def __init__(
+        self, *, stream_mode: str = "text", throttle_window: float = 0.01
+    ) -> None:
+        self.stream_mode = stream_mode
+        self.throttle_window = throttle_window
         self.replies: list[tuple[str, str]] = []
         self.stopped = False
         self.cards: list[dict] = []
@@ -59,6 +65,17 @@ class FakeBridge:
         if threaded:
             return self.reply_in_thread(target_id, text)
         return self.reply(target_id, text)
+
+    def open_output(
+        self, target_id: str, title: str, *, footer: str = ""
+    ) -> StreamingOutput:
+        if self.stream_mode == "card":
+            return LiveCard(self, target_id, title, footer=footer)
+
+        async def send_piece(piece: str) -> None:
+            await asyncio.to_thread(self.reply_text, target_id, piece, threaded=True)
+
+        return StreamThrottler(send_piece, window=self.throttle_window)
 
     def send_root_message(self, chat_id: str, text: str) -> str:
         self.roots.append((chat_id, text))
@@ -263,7 +280,10 @@ def make_daemon(
         idle_timeout=idle_timeout,
         stream_mode=stream_mode,
     )
-    bridge = FakeBridge()
+    bridge = FakeBridge(
+        stream_mode=cfg.stream_mode,
+        throttle_window=cfg.throttle_window,
+    )
     daemon = _Daemon(
         cfg,
         store=store or TaskStore(None),
@@ -302,6 +322,8 @@ async def test_run_builds_default_feishu_channel_and_injects_it(monkeypatch, tmp
             main_loop,
             chat_whitelist: str,
             qps: float,
+            stream_mode: str,
+            throttle_window: float,
         ) -> None:
             super().__init__()
             constructed.update(
@@ -310,6 +332,8 @@ async def test_run_builds_default_feishu_channel_and_injects_it(monkeypatch, tmp
                 main_loop=main_loop,
                 chat_whitelist=chat_whitelist,
                 qps=qps,
+                stream_mode=stream_mode,
+                throttle_window=throttle_window,
             )
 
     async def fake_daemon_run(self) -> None:
@@ -329,6 +353,8 @@ async def test_run_builds_default_feishu_channel_and_injects_it(monkeypatch, tmp
     assert constructed["main_loop"] is asyncio.get_running_loop()
     assert constructed["chat_whitelist"] == "oc-main"
     assert constructed["qps"] == 3.5
+    assert constructed["stream_mode"] == "card"
+    assert constructed["throttle_window"] == 0.5
     assert isinstance(constructed["injected"], FakeFeishuChannel)
 
 
@@ -468,6 +494,94 @@ async def test_run_dispatches_and_streams_output():
     assert len(created) == 1
     assert created[0].prompts == ["do stuff"]
     assert created[0].start_count == 1
+
+
+async def test_run_uses_text_only_channel_output_lifecycle():
+    class RecordingOutput:
+        def __init__(self) -> None:
+            self.text = ""
+            self.flush_count = 0
+            self.statuses: list[str] = []
+            self.closed = False
+
+        def feed(self, text: str) -> None:
+            self.text += text
+
+        def set_footer(self, footer: str) -> None:  # noqa: ARG002
+            return None
+
+        async def flush(self) -> None:
+            self.flush_count += 1
+
+        async def set_status(self, status: str) -> None:
+            self.statuses.append(status)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class TextOnlyChannel:
+        def __init__(self) -> None:
+            self.replies: list[tuple[str, str, bool]] = []
+            self.outputs: list[RecordingOutput] = []
+            self.opened: list[tuple[str, str, str]] = []
+            self.stopped = False
+
+        def start(self, on_message) -> None:
+            self.on_message = on_message
+
+        def stop(self) -> None:
+            self.stopped = True
+
+        def is_alive(self) -> bool:
+            return not self.stopped
+
+        def restart(self) -> None:
+            self.stopped = False
+
+        def send_text(self, conversation_id: str, text: str) -> str:
+            self.replies.append((conversation_id, text, False))
+            return f"om_root_{len(self.replies)}"
+
+        def reply_text(
+            self,
+            target_id: str,
+            text: str,
+            *,
+            threaded: bool = False,
+        ) -> str:
+            self.replies.append((target_id, text, threaded))
+            return f"om_reply_{len(self.replies)}"
+
+        def open_output(
+            self,
+            target_id: str,
+            title: str,
+            *,
+            footer: str = "",
+        ) -> StreamingOutput:
+            output = RecordingOutput()
+            self.outputs.append(output)
+            self.opened.append((target_id, title, footer))
+            return output
+
+    daemon, _, created = make_daemon()
+    channel = TextOnlyChannel()
+    daemon._channel = channel
+
+    assert not hasattr(channel, "send_card")
+    assert not hasattr(channel, "update_card")
+
+    await daemon._handle_message(root_msg("/run demo do stuff"))
+    await wait_until(lambda: channel.outputs and channel.outputs[0].closed)
+
+    output = channel.outputs[0]
+    assert channel.opened == [("om_root1", "demo · copilot", "demo")]
+    assert output.text == "echo:do stuff"
+    assert output.flush_count == 1
+    assert output.statuses == ["done"]
+
+    await daemon._handle_message(thread_msg("/stop"))
+    await wait_until(lambda: created[0].closed)
 
 
 async def test_run_agent_flag_overrides_default():
