@@ -434,7 +434,9 @@ class _Daemon:
     _channel_key: str = "feishu"
     #: 每个 Task 的单活 current runner；Thread 只经 Task 路由到这里。
     _runners: _CurrentRunnerRegistry = field(default_factory=_CurrentRunnerRegistry)
-    _seen_message_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
+    _seen_message_keys: OrderedDict[tuple[ConversationRef, str], None] = field(
+        default_factory=OrderedDict
+    )
     #: 本地控制面（agent CLI 入口）；run() 里启动，测试构造 _Daemon 时为 None（不起 HTTP）
     _control: "ControlServer | None" = None
     #: 移动端查看器（只读 HTTP，给手机）；run() 里按 cfg.viewer.enabled 启动，否则 None。
@@ -559,30 +561,46 @@ class _Daemon:
     # 消息分发
     # ------------------------------------------------------------------ #
 
-    def _is_duplicate(self, message_id: str) -> bool:
-        """按 message_id 幂等去重（R5：ACK 异常时飞书会重推同一事件）。"""
+    def _is_duplicate(self, conversation: ConversationRef, message_id: str) -> bool:
+        """在 Conversation 作用域内按 message_id 幂等去重。"""
         if not message_id:
             return False
-        if message_id in self._seen_message_ids:
+        message_key = (conversation, message_id)
+        if message_key in self._seen_message_keys:
             return True
-        self._seen_message_ids[message_id] = None
-        while len(self._seen_message_ids) > _DEDUP_CAPACITY:
-            self._seen_message_ids.popitem(last=False)
+        self._seen_message_keys[message_key] = None
+        while len(self._seen_message_keys) > _DEDUP_CAPACITY:
+            self._seen_message_keys.popitem(last=False)
         return False
 
     async def _handle_message(self, msg: ChannelMessage) -> None:
-        """所有飞书消息的入口（在主 event loop 上）。"""
+        """当前单 Channel 的消息入口（在主 event loop 上）。"""
+        await self._handle_channel_message(self._channel_key, msg)
+
+    async def _handle_channel_message(
+        self, channel_key: str, msg: ChannelMessage
+    ) -> None:
+        """携带稳定 Channel 身份的内部消息入口。"""
+        channel_key = channel_key.strip()
+        if not channel_key:
+            raise ValueError("channel_key 不能为空")
+        conversation = ConversationRef(channel_key, msg.conversation_id)
         if self.cfg.chat_id and msg.conversation_id != self.cfg.chat_id:
             logger.debug("忽略非目标群消息 chat_id=%s", msg.conversation_id)
             return
         # 忽略无发送者的系统消息
         if not msg.sender_id:
             return
-        if self._is_duplicate(msg.message_id):
-            logger.info("忽略重复消息 message_id=%s", msg.message_id)
+        if self._is_duplicate(conversation, msg.message_id):
+            logger.info(
+                "忽略重复消息 channel=%s message_id=%s",
+                channel_key,
+                msg.message_id,
+            )
             return
         logger.info(
-            "收到消息 chat=%s msg=%s thread_root=%s text=%r",
+            "收到消息 channel=%s chat=%s msg=%s thread_root=%s text=%r",
+            channel_key,
             msg.conversation_id,
             msg.message_id,
             msg.thread_id,
@@ -608,14 +626,22 @@ class _Daemon:
             return
 
         if msg.thread_id:
-            await self._forward_to_agent(msg)
+            await self._forward_to_agent(msg, conversation=conversation)
             return
 
         text = msg.text.strip()
         if text.startswith(_DISPATCH_PREFIX):
-            await self._spawn_for_root(msg, text[len(_DISPATCH_PREFIX) :].strip())
+            await self._spawn_for_root(
+                msg,
+                text[len(_DISPATCH_PREFIX) :].strip(),
+                conversation=conversation,
+            )
         elif text == _ATTACH_CMD or text.startswith(_ATTACH_CMD + " "):
-            await self._attach_for_root(msg, text[len(_ATTACH_CMD) :].strip())
+            await self._attach_for_root(
+                msg,
+                text[len(_ATTACH_CMD) :].strip(),
+                conversation=conversation,
+            )
         elif text.startswith(_TASK_PREFIX):
             await self._show_task(msg, text[len(_TASK_PREFIX) :].strip())
         elif text == _LIST_CMD:
@@ -933,7 +959,13 @@ class _Daemon:
             )
         return label, argv, ""
 
-    async def _spawn_for_root(self, msg: ChannelMessage, body: str) -> None:
+    async def _spawn_for_root(
+        self,
+        msg: ChannelMessage,
+        body: str,
+        *,
+        conversation: ConversationRef,
+    ) -> None:
         """解析 ``/run <project> <task> [--agent <name>]``，建 session 并启动 worker。"""
         usage = "格式：`/run <项目名> <任务描述> [--agent <agent>]`"
         parts = body.split(maxsplit=1)
@@ -958,7 +990,7 @@ class _Daemon:
             return
 
         thread_root = msg.message_id
-        existing = self.store.by_thread(thread_root)
+        existing = self.store.by_thread(conversation, thread_root)
         if (
             existing is not None
             and self._runners.get_for_task(existing.task_id) is not None
@@ -980,7 +1012,7 @@ class _Daemon:
             project_name=project_name,
             agent_label=agent_label,
             description=task,
-            conversation=ConversationRef(self._channel_key, msg.conversation_id),
+            conversation=conversation,
             thread_root_id=thread_root,
             workspace=str(project.path),
         )
@@ -991,7 +1023,13 @@ class _Daemon:
             f"{project_name}…\n任务: {task}",
         )
 
-    async def _attach_for_root(self, msg: ChannelMessage, arg: str) -> None:
+    async def _attach_for_root(
+        self,
+        msg: ChannelMessage,
+        arg: str,
+        *,
+        conversation: ConversationRef,
+    ) -> None:
         """解析 ``/attach <项目> <agent> <session_id> [描述...]`` 并附着外部会话。
 
         参数解析后交给共用底层 :meth:`_attach_task`；按返回结果决定回复目标：
@@ -1015,7 +1053,7 @@ class _Daemon:
             agent_in,
             session_id,
             user_desc,
-            conversation=ConversationRef(self._channel_key, msg.conversation_id),
+            conversation=conversation,
         )
         if task is not None:
             return  # 成功：新话题的附着摘要由 worker 发
@@ -1519,7 +1557,9 @@ class _Daemon:
         except Exception:
             logger.exception("取消当前轮失败 task=%s", sess.task_id)
 
-    async def _forward_to_agent(self, msg: ChannelMessage) -> None:
+    async def _forward_to_agent(
+        self, msg: ChannelMessage, *, conversation: ConversationRef
+    ) -> None:
         """话题内回复 → 入队给对应 agent；agent 不在则尝试跨重启恢复。"""
         thread_root = msg.thread_id or ""
         text = msg.text.strip()
@@ -1541,7 +1581,7 @@ class _Daemon:
                 )
                 return
             forward_raw = True
-        task = self.store.by_thread(thread_root)
+        task = self.store.by_thread(conversation, thread_root)
         sess = self._runners.get_for_task(task.task_id) if task is not None else None
         if sess is None:
             # Thread 只负责路由到 Task；无 current runner 时再按 Task 恢复或明确提示。
@@ -1549,6 +1589,7 @@ class _Daemon:
                 thread_root or msg.message_id,
                 thread_root,
                 text,
+                conversation=conversation,
                 forward_raw=forward_raw,
                 task=task,
             )
@@ -1654,6 +1695,7 @@ class _Daemon:
         thread_root: str,
         text: str,
         *,
+        conversation: ConversationRef,
         forward_raw: bool = False,
         task: Task | None = None,
     ) -> None:
@@ -1662,7 +1704,7 @@ class _Daemon:
         ``forward_raw``（来自 ``/raw <文本>``）时跳过 ``/stop``/``/done`` 解释——恢复
         agent 后把 <文本> 当普通首轮转发，即使它恰好是 ``/stop`` 也不误当停止命令。
         """
-        task = task or self.store.by_thread(thread_root)
+        task = task or self.store.by_thread(conversation, thread_root)
         if task is None:
             await self._safe_reply(
                 reply_target,

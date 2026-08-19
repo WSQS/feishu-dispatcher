@@ -70,8 +70,27 @@ def test_get_and_by_thread():
     s = TaskStore(None)
     t = make(s, thread="om_1")
     assert s.get("t1") is t
-    assert s.by_thread("om_1") is t
-    assert s.by_thread("nope") is None
+    assert s.by_thread(_TEST_CONVERSATION, "om_1") is t
+    assert s.by_thread(_TEST_CONVERSATION, "nope") is None
+
+
+def test_by_thread_is_scoped_to_conversation():
+    s = TaskStore(None)
+    feishu_task = make(s, thread="shared-thread")
+    web_conversation = ConversationRef("web", "oc_main")
+    web_task = s.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="做 Y",
+        conversation=web_conversation,
+        thread_root_id="shared-thread",
+        workspace="C:/y",
+    )
+
+    assert s.by_thread(_TEST_CONVERSATION, "shared-thread") is feishu_task
+    assert s.by_thread(web_conversation, "shared-thread") is web_task
+    assert s.by_thread(ConversationRef("other", "oc_main"), "shared-thread") is None
+    assert s.by_thread(ConversationRef("", ""), "shared-thread") is None
 
 
 def test_task_conversation_ref_persists_and_reloads(tmp_path: Path):
@@ -109,7 +128,7 @@ def test_persists_and_counter_never_reuses(tmp_path: Path):
     s1.update("t1", status="idle")
     s2 = TaskStore(p)  # reload
     assert s2.get("t1").status == "idle"
-    assert s2.by_thread("om_2").task_id == "t2"
+    assert s2.by_thread(_TEST_CONVERSATION, "om_2").task_id == "t2"
     # 计数器随之持久化 → 下一个是 t3，不复用
     assert make(s2, thread="om_3").task_id == "t3"
 
@@ -135,8 +154,8 @@ def test_create_self_heals_reverted_seq_never_reuses_id():
     s._seq = 1
     t = make(s, thread="om_4")
     assert t.task_id == "t4"  # 不是 t2/t3——现有最大 id 是 3，跳到 4
-    assert s.by_thread("om_1").task_id == "t1"  # 老任务映射未被覆盖
-    assert s.by_thread("om_4").task_id == "t4"
+    assert s.by_thread(_TEST_CONVERSATION, "om_1").task_id == "t1"  # 老任务映射未被覆盖
+    assert s.by_thread(_TEST_CONVERSATION, "om_4").task_id == "t4"
 
 
 def test_create_reload_with_tampered_seq_does_not_clobber(tmp_path: Path):
@@ -154,8 +173,8 @@ def test_create_reload_with_tampered_seq_does_not_clobber(tmp_path: Path):
     s2 = TaskStore(p)  # 重载：seq=0，但仍有 t1/t2
     t = make(s2, thread="om_3")
     assert t.task_id == "t3"  # 不复用 t1
-    assert s2.by_thread("om_1").task_id == "t1"
-    assert s2.by_thread("om_2").task_id == "t2"
+    assert s2.by_thread(_TEST_CONVERSATION, "om_1").task_id == "t1"  # 历史未被清空
+    assert s2.by_thread(_TEST_CONVERSATION, "om_2").task_id == "t2"
 
 
 def test_failed_is_resumable_not_terminal_and_error_persists(tmp_path: Path):
@@ -251,8 +270,8 @@ def test_corrupt_primary_recovers_from_backup_not_wiped(tmp_path: Path):
     make(s1, thread="om_3")  # t3；.bak = {t1, t2}
     p.write_text("truncated{", encoding="utf-8")  # 系统崩溃把主文件写花
     s2 = TaskStore(p)  # 主损坏 → 回退 .bak（含 t1、t2）
-    assert s2.by_thread("om_1").task_id == "t1"  # 历史未被清空
-    assert s2.by_thread("om_2").task_id == "t2"
+    assert s2.by_thread(_TEST_CONVERSATION, "om_1").task_id == "t1"
+    assert s2.by_thread(_TEST_CONVERSATION, "om_2").task_id == "t2"
     nxt = make(s2, thread="om_4")  # seq 从 .bak 恢复 → 不落回 t1
     assert nxt.task_id not in {"t1", "t2"}
     assert int(nxt.task_id[1:]) >= 3  # 旧行为会给 t1（清空+seq 归零）
@@ -276,7 +295,7 @@ def test_missing_primary_recovers_from_backup(tmp_path: Path):
     make(s1, thread="om_2")  # .bak = {t1}
     p.unlink()
     s2 = TaskStore(p)
-    assert s2.by_thread("om_1").task_id == "t1"
+    assert s2.by_thread(_TEST_CONVERSATION, "om_1").task_id == "t1"
 
 
 def test_clear_terminal():
@@ -539,8 +558,8 @@ def test_task_origin_persists_and_reloads(tmp_path: Path):
         origin="attach",
     )
     s2 = TaskStore(p)
-    assert s2.by_thread("om_1").origin == "spawn"
-    assert s2.by_thread("om_2").origin == "attach"
+    assert s2.by_thread(_TEST_CONVERSATION, "om_1").origin == "spawn"
+    assert s2.by_thread(_TEST_CONVERSATION, "om_2").origin == "attach"
 
 
 def test_old_tasks_json_without_origin_reads_spawn(tmp_path: Path):
@@ -575,6 +594,7 @@ def test_old_tasks_json_without_origin_reads_spawn(tmp_path: Path):
     s = TaskStore(p)
     assert s.get("t1").origin == "spawn"  # 缺省补齐
     assert s.get("t1").conversation_ref == ConversationRef("", "")
+    assert s.by_thread(_TEST_CONVERSATION, "om_1") is None
 
 
 def test_by_agent_session_matches_agent_and_session():
