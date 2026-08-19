@@ -27,7 +27,7 @@ from pathlib import Path
 
 from . import forge
 from .acp_client import AcpAgent, AgentSpawn, OnAction, OnOutput, _resolve_executable
-from .channel import Channel, ChannelMessage, StreamingOutput
+from .channel import Channel, ChannelMessage, ConversationRef, StreamingOutput
 from .config import DEFAULT_CONFIG_PATH, Config, Project
 from .control import ControlServer
 from .feishu import FeishuBridge
@@ -246,16 +246,26 @@ async def run(
     discover: bool = False,
     store_path: Path | None = None,
     channel: Channel | None = None,
+    channel_key: str | None = None,
 ) -> bool:
     """启动 daemon：飞书 WS 长连接 + agent 调度。阻塞直到收到退出信号。
 
     ``discover=True`` 时只打印收到消息的 chat_id，不执行任何命令
     （帮助用户发现群 id 后填进配置）。``store_path`` 是会话持久化文件
     （默认 config 同目录的 sessions.json）。``channel`` 未传时装配现有 Feishu
-    Channel；调用方也可注入其它实现。
+    Channel；注入其它实现时必须用 ``channel_key`` 指定稳定身份。未注入 Channel
+    时 ``channel_key`` 默认取 ``feishu``。
 
     返回是否收到 ``/reboot``——cli.py 据此 re-exec 重启进程。
     """
+    if channel_key is None:
+        if channel is not None:
+            raise ValueError("注入 Channel 时必须显式提供 channel_key")
+        resolved_channel_key = "feishu"
+    else:
+        resolved_channel_key = channel_key.strip()
+        if not resolved_channel_key:
+            raise ValueError("channel_key 不能为空")
     if store_path is None:
         store_path = DEFAULT_CONFIG_PATH.parent / "sessions.json"
     if channel is None:
@@ -283,6 +293,7 @@ async def run(
             max_turns=cfg.llm.memory_rounds if cfg.llm else 12,
         ),
         _channel=channel,
+        _channel_key=resolved_channel_key,
     )
     await daemon.run()
     return daemon._reboot_requested
@@ -419,6 +430,8 @@ class _Daemon:
     )
     #: 由启动装配层注入；_Daemon 不负责选择或构造具体通道实现。
     _channel: Channel | None = None
+    #: 当前单 Channel 的稳定身份；后续多 Channel registry 以此作为持久化 lookup key。
+    _channel_key: str = "feishu"
     #: 每个 Task 的单活 current runner；Thread 只经 Task 路由到这里。
     _runners: _CurrentRunnerRegistry = field(default_factory=_CurrentRunnerRegistry)
     _seen_message_ids: OrderedDict[str, None] = field(default_factory=OrderedDict)
@@ -967,6 +980,7 @@ class _Daemon:
             project_name=project_name,
             agent_label=agent_label,
             description=task,
+            conversation=ConversationRef(self._channel_key, msg.conversation_id),
             thread_root_id=thread_root,
             workspace=str(project.path),
         )
@@ -1001,7 +1015,7 @@ class _Daemon:
             agent_in,
             session_id,
             user_desc,
-            conversation_id=msg.conversation_id,
+            conversation=ConversationRef(self._channel_key, msg.conversation_id),
         )
         if task is not None:
             return  # 成功：新话题的附着摘要由 worker 发
@@ -1017,7 +1031,7 @@ class _Daemon:
         session_id: str,
         description: str = "",
         *,
-        conversation_id: str,
+        conversation: ConversationRef,
     ) -> tuple["Task | None", str, str]:
         """附着外部会话为新 Task 的共用底层（``/attach`` 与 ``attach_session`` 工具都调它）。
 
@@ -1077,7 +1091,7 @@ class _Daemon:
         if description:
             header += f"\n说明: {description}"
         root = await asyncio.to_thread(
-            self._channel.create_thread, conversation_id, header
+            self._channel.create_thread, conversation.conversation_id, header
         )
         #  ② 终查——create_thread 是 await，其间别的并发附着/派发可能占走名额；
         # 终查与 create+_launch 之间**无 await**，守住「check→launch 无 await」不变量。
@@ -1096,6 +1110,7 @@ class _Daemon:
             project_name=project_name,
             agent_label=agent_label,
             description=task_desc,
+            conversation=conversation,
             thread_root_id=root,
             workspace=str(project.path),
             session_id=session_id,
@@ -2024,7 +2039,7 @@ class _Daemon:
             agent,
             session_id,
             description,
-            conversation_id=self.cfg.chat_id,
+            conversation=ConversationRef(self._channel_key, self.cfg.chat_id),
         )
         return message
 
@@ -2079,6 +2094,7 @@ class _Daemon:
             project_name=project_name,
             agent_label=agent_label,
             description=task,
+            conversation=ConversationRef(self._channel_key, self.cfg.chat_id),
             thread_root_id=root,
             workspace=str(project.path),
             issue_url=issue_url,

@@ -15,7 +15,7 @@ import pytest
 
 import feishu_dispatcher.daemon as daemon_module
 from feishu_dispatcher.config import Config, LLMSettings, Project, ViewerConfig
-from feishu_dispatcher.channel import ChannelMessage, StreamingOutput
+from feishu_dispatcher.channel import ChannelMessage, ConversationRef, StreamingOutput
 from feishu_dispatcher.daemon import _AgentSession, _CurrentRunnerRegistry, _Daemon
 from feishu_dispatcher.livecard import LiveCard
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
@@ -274,6 +274,7 @@ def make_daemon(
     store: TaskStore | None = None,
     project_store: ProjectStore | None = None,
     idle_timeout: float = 1800.0,
+    channel_key: str = "feishu",
 ) -> tuple[_Daemon, FakeBridge, list[FakeAgent]]:
     cfg = Config(
         app_id="a",
@@ -294,6 +295,7 @@ def make_daemon(
         store=store or TaskStore(None),
         project_store=project_store or ProjectStore(None),
         _channel=bridge,
+        _channel_key=channel_key,
     )
     created: list[FakeAgent] = []
 
@@ -343,6 +345,7 @@ async def test_run_builds_default_feishu_channel_and_injects_it(monkeypatch, tmp
 
     async def fake_daemon_run(self) -> None:
         constructed["injected"] = self._channel
+        constructed["channel_key"] = self._channel_key
 
     monkeypatch.setattr(daemon_module, "FeishuBridge", FakeFeishuChannel)
     monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
@@ -361,6 +364,21 @@ async def test_run_builds_default_feishu_channel_and_injects_it(monkeypatch, tmp
     assert constructed["stream_mode"] == "card"
     assert constructed["throttle_window"] == 0.5
     assert isinstance(constructed["injected"], FakeFeishuChannel)
+    assert constructed["channel_key"] == "feishu"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("channel_key", [None, " "])
+async def test_run_rejects_injected_channel_without_stable_key(tmp_path, channel_key):
+    cfg = Config(app_id="a", app_secret="b", chat_id="oc-main")
+
+    with pytest.raises(ValueError, match="channel_key"):
+        await daemon_module.run(
+            cfg,
+            store_path=tmp_path / "sessions.json",
+            channel=FakeBridge(),
+            channel_key=channel_key,
+        )
 
 
 @pytest.mark.asyncio
@@ -389,6 +407,7 @@ async def test_run_uses_injected_channel_lifecycle(monkeypatch, tmp_path):
             self.started = True
             self.on_message = on_message
             daemon = on_message.__self__
+            assert daemon._channel_key == "test"
             assert daemon._stop_event is not None
             daemon._stop_event.set()
 
@@ -399,6 +418,7 @@ async def test_run_uses_injected_channel_lifecycle(monkeypatch, tmp_path):
         cfg,
         store_path=tmp_path / "sessions.json",
         channel=channel,
+        channel_key="test",
     )
 
     assert reboot is False
@@ -1136,6 +1156,7 @@ def _seed_task(
         project_name="demo",
         agent_label=agent,
         description="旧任务",
+        conversation=ConversationRef("feishu", "oc_1"),
         thread_root_id=thread,
         workspace="C:/tmp/demo",
     )
@@ -1145,7 +1166,7 @@ def _seed_task(
 
 async def test_run_creates_task():
     store = TaskStore(None)
-    daemon, bridge, created = make_daemon(store=store)
+    daemon, bridge, created = make_daemon(store=store, channel_key="test")
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(
         lambda: store.by_thread("om_root1") and store.by_thread("om_root1").session_id
@@ -1155,6 +1176,7 @@ async def test_run_creates_task():
     assert t.agent_label == "copilot"
     assert t.session_id == created[0].session_id
     assert t.description == "task"
+    assert t.conversation_ref == ConversationRef("test", "oc_1")
     await daemon._shutdown()
 
 
@@ -1991,6 +2013,7 @@ async def test_attach_creates_task_and_resumes_external_session():
     assert t.session_id == "ext_sid_1"
     assert t.agent_label == "opencode"
     assert t.project_name == "demo"
+    assert t.conversation_ref == ConversationRef("feishu", "oc_1")
     assert "附着外部会话 opencode/ext_sid_1" in t.description
     assert "继续之前的活" in t.description
     # 探针：resume_session_id 探测 + 已关闭（进程树清理）
@@ -2040,6 +2063,7 @@ async def test_attach_duplicate_rejected_and_guides_to_existing():
         project_name="demo",
         agent_label="opencode",
         description="附着外部会话 opencode/ext_sid_1",
+        conversation=ConversationRef("feishu", "oc_1"),
         thread_root_id="om_old",
         workspace="C:/tmp/demo",
         session_id="ext_sid_1",
@@ -2087,6 +2111,7 @@ async def test_attach_launch_failure_reports_attach_error():
         project_name="demo",
         agent_label="opencode",
         description="附着外部会话 opencode/ext_sid_1",
+        conversation=ConversationRef("feishu", "oc_1"),
         thread_root_id="om_root1",
         workspace="C:/tmp/demo",
         session_id="ext_sid_1",
@@ -2160,6 +2185,7 @@ async def test_sched_attach_session_creates_task_and_resumes_external_session():
     assert t.session_id == "ext_sid_1"
     assert t.agent_label == "opencode"
     assert t.project_name == "demo"
+    assert t.conversation_ref == ConversationRef("feishu", "oc_1")
     assert "附着外部会话 opencode/ext_sid_1" in t.description
     assert "继续之前的活" in t.description
     # 工具返回给 LLM 的成功摘要带 task_id
@@ -2202,6 +2228,7 @@ async def test_sched_attach_session_duplicate_rejected():
         project_name="demo",
         agent_label="opencode",
         description="附着外部会话 opencode/ext_sid_1",
+        conversation=ConversationRef("feishu", "oc_1"),
         thread_root_id="om_old",
         workspace="C:/tmp/demo",
         session_id="ext_sid_1",
@@ -2231,8 +2258,8 @@ async def test_attach_session_and_attach_share_bottom_layer():
     daemon, bridge, _ = make_daemon()
     calls: list[tuple] = []
 
-    async def spy(project_name, agent, session_id, description="", *, conversation_id):
-        calls.append((project_name, agent, session_id, description, conversation_id))
+    async def spy(project_name, agent, session_id, description="", *, conversation):
+        calls.append((project_name, agent, session_id, description, conversation))
         return None, "", "spied"
 
     daemon._attach_task = spy  # type: ignore[method-assign]
@@ -2245,12 +2272,22 @@ async def test_attach_session_and_attach_share_bottom_layer():
         ),
         "demo opencode sid1",
     )
-    assert calls == [("demo", "opencode", "sid1", "", "oc_source")]
+    assert calls == [
+        (
+            "demo",
+            "opencode",
+            "sid1",
+            "",
+            ConversationRef("feishu", "oc_source"),
+        )
+    ]
     calls.clear()
     await daemon._sched_attach_session(
         "demo", "sid2", agent="opencode", description="d"
     )
-    assert calls == [("demo", "opencode", "sid2", "d", "oc_1")]
+    assert calls == [
+        ("demo", "opencode", "sid2", "d", ConversationRef("feishu", "oc_1"))
+    ]
 
 
 # ---------------------------------------------------------------------- #
@@ -2584,6 +2621,7 @@ async def test_sched_spawn_with_issue_uses_body_as_brief(monkeypatch):
     # Task 锚定了 issue_url
     t = daemon.store.all()[0]
     assert t.issue_url == "https://github.com/o/r/issues/3"
+    assert t.conversation_ref == ConversationRef("feishu", "oc_1")
     assert "issue" in out and "issues/3" in out
     # 就绪消息带 issue 链接
     assert any("issues/3" in text for _, text in bridge.roots)
@@ -2617,6 +2655,7 @@ async def test_sched_get_task_reports_issue_url():
         project_name="demo",
         agent_label="copilot",
         description="x",
+        conversation=ConversationRef("feishu", "oc_1"),
         thread_root_id="om_x",
         workspace="C:/tmp/demo",
         issue_url="https://github.com/o/r/issues/7",
