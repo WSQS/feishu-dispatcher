@@ -36,18 +36,23 @@ class FakeBridge:
         self.card_patches: list[tuple[str, dict]] = []
         self.reply_card_errors: int = 0
         self.patch_card_errors: int = 0
+        self.start_count = 0
+        self.restart_count = 0
+        self.stop_count = 0
 
         self.roots: list[tuple[str, str]] = []
         self.created_threads: list[tuple[str, str]] = []
         self.plain: list[tuple[str, str]] = []  # reply_in_thread=False（不建话题）
 
     def start(self, on_message) -> None:
+        self.start_count += 1
         self.on_message = on_message
 
     def is_alive(self) -> bool:
         return not self.stopped
 
     def restart(self) -> None:
+        self.restart_count += 1
         self.stopped = False
 
     def reply_in_thread(self, root_message_id: str, text: str) -> str:
@@ -109,6 +114,7 @@ class FakeBridge:
         self.patch_card(message_id, card)
 
     def stop(self) -> None:
+        self.stop_count += 1
         self.stopped = True
 
     def texts(self, root: str | None = None) -> list[str]:
@@ -294,8 +300,8 @@ def make_daemon(
         cfg,
         store=store or TaskStore(None),
         project_store=project_store or ProjectStore(None),
-        _channel=bridge,
-        _channel_key=channel_key,
+        _channels={channel_key: bridge},
+        _primary_channel_key=channel_key,
     )
     created: list[FakeAgent] = []
 
@@ -344,8 +350,8 @@ async def test_run_builds_default_feishu_channel_and_injects_it(monkeypatch, tmp
             )
 
     async def fake_daemon_run(self) -> None:
-        constructed["injected"] = self._channel
-        constructed["channel_key"] = self._channel_key
+        constructed["channels"] = dict(self._channels)
+        constructed["primary_channel_key"] = self._primary_channel_key
 
     monkeypatch.setattr(daemon_module, "FeishuBridge", FakeFeishuChannel)
     monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
@@ -363,8 +369,10 @@ async def test_run_builds_default_feishu_channel_and_injects_it(monkeypatch, tmp
     assert constructed["qps"] == 3.5
     assert constructed["stream_mode"] == "card"
     assert constructed["throttle_window"] == 0.5
-    assert isinstance(constructed["injected"], FakeFeishuChannel)
-    assert constructed["channel_key"] == "feishu"
+    channels = constructed["channels"]
+    assert isinstance(channels, dict)
+    assert isinstance(channels["feishu"], FakeFeishuChannel)
+    assert constructed["primary_channel_key"] == "feishu"
 
 
 @pytest.mark.asyncio
@@ -406,8 +414,9 @@ async def test_run_uses_injected_channel_lifecycle(monkeypatch, tmp_path):
         def start(self, on_message) -> None:
             self.started = True
             self.on_message = on_message
-            daemon = on_message.__self__
-            assert daemon._channel_key == "test"
+            daemon = on_message.func.__self__
+            assert on_message.args == ("test",)
+            assert daemon._primary_channel_key == "test"
             assert daemon._stop_event is not None
             daemon._stop_event.set()
 
@@ -424,11 +433,109 @@ async def test_run_uses_injected_channel_lifecycle(monkeypatch, tmp_path):
     assert reboot is False
     assert channel.started
     assert channel.stopped
-    assert isinstance(channel.on_message.__self__, _Daemon)
-    assert channel.on_message.__func__ is _Daemon._handle_message
+    assert isinstance(channel.on_message.func.__self__, _Daemon)
+    assert channel.on_message.func.__func__ is _Daemon._handle_channel_message
+    assert channel.on_message.args == ("test",)
     assert len(controls) == 1
     assert controls[0].started
     assert controls[0].stopped
+
+
+def make_channel_registry_daemon(
+    channels: dict[str, FakeBridge], primary_channel_key: str = "feishu"
+) -> _Daemon:
+    cfg = Config(app_id="a", app_secret="b", chat_id="oc-main")
+    return _Daemon(
+        cfg,
+        _channels=channels,
+        _primary_channel_key=primary_channel_key,
+    )
+
+
+@pytest.mark.asyncio
+async def test_channel_registry_starts_all_with_scoped_handlers():
+    feishu = FakeBridge()
+    web = FakeBridge()
+    daemon = make_channel_registry_daemon({"feishu": feishu, "web": web})
+    seen: list[tuple[str, str]] = []
+
+    async def record_message(channel_key: str, msg: ChannelMessage) -> None:
+        seen.append((channel_key, msg.message_id))
+
+    daemon._handle_channel_message = record_message  # type: ignore[method-assign]
+    daemon._start_channels()
+    try:
+        await feishu.on_message(root_msg("ignored", mid="om_feishu"))
+        await web.on_message(root_msg("ignored", mid="om_web"))
+    finally:
+        daemon._stop_channels()
+
+    assert feishu.start_count == 1
+    assert web.start_count == 1
+    assert seen == [("feishu", "om_feishu"), ("web", "om_web")]
+
+
+@pytest.mark.parametrize(
+    ("channels", "primary_channel_key", "error", "message"),
+    [
+        ({}, "feishu", RuntimeError, "registry"),
+        ({" ": FakeBridge()}, " ", ValueError, "key"),
+        ({"feishu": FakeBridge()}, "web", RuntimeError, "主 Channel"),
+    ],
+)
+def test_channel_registry_rejects_invalid_configuration(
+    channels, primary_channel_key, error, message
+):
+    daemon = make_channel_registry_daemon(channels, primary_channel_key)
+
+    with pytest.raises(error, match=message):
+        daemon._start_channels()
+
+
+def test_channel_registry_restarts_only_dead_channels():
+    healthy = FakeBridge()
+    dead = FakeBridge()
+    dead.stopped = True
+    daemon = make_channel_registry_daemon({"feishu": healthy, "web": dead})
+
+    daemon._restart_dead_channels()
+
+    assert healthy.restart_count == 0
+    assert dead.restart_count == 1
+
+
+def test_channel_registry_rolls_back_started_channels_on_start_failure():
+    class BrokenStartChannel(FakeBridge):
+        def start(self, on_message) -> None:
+            self.start_count += 1
+            raise RuntimeError("start boom")
+
+    started = FakeBridge()
+    broken = BrokenStartChannel()
+    daemon = make_channel_registry_daemon({"feishu": started, "broken": broken})
+
+    with pytest.raises(RuntimeError, match="start boom"):
+        daemon._start_channels()
+
+    assert started.stop_count == 1
+    assert broken.stop_count == 0
+
+
+def test_channel_registry_stops_all_when_one_channel_fails():
+    class BrokenStopChannel(FakeBridge):
+        def stop(self) -> None:
+            self.stop_count += 1
+            raise RuntimeError("stop boom")
+
+    broken = BrokenStopChannel()
+    healthy = FakeBridge()
+    daemon = make_channel_registry_daemon({"broken": broken, "feishu": healthy})
+
+    daemon._stop_channels()
+
+    assert broken.stop_count == 1
+    assert healthy.stop_count == 1
+    assert healthy.stopped
 
 
 def root_msg(
@@ -613,7 +720,7 @@ async def test_run_uses_text_only_channel_output_lifecycle():
 
     daemon, _, created = make_daemon()
     channel = TextOnlyChannel()
-    daemon._channel = channel
+    daemon._channels[daemon._primary_channel_key] = channel
 
     assert not hasattr(channel, "send_card")
     assert not hasattr(channel, "update_card")
@@ -1025,7 +1132,7 @@ def make_daemon_with_limit(
     )
     daemon = _Daemon(cfg, store=store or TaskStore(None))
     bridge = FakeBridge()
-    daemon._channel = bridge
+    daemon._channels[daemon._primary_channel_key] = bridge
     created: list[FakeAgent] = []
 
     def factory(spawn, on_output, on_action=None, *, resume_session_id=None):
@@ -1075,7 +1182,7 @@ def make_daemon_with_whitelist(
     )
     daemon = _Daemon(cfg)
     bridge = FakeBridge()
-    daemon._channel = bridge
+    daemon._channels[daemon._primary_channel_key] = bridge
     created: list[FakeAgent] = []
     daemon._make_agent = (
         lambda spawn, on_output, on_action=None, *, resume_session_id=None: (  # noqa: E731
@@ -1117,7 +1224,7 @@ async def test_discover_mode_does_not_execute_commands():
     )
     daemon = _Daemon(cfg, discover=True)
     bridge = FakeBridge()
-    daemon._channel = bridge
+    daemon._channels[daemon._primary_channel_key] = bridge
     created: list[FakeAgent] = []
     daemon._make_agent = (
         lambda spawn, on_output, on_action=None, *, resume_session_id=None: (  # noqa: E731
@@ -2810,7 +2917,7 @@ def _daemon_with_llm_profiles() -> tuple[_Daemon, FakeBridge]:
     )
     daemon = _Daemon(cfg)
     bridge = FakeBridge()
-    daemon._channel = bridge
+    daemon._channels[daemon._primary_channel_key] = bridge
     daemon._llm_active = "deepseek"  # 模拟 run() 后状态（run() 未调用）
     return daemon, bridge
 
@@ -3284,7 +3391,7 @@ async def test_launch_threads_agent_env_into_spawn():
     )
     daemon = _Daemon(cfg, store=TaskStore(None), project_store=ProjectStore(None))
     bridge = FakeBridge()
-    daemon._channel = bridge
+    daemon._channels[daemon._primary_channel_key] = bridge
     created: list[FakeAgent] = []
 
     def factory(spawn, on_output, on_action=None, *, resume_session_id=None):

@@ -22,6 +22,7 @@ import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from functools import partial
 
 from pathlib import Path
 
@@ -292,8 +293,8 @@ async def run(
             # [llm].memory_rounds 可配；未配 [llm] 时记忆不参与派发，取默认即可
             max_turns=cfg.llm.memory_rounds if cfg.llm else 12,
         ),
-        _channel=channel,
-        _channel_key=resolved_channel_key,
+        _channels={resolved_channel_key: channel},
+        _primary_channel_key=resolved_channel_key,
     )
     await daemon.run()
     return daemon._reboot_requested
@@ -428,10 +429,10 @@ class _Daemon:
     _sched_memory: SchedulerMemory = field(
         default_factory=lambda: SchedulerMemory(None)
     )
-    #: 由启动装配层注入；_Daemon 不负责选择或构造具体通道实现。
-    _channel: Channel | None = None
-    #: 当前单 Channel 的稳定身份；后续多 Channel registry 以此作为持久化 lookup key。
-    _channel_key: str = "feishu"
+    #: 由启动装配层注入；稳定 key → Channel 实例。
+    _channels: dict[str, Channel] = field(default_factory=dict)
+    #: 现有未作用域化的出站路径继续使用该 Channel；后续按 ConversationRef 寻址。
+    _primary_channel_key: str = "feishu"
     #: 每个 Task 的单活 current runner；Thread 只经 Task 路由到这里。
     _runners: _CurrentRunnerRegistry = field(default_factory=_CurrentRunnerRegistry)
     _seen_message_keys: OrderedDict[tuple[ConversationRef, str], None] = field(
@@ -458,10 +459,68 @@ class _Daemon:
     #: run() 里创建的退出事件；/reboot 或退出信号 set 它跳出主循环
     _stop_event: "asyncio.Event | None" = None
 
+    def _validate_channel_registry(self) -> None:
+        if not self._channels:
+            raise RuntimeError("Channel registry 不能为空")
+        for channel_key in self._channels:
+            if not channel_key or channel_key != channel_key.strip():
+                raise ValueError("Channel key 必须非空且不能包含首尾空白")
+        if self._primary_channel_key not in self._channels:
+            raise RuntimeError(f"主 Channel 未注册: {self._primary_channel_key!r}")
+
+    @property
+    def _primary_channel(self) -> Channel:
+        try:
+            return self._channels[self._primary_channel_key]
+        except KeyError as exc:
+            raise RuntimeError(
+                f"主 Channel 未注册: {self._primary_channel_key!r}"
+            ) from exc
+
+    def _start_channels(self) -> None:
+        self._validate_channel_registry()
+        started: list[tuple[str, Channel]] = []
+        try:
+            for channel_key, channel in self._channels.items():
+                channel.start(partial(self._handle_channel_message, channel_key))
+                started.append((channel_key, channel))
+        except Exception:
+            for channel_key, channel in reversed(started):
+                try:
+                    channel.stop()
+                except Exception:
+                    logger.warning(
+                        "Channel %s 启动回滚关闭失败，忽略",
+                        channel_key,
+                        exc_info=True,
+                    )
+            raise
+
+    def _restart_dead_channels(self) -> None:
+        for channel_key, channel in self._channels.items():
+            try:
+                alive = channel.is_alive()
+            except Exception:
+                logger.exception("Channel %s 健康检查失败", channel_key)
+                continue
+            if alive:
+                continue
+            logger.error("Channel %s 连接已死亡，尝试重启…", channel_key)
+            try:
+                channel.restart()
+            except Exception:
+                logger.exception("Channel %s 重启失败", channel_key)
+
+    def _stop_channels(self) -> None:
+        for channel_key, channel in self._channels.items():
+            try:
+                channel.stop()
+            except Exception:
+                logger.warning("Channel %s 关闭失败，忽略", channel_key, exc_info=True)
+
     async def run(self) -> None:
         loop = asyncio.get_running_loop()
-        if self._channel is None:
-            raise RuntimeError("Channel 未注入")
+        self._validate_channel_registry()
         if self._llm is None:
             self._llm = build_llm_client(self.cfg.llm)
             self._llm_active = self.cfg.llm_active
@@ -484,9 +543,10 @@ class _Daemon:
         # 飞书功能照常（决策 Q3=β）。token 未填则自动生成 + 持久化（决策 Q3/Q8）。
         if self.cfg.viewer and self.cfg.viewer.enabled:
             self._viewer = self._start_viewer(loop)
-        self._channel.start(self._handle_message)
+        self._start_channels()
         logger.info(
-            "feishu-dispatcher daemon 已启动（调度器 LLM: %s），等待飞书消息…",
+            "feishu-dispatcher daemon 已启动（Channel: %d；调度器 LLM: %s），等待消息…",
+            len(self._channels),
             "on" if self._llm else "off",
         )
         # re-exec 重启起来的进程：给控制台发一条「已重启」回执（HTTP，不依赖 WS）
@@ -494,7 +554,7 @@ class _Daemon:
             await self._notify_main("✅ daemon 已重启完成。")
         try:
             # R13：看门狗——最多等 30s 或直到 _stop_event 被 set（/reboot / 退出）；
-            # 超时则检查 WS 线程是否存活，死了 channel.restart()。
+            # 超时则分别检查 Channel 是否存活，只重启失活实例。
             while not self._stop_event.is_set():
                 try:
                     await asyncio.wait_for(self._stop_event.wait(), timeout=30.0)
@@ -502,9 +562,7 @@ class _Daemon:
                     pass  # 正常：每 30s 醒来检查一次
                 if self._stop_event.is_set():
                     break
-                if not self._channel.is_alive():
-                    logger.error("飞书 WS 线程已死亡，尝试重启…")
-                    self._channel.restart()
+                self._restart_dead_channels()
         except (KeyboardInterrupt, asyncio.CancelledError):
             logger.info("收到退出信号，清理 agent…")
         finally:
@@ -574,8 +632,8 @@ class _Daemon:
         return False
 
     async def _handle_message(self, msg: ChannelMessage) -> None:
-        """当前单 Channel 的消息入口（在主 event loop 上）。"""
-        await self._handle_channel_message(self._channel_key, msg)
+        """当前主 Channel 的直接消息入口（测试与内部兼容路径）。"""
+        await self._handle_channel_message(self._primary_channel_key, msg)
 
     async def _handle_channel_message(
         self, channel_key: str, msg: ChannelMessage
@@ -1123,13 +1181,14 @@ class _Daemon:
             )
         # 新话题（Channel.create_thread 开新话题拿 thread_root_id），header = 固定摘要 + 截断
         # session_id + 可选描述。
-        assert self._channel is not None
         sid = _short_sid(session_id)
         header = f"🔗 {agent_label} · {project_name}\n附着外部会话: {sid}"
         if description:
             header += f"\n说明: {description}"
         root = await asyncio.to_thread(
-            self._channel.create_thread, conversation.conversation_id, header
+            self._primary_channel.create_thread,
+            conversation.conversation_id,
+            header,
         )
         #  ② 终查——create_thread 是 await，其间别的并发附着/派发可能占走名额；
         # 终查与 create+_launch 之间**无 await**，守住「check→launch 无 await」不变量。
@@ -1428,8 +1487,7 @@ class _Daemon:
                 issue_tag = _issue_tag(sess.issue_url)  # 绑定了 issue 则标 · #N（#63）
                 if issue_tag:
                     footer += f" · {issue_tag}"
-                assert self._channel is not None
-                output = self._channel.open_output(root, title, footer=footer)
+                output = self._primary_channel.open_output(root, title, footer=footer)
                 sess.current_output = output
                 self.store.update(sess.task_id, status="running")
                 logger.info(
@@ -2081,7 +2139,7 @@ class _Daemon:
             agent,
             session_id,
             description,
-            conversation=ConversationRef(self._channel_key, self.cfg.chat_id),
+            conversation=ConversationRef(self._primary_channel_key, self.cfg.chat_id),
         )
         return message
 
@@ -2124,19 +2182,18 @@ class _Daemon:
             )
         if self._runners.count() >= self.cfg.max_agents:
             return f"已达并发上限 {self.cfg.max_agents}，请先 `/stop` 一个再派发。"
-        assert self._channel is not None
         # 每个派发新建一个话题根消息，agent 输出流进该话题
         header = f"🚀 {agent_label} · {project_name}\n任务: {task}"
         if issue_url:
             header += f"\nissue: {issue_url}"
         root = await asyncio.to_thread(
-            self._channel.create_thread, self.cfg.chat_id, header
+            self._primary_channel.create_thread, self.cfg.chat_id, header
         )
         new_task = self.store.create(
             project_name=project_name,
             agent_label=agent_label,
             description=task,
-            conversation=ConversationRef(self._channel_key, self.cfg.chat_id),
+            conversation=ConversationRef(self._primary_channel_key, self.cfg.chat_id),
             thread_root_id=root,
             workspace=str(project.path),
             issue_url=issue_url,
@@ -2472,10 +2529,9 @@ class _Daemon:
         ``in_thread=True``（默认）用于 agent 话题内的输出/状态；``in_thread=False``
         用于对用户对话/命令的普通回复——**不创建话题**（只有派发 agent 才建话题）。
         """
-        assert self._channel is not None
         try:
             await asyncio.to_thread(
-                self._channel.reply_text,
+                self._primary_channel.reply_text,
                 message_id,
                 text,
                 threaded=in_thread,
@@ -2489,10 +2545,12 @@ class _Daemon:
 
     async def _notify_main(self, text: str) -> None:
         """向控制台主线推一条独立通知（不建话题）——agent 完成/出错/挂起时用。"""
-        if not self.cfg.chat_id or self._channel is None:
+        if not self.cfg.chat_id:
             return
         try:
-            await asyncio.to_thread(self._channel.send_text, self.cfg.chat_id, text)
+            await asyncio.to_thread(
+                self._primary_channel.send_text, self.cfg.chat_id, text
+            )
         except Exception:
             logger.exception("主线通知发送失败")
 
@@ -2513,8 +2571,7 @@ class _Daemon:
                 )
             except Exception:
                 logger.warning("控制面关闭失败，忽略", exc_info=True)
-        if self._channel is not None:
-            self._channel.stop()
+        self._stop_channels()
         # 把仍活跃的任务标记为 suspended，让重启后台账状态准确（且可 load_session 恢复）
         for sess in self._runners.values():
             task = self.store.get(sess.task_id)
