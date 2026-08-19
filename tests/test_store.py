@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
+from feishu_dispatcher.channel import ConversationRef
 from feishu_dispatcher.config import Project
 from feishu_dispatcher.store import (
     _MAX_ACTIONS,
@@ -13,6 +16,8 @@ from feishu_dispatcher.store import (
     TaskStore,
 )
 
+_TEST_CONVERSATION = ConversationRef("feishu", "oc_main")
+
 
 def make(
     store: TaskStore, *, thread: str = "om_1", project: str = "demo", desc: str = "做 X"
@@ -21,6 +26,7 @@ def make(
         project_name=project,
         agent_label="copilot",
         description=desc,
+        conversation=_TEST_CONVERSATION,
         thread_root_id=thread,
         workspace="C:/x",
     )
@@ -35,12 +41,54 @@ def test_create_assigns_incrementing_ids():
     assert t1.status == "starting"
 
 
+@pytest.mark.parametrize(
+    ("conversation", "field"),
+    [
+        (ConversationRef(" ", "oc_main"), "channel_key"),
+        (ConversationRef("feishu", " "), "conversation_id"),
+    ],
+)
+def test_create_rejects_blank_conversation_ref_without_consuming_id(
+    conversation: ConversationRef, field: str
+):
+    s = TaskStore(None)
+
+    with pytest.raises(ValueError, match=field):
+        s.create(
+            project_name="demo",
+            agent_label="copilot",
+            description="做 X",
+            conversation=conversation,
+            thread_root_id="om_1",
+            workspace="C:/x",
+        )
+
+    assert make(s).task_id == "t1"
+
+
 def test_get_and_by_thread():
     s = TaskStore(None)
     t = make(s, thread="om_1")
     assert s.get("t1") is t
     assert s.by_thread("om_1") is t
     assert s.by_thread("nope") is None
+
+
+def test_task_conversation_ref_persists_and_reloads(tmp_path: Path):
+    p = tmp_path / "tasks.json"
+    s1 = TaskStore(p)
+    conversation = ConversationRef("web", "workspace-main")
+    task = s1.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="做 X",
+        conversation=conversation,
+        thread_root_id="thread-1",
+        workspace="C:/x",
+    )
+
+    assert task.conversation_ref == conversation
+    assert TaskStore(p).get(task.task_id).conversation_ref == conversation
 
 
 def test_update_mutates_and_bumps():
@@ -348,6 +396,7 @@ def test_task_create_records_model():
         project_name="p",
         agent_label="opencode",
         description="x",
+        conversation=_TEST_CONVERSATION,
         thread_root_id="om_1",
         workspace="C:/x",
         model="glm-5",
@@ -466,6 +515,7 @@ def test_task_create_with_origin_attach():
         project_name="p",
         agent_label="opencode",
         description="附着",
+        conversation=_TEST_CONVERSATION,
         thread_root_id="om_1",
         workspace="C:/x",
         session_id="ext_sid_1",
@@ -482,6 +532,7 @@ def test_task_origin_persists_and_reloads(tmp_path: Path):
         project_name="p",
         agent_label="opencode",
         description="附着",
+        conversation=_TEST_CONVERSATION,
         thread_root_id="om_2",
         workspace="C:/x",
         session_id="ext_sid_1",
@@ -523,6 +574,7 @@ def test_old_tasks_json_without_origin_reads_spawn(tmp_path: Path):
     p.write_text(json.dumps(payload), encoding="utf-8")
     s = TaskStore(p)
     assert s.get("t1").origin == "spawn"  # 缺省补齐
+    assert s.get("t1").conversation_ref == ConversationRef("", "")
 
 
 def test_by_agent_session_matches_agent_and_session():
@@ -544,6 +596,7 @@ def test_by_agent_session_cross_agent_same_session_id_no_conflict():
         project_name="p",
         agent_label="copilot",
         description="a",
+        conversation=_TEST_CONVERSATION,
         thread_root_id="om_1",
         workspace="C:/x",
         session_id="shared_sid",
@@ -552,6 +605,7 @@ def test_by_agent_session_cross_agent_same_session_id_no_conflict():
         project_name="p",
         agent_label="opencode",
         description="b",
+        conversation=_TEST_CONVERSATION,
         thread_root_id="om_2",
         workspace="C:/x",
         session_id="shared_sid",

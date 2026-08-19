@@ -1,8 +1,9 @@
 """任务台账持久化：Task 是 daemon 拥有的核心实体。
 
 一个 Task = 派发在某项目上的一个工作单元，持有它的 session_id（agent 侧记忆）、
-thread_root_id（飞书话题）、workspace（工作目录）。落盘到 tasks.json，按 `task_id`
-（短自增 `t<N>`，持久单调计数器、**永不复用**）索引；另存 thread→task 便于路由。
+ConversationRef + thread_root_id（交互入口）、workspace（工作目录）。落盘到 tasks.json，
+按 `task_id`（短自增 `t<N>`，持久单调计数器、**永不复用**）索引；另存
+thread→task 便于路由。
 
 status 生命周期：
 - 机械态（worker 自动）：starting → running ↔ idle → suspended；turn 异常 → failed
@@ -24,6 +25,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from ._atomic import atomic_write
+from .channel import ConversationRef
 from .config import Project
 
 logger = logging.getLogger(__name__)
@@ -109,6 +111,8 @@ _TASK_FIELDS = (
     "description",
     "status",
     "session_id",
+    "channel_key",
+    "conversation_id",
     "thread_root_id",
     "workspace",
     "turns",
@@ -131,6 +135,8 @@ class Task:
     description: str
     status: str  # starting/running/idle/suspended/done/stopped/failed
     session_id: str = ""
+    channel_key: str = ""
+    conversation_id: str = ""
     thread_root_id: str = ""
     workspace: str = ""
     turns: int = 0
@@ -150,6 +156,10 @@ class Task:
     #: 会话来源：spawn = daemon 新建会话（/run、spawn_agent），attach = 附着外部会话
     #: （/attach，#99）。旧 tasks.json 无此键时缺省为 spawn（向后兼容）。
     origin: str = "spawn"
+
+    @property
+    def conversation_ref(self) -> ConversationRef:
+        return ConversationRef(self.channel_key, self.conversation_id)
 
     @property
     def is_active(self) -> bool:
@@ -252,6 +262,7 @@ class TaskStore:
         project_name: str,
         agent_label: str,
         description: str,
+        conversation: ConversationRef,
         thread_root_id: str,
         workspace: str,
         session_id: str = "",
@@ -260,6 +271,10 @@ class TaskStore:
         model: str = "",
         origin: str = "spawn",
     ) -> Task:
+        if not conversation.channel_key.strip():
+            raise ValueError("ConversationRef.channel_key 不能为空")
+        if not conversation.conversation_id.strip():
+            raise ValueError("ConversationRef.conversation_id 不能为空")
         # 铸号自愈守卫（#81）：不只信持久化的 seq——同时从现有 task id 推出下界，
         # 取两者较大再 +1。即使 seq 因故被回退/污染（多实例踩踏、手工改 tasks.json、
         # 半截原子写），也绝不落到已存在的 id 上，守住「task_id 永不复用」不变量。
@@ -276,6 +291,8 @@ class TaskStore:
             description=description,
             status=status,
             session_id=session_id,
+            channel_key=conversation.channel_key,
+            conversation_id=conversation.conversation_id,
             thread_root_id=thread_root_id,
             workspace=workspace,
             created_at=now,
