@@ -8,6 +8,14 @@ from typing import Literal, Protocol
 
 
 @dataclass(frozen=True)
+class ConversationRef:
+    """一个 Channel 内会话的稳定引用。"""
+
+    channel_key: str
+    conversation_id: str
+
+
+@dataclass(frozen=True)
 class ChannelMessage:
     """通道收到的、已规整的消息。"""
 
