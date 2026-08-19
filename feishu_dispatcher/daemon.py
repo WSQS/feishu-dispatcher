@@ -259,6 +259,7 @@ async def run(
 
     返回是否收到 ``/reboot``——cli.py 据此 re-exec 重启进程。
     """
+    default_feishu = channel is None and channel_key is None
     if channel_key is None:
         if channel is not None:
             raise ValueError("注入 Channel 时必须显式提供 channel_key")
@@ -280,10 +281,13 @@ async def run(
             stream_mode=cfg.stream_mode,
             throttle_window=cfg.throttle_window,
         )
+    task_store = TaskStore(store_path.parent / "tasks.json")
+    if default_feishu and cfg.chat_id:
+        task_store.backfill_missing_conversation(ConversationRef("feishu", cfg.chat_id))
     daemon = _Daemon(
         cfg,
         discover=discover,
-        store=TaskStore(store_path.parent / "tasks.json"),
+        store=task_store,
         project_store=ProjectStore(store_path.parent / "projects.json"),
         model_store=ModelStore(store_path.parent / "models.json"),
         job_store=JobStore(store_path.parent / "jobs.json"),

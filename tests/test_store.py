@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -108,6 +109,85 @@ def test_task_conversation_ref_persists_and_reloads(tmp_path: Path):
 
     assert task.conversation_ref == conversation
     assert TaskStore(p).get(task.task_id).conversation_ref == conversation
+
+
+def test_backfill_missing_conversation_round_trips_and_restores_thread_route(
+    tmp_path: Path,
+):
+    p = tmp_path / "tasks.json"
+    original = make(TaskStore(p), thread="om_legacy")
+    original_updated_at = original.updated_at
+    payload = json.loads(p.read_text(encoding="utf-8"))
+    payload["tasks"][original.task_id].pop("channel_key")
+    payload["tasks"][original.task_id].pop("conversation_id")
+    p.write_text(json.dumps(payload), encoding="utf-8")
+
+    store = TaskStore(p)
+    assert store.by_thread(_TEST_CONVERSATION, "om_legacy") is None
+
+    assert store.backfill_missing_conversation(_TEST_CONVERSATION) == 1
+    migrated = store.by_thread(_TEST_CONVERSATION, "om_legacy")
+    assert migrated is not None
+    assert migrated.updated_at == original_updated_at
+    assert TaskStore(p).by_thread(_TEST_CONVERSATION, "om_legacy") is not None
+
+
+def test_backfill_missing_conversation_preserves_complete_and_partial_sources(
+    caplog,
+):
+    store = TaskStore(None)
+    complete = make(store, thread="om_complete")
+    missing_channel = make(store, thread="om_missing_channel")
+    missing_conversation = make(store, thread="om_missing_conversation")
+    missing_channel.channel_key = ""
+    missing_conversation.conversation_id = ""
+
+    with caplog.at_level("WARNING", logger="feishu_dispatcher.store"):
+        assert (
+            store.backfill_missing_conversation(
+                ConversationRef("http", "browser-session")
+            )
+            == 0
+        )
+
+    assert complete.conversation_ref == _TEST_CONVERSATION
+    assert missing_channel.conversation_ref == ConversationRef("", "oc_main")
+    assert missing_conversation.conversation_ref == ConversationRef("feishu", "")
+    assert "2 个来源字段不完整" in caplog.text
+
+
+def test_backfill_missing_conversation_flushes_once_and_logs_count(monkeypatch, caplog):
+    store = TaskStore(None)
+    first = make(store, thread="om_1")
+    second = make(store, thread="om_2")
+    first.channel_key = first.conversation_id = ""
+    second.channel_key = second.conversation_id = ""
+    flushes = 0
+
+    def count_flush() -> None:
+        nonlocal flushes
+        flushes += 1
+
+    monkeypatch.setattr(store, "_flush", count_flush)
+    with caplog.at_level("INFO", logger="feishu_dispatcher.store"):
+        assert store.backfill_missing_conversation(_TEST_CONVERSATION) == 2
+
+    assert flushes == 1
+    assert "已为 2 个旧任务回填来源" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("conversation", "field"),
+    [
+        (ConversationRef(" ", "oc_main"), "channel_key"),
+        (ConversationRef("feishu", " "), "conversation_id"),
+    ],
+)
+def test_backfill_missing_conversation_rejects_blank_target(
+    conversation: ConversationRef, field: str
+):
+    with pytest.raises(ValueError, match=field):
+        TaskStore(None).backfill_missing_conversation(conversation)
 
 
 def test_update_mutates_and_bumps():

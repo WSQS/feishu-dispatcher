@@ -318,6 +318,24 @@ def make_daemon(
     return daemon, bridge, created
 
 
+def write_legacy_task(path: Path, *, thread_root_id: str = "om_legacy") -> None:
+    store = TaskStore(path)
+    task = store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="旧任务",
+        conversation=ConversationRef("feishu", "oc_old"),
+        thread_root_id=thread_root_id,
+        workspace="C:/tmp/demo",
+        session_id="legacy-session",
+        status="suspended",
+    )
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["tasks"][task.task_id].pop("channel_key")
+    payload["tasks"][task.task_id].pop("conversation_id")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("discover", "expected_sender_whitelist"),
@@ -386,6 +404,76 @@ async def test_run_builds_default_feishu_channel_and_injects_it(
     assert isinstance(channels, dict)
     assert isinstance(channels["feishu"], FakeFeishuChannel)
     assert constructed["primary_channel_key"] == "feishu"
+
+
+@pytest.mark.asyncio
+async def test_run_backfills_legacy_tasks_for_default_feishu(monkeypatch, tmp_path):
+    tasks_path = tmp_path / "tasks.json"
+    write_legacy_task(tasks_path)
+    cfg = Config(app_id="a", app_secret="b", chat_id="oc-main")
+
+    monkeypatch.setattr(daemon_module, "FeishuBridge", lambda **_kwargs: FakeBridge())
+
+    async def fake_daemon_run(self) -> None:
+        return None
+
+    monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
+
+    await daemon_module.run(cfg, store_path=tmp_path / "sessions.json")
+
+    store = TaskStore(tasks_path)
+    assert store.by_thread(ConversationRef("feishu", "oc-main"), "om_legacy")
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_backfill_legacy_tasks_for_injected_channel(
+    monkeypatch, tmp_path
+):
+    tasks_path = tmp_path / "tasks.json"
+    write_legacy_task(tasks_path)
+    cfg = Config(app_id="a", app_secret="b", chat_id="oc-main")
+
+    async def fake_daemon_run(self) -> None:
+        return None
+
+    monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
+
+    await daemon_module.run(
+        cfg,
+        store_path=tmp_path / "sessions.json",
+        channel=FakeBridge(),
+        channel_key="http",
+    )
+
+    task = TaskStore(tasks_path).get("t1")
+    assert task is not None
+    assert task.conversation_ref == ConversationRef("", "")
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_backfill_legacy_tasks_without_chat_id(
+    monkeypatch, tmp_path
+):
+    tasks_path = tmp_path / "tasks.json"
+    write_legacy_task(tasks_path)
+    cfg = Config(app_id="a", app_secret="b", chat_id="")
+
+    monkeypatch.setattr(daemon_module, "FeishuBridge", lambda **_kwargs: FakeBridge())
+
+    async def fake_daemon_run(self) -> None:
+        return None
+
+    monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
+
+    await daemon_module.run(
+        cfg,
+        discover=True,
+        store_path=tmp_path / "sessions.json",
+    )
+
+    task = TaskStore(tasks_path).get("t1")
+    assert task is not None
+    assert task.conversation_ref == ConversationRef("", "")
 
 
 @pytest.mark.asyncio

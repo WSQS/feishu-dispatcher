@@ -265,6 +265,37 @@ class TaskStore:
 
     # ---- 写 ---- #
 
+    def backfill_missing_conversation(self, conversation: ConversationRef) -> int:
+        """为来源完全缺失的旧 Task 回填唯一已知 Conversation，并一次性刷盘。"""
+        if not conversation.channel_key.strip():
+            raise ValueError("ConversationRef.channel_key 不能为空")
+        if not conversation.conversation_id.strip():
+            raise ValueError("ConversationRef.conversation_id 不能为空")
+
+        migrated = 0
+        partial = 0
+        for task in self._tasks.values():
+            has_channel = bool(task.channel_key.strip())
+            has_conversation = bool(task.conversation_id.strip())
+            if not has_channel and not has_conversation:
+                task.channel_key = conversation.channel_key
+                task.conversation_id = conversation.conversation_id
+                migrated += 1
+            elif has_channel != has_conversation:
+                partial += 1
+
+        if migrated:
+            self._flush()
+            logger.info(
+                "已为 %d 个旧任务回填来源 channel=%s conversation=%s",
+                migrated,
+                conversation.channel_key,
+                conversation.conversation_id,
+            )
+        if partial:
+            logger.warning("发现 %d 个来源字段不完整的任务，未自动回填", partial)
+        return migrated
+
     def create(
         self,
         *,
