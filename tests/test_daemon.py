@@ -281,6 +281,7 @@ def make_daemon(
     project_store: ProjectStore | None = None,
     idle_timeout: float = 1800.0,
     channel_key: str = "feishu",
+    sender_whitelist: list[str] | None = None,
 ) -> tuple[_Daemon, FakeBridge, list[FakeAgent]]:
     cfg = Config(
         app_id="a",
@@ -290,6 +291,7 @@ def make_daemon(
         projects={"demo": Project(name="demo", path=Path("C:/tmp/demo"))},
         throttle_window=0.01,
         idle_timeout=idle_timeout,
+        sender_whitelist=sender_whitelist or [],
         stream_mode=stream_mode,
     )
     bridge = FakeBridge(
@@ -317,11 +319,18 @@ def make_daemon(
 
 
 @pytest.mark.asyncio
-async def test_run_builds_default_feishu_channel_and_injects_it(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("discover", "expected_sender_whitelist"),
+    [(False, ["ou-owner"]), (True, [])],
+)
+async def test_run_builds_default_feishu_channel_and_injects_it(
+    monkeypatch, tmp_path, discover, expected_sender_whitelist
+):
     cfg = Config(
         app_id="app-id",
         app_secret="app-secret",
         chat_id="oc-main",
+        sender_whitelist=["ou-owner"],
         feishu_qps=3.5,
     )
     constructed: dict[str, object] = {}
@@ -334,6 +343,7 @@ async def test_run_builds_default_feishu_channel_and_injects_it(monkeypatch, tmp
             app_secret: str,
             main_loop,
             chat_whitelist: str,
+            sender_whitelist,
             qps: float,
             stream_mode: str,
             throttle_window: float,
@@ -344,6 +354,7 @@ async def test_run_builds_default_feishu_channel_and_injects_it(monkeypatch, tmp
                 app_secret=app_secret,
                 main_loop=main_loop,
                 chat_whitelist=chat_whitelist,
+                sender_whitelist=list(sender_whitelist),
                 qps=qps,
                 stream_mode=stream_mode,
                 throttle_window=throttle_window,
@@ -358,6 +369,7 @@ async def test_run_builds_default_feishu_channel_and_injects_it(monkeypatch, tmp
 
     reboot = await daemon_module.run(
         cfg,
+        discover=discover,
         store_path=tmp_path / "sessions.json",
     )
 
@@ -366,6 +378,7 @@ async def test_run_builds_default_feishu_channel_and_injects_it(monkeypatch, tmp
     assert constructed["app_secret"] == "app-secret"
     assert constructed["main_loop"] is asyncio.get_running_loop()
     assert constructed["chat_whitelist"] == "oc-main"
+    assert constructed["sender_whitelist"] == expected_sender_whitelist
     assert constructed["qps"] == 3.5
     assert constructed["stream_mode"] == "card"
     assert constructed["throttle_window"] == 0.5
@@ -1028,6 +1041,20 @@ async def test_same_message_id_help_replies_on_source_channel():
     assert [target for target, _ in web.plain] == ["om_shared"]
 
 
+async def test_non_primary_channel_uses_own_admission_scope():
+    daemon, feishu, _ = make_daemon(sender_whitelist=["ou_feishu"])
+    web = FakeBridge()
+    daemon._channels["web"] = web
+
+    await daemon._handle_channel_message(
+        "web",
+        root_msg("/help", mid="om_web", conversation_id="web-room"),
+    )
+
+    assert feishu.plain == []
+    assert [target for target, _ in web.plain] == ["om_web"]
+
+
 async def test_same_inbound_ids_are_isolated_by_channel():
     daemon, feishu, created = make_daemon()
     web = FakeBridge()
@@ -1226,55 +1253,8 @@ async def test_max_agents_limit_blocks_excess_spawns():
 
 
 # ---------------------------------------------------------------------- #
-# R10: sender_whitelist 过滤 + discover 模式
+# R10: discover 模式
 # ---------------------------------------------------------------------- #
-
-
-def make_daemon_with_whitelist(
-    sender_whitelist: list[str],
-    *,
-    stream_mode: str = "text",
-) -> tuple[_Daemon, FakeBridge, list[FakeAgent]]:
-    cfg = Config(
-        app_id="a",
-        app_secret="b",
-        chat_id="oc_1",
-        agents={"copilot": ["copilot", "--acp"], "opencode": ["opencode", "acp"]},
-        projects={"demo": Project(name="demo", path=Path("C:/tmp/demo"))},
-        throttle_window=0.01,
-        sender_whitelist=sender_whitelist,
-        stream_mode=stream_mode,
-    )
-    daemon = _Daemon(cfg)
-    bridge = FakeBridge()
-    daemon._channels[daemon._primary_channel_key] = bridge
-    created: list[FakeAgent] = []
-    daemon._make_agent = (
-        lambda spawn, on_output, on_action=None, *, resume_session_id=None: (  # noqa: E731
-            created.append(
-                FakeAgent(
-                    spawn, on_output, on_action, resume_session_id=resume_session_id
-                )
-            )
-            or created[-1]
-        )
-    )
-    return daemon, bridge, created
-
-
-async def test_sender_whitelist_blocks_non_whitelisted():
-    daemon, bridge, created = make_daemon_with_whitelist(["ou_allowed"])
-    # 非白名单发送者（root_msg 默认 sender_id=ou_user）
-    await daemon._handle_message(root_msg("/run demo task"))
-    assert created == []
-    assert bridge.texts() == []
-
-
-async def test_sender_whitelist_allows_whitelisted():
-    daemon, bridge, created = make_daemon_with_whitelist(["ou_user"])
-    await daemon._handle_message(root_msg("/run demo task"))
-    await wait_until(lambda: created and created[0].prompts == ["task"])
-    await daemon._shutdown()
 
 
 async def test_discover_mode_does_not_execute_commands():

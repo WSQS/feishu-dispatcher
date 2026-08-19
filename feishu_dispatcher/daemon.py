@@ -275,6 +275,7 @@ async def run(
             app_secret=cfg.app_secret,
             main_loop=asyncio.get_running_loop(),
             chat_whitelist=cfg.chat_id,
+            sender_whitelist=() if discover else cfg.sender_whitelist,
             qps=cfg.feishu_qps,
             stream_mode=cfg.stream_mode,
             throttle_window=cfg.throttle_window,
@@ -651,9 +652,6 @@ class _Daemon:
         if not channel_key:
             raise ValueError("channel_key 不能为空")
         conversation = ConversationRef(channel_key, msg.conversation_id)
-        if self.cfg.chat_id and msg.conversation_id != self.cfg.chat_id:
-            logger.debug("忽略非目标群消息 chat_id=%s", msg.conversation_id)
-            return
         # 忽略无发送者的系统消息
         if not msg.sender_id:
             return
@@ -679,15 +677,6 @@ class _Daemon:
                 "[discover] chat_id=%r sender_id=%r — 填入 config.toml 的 chat_id 即可",
                 msg.conversation_id,
                 msg.sender_id,
-            )
-            return
-
-        # R10：发送者白名单（非空时校验）
-        if self.cfg.sender_whitelist and msg.sender_id not in self.cfg.sender_whitelist:
-            logger.debug(
-                "忽略非白名单发送者 sender_id=%s (msg=%s)",
-                msg.sender_id,
-                msg.message_id,
             )
             return
 
