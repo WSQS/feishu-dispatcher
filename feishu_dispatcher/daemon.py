@@ -331,6 +331,10 @@ class _AgentSession:
     agent_label: str
     #: 关联的 Task id（持久台账的主键）
     task_id: str = ""
+    #: Task 的来源 Conversation；所有异步输出据此选择 Channel。
+    conversation: ConversationRef = field(
+        default_factory=lambda: ConversationRef("", "")
+    )
     #: agent 工作目录（= Task.workspace）
     cwd: str = ""
     #: 是否由 load_session 恢复而来（影响启动失败时的提示文案）
@@ -431,7 +435,7 @@ class _Daemon:
     )
     #: 由启动装配层注入；稳定 key → Channel 实例。
     _channels: dict[str, Channel] = field(default_factory=dict)
-    #: 现有未作用域化的出站路径继续使用该 Channel；后续按 ConversationRef 寻址。
+    #: 控制台主线通知与兼容消息入口使用的主 Channel key。
     _primary_channel_key: str = "feishu"
     #: 每个 Task 的单活 current runner；Thread 只经 Task 路由到这里。
     _runners: _CurrentRunnerRegistry = field(default_factory=_CurrentRunnerRegistry)
@@ -469,13 +473,17 @@ class _Daemon:
             raise RuntimeError(f"主 Channel 未注册: {self._primary_channel_key!r}")
 
     @property
-    def _primary_channel(self) -> Channel:
+    def _main_conversation(self) -> ConversationRef:
+        return ConversationRef(self._primary_channel_key, self.cfg.chat_id)
+
+    def _channel_for(self, conversation: ConversationRef) -> Channel:
+        channel_key = conversation.channel_key.strip()
+        if not channel_key:
+            raise RuntimeError("Conversation 缺少 channel_key")
         try:
-            return self._channels[self._primary_channel_key]
+            return self._channels[channel_key]
         except KeyError as exc:
-            raise RuntimeError(
-                f"主 Channel 未注册: {self._primary_channel_key!r}"
-            ) from exc
+            raise RuntimeError(f"Channel 未注册: {channel_key!r}") from exc
 
     def _start_channels(self) -> None:
         self._validate_channel_registry()
@@ -701,29 +709,47 @@ class _Daemon:
                 conversation=conversation,
             )
         elif text.startswith(_TASK_PREFIX):
-            await self._show_task(msg, text[len(_TASK_PREFIX) :].strip())
+            await self._show_task(
+                msg,
+                text[len(_TASK_PREFIX) :].strip(),
+                conversation=conversation,
+            )
         elif text == _LIST_CMD:
-            await self._list_agents(msg)
+            await self._list_agents(msg, conversation=conversation)
         elif text == _CLEAR_CMD:
             n = self.store.clear_terminal()
             await self._reply_user(
-                msg.message_id, f"🧹 已清理 {n} 条已结束任务的历史。"
+                msg.message_id,
+                f"🧹 已清理 {n} 条已结束任务的历史。",
+                conversation=conversation,
             )
         elif text == _PROJECT_CMD or text.startswith(_PROJECT_CMD + " "):
-            await self._handle_project_cmd(msg, text[len(_PROJECT_CMD) :].strip())
+            await self._handle_project_cmd(
+                msg,
+                text[len(_PROJECT_CMD) :].strip(),
+                conversation=conversation,
+            )
         elif text == _MODELS_CMD or text.startswith(_MODELS_CMD + " "):
-            await self._handle_models_cmd(msg, text[len(_MODELS_CMD) :].strip())
+            await self._handle_models_cmd(
+                msg,
+                text[len(_MODELS_CMD) :].strip(),
+                conversation=conversation,
+            )
         elif text == _LLM_CMD or text.startswith(_LLM_CMD + " "):
-            await self._handle_llm_cmd(msg, text[len(_LLM_CMD) :].strip())
+            await self._handle_llm_cmd(
+                msg,
+                text[len(_LLM_CMD) :].strip(),
+                conversation=conversation,
+            )
         elif text == _REBOOT_CMD:
-            await self._reboot(msg)
+            await self._reboot(msg, conversation=conversation)
         elif text in _HELP_CMDS:
-            await self._reply_user(msg.message_id, _USAGE)
+            await self._reply_user(msg.message_id, _USAGE, conversation=conversation)
         elif self._llm is not None and text and not text.startswith("/"):
             # P2：自然语言交给调度器 LLM 理解并派发（未配置 LLM 则回退到用法）
-            await self._dispatch_nl(msg, text)
+            await self._dispatch_nl(msg, text, conversation=conversation)
         else:
-            await self._reply_user(msg.message_id, _USAGE)
+            await self._reply_user(msg.message_id, _USAGE, conversation=conversation)
 
     # ------------------------------------------------------------------ #
     # 项目：有效项目表（种子 + 注册）解析 + /project 命令 + register_project 工具
@@ -828,10 +854,20 @@ class _Daemon:
         )
         return "\n".join(lines)
 
-    async def _handle_project_cmd(self, msg: ChannelMessage, arg: str) -> None:
+    async def _handle_project_cmd(
+        self,
+        msg: ChannelMessage,
+        arg: str,
+        *,
+        conversation: ConversationRef,
+    ) -> None:
         """root：``/project`` 列出、``/project add|remove`` 增删（对话/命令层）。"""
         if not arg:
-            await self._reply_user(msg.message_id, self._format_project_list())
+            await self._reply_user(
+                msg.message_id,
+                self._format_project_list(),
+                conversation=conversation,
+            )
             return
         parts = arg.split(maxsplit=1)
         sub = parts[0].lower()
@@ -840,19 +876,26 @@ class _Daemon:
             fields = rest.split(maxsplit=2)
             if len(fields) < 3:
                 await self._reply_user(
-                    msg.message_id, "格式：`/project add <名称> <agent> <路径>`"
+                    msg.message_id,
+                    "格式：`/project add <名称> <agent> <路径>`",
+                    conversation=conversation,
                 )
                 return
             _, out = self._register_project(fields[0], fields[1], fields[2])
-            await self._reply_user(msg.message_id, out)
+            await self._reply_user(msg.message_id, out, conversation=conversation)
         elif sub == "remove":
-            await self._reply_user(msg.message_id, self._remove_project(rest))
+            await self._reply_user(
+                msg.message_id,
+                self._remove_project(rest),
+                conversation=conversation,
+            )
         else:
             await self._reply_user(
                 msg.message_id,
                 "用法：`/project`（列出）/ "
                 "`/project add <名称> <agent> <路径>` / "
                 "`/project remove <名称>`",
+                conversation=conversation,
             )
 
     def _remove_project(self, name: str) -> str:
@@ -873,13 +916,20 @@ class _Daemon:
     # 调度器 LLM profile：/llm 列出 / 切换（#74，运行时换后端，不持久化）
     # ------------------------------------------------------------------ #
 
-    async def _handle_llm_cmd(self, msg: ChannelMessage, arg: str) -> None:
+    async def _handle_llm_cmd(
+        self,
+        msg: ChannelMessage,
+        arg: str,
+        *,
+        conversation: ConversationRef,
+    ) -> None:
         """root：``/llm`` 列出 LLM profile、``/llm <名>`` 切换激活的（重建 client，下轮生效）。"""
         profiles = self.cfg.llm_profiles
         if not profiles:
             await self._reply_user(
                 msg.message_id,
                 "未配置调度器 LLM（`[llm]` 段为空），无可切换的 profile。",
+                conversation=conversation,
             )
             return
         arg = arg.strip()
@@ -890,16 +940,23 @@ class _Daemon:
             for name, s in profiles.items():
                 mark = "▶ " if name == self._llm_active else "  "
                 lines.append(f"{mark}{name}：{s.model}（{s.api}）")
-            await self._reply_user(msg.message_id, "\n".join(lines))
+            await self._reply_user(
+                msg.message_id, "\n".join(lines), conversation=conversation
+            )
             return
         if arg not in profiles:
             await self._reply_user(
                 msg.message_id,
                 f"未知 profile '{arg}'。可选：{', '.join(profiles)}",
+                conversation=conversation,
             )
             return
         if arg == self._llm_active:
-            await self._reply_user(msg.message_id, f"当前已是 profile「{arg}」。")
+            await self._reply_user(
+                msg.message_id,
+                f"当前已是 profile「{arg}」。",
+                conversation=conversation,
+            )
             return
         self._llm = build_llm_client(profiles[arg])
         self._llm_active = arg
@@ -908,28 +965,44 @@ class _Daemon:
         await self._reply_user(
             msg.message_id,
             f"✅ 已切换调度器 LLM → 「{arg}」（{s.model} · {s.api}）。下次派发生效。",
+            conversation=conversation,
         )
 
     # ------------------------------------------------------------------ #
     # 模型缓存：/models 列出 / refresh 主动刷新（#65）
     # ------------------------------------------------------------------ #
 
-    async def _handle_models_cmd(self, msg: ChannelMessage, arg: str) -> None:
+    async def _handle_models_cmd(
+        self,
+        msg: ChannelMessage,
+        arg: str,
+        *,
+        conversation: ConversationRef,
+    ) -> None:
         """root：``/models`` 列缓存、``/models refresh [agent]`` 主动刷新。"""
         arg = arg.strip()
         if arg == "refresh" or arg.startswith("refresh "):
             target = arg[len("refresh") :].strip()
             backends = [target] if target else list(self.cfg.agents.keys())
             if not backends:
-                await self._reply_user(msg.message_id, "没有配置任何 [agents]。")
+                await self._reply_user(
+                    msg.message_id,
+                    "没有配置任何 [agents]。",
+                    conversation=conversation,
+                )
                 return
             await self._reply_user(
                 msg.message_id,
                 f"🔄 正在刷新模型缓存（{', '.join(backends)}）…冷启动稍慢，请稍候。",
+                conversation=conversation,
             )
             results = await asyncio.gather(*(self._refresh_models(b) for b in backends))
             lines = [("✅ " if ok else "❌ ") + m for ok, m in results]
-            await self._reply_user(msg.message_id, "刷新完成：\n" + "\n".join(lines))
+            await self._reply_user(
+                msg.message_id,
+                "刷新完成：\n" + "\n".join(lines),
+                conversation=conversation,
+            )
             return
         # 无参 = 列缓存
         cache = self.model_store.all()
@@ -937,6 +1010,7 @@ class _Daemon:
             await self._reply_user(
                 msg.message_id,
                 "模型缓存为空。发 `/models refresh` 采集（会临时起 agent 读取模型清单）。",
+                conversation=conversation,
             )
             return
         lines = []
@@ -946,7 +1020,11 @@ class _Daemon:
             shown = "、".join(models) if models else "（该后端不暴露模型）"
             lines.append(f"• {backend}（更新于 {when}）：{shown}")
         lines.append("`/models refresh [agent]` 主动刷新。")
-        await self._reply_user(msg.message_id, "模型缓存：\n" + "\n".join(lines))
+        await self._reply_user(
+            msg.message_id,
+            "模型缓存：\n" + "\n".join(lines),
+            conversation=conversation,
+        )
 
     async def _refresh_models(self, backend: str) -> tuple[bool, str]:
         """临时起一个该 backend 的一次性 agent、读 available_models 后关掉，刷新缓存。
@@ -1028,23 +1106,25 @@ class _Daemon:
         usage = "格式：`/run <项目名> <任务描述> [--agent <agent>]`"
         parts = body.split(maxsplit=1)
         if len(parts) < 2:
-            await self._reply_user(msg.message_id, usage)
+            await self._reply_user(msg.message_id, usage, conversation=conversation)
             return
         project_name = parts[0].strip()
         task, agent_override = _parse_agent_flag(parts[1].strip())
         if not task:
-            await self._reply_user(msg.message_id, usage)
+            await self._reply_user(msg.message_id, usage, conversation=conversation)
             return
         project = self._resolve_project(project_name)
         if project is None:
             known = ", ".join(self._all_projects()) or "(无)"
             await self._reply_user(
-                msg.message_id, f"未知项目 '{project_name}'。已知项目: {known}"
+                msg.message_id,
+                f"未知项目 '{project_name}'。已知项目: {known}",
+                conversation=conversation,
             )
             return
         agent_label, agent_argv, err = self._resolve_agent(project, agent_override)
         if agent_argv is None:
-            await self._reply_user(msg.message_id, err)
+            await self._reply_user(msg.message_id, err, conversation=conversation)
             return
 
         thread_root = msg.message_id
@@ -1063,6 +1143,7 @@ class _Daemon:
             await self._reply_user(
                 msg.message_id,
                 f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，请先 `/stop` 一个。",
+                conversation=conversation,
             )
             return
 
@@ -1079,6 +1160,7 @@ class _Daemon:
             thread_root,
             f"🚀 [{new_task.task_id}] 启动 {agent_label} 处理项目 "
             f"{project_name}…\n任务: {task}",
+            conversation=conversation,
         )
 
     async def _attach_for_root(
@@ -1097,14 +1179,14 @@ class _Daemon:
         usage = "格式：`/attach <项目名> <agent> <session_id> [描述...]`"
         parts = arg.split(maxsplit=3)
         if len(parts) < 3:
-            await self._reply_user(msg.message_id, usage)
+            await self._reply_user(msg.message_id, usage, conversation=conversation)
             return
         project_name = parts[0].strip()
         agent_in = parts[1].strip()
         session_id = parts[2].strip()
         user_desc = parts[3].strip() if len(parts) > 3 else ""
         if not project_name or not agent_in or not session_id:
-            await self._reply_user(msg.message_id, usage)
+            await self._reply_user(msg.message_id, usage, conversation=conversation)
             return
         task, root, message = await self._attach_task(
             project_name,
@@ -1116,9 +1198,9 @@ class _Daemon:
         if task is not None:
             return  # 成功：新话题的附着摘要由 worker 发
         if root:
-            await self._safe_reply(root, message)
+            await self._safe_reply(root, message, conversation=conversation)
         else:
-            await self._reply_user(msg.message_id, message)
+            await self._reply_user(msg.message_id, message, conversation=conversation)
 
     async def _attach_task(
         self,
@@ -1131,7 +1213,8 @@ class _Daemon:
     ) -> tuple["Task | None", str, str]:
         """附着外部会话为新 Task 的共用底层（``/attach`` 与 ``attach_session`` 工具都调它）。
 
-        流程：校验→去重→先 load_session 探测→建 Task + 新飞书话题→``_launch(resume)``
+        流程：校验→去重→先 load_session 探测→建 Task + 在来源 Channel 新建话题→
+        ``_launch(resume)``
         （附着摘要由 worker 就绪后发）。``agent`` 非空则覆盖项目 default_agent（须在
         ``[agents]``），空则用项目默认——``attach_session`` 的 agent 可选正依赖此语义。
 
@@ -1185,8 +1268,9 @@ class _Daemon:
         header = f"🔗 {agent_label} · {project_name}\n附着外部会话: {sid}"
         if description:
             header += f"\n说明: {description}"
+        channel = self._channel_for(conversation)
         root = await asyncio.to_thread(
-            self._primary_channel.create_thread,
+            channel.create_thread,
             conversation.conversation_id,
             header,
         )
@@ -1305,6 +1389,7 @@ class _Daemon:
             project_name=task.project_name,
             agent_label=task.agent_label,
             task_id=task.task_id,
+            conversation=task.conversation_ref,
             cwd=task.workspace,
             resumed=resume_session_id is not None,
             attached=attached,
@@ -1371,14 +1456,20 @@ class _Daemon:
                         root,
                         "❌ 附着失败（session 无法恢复或已过期）。"
                         "请确认后重试，或发送 `/run` 新开。",
+                        conversation=sess.conversation,
                     )
                 elif sess.resumed:
                     await self._safe_reply(
                         root,
                         "❌ 会话恢复失败（可能已在 agent 侧过期）。发送 `/run` 重开。",
+                        conversation=sess.conversation,
                     )
                 else:
-                    await self._safe_reply(root, f"❌ agent 启动失败: {str(exc)[:200]}")
+                    await self._safe_reply(
+                        root,
+                        f"❌ agent 启动失败: {str(exc)[:200]}",
+                        conversation=sess.conversation,
+                    )
             await self._close_session(sess)
             return
         if not self._runners.is_current(sess.task_id, sess):
@@ -1439,7 +1530,7 @@ class _Daemon:
             base = "▶️ agent 已就绪，开始执行…"
             if model:
                 base += f"（模型：{model}）"
-        await self._safe_reply(root, base)
+        await self._safe_reply(root, base, conversation=sess.conversation)
         try:
             while True:
                 # 空闲挂起（坑 1）：超时无新回复就关掉 agent 腾出 max_agents 名额，
@@ -1455,6 +1546,7 @@ class _Daemon:
                     await self._safe_reply(
                         root,
                         "💤 空闲超时，已挂起该 agent（在本话题回复即自动恢复）。",
+                        conversation=sess.conversation,
                     )
                     if self._runners.is_current(sess.task_id, sess):
                         await self._notify_main(
@@ -1471,6 +1563,7 @@ class _Daemon:
                         "✅ 任务已完成并归档。"
                         if status == "done"
                         else "🛑 agent 已停止。",
+                        conversation=sess.conversation,
                     )
                     break
                 if isinstance(prompt, _BgBatch):
@@ -1487,7 +1580,9 @@ class _Daemon:
                 issue_tag = _issue_tag(sess.issue_url)  # 绑定了 issue 则标 · #N（#63）
                 if issue_tag:
                     footer += f" · {issue_tag}"
-                output = self._primary_channel.open_output(root, title, footer=footer)
+                output = self._channel_for(sess.conversation).open_output(
+                    root, title, footer=footer
+                )
                 sess.current_output = output
                 self.store.update(sess.task_id, status="running")
                 logger.info(
@@ -1537,7 +1632,9 @@ class _Daemon:
                         error_message="",  # 一轮成功即清掉上次异常诊断（恢复成功）
                     )
                     await self._safe_reply(
-                        root, "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）"
+                        root,
+                        "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）",
+                        conversation=sess.conversation,
                     )
                     # 完成且已闲下来（无排队）→ 推一条主线通知（带收尾摘要），免得挨个点话题
                     if (
@@ -1569,6 +1666,7 @@ class _Daemon:
                             root,
                             f"❌ 本轮异常，已暂停：{err}\n"
                             "在话题回复即尝试恢复（load_session 接回上下文），或 `/stop` 结束。",
+                            conversation=sess.conversation,
                         )
                         await self._notify_main(
                             f"❌ {sess.project_name} 本轮异常，已暂停（在其话题回复即尝试恢复）。"
@@ -1624,7 +1722,11 @@ class _Daemon:
         # /help 先于 session 检查：不依赖 agent 是否在线（挂起的话题里也能查用法），
         # 且绝不入队 / 触发恢复。
         if text in _HELP_CMDS:
-            await self._safe_reply(thread_root or msg.message_id, _THREAD_USAGE)
+            await self._safe_reply(
+                thread_root or msg.message_id,
+                _THREAD_USAGE,
+                conversation=conversation,
+            )
             return
         # /raw <文本>：把 <文本> 逐字转发给 agent，绕过下面所有话题命令（/stop、/model…）
         # 的解释——用来给 coding agent 发它自己的、恰好与保留名撞车的 slash 指令。剥掉
@@ -1636,6 +1738,7 @@ class _Daemon:
                 await self._safe_reply(
                     thread_root or msg.message_id,
                     "用法：`/raw <指令>` —— 把 <指令> 原样发给 agent（如 `/raw /model`）。",
+                    conversation=conversation,
                 )
                 return
             forward_raw = True
@@ -1658,6 +1761,7 @@ class _Daemon:
             await self._safe_reply(
                 thread_root or msg.message_id,
                 "⚠️ 该 agent 已结束。发送 `/run ...` 新建任务。",
+                conversation=conversation,
             )
             return
         if forward_raw:
@@ -1686,25 +1790,35 @@ class _Daemon:
                     "🛑 已取消当前轮，改执行新指令…"
                     if new_input
                     else "🛑 已取消当前轮（agent 保留，可继续发指令）。",
+                    conversation=conversation,
                 )
             elif new_input:
                 # 无在途轮：没什么可取消，新输入当普通消息执行
                 sess.enqueue(new_input)
             else:
                 await self._safe_reply(
-                    thread_root or msg.message_id, "当前没有在跑的轮，无需取消。"
+                    thread_root or msg.message_id,
+                    "当前没有在跑的轮，无需取消。",
+                    conversation=conversation,
                 )
             return
         if text == _DONE_CMD:
             self._finish_task(sess.task_id, "done")  # 优雅收尾，worker 发完成消息
             return
         if text == _MODEL_CMD or text.startswith(_MODEL_CMD + " "):
-            await self._handle_model_cmd(sess, thread_root, text)
+            await self._handle_model_cmd(
+                sess, thread_root, text, conversation=conversation
+            )
             return
         sess.enqueue(text)
 
     async def _handle_model_cmd(
-        self, sess: _AgentSession, reply_target: str, text: str
+        self,
+        sess: _AgentSession,
+        reply_target: str,
+        text: str,
+        *,
+        conversation: ConversationRef,
     ) -> None:
         """`/model` 列出当前+可选模型；`/model <名>` 切换（ACP set_config_option）。
 
@@ -1715,7 +1829,9 @@ class _Daemon:
         current = getattr(agent, "model", "") or ""
         if not models:
             await self._safe_reply(
-                reply_target, "⚠️ 该 agent 不支持切换模型（未通过 ACP 暴露模型选项）。"
+                reply_target,
+                "⚠️ 该 agent 不支持切换模型（未通过 ACP 暴露模型选项）。",
+                conversation=conversation,
             )
             return
         arg = text[len(_MODEL_CMD) :].strip()
@@ -1725,11 +1841,15 @@ class _Daemon:
                 "可切换（发 `/model <完整名>`）：",
             ]
             lines += [f"• {m}" for m in models]
-            await self._safe_reply(reply_target, "\n".join(lines))
+            await self._safe_reply(
+                reply_target, "\n".join(lines), conversation=conversation
+            )
             return
         if arg not in models:
             await self._safe_reply(
-                reply_target, f"⚠️ 未知模型 '{arg}'。发 `/model` 查看可选列表。"
+                reply_target,
+                f"⚠️ 未知模型 '{arg}'。发 `/model` 查看可选列表。",
+                conversation=conversation,
             )
             return
         try:
@@ -1738,14 +1858,20 @@ class _Daemon:
             logger.exception("切换模型失败 task=%s model=%s", sess.task_id, arg)
             if self._runners.is_current(sess.task_id, sess):
                 await self._safe_reply(
-                    reply_target, f"❌ 切换模型失败：{str(exc)[:200]}"
+                    reply_target,
+                    f"❌ 切换模型失败：{str(exc)[:200]}",
+                    conversation=conversation,
                 )
             return
         if not self._runners.is_current(sess.task_id, sess):
             return
         self.store.update(sess.task_id, model=arg)
         logger.info("任务 %s 切换模型 → %s", sess.task_id, arg)
-        await self._safe_reply(reply_target, f"✅ 已切换模型为 {arg}（下一轮起生效）。")
+        await self._safe_reply(
+            reply_target,
+            f"✅ 已切换模型为 {arg}（下一轮起生效）。",
+            conversation=conversation,
+        )
 
     async def _recover_or_notify(
         self,
@@ -1767,31 +1893,43 @@ class _Daemon:
             await self._safe_reply(
                 reply_target,
                 "⚠️ 该话题没有对应任务（可能从未启动）。发送 `/run` 新建任务。",
+                conversation=conversation,
             )
             return
         if task.is_terminal:
             await self._safe_reply(
                 reply_target,
                 f"⚠️ 任务 [{task.task_id}] 已结束（{task.status}）。发送 `/run` 新开一个。",
+                conversation=conversation,
             )
             return
         if not forward_raw and text == _STOP_CMD:
             self.store.update(task.task_id, status="stopped")
-            await self._safe_reply(reply_target, f"🛑 任务 [{task.task_id}] 已结束。")
+            await self._safe_reply(
+                reply_target,
+                f"🛑 任务 [{task.task_id}] 已结束。",
+                conversation=conversation,
+            )
             return
         if not forward_raw and text == _DONE_CMD:
             self.store.update(task.task_id, status="done")
             await self._safe_reply(
-                reply_target, f"✅ 任务 [{task.task_id}] 已完成并归档。"
+                reply_target,
+                f"✅ 任务 [{task.task_id}] 已完成并归档。",
+                conversation=conversation,
             )
             return
         if not text:
             return  # 空回复不触发恢复
         ok, why = self._try_resume(task, first_prompt=text)
         if not ok:
-            await self._safe_reply(reply_target, why)
+            await self._safe_reply(reply_target, why, conversation=conversation)
             return
-        await self._safe_reply(reply_target, f"♻️ 正在恢复任务 [{task.task_id}]…")
+        await self._safe_reply(
+            reply_target,
+            f"♻️ 正在恢复任务 [{task.task_id}]…",
+            conversation=conversation,
+        )
 
     def _try_resume(self, task: Task, *, first_prompt: str | None) -> tuple[bool, str]:
         """把一个非活跃任务 load_session 惰性重连；返回 (成功, 失败文案)。
@@ -1839,7 +1977,9 @@ class _Daemon:
             self.store.update(task_id, status=status)
         return True
 
-    async def _list_agents(self, msg: ChannelMessage) -> None:
+    async def _list_agents(
+        self, msg: ChannelMessage, *, conversation: ConversationRef
+    ) -> None:
         tasks = self.store.all()
         # failed 虽算 is_active（可恢复），但单拉一段标注，别和在跑的混
         paused = [t for t in tasks if t.status == "failed"]
@@ -1872,15 +2012,25 @@ class _Daemon:
                 )
             )
         await self._reply_user(
-            msg.message_id, "\n\n".join(parts) if parts else "当前无任务。"
+            msg.message_id,
+            "\n\n".join(parts) if parts else "当前无任务。",
+            conversation=conversation,
         )
 
-    async def _show_task(self, msg: ChannelMessage, task_id: str) -> None:
+    async def _show_task(
+        self,
+        msg: ChannelMessage,
+        task_id: str,
+        *,
+        conversation: ConversationRef,
+    ) -> None:
         """`/task <id>`：任务详情 + 最近动作日志（审计 A 的人读入口，无需 LLM）。"""
         t = self.store.get(task_id)
         if t is None:
             await self._reply_user(
-                msg.message_id, f"未找到任务 {task_id}。用 `/agents` 查看有哪些任务。"
+                msg.message_id,
+                f"未找到任务 {task_id}。用 `/agents` 查看有哪些任务。",
+                conversation=conversation,
             )
             return
         head = (
@@ -1908,15 +2058,21 @@ class _Daemon:
             ]
         else:
             lines.append("（暂无动作记录）")
-        await self._reply_user(msg.message_id, "\n".join(lines))
+        await self._reply_user(
+            msg.message_id, "\n".join(lines), conversation=conversation
+        )
 
-    async def _reboot(self, msg: ChannelMessage) -> None:
+    async def _reboot(
+        self, msg: ChannelMessage, *, conversation: ConversationRef
+    ) -> None:
         """`/reboot`：优雅关停后由 cli.py re-exec 重启整个 daemon 进程。
 
         先发回执再置位（之后 WS 会断）；活跃任务由 `_shutdown` 标 suspended、
         重启后可 `load_session` 恢复，不丢上下文。"""
         await self._reply_user(
-            msg.message_id, "🔄 正在重启 daemon…（十几秒后回来，任务会自动恢复）"
+            msg.message_id,
+            "🔄 正在重启 daemon…（十几秒后回来，任务会自动恢复）",
+            conversation=conversation,
         )
         logger.info("收到 /reboot，准备重启 daemon")
         self._reboot_requested = True
@@ -1927,12 +2083,18 @@ class _Daemon:
     # P2：调度器 LLM（自然语言派发）
     # ------------------------------------------------------------------ #
 
-    async def _dispatch_nl(self, msg: ChannelMessage, text: str) -> None:
+    async def _dispatch_nl(
+        self,
+        msg: ChannelMessage,
+        text: str,
+        *,
+        conversation: ConversationRef,
+    ) -> None:
         """自然语言 → 调度器 LLM 理解并调用工具派发（P2）。"""
         assert self._llm is not None
         tools = build_scheduler_tools(
             list_projects=self._sched_list_projects,
-            spawn_agent=self._sched_spawn_agent,
+            spawn_agent=partial(self._sched_spawn_agent, conversation=conversation),
             list_tasks=self._sched_list_tasks,
             get_task=self._sched_get_task,
             send_to_task=self._sched_send_to_task,
@@ -1940,7 +2102,9 @@ class _Daemon:
             mark_done=self._sched_mark_done,
             register_project=self._sched_register_project,
             unregister_project=self._sched_unregister_project,
-            attach_session=self._sched_attach_session,
+            attach_session=partial(
+                self._sched_attach_session, conversation=conversation
+            ),
             list_forge=self._sched_list_forge,
             get_forge=self._sched_get_forge,
             list_models=self._sched_list_models,
@@ -1961,7 +2125,7 @@ class _Daemon:
             self._sched_memory.add_turn(turn)
         else:
             self._sched_memory.add_exchange(text, reply)  # 出错兜底：至少存问答对
-        await self._reply_user(msg.message_id, reply)
+        await self._reply_user(msg.message_id, reply, conversation=conversation)
 
     def _sched_list_projects(self) -> list[dict]:
         return [
@@ -2128,6 +2292,8 @@ class _Daemon:
         session_id: str,
         agent: str = "",
         description: str = "",
+        *,
+        conversation: ConversationRef,
     ) -> str:
         """attach_session 工具：附着 daemon 外部的 agent 会话为新 Task（与 /attach 共用底层）。
 
@@ -2139,7 +2305,7 @@ class _Daemon:
             agent,
             session_id,
             description,
-            conversation=ConversationRef(self._primary_channel_key, self.cfg.chat_id),
+            conversation=conversation,
         )
         return message
 
@@ -2150,6 +2316,8 @@ class _Daemon:
         agent: str = "",
         issue: int = 0,
         model: str = "",
+        *,
+        conversation: ConversationRef,
     ) -> str:
         """spawn_agent 工具实现：建 Task + 新话题 + 启动 agent，返回给 LLM 的状态串。
 
@@ -2186,14 +2354,15 @@ class _Daemon:
         header = f"🚀 {agent_label} · {project_name}\n任务: {task}"
         if issue_url:
             header += f"\nissue: {issue_url}"
+        channel = self._channel_for(conversation)
         root = await asyncio.to_thread(
-            self._primary_channel.create_thread, self.cfg.chat_id, header
+            channel.create_thread, conversation.conversation_id, header
         )
         new_task = self.store.create(
             project_name=project_name,
             agent_label=agent_label,
             description=task,
-            conversation=ConversationRef(self._primary_channel_key, self.cfg.chat_id),
+            conversation=conversation,
             thread_root_id=root,
             workspace=str(project.path),
             issue_url=issue_url,
@@ -2483,7 +2652,11 @@ class _Daemon:
             )
             return
         # 先把「结果」发到话题（可见），再驱动 agent 接续
-        await self._safe_reply(task.thread_root_id, self._bg_result_message(job, rc))
+        await self._safe_reply(
+            task.thread_root_id,
+            self._bg_result_message(job, rc),
+            conversation=task.conversation_ref,
+        )
         sess = self._runners.get_for_task(task.task_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             # check-set 之间无 await：单线程原子，并发完成的 job 不会漏合并/重复入队。
@@ -2522,37 +2695,65 @@ class _Daemon:
     # ------------------------------------------------------------------ #
 
     async def _safe_reply(
-        self, message_id: str, text: str, *, in_thread: bool = True
+        self,
+        message_id: str,
+        text: str,
+        *,
+        conversation: ConversationRef,
+        in_thread: bool = True,
     ) -> None:
         """发消息但吞掉异常（只记录日志），避免一条失败拖垮 daemon。
 
+        ``conversation`` 只用于选择 Channel；``message_id`` 是该 Channel 内的目标。
         ``in_thread=True``（默认）用于 agent 话题内的输出/状态；``in_thread=False``
         用于对用户对话/命令的普通回复——**不创建话题**（只有派发 agent 才建话题）。
         """
         try:
+            channel = self._channel_for(conversation)
             await asyncio.to_thread(
-                self._primary_channel.reply_text,
+                channel.reply_text,
                 message_id,
                 text,
                 threaded=in_thread,
             )
         except Exception:
-            logger.exception("飞书发送失败 msg=%s", message_id)
+            logger.exception(
+                "Channel 发送失败 channel=%s msg=%s",
+                conversation.channel_key,
+                message_id,
+            )
 
-    async def _reply_user(self, message_id: str, text: str) -> None:
+    async def _reply_user(
+        self,
+        message_id: str,
+        text: str,
+        *,
+        conversation: ConversationRef,
+    ) -> None:
         """对用户对话/命令消息的普通回复（不建话题）。"""
-        await self._safe_reply(message_id, text, in_thread=False)
+        await self._safe_reply(
+            message_id,
+            text,
+            conversation=conversation,
+            in_thread=False,
+        )
 
     async def _notify_main(self, text: str) -> None:
         """向控制台主线推一条独立通知（不建话题）——agent 完成/出错/挂起时用。"""
-        if not self.cfg.chat_id:
+        conversation = self._main_conversation
+        if not conversation.conversation_id:
             return
         try:
+            channel = self._channel_for(conversation)
             await asyncio.to_thread(
-                self._primary_channel.send_text, self.cfg.chat_id, text
+                channel.send_text, conversation.conversation_id, text
             )
         except Exception:
-            logger.exception("主线通知发送失败")
+            logger.exception(
+                "主线通知发送失败 channel=%s conversation=%s",
+                conversation.channel_key,
+                conversation.conversation_id,
+            )
 
     async def _shutdown(self) -> None:
         """退出清理：停 WS 线程，取消并等待全部 agent worker 收尾。"""

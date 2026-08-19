@@ -132,7 +132,7 @@ SYSTEM_PROMPT = """你是一个任务调度器（控制台主线的「控制塔�
 1. 理解用户需求，识别涉及哪些已注册项目（先用 list_projects 查看有哪些项目）。
 2. 用 list_tasks 掌握当前有哪些任务及其状态；需要细节时用 get_task(task_id)。
 3. 区分「新建任务」「附着外部会话」「操作已有任务」——这是关键：
-   - 全新的工作 → spawn_agent(project, task) 新建任务（会新建一个飞书话题、开新会话）。
+   - 全新的工作 → spawn_agent(project, task) 新建任务（会在当前 Channel 新建话题、开新会话）。
    - 用户已在 daemon 外跑了 agent 会话、并**给了 session_id** 要接进来继续 →
      attach_session(project, session_id, ...) 把外部会话附着为**新任务**（附着后接回
      原上下文继续，不跑首轮）。**别对它 spawn_agent**——那是另起新会话、丢掉原上下文。
@@ -438,7 +438,7 @@ def build_scheduler_tools(
         ToolSpec(
             name="spawn_agent",
             description=(
-                "给指定项目派发一个**新** coding agent 执行任务，会新建一个飞书话题。"
+                "给指定项目派发一个**新** coding agent 执行任务，会在当前 Channel 新建话题。"
                 "仅用于全新工作；要操作已有任务请改用 send_to_task。"
                 "可选 agent 参数覆盖项目默认 agent（如用户说「用 claude 跑一下」）。"
                 "用户要**基于某 issue 派活**时带上 issue 编号——daemon 会自动取该 issue "
@@ -483,7 +483,8 @@ def build_scheduler_tools(
             name="attach_session",
             description=(
                 "把 daemon 外部的一个 agent 会话（session_id）附着为指定项目下的**新**"
-                "任务：先 load_session 探测该会话可恢复、成功才建任务并开新飞书话题接回"
+                "任务：先 load_session 探测该会话可恢复、成功才建任务并在当前 Channel 开"
+                "新话题接回"
                 "上下文（附着后继续原会话，不跑首轮）。用于把用户已在别处跑（且已停止）的"
                 "会话接进本项目继续。重复附着同一 (agent, session_id) 会被拒绝。可选 "
                 "agent 覆盖项目默认 agent（如用户说「用 claude 附着」），不填用项目默认。"
