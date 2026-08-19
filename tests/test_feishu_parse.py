@@ -19,20 +19,31 @@ def _event(
     content: dict | str,
     chat_type: str = "group",
     message_type: str = "text",
+    chat_id: str = "oc_chat1",
+    sender_id: str = "ou_test",
 ) -> dict:
     if isinstance(content, dict):
         content = json.dumps(content)
     return {
-        "sender": {"sender_id": {"open_id": "ou_test", "user_id": "u1"}},
+        "sender": {"sender_id": {"open_id": sender_id, "user_id": "u1"}},
         "message": {
             "message_id": message_id,
             "root_id": root_id,
-            "chat_id": "oc_chat1",
+            "chat_id": chat_id,
             "chat_type": chat_type,
             "message_type": message_type,
             "content": content,
         },
     }
+
+
+def _event_payload(event: dict) -> bytes:
+    return json.dumps(
+        {
+            "header": {"event_type": "im.message.receive_v1"},
+            "event": event,
+        }
+    ).encode()
 
 
 def test_parse_root_message_has_no_thread_root():
@@ -239,6 +250,111 @@ def test_channel_start_registers_handler_before_starting(monkeypatch):
     bridge.start(handler)
 
     assert started == [True]
+
+
+async def test_channel_rejects_non_whitelisted_chat():
+    received: list[ChannelMessage] = []
+
+    async def handler(msg: ChannelMessage) -> None:
+        received.append(msg)
+
+    bridge = FeishuBridge(
+        app_id="a",
+        app_secret="b",
+        main_loop=asyncio.get_running_loop(),
+        on_event=handler,
+        chat_whitelist="oc_allowed",
+        sender_whitelist=["ou_allowed"],
+    )
+
+    bridge._dispatch_event(
+        _event_payload(
+            _event(
+                message_id="om_other_chat",
+                root_id=None,
+                content={"text": "hello"},
+                chat_id="oc_other",
+                sender_id="ou_allowed",
+            )
+        )
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert received == []
+
+
+async def test_channel_rejects_non_whitelisted_sender():
+    received: list[ChannelMessage] = []
+
+    async def handler(msg: ChannelMessage) -> None:
+        received.append(msg)
+
+    bridge = FeishuBridge(
+        app_id="a",
+        app_secret="b",
+        main_loop=asyncio.get_running_loop(),
+        on_event=handler,
+        chat_whitelist="oc_allowed",
+        sender_whitelist=["ou_allowed"],
+    )
+
+    bridge._dispatch_event(
+        _event_payload(
+            _event(
+                message_id="om_other_sender",
+                root_id=None,
+                content={"text": "hello"},
+                chat_id="oc_allowed",
+                sender_id="ou_other",
+            )
+        )
+    )
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
+
+    assert received == []
+
+
+async def test_channel_accepts_whitelisted_chat_and_sender():
+    received: list[ChannelMessage] = []
+    delivered = asyncio.Event()
+
+    async def handler(msg: ChannelMessage) -> None:
+        received.append(msg)
+        delivered.set()
+
+    bridge = FeishuBridge(
+        app_id="a",
+        app_secret="b",
+        main_loop=asyncio.get_running_loop(),
+        on_event=handler,
+        chat_whitelist="oc_allowed",
+        sender_whitelist=["ou_allowed"],
+    )
+
+    bridge._dispatch_event(
+        _event_payload(
+            _event(
+                message_id="om_allowed",
+                root_id=None,
+                content={"text": "hello"},
+                chat_id="oc_allowed",
+                sender_id="ou_allowed",
+            )
+        )
+    )
+    await asyncio.wait_for(delivered.wait(), timeout=1)
+
+    assert received == [
+        ChannelMessage(
+            conversation_id="oc_allowed",
+            message_id="om_allowed",
+            thread_id=None,
+            text="hello",
+            sender_id="ou_allowed",
+        )
+    ]
 
 
 def test_channel_stop_cancels_websocket_task():

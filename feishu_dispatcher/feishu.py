@@ -22,7 +22,7 @@ import logging
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -166,6 +166,7 @@ class FeishuBridge:
         on_event: MessageHandler | None = None,
         *,
         chat_whitelist: str = "",
+        sender_whitelist: Collection[str] = (),
         domain: str = _FEISHU_DOMAIN,
         qps: float = 5.0,
         stream_mode: str = "card",
@@ -176,6 +177,7 @@ class FeishuBridge:
         self._main_loop = main_loop
         self._on_event = on_event
         self._chat_whitelist = chat_whitelist
+        self._sender_whitelist = frozenset(sender_whitelist)
         self._domain = domain.rstrip("/")
         self._stream_mode = stream_mode
         self._throttle_window = throttle_window
@@ -437,6 +439,13 @@ class FeishuBridge:
             return
         if self._chat_whitelist and msg.conversation_id != self._chat_whitelist:
             logger.debug("忽略非白名单群消息 chat_id=%s", msg.conversation_id)
+            return
+        if self._sender_whitelist and msg.sender_id not in self._sender_whitelist:
+            logger.debug(
+                "忽略非白名单发送者 sender_id=%s message_id=%s",
+                msg.sender_id,
+                msg.message_id,
+            )
             return
         if self._on_event is None:
             logger.warning("飞书消息处理器未注册，丢弃 message_id=%s", msg.message_id)
