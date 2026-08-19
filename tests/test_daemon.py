@@ -492,6 +492,40 @@ def test_channel_registry_rejects_invalid_configuration(
         daemon._start_channels()
 
 
+def test_channel_lookup_requires_registered_nonempty_key():
+    daemon, feishu, _ = make_daemon()
+
+    assert daemon._channel_for(_TEST_CONVERSATION) is feishu
+    with pytest.raises(RuntimeError, match="缺少 channel_key"):
+        daemon._channel_for(ConversationRef("", "oc_1"))
+    with pytest.raises(RuntimeError, match="Channel 未注册"):
+        daemon._channel_for(ConversationRef("web", "oc_1"))
+
+
+async def test_invalid_output_channel_never_falls_back_to_primary():
+    daemon, feishu, _ = make_daemon()
+
+    await daemon._safe_reply(
+        "om_empty", "empty", conversation=ConversationRef("", "oc_1")
+    )
+    await daemon._safe_reply(
+        "om_unknown", "unknown", conversation=ConversationRef("web", "oc_1")
+    )
+
+    assert feishu.replies == []
+
+
+async def test_main_notification_uses_explicit_primary_conversation():
+    daemon, feishu, _ = make_daemon()
+    web = FakeBridge()
+    daemon._channels["web"] = web
+
+    await daemon._notify_main("main notice")
+
+    assert feishu.roots == [("oc_1", "main notice")]
+    assert web.roots == []
+
+
 def test_channel_registry_restarts_only_dead_channels():
     healthy = FakeBridge()
     dead = FakeBridge()
@@ -979,8 +1013,25 @@ def test_duplicate_message_id_is_scoped_to_conversation():
     assert daemon._is_duplicate(conversation_a, "om_shared")
 
 
+async def test_same_message_id_help_replies_on_source_channel():
+    daemon, feishu, _ = make_daemon()
+    web = FakeBridge()
+    daemon._channels["web"] = web
+    message = root_msg("/help", mid="om_shared")
+
+    await daemon._handle_channel_message("feishu", message)
+    assert [target for target, _ in feishu.plain] == ["om_shared"]
+    assert web.plain == []
+
+    await daemon._handle_channel_message("web", message)
+    assert [target for target, _ in feishu.plain] == ["om_shared"]
+    assert [target for target, _ in web.plain] == ["om_shared"]
+
+
 async def test_same_inbound_ids_are_isolated_by_channel():
-    daemon, _, created = make_daemon()
+    daemon, feishu, created = make_daemon()
+    web = FakeBridge()
+    daemon._channels["web"] = web
     root = "om_shared"
     feishu_conversation = ConversationRef("feishu", "oc_1")
     web_conversation = ConversationRef("web", "oc_1")
@@ -998,12 +1049,26 @@ async def test_same_inbound_ids_are_isolated_by_channel():
             and created[1].prompts == ["web task"]
         )
     )
+    await wait_until(
+        lambda: (
+            any("echo:feishu task" in text for text in feishu.texts(root))
+            and any("本轮结束" in text for text in feishu.texts(root))
+            and any("echo:web task" in text for text in web.texts(root))
+            and any("本轮结束" in text for text in web.texts(root))
+        )
+    )
 
     feishu_task = task_by_thread(daemon.store, root, feishu_conversation)
     web_task = task_by_thread(daemon.store, root, web_conversation)
     assert feishu_task is not None
     assert web_task is not None
     assert feishu_task.task_id != web_task.task_id
+    assert any("agent 已就绪" in text for text in feishu.texts(root))
+    assert any("echo:feishu task" in text for text in feishu.texts(root))
+    assert not any("web task" in text for text in feishu.texts(root))
+    assert any("agent 已就绪" in text for text in web.texts(root))
+    assert any("echo:web task" in text for text in web.texts(root))
+    assert not any("feishu task" in text for text in web.texts(root))
 
     await daemon._handle_channel_message(
         "web",
@@ -1522,6 +1587,68 @@ async def test_nl_dispatch_spawns_agent_via_llm():
     # 用户的对话消息 om_nl 不应成为任何 agent 话题的根
     assert all(root != "om_nl" for root, _ in bridge.roots)
     await daemon._shutdown()
+
+
+async def test_nl_channel_tools_receive_source_conversation():
+    daemon, feishu, _ = make_daemon()
+    web = FakeBridge()
+    daemon._channels["web"] = web
+    seen: dict[str, ConversationRef] = {}
+
+    async def spy_spawn(
+        project_name,
+        task,
+        agent="",
+        issue=0,
+        model="",
+        *,
+        conversation,
+    ):
+        seen["spawn_agent"] = conversation
+        return "spawned"
+
+    async def spy_attach(
+        project_name,
+        session_id,
+        agent="",
+        description="",
+        *,
+        conversation,
+    ):
+        seen["attach_session"] = conversation
+        return "attached"
+
+    daemon._sched_spawn_agent = spy_spawn  # type: ignore[method-assign]
+    daemon._sched_attach_session = spy_attach  # type: ignore[method-assign]
+    daemon._llm = ScriptedLLM(
+        [
+            LLMResponse(
+                tool_calls=[
+                    ToolCall(
+                        "1", "spawn_agent", {"project": "demo", "task": "web task"}
+                    ),
+                    ToolCall(
+                        "2",
+                        "attach_session",
+                        {"project": "demo", "session_id": "web_sid"},
+                    ),
+                ]
+            ),
+            LLMResponse(content="web tools done"),
+        ]
+    )
+
+    await daemon._handle_channel_message(
+        "web", root_msg("dispatch through web", mid="om_web_nl")
+    )
+
+    conversation = ConversationRef("web", "oc_1")
+    assert seen == {
+        "spawn_agent": conversation,
+        "attach_session": conversation,
+    }
+    assert feishu.plain == []
+    assert web.plain == [("om_web_nl", "web tools done")]
 
 
 async def test_nl_reply_does_not_create_thread():
@@ -2354,7 +2481,11 @@ async def test_sched_attach_session_creates_task_and_resumes_external_session():
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store)
     out = await daemon._sched_attach_session(
-        "demo", "ext_sid_1", agent="opencode", description="继续之前的活"
+        "demo",
+        "ext_sid_1",
+        agent="opencode",
+        description="继续之前的活",
+        conversation=_TEST_CONVERSATION,
     )
     root = "om_newroot_1"
     await wait_until(lambda: len(created) == 2)  # 探针 + 拉起各一个 agent
@@ -2379,10 +2510,57 @@ async def test_sched_attach_session_creates_task_and_resumes_external_session():
     await daemon._shutdown()
 
 
+async def test_sched_attach_session_routes_thread_and_output_to_source_channel():
+    store = TaskStore(None)
+    daemon, feishu, created = make_daemon(store=store)
+    web = FakeBridge()
+    daemon._channels["web"] = web
+    conversation = ConversationRef("web", "oc_1")
+
+    await daemon._sched_attach_session(
+        "demo",
+        "ext_sid_web",
+        agent="opencode",
+        description="web attach",
+        conversation=conversation,
+    )
+    root = "om_newroot_1"
+    await wait_until(
+        lambda: (
+            len(created) == 2
+            and any("已附着外部会话" in text for text in web.texts(root))
+        )
+    )
+
+    task = task_by_thread(store, root, conversation)
+    assert task is not None
+    assert task.conversation_ref == conversation
+    assert feishu.created_threads == []
+    assert web.created_threads == [
+        ("oc_1", "🔗 opencode · demo\n附着外部会话: ext_sid_web\n说明: web attach")
+    ]
+    assert feishu.texts(root) == []
+
+    await daemon._handle_channel_message(
+        "web", thread_msg("continue", root=root, mid="om_web_follow")
+    )
+    await wait_until(
+        lambda: (
+            created[1].prompts == ["continue"]
+            and any("echo:continue" in text for text in web.texts(root))
+            and any("本轮结束" in text for text in web.texts(root))
+        )
+    )
+    assert feishu.texts(root) == []
+    await daemon._shutdown()
+
+
 async def test_sched_attach_session_uses_default_agent_when_omitted():
     store = TaskStore(None)
     daemon, bridge, _ = make_daemon(store=store)
-    out = await daemon._sched_attach_session("demo", "ext_sid_1")
+    out = await daemon._sched_attach_session(
+        "demo", "ext_sid_1", conversation=_TEST_CONVERSATION
+    )
     root = "om_newroot_1"
     await wait_until(lambda: task_by_thread(store, root) is not None)
     t = task_by_thread(store, root)
@@ -2395,9 +2573,13 @@ async def test_sched_attach_session_uses_default_agent_when_omitted():
 async def test_sched_attach_session_unknown_project_or_agent_errors():
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store)
-    out_p = await daemon._sched_attach_session("nope", "ext_sid_1")
+    out_p = await daemon._sched_attach_session(
+        "nope", "ext_sid_1", conversation=_TEST_CONVERSATION
+    )
     assert "未知项目" in out_p
-    out_a = await daemon._sched_attach_session("demo", "ext_sid_1", agent="nope")
+    out_a = await daemon._sched_attach_session(
+        "demo", "ext_sid_1", agent="nope", conversation=_TEST_CONVERSATION
+    )
     assert "未知 agent" in out_a
     assert created == []  # 校验失败不起探针
     assert store.all() == []  # 不落 Task
@@ -2416,7 +2598,12 @@ async def test_sched_attach_session_duplicate_rejected():
         origin="attach",
     )
     daemon, bridge, created = make_daemon(store=store)
-    out = await daemon._sched_attach_session("demo", "ext_sid_1", agent="opencode")
+    out = await daemon._sched_attach_session(
+        "demo",
+        "ext_sid_1",
+        agent="opencode",
+        conversation=_TEST_CONVERSATION,
+    )
     assert "已由任务 [t1] 附着" in out
     assert len(created) == 0  # 去重在探测前，不起探针
     assert len(store.all()) == 1  # 未新增任务
@@ -2427,7 +2614,12 @@ async def test_sched_attach_session_backend_unsupported_returns_error():
     daemon, bridge, created = make_daemon(
         store=store, agent_cls=LoadSessionUnsupportedAgent
     )
-    out = await daemon._sched_attach_session("demo", "ext_sid_1", agent="opencode")
+    out = await daemon._sched_attach_session(
+        "demo",
+        "ext_sid_1",
+        agent="opencode",
+        conversation=_TEST_CONVERSATION,
+    )
     assert "不支持 load_session" in out
     assert store.all() == []  # 探测失败不落 Task
     assert len(created) == 1  # 只有探针，无拉起
@@ -2465,7 +2657,11 @@ async def test_attach_session_and_attach_share_bottom_layer():
     ]
     calls.clear()
     await daemon._sched_attach_session(
-        "demo", "sid2", agent="opencode", description="d"
+        "demo",
+        "sid2",
+        agent="opencode",
+        description="d",
+        conversation=_TEST_CONVERSATION,
     )
     assert calls == [
         ("demo", "opencode", "sid2", "d", ConversationRef("feishu", "oc_1"))
@@ -2781,6 +2977,33 @@ def test_issue_tag_extracts_number():
     assert _issue_tag("https://x/no/number/here") == ""  # 末段非数字 → 不显示
 
 
+async def test_sched_spawn_routes_thread_and_output_to_source_channel():
+    daemon, feishu, created = make_daemon()
+    web = FakeBridge()
+    daemon._channels["web"] = web
+    conversation = ConversationRef("web", "oc_1")
+
+    await daemon._sched_spawn_agent("demo", "web task", conversation=conversation)
+    root = "om_newroot_1"
+    await wait_until(
+        lambda: (
+            created
+            and created[0].prompts == ["web task"]
+            and any("echo:web task" in text for text in web.texts(root))
+            and any("本轮结束" in text for text in web.texts(root))
+        )
+    )
+
+    task = task_by_thread(daemon.store, root, conversation)
+    assert task is not None
+    assert task.conversation_ref == conversation
+    assert feishu.created_threads == []
+    assert web.created_threads == [("oc_1", "🚀 copilot · demo\n任务: web task")]
+    assert feishu.texts(root) == []
+    assert any("agent 已就绪" in text for text in web.texts(root))
+    await daemon._shutdown()
+
+
 async def test_sched_spawn_with_issue_uses_body_as_brief(monkeypatch):
     from feishu_dispatcher import forge
 
@@ -2799,7 +3022,9 @@ async def test_sched_spawn_with_issue_uses_body_as_brief(monkeypatch):
     monkeypatch.setattr(forge, "resolve_forge", fake_ref)
     monkeypatch.setattr(forge, "get_item", fake_get)
     daemon, bridge, created = make_daemon()
-    out = await daemon._sched_spawn_agent("demo", "照这个改", issue=3)
+    out = await daemon._sched_spawn_agent(
+        "demo", "照这个改", issue=3, conversation=_TEST_CONVERSATION
+    )
     # Task 锚定了 issue_url
     t = daemon.store.all()[0]
     assert t.issue_url == "https://github.com/o/r/issues/3"
@@ -2822,7 +3047,9 @@ async def test_sched_spawn_with_issue_no_binding_degrades(monkeypatch):
 
     monkeypatch.setattr(forge, "resolve_forge", no_ref)
     daemon, _, created = make_daemon()
-    out = await daemon._sched_spawn_agent("demo", "照这个改", issue=3)
+    out = await daemon._sched_spawn_agent(
+        "demo", "照这个改", issue=3, conversation=_TEST_CONVERSATION
+    )
     # 取不到 forge → 优雅退化：任务照建但没绑 issue，brief 就是原任务
     t = daemon.store.all()[0]
     assert t.issue_url == ""
@@ -2855,7 +3082,12 @@ async def test_sched_get_task_reports_issue_url():
 async def test_sched_spawn_with_model_pins_it():
     # ModelAgent 报 available=[v4-pro, glm-5]；指定 glm-5 → 启动后下发并记台账
     daemon, _, created = make_daemon(ModelAgent)
-    await daemon._sched_spawn_agent("demo", "X", model="zhipuai/glm-5")
+    await daemon._sched_spawn_agent(
+        "demo",
+        "X",
+        model="zhipuai/glm-5",
+        conversation=_TEST_CONVERSATION,
+    )
     await wait_until(lambda: bool(created and created[0].set_model_calls))
     assert "zhipuai/glm-5" in created[0].set_model_calls
     await wait_until(lambda: daemon.store.all()[0].model == "zhipuai/glm-5")
@@ -2865,7 +3097,7 @@ async def test_sched_spawn_with_model_pins_it():
 async def test_worker_passively_caches_models():
     # 真实 agent 一启动，worker 就把它报的 available_models 存进缓存（键 = agent_label）
     daemon, _, _ = make_daemon(ModelAgent)
-    await daemon._sched_spawn_agent("demo", "X")
+    await daemon._sched_spawn_agent("demo", "X", conversation=_TEST_CONVERSATION)
     await wait_until(lambda: bool(daemon.model_store.get("copilot")))
     assert "zhipuai/glm-5" in daemon.model_store.get("copilot")
     await daemon._shutdown()
@@ -3055,6 +3287,35 @@ async def test_bg_job_completion_posts_visible_result_to_thread(tmp_path: Path):
     assert any("后台任务 j1 完成" in t and "exit 0" in t for t in thread_texts)
     assert any("fdx test done" in t for t in thread_texts)
     await daemon._shutdown()
+
+
+async def test_bg_job_visible_result_uses_task_channel(tmp_path: Path):
+    store = TaskStore(None)
+    daemon, feishu, _ = make_daemon(store=store)
+    web = FakeBridge()
+    daemon._channels["web"] = web
+    conversation = ConversationRef("web", "oc_1")
+    task = store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="web background task",
+        conversation=conversation,
+        thread_root_id="om_web_thread",
+        workspace="C:/tmp/demo",
+        status="done",
+    )
+    out = tmp_path / "j1-web.log"
+    out.write_text("web result\n", encoding="utf-8")
+    job = daemon.job_store.create(task_id=task.task_id, command=["x"], cwd="c")
+    daemon.job_store.update(
+        job.job_id, output_file=str(out), exit_code=0, finished_at=time.time()
+    )
+
+    await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 0)
+
+    assert any("后台任务 j1 完成" in text for text in web.texts("om_web_thread"))
+    assert any("web result" in text for text in web.texts("om_web_thread"))
+    assert feishu.texts("om_web_thread") == []
 
 
 async def test_bg_job_completion_resumes_suspended_task():
