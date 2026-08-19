@@ -2,8 +2,8 @@
 
 一个 Task = 派发在某项目上的一个工作单元，持有它的 session_id（agent 侧记忆）、
 ConversationRef + thread_root_id（交互入口）、workspace（工作目录）。落盘到 tasks.json，
-按 `task_id`（短自增 `t<N>`，持久单调计数器、**永不复用**）索引；另存
-thread→task 便于路由。
+按 `task_id`（短自增 `t<N>`，持久单调计数器、**永不复用**）索引；按
+ConversationRef + thread_root_id 路由交互线程。
 
 status 生命周期：
 - 机械态（worker 自动）：starting → running ↔ idle → suspended；turn 异常 → failed
@@ -175,7 +175,7 @@ class Task:
 
 
 class TaskStore:
-    """task_id → Task 台账 + thread_root_id → task_id 路由索引 + 单调计数器。
+    """task_id → Task 台账 + Channel-scoped thread 路由 + 单调计数器。
 
     只被单个 daemon 实例（单线程 event loop）读写，无需加锁。
     ``keep_terminal`` 限制终止任务的历史条数，防 tasks.json 无限涨。
@@ -227,11 +227,20 @@ class TaskStore:
     def get(self, task_id: str) -> Task | None:
         return self._tasks.get(task_id)
 
-    def by_thread(self, thread_root_id: str) -> Task | None:
-        if not thread_root_id:
+    def by_thread(
+        self, conversation: ConversationRef, thread_root_id: str
+    ) -> Task | None:
+        if (
+            not conversation.channel_key.strip()
+            or not conversation.conversation_id.strip()
+            or not thread_root_id
+        ):
             return None
         for t in self._tasks.values():
-            if t.thread_root_id == thread_root_id:
+            if (
+                t.conversation_ref == conversation
+                and t.thread_root_id == thread_root_id
+            ):
                 return t
         return None
 

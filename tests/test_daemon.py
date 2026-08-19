@@ -443,14 +443,30 @@ def root_msg(
     )
 
 
-def thread_msg(text: str, root: str = "om_root1", mid: str = "om_t1") -> ChannelMessage:
+def thread_msg(
+    text: str,
+    root: str = "om_root1",
+    mid: str = "om_t1",
+    conversation_id: str = "oc_1",
+) -> ChannelMessage:
     return ChannelMessage(
-        conversation_id="oc_1",
+        conversation_id=conversation_id,
         message_id=mid,
         thread_id=root,
         text=text,
         sender_id="ou_user",
     )
+
+
+_TEST_CONVERSATION = ConversationRef("feishu", "oc_1")
+
+
+def task_by_thread(
+    store: TaskStore,
+    thread: str,
+    conversation: ConversationRef = _TEST_CONVERSATION,
+):
+    return store.by_thread(conversation, thread)
 
 
 async def wait_until(cond, timeout: float = 2.0) -> None:
@@ -462,7 +478,7 @@ async def wait_until(cond, timeout: float = 2.0) -> None:
 
 
 def current_runner(daemon: _Daemon, thread: str = "om_root1"):
-    task = daemon.store.by_thread(thread)
+    task = task_by_thread(daemon.store, thread)
     return daemon._runners.get_for_task(task.task_id) if task is not None else None
 
 
@@ -620,7 +636,7 @@ async def test_run_agent_flag_overrides_default():
     # demo 默认 copilot；--agent opencode 覆盖
     await daemon._handle_message(root_msg("/run demo 做点事 --agent opencode"))
     await wait_until(lambda: created and created[0].prompts == ["做点事"])
-    assert daemon.store.by_thread("om_root1").agent_label == "opencode"
+    assert task_by_thread(daemon.store, "om_root1").agent_label == "opencode"
     assert any("opencode" in t for t in bridge.texts("om_root1"))
 
 
@@ -628,7 +644,7 @@ async def test_run_without_agent_flag_uses_default():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo 做点事"))
     await wait_until(lambda: created and created[0].prompts == ["做点事"])
-    assert daemon.store.by_thread("om_root1").agent_label == "copilot"  # 项目默认
+    assert task_by_thread(daemon.store, "om_root1").agent_label == "copilot"  # 项目默认
 
 
 async def test_run_unknown_agent_errors_no_spawn():
@@ -636,7 +652,7 @@ async def test_run_unknown_agent_errors_no_spawn():
     await daemon._handle_message(root_msg("/run demo 做点事 --agent nope"))
     assert any("未知 agent" in t for m, t in bridge.plain if m == "om_root1")
     assert created == []  # 未知 agent 直接报错，不启动
-    assert daemon.store.by_thread("om_root1") is None
+    assert task_by_thread(daemon.store, "om_root1") is None
 
 
 async def test_old_runner_repeated_cleanup_does_not_remove_replacement():
@@ -710,7 +726,7 @@ async def test_stop_cancels_in_flight_turn():
     await wait_until(lambda: created[0].closed)
     await wait_until(lambda: current_runner(daemon) is None)
     assert any("🛑" in t for t in bridge.texts("om_root1"))
-    assert daemon.store.by_thread("om_root1").status == "stopped"
+    assert task_by_thread(daemon.store, "om_root1").status == "stopped"
 
 
 async def test_stop_when_idle_does_not_cancel():
@@ -734,7 +750,7 @@ async def test_cancel_stops_turn_but_keeps_agent():
     # agent 保留：未关闭、session 还在、任务回 idle（非 stopped）
     assert not created[0].closed
     assert current_runner(daemon) is not None
-    await wait_until(lambda: daemon.store.by_thread("om_root1").status == "idle")
+    await wait_until(lambda: task_by_thread(daemon.store, "om_root1").status == "idle")
     assert any("已取消当前轮" in t for t in bridge.texts("om_root1"))
     await daemon._shutdown()
 
@@ -834,7 +850,7 @@ async def test_raw_in_dormant_thread_recovers_not_stops():
         thread_msg("/raw /stop", root="om_orphan", mid="om_rz")
     )
     await wait_until(lambda: created and created[0].prompts == ["/stop"])
-    assert store.by_thread("om_orphan").status != "stopped"
+    assert task_by_thread(store, "om_orphan").status != "stopped"
     await daemon._shutdown()
 
 
@@ -844,6 +860,51 @@ async def test_duplicate_message_id_spawns_only_once():
     await daemon._handle_message(root_msg("/run demo task", mid="om_dup"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
     assert len(created) == 1
+
+
+def test_duplicate_message_id_is_scoped_to_conversation():
+    daemon, _, _ = make_daemon()
+    conversation_a = ConversationRef("feishu", "oc_a")
+    conversation_b = ConversationRef("feishu", "oc_b")
+
+    assert not daemon._is_duplicate(conversation_a, "om_shared")
+    assert not daemon._is_duplicate(conversation_b, "om_shared")
+    assert daemon._is_duplicate(conversation_a, "om_shared")
+
+
+async def test_same_inbound_ids_are_isolated_by_channel():
+    daemon, _, created = make_daemon()
+    root = "om_shared"
+    feishu_conversation = ConversationRef("feishu", "oc_1")
+    web_conversation = ConversationRef("web", "oc_1")
+
+    await daemon._handle_channel_message(
+        "feishu", root_msg("/run demo feishu task", mid=root)
+    )
+    await daemon._handle_channel_message(
+        "web", root_msg("/run demo web task", mid=root)
+    )
+    await wait_until(
+        lambda: (
+            len(created) == 2
+            and created[0].prompts == ["feishu task"]
+            and created[1].prompts == ["web task"]
+        )
+    )
+
+    feishu_task = task_by_thread(daemon.store, root, feishu_conversation)
+    web_task = task_by_thread(daemon.store, root, web_conversation)
+    assert feishu_task is not None
+    assert web_task is not None
+    assert feishu_task.task_id != web_task.task_id
+
+    await daemon._handle_channel_message(
+        "web",
+        thread_msg("web follow up", root=root, mid="om_follow"),
+    )
+    await wait_until(lambda: created[1].prompts == ["web task", "web follow up"])
+    assert created[0].prompts == ["feishu task"]
+    await daemon._shutdown()
 
 
 async def test_replaced_runner_late_completion_does_not_overwrite_current_state():
@@ -1167,11 +1228,15 @@ def _seed_task(
 async def test_run_creates_task():
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store, channel_key="test")
+    conversation = ConversationRef("test", "oc_1")
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(
-        lambda: store.by_thread("om_root1") and store.by_thread("om_root1").session_id
+        lambda: (
+            task_by_thread(store, "om_root1", conversation)
+            and task_by_thread(store, "om_root1", conversation).session_id
+        )
     )
-    t = store.by_thread("om_root1")
+    t = task_by_thread(store, "om_root1", conversation)
     assert t.project_name == "demo"
     assert t.agent_label == "copilot"
     assert t.session_id == created[0].session_id
@@ -1186,11 +1251,14 @@ async def test_recovery_after_restart_uses_file_task_store(tmp_path: Path):
     d1, _, _ = make_daemon(store=store1)
     await d1._handle_message(root_msg("/run demo task1"))
     await wait_until(
-        lambda: store1.by_thread("om_root1") and store1.by_thread("om_root1").session_id
+        lambda: (
+            task_by_thread(store1, "om_root1")
+            and task_by_thread(store1, "om_root1").session_id
+        )
     )
-    saved_sid = store1.by_thread("om_root1").session_id
+    saved_sid = task_by_thread(store1, "om_root1").session_id
     await d1._shutdown()
-    assert store1.by_thread("om_root1").status == "suspended"
+    assert task_by_thread(store1, "om_root1").status == "suspended"
 
     store2 = TaskStore(store_path)
     d2, b2, c2 = make_daemon(store=store2)
@@ -1198,7 +1266,7 @@ async def test_recovery_after_restart_uses_file_task_store(tmp_path: Path):
     await d2._handle_message(thread_msg("follow up", root="om_root1", mid="om_t2"))
     await wait_until(lambda: c2 and c2[0].prompts == ["follow up"])
     assert c2[0].resume_session_id == saved_sid
-    assert current_runner(d2).task_id == store2.by_thread("om_root1").task_id
+    assert current_runner(d2).task_id == task_by_thread(store2, "om_root1").task_id
     assert c2[0].start_count == 1
     assert any("恢复" in t for t in b2.texts("om_root1"))
     await d2._shutdown()
@@ -1215,9 +1283,9 @@ async def test_stop_marks_task_stopped():
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo task"))
-    await wait_until(lambda: store.by_thread("om_root1") is not None)
+    await wait_until(lambda: task_by_thread(store, "om_root1") is not None)
     await daemon._handle_message(thread_msg("/stop"))
-    await wait_until(lambda: store.by_thread("om_root1").status == "stopped")
+    await wait_until(lambda: task_by_thread(store, "om_root1").status == "stopped")
 
 
 async def test_recovery_fails_when_agent_unconfigured():
@@ -1227,7 +1295,7 @@ async def test_recovery_fails_when_agent_unconfigured():
     await daemon._handle_message(thread_msg("hello", root="om_orphan", mid="om_y"))
     assert created == []
     assert any("未配置" in t for t in bridge.texts("om_orphan"))
-    assert store.by_thread("om_orphan").status == "failed"
+    assert task_by_thread(store, "om_orphan").status == "failed"
 
 
 async def test_orphan_stop_marks_stopped_without_recovering():
@@ -1236,7 +1304,7 @@ async def test_orphan_stop_marks_stopped_without_recovering():
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(thread_msg("/stop", root="om_orphan", mid="om_z"))
     assert created == []  # 没为了停而恢复
-    assert store.by_thread("om_orphan").status == "stopped"
+    assert task_by_thread(store, "om_orphan").status == "stopped"
     assert any("已结束" in t for t in bridge.texts("om_orphan"))
 
 
@@ -1276,7 +1344,7 @@ async def test_idle_timeout_suspends_but_keeps_record_recoverable():
     await wait_until(lambda: any("💤" in t for t in bridge.texts("om_root1")))
     await wait_until(lambda: current_runner(daemon) is None)  # 名额已释放
     assert created[0].closed
-    await wait_until(lambda: store.by_thread("om_root1").status == "suspended")
+    await wait_until(lambda: task_by_thread(store, "om_root1").status == "suspended")
 
     # 在话题里回复 → 自动 load_session 恢复
     await daemon._handle_message(thread_msg("more", root="om_root1", mid="om_t2"))
@@ -1412,7 +1480,7 @@ async def test_agent_error_pauses_recoverable_notifies_main_line():
     await wait_until(lambda: any("❌" in t and "暂停" in t for _, t in bridge.roots))
     await wait_until(lambda: current_runner(daemon) is None)
     # 关键：failed 是可恢复态（非终止），且记下诊断
-    task = daemon.store.by_thread("om_root1")
+    task = task_by_thread(daemon.store, "om_root1")
     assert task.status == "failed"
     assert task.is_resumable and not task.is_terminal
     assert "RuntimeError" in task.error_message and "boom" in task.error_message
@@ -1422,9 +1490,13 @@ async def test_failed_task_resumes_on_thread_reply():
     daemon, bridge, created = make_daemon(agent_cls=FailUnlessResumedAgent)
     await daemon._handle_message(root_msg("/run demo task"))
     # 第一轮异常 → failed（有 session），worker 关闭
-    await wait_until(lambda: daemon.store.by_thread("om_root1").status == "failed")
+    await wait_until(
+        lambda: task_by_thread(daemon.store, "om_root1").status == "failed"
+    )
     await wait_until(lambda: current_runner(daemon) is None)
-    assert daemon.store.by_thread("om_root1").session_id  # turn 失败时 session 已建
+    assert task_by_thread(
+        daemon.store, "om_root1"
+    ).session_id  # turn 失败时 session 已建
     # 话题回复 → load_session 恢复（起第二个 agent，带 resume_session_id）→ 成功
     await daemon._handle_message(thread_msg("再试一次"))
     await wait_until(lambda: len(created) == 2)
@@ -1433,17 +1505,19 @@ async def test_failed_task_resumes_on_thread_reply():
         lambda: any("echo:再试一次" in t for t in bridge.texts("om_root1"))
     )
     # 恢复成功 → 回 idle，error_message 清空
-    await wait_until(lambda: daemon.store.by_thread("om_root1").status == "idle")
-    assert daemon.store.by_thread("om_root1").error_message == ""
+    await wait_until(lambda: task_by_thread(daemon.store, "om_root1").status == "idle")
+    assert task_by_thread(daemon.store, "om_root1").error_message == ""
     await daemon._shutdown()
 
 
 async def test_startup_failure_stays_unresumable_guides_to_run():
     daemon, bridge, created = make_daemon(agent_cls=StartupFailAgent)
     await daemon._handle_message(root_msg("/run demo task"))
-    await wait_until(lambda: daemon.store.by_thread("om_root1").status == "failed")
+    await wait_until(
+        lambda: task_by_thread(daemon.store, "om_root1").status == "failed"
+    )
     await wait_until(lambda: current_runner(daemon) is None)
-    task = daemon.store.by_thread("om_root1")
+    task = task_by_thread(daemon.store, "om_root1")
     assert not task.session_id  # startup 失败没建会话
     # 话题回复 → 尝试恢复但无 session → 挡回 /run（不丢人，只是没得恢复）
     await daemon._handle_message(thread_msg("再试"))
@@ -1906,11 +1980,11 @@ async def test_model_choice_survives_suspend_resume():
     # 切到 glm-5 → 台账记成 glm-5
     await d1._handle_message(thread_msg("/model zhipuai/glm-5", mid="om_m"))
     assert store.get("t1").model == "zhipuai/glm-5"
-    saved_sid = store.by_thread("om_root1").session_id
+    saved_sid = task_by_thread(store, "om_root1").session_id
 
     # 挂起：任务标 suspended、记录保留，Task.model 应仍是 glm-5
     await d1._shutdown()
-    assert store.by_thread("om_root1").status == "suspended"
+    assert task_by_thread(store, "om_root1").status == "suspended"
     assert store.get("t1").model == "zhipuai/glm-5"
 
     # 新 daemon（共享 store）+ 话题回复 → load_session 恢复（新 agent 上报默认模型）
@@ -2004,11 +2078,11 @@ async def test_attach_creates_task_and_resumes_external_session():
     )
     # 新话题经 create_thread 开（root != /attach 消息 id）
     root = "om_newroot_1"
-    await wait_until(lambda: store.by_thread(root) is not None)
+    await wait_until(lambda: task_by_thread(store, root) is not None)
     await wait_until(lambda: len(created) == 2)  # 探针 + 拉起各一个 agent
     await wait_until(lambda: any("已附着外部会话" in t for t in bridge.texts(root)))
 
-    t = store.by_thread(root)
+    t = task_by_thread(store, root)
     assert t.origin == "attach"
     assert t.session_id == "ext_sid_1"
     assert t.agent_label == "opencode"
@@ -2135,13 +2209,13 @@ async def test_attach_after_restart_recovers_via_load_session(tmp_path: Path):
     d1, b1, c1 = make_daemon(store=store1)
     await d1._handle_message(root_msg("/attach demo opencode ext_sid_1", mid="om_att"))
     root = "om_newroot_1"
-    await wait_until(lambda: store1.by_thread(root) is not None)
+    await wait_until(lambda: task_by_thread(store1, root) is not None)
     await wait_until(lambda: len(c1) == 2)
-    saved_sid = store1.by_thread(root).session_id
+    saved_sid = task_by_thread(store1, root).session_id
     assert saved_sid == "ext_sid_1"
-    assert store1.by_thread(root).origin == "attach"
+    assert task_by_thread(store1, root).origin == "attach"
     await d1._shutdown()
-    assert store1.by_thread(root).status == "suspended"
+    assert task_by_thread(store1, root).status == "suspended"
 
     # 新 daemon（共享台账）→ 话题回复 → 普通 load_session 恢复（走「已恢复」而非「附着」）
     store2 = TaskStore(store_path)
@@ -2159,8 +2233,8 @@ async def test_run_still_works_after_attach_feature():
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo do stuff"))
     await wait_until(lambda: created and created[0].prompts == ["do stuff"])
-    await wait_until(lambda: store.by_thread("om_root1") is not None)
-    assert store.by_thread("om_root1").origin == "spawn"
+    await wait_until(lambda: task_by_thread(store, "om_root1") is not None)
+    assert task_by_thread(store, "om_root1").origin == "spawn"
     await daemon._shutdown()
 
 
@@ -2179,7 +2253,7 @@ async def test_sched_attach_session_creates_task_and_resumes_external_session():
     await wait_until(lambda: len(created) == 2)  # 探针 + 拉起各一个 agent
     await wait_until(lambda: any("已附着外部会话" in t for t in bridge.texts(root)))
 
-    t = store.by_thread(root)
+    t = task_by_thread(store, root)
     assert t is not None
     assert t.origin == "attach"
     assert t.session_id == "ext_sid_1"
@@ -2203,8 +2277,8 @@ async def test_sched_attach_session_uses_default_agent_when_omitted():
     daemon, bridge, _ = make_daemon(store=store)
     out = await daemon._sched_attach_session("demo", "ext_sid_1")
     root = "om_newroot_1"
-    await wait_until(lambda: store.by_thread(root) is not None)
-    t = store.by_thread(root)
+    await wait_until(lambda: task_by_thread(store, root) is not None)
+    t = task_by_thread(store, root)
     assert t.agent_label == "copilot"  # demo 默认 copilot（agent 缺省）
     assert t.origin == "attach"
     assert "已附着外部会话 copilot/ext_sid_1" in out
@@ -2271,6 +2345,7 @@ async def test_attach_session_and_attach_share_bottom_layer():
             conversation_id="oc_source",
         ),
         "demo opencode sid1",
+        conversation=ConversationRef("feishu", "oc_source"),
     )
     assert calls == [
         (
