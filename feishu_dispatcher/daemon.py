@@ -463,6 +463,8 @@ class _Daemon:
     _channels: dict[str, Channel] = field(default_factory=dict)
     #: 控制台主线通知与兼容消息入口使用的主 Channel key。
     _primary_channel_key: str = "feishu"
+    #: 进程内 Conversation → Task 绑定；额外入口不持久化，主入口可由 TaskStore 懒回填。
+    _conversation_task_ids: dict[ConversationRef, str] = field(default_factory=dict)
     #: 每个 Task 的单活 current runner；Thread 只经 Task 路由到这里。
     _runners: _CurrentRunnerRegistry = field(default_factory=_CurrentRunnerRegistry)
     _seen_message_keys: OrderedDict[tuple[ConversationRef, str], None] = field(
@@ -510,6 +512,36 @@ class _Daemon:
             return self._channels[channel_key]
         except KeyError as exc:
             raise RuntimeError(f"Channel 未注册: {channel_key!r}") from exc
+
+    def _bind_conversation(self, conversation: ConversationRef, task_id: str) -> None:
+        """把完整 Conversation 绑定到一个现存 Task；重复绑定同一 Task 幂等。"""
+        if not conversation.channel_key.strip():
+            raise ValueError("ConversationRef.channel_key 不能为空")
+        if not conversation.conversation_id.strip():
+            raise ValueError("ConversationRef.conversation_id 不能为空")
+        if self.store.get(task_id) is None:
+            raise ValueError(f"Task 不存在: {task_id}")
+
+        bound_task_id = self._conversation_task_ids.get(conversation)
+        if bound_task_id is not None and self.store.get(bound_task_id) is None:
+            self._conversation_task_ids.pop(conversation, None)
+            bound_task_id = None
+        if bound_task_id is not None and bound_task_id != task_id:
+            raise RuntimeError(
+                f"Conversation {conversation!r} 已绑定 Task {bound_task_id}"
+            )
+        self._conversation_task_ids[conversation] = task_id
+
+    def _task_for_conversation(self, conversation: ConversationRef) -> Task | None:
+        """按运行时绑定取 Task；Task 已被清理时同步丢弃陈旧绑定。"""
+        task_id = self._conversation_task_ids.get(conversation)
+        if task_id is None:
+            return None
+        task = self.store.get(task_id)
+        if task is not None:
+            return task
+        self._conversation_task_ids.pop(conversation, None)
+        return None
 
     def _start_channels(self) -> None:
         self._validate_channel_registry()
@@ -1406,11 +1438,13 @@ class _Daemon:
         ``attached=True`` 仅由 ``/attach`` 的**首次**拉起置位——附着摘要文案；附着任务
         事后经 ``_try_resume`` 恢复时仍走普通「已恢复」路径（attached 默认 False）。
         """
+        task_conversation = ConversationRef(task.channel_key, task.thread_root_id)
+        self._bind_conversation(task_conversation, task.task_id)
         sess = _AgentSession(
             project_name=task.project_name,
             agent_label=task.agent_label,
             task_id=task.task_id,
-            conversation=ConversationRef(task.channel_key, task.thread_root_id),
+            conversation=task_conversation,
             cwd=task.workspace,
             resumed=resume_session_id is not None,
             attached=attached,
@@ -1777,8 +1811,12 @@ class _Daemon:
                 )
                 return
             forward_raw = True
-        task_source = ConversationRef(conversation.channel_key, msg.conversation_id)
-        task = self.store.by_thread(task_source, thread_root)
+        task = self._task_for_conversation(conversation)
+        if task is None:
+            task_source = ConversationRef(conversation.channel_key, msg.conversation_id)
+            task = self.store.by_thread(task_source, thread_root)
+            if task is not None:
+                self._bind_conversation(conversation, task.task_id)
         sess = self._runners.get_for_task(task.task_id) if task is not None else None
         if sess is None:
             # Thread 只负责路由到 Task；无 current runner 时再按 Task 恢复或明确提示。
