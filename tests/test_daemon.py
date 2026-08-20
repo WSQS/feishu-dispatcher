@@ -28,6 +28,7 @@ from feishu_dispatcher.daemon import (
     _AgentSession,
     _CurrentRunnerRegistry,
     _Daemon,
+    _FanoutStreamingOutput,
 )
 from feishu_dispatcher.http_channel import HttpChannel
 from feishu_dispatcher.livecard import LiveCard
@@ -1072,6 +1073,72 @@ async def test_run_uses_text_only_channel_output_lifecycle():
     await wait_until(lambda: created[0].closed)
 
 
+async def test_fanout_streaming_output_isolates_target_failures(caplog):
+    class RecordingOutput:
+        def __init__(self) -> None:
+            self.text = ""
+            self.footer = ""
+            self.flush_count = 0
+            self.statuses: list[str] = []
+            self.closed = False
+
+        def feed(self, text: str) -> None:
+            self.text += text
+
+        def set_footer(self, footer: str) -> None:
+            self.footer = footer
+
+        async def flush(self) -> None:
+            self.flush_count += 1
+
+        async def set_status(self, status: str) -> None:
+            self.statuses.append(status)
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    class BrokenOutput:
+        def feed(self, text: str) -> None:  # noqa: ARG002
+            raise RuntimeError("feed boom")
+
+        def set_footer(self, footer: str) -> None:  # noqa: ARG002
+            raise RuntimeError("footer boom")
+
+        async def flush(self) -> None:
+            raise RuntimeError("flush boom")
+
+        async def set_status(self, status: str) -> None:  # noqa: ARG002
+            raise RuntimeError("status boom")
+
+        async def aclose(self) -> None:
+            raise RuntimeError("close boom")
+
+    first = RecordingOutput()
+    second = RecordingOutput()
+    output = _FanoutStreamingOutput(
+        [
+            (ConversationRef("feishu", "thread-a"), first),
+            (ConversationRef("web", "thread-b"), second),
+            (ConversationRef("broken", "thread-c"), BrokenOutput()),
+        ]
+    )
+
+    with caplog.at_level("ERROR"):
+        output.feed("hello")
+        output.set_footer("footer")
+        await output.flush()
+        await output.set_status("done")
+        await output.aclose()
+
+    for target in (first, second):
+        assert target.text == "hello"
+        assert target.footer == "footer"
+        assert target.flush_count == 1
+        assert target.statuses == ["done"]
+        assert target.closed
+    assert "channel=broken conversation=thread-c" in caplog.text
+
+
 async def test_run_agent_flag_overrides_default():
     daemon, bridge, created = make_daemon()
     # demo 默认 copilot；--agent opencode 覆盖
@@ -1420,7 +1487,7 @@ async def test_same_inbound_ids_are_isolated_by_channel():
     await daemon._shutdown()
 
 
-async def test_runner_routes_each_turn_to_its_request_source():
+async def test_runner_fans_out_turns_to_bound_conversations():
     daemon, feishu, created = make_daemon()
     web = FakeBridge()
     daemon._channels["web"] = web
@@ -1434,7 +1501,9 @@ async def test_runner_routes_each_turn_to_its_request_source():
     )
     task = task_by_thread(daemon.store, "om_root1")
     runner = current_runner(daemon)
+    main_conversation = ConversationRef("feishu", "om_root1")
     web_conversation = ConversationRef("web", "web-thread")
+    daemon._bind_conversation(web_conversation, task.task_id)
 
     runner.enqueue(TurnRequest("web turn", web_conversation))
     await wait_until(
@@ -1442,20 +1511,25 @@ async def test_runner_routes_each_turn_to_its_request_source():
             created[0].prompts == ["first", "web turn"]
             and any("echo:web turn" in text for text in web.texts("web-thread"))
             and any("本轮结束" in text for text in web.texts("web-thread"))
+            and any("echo:web turn" in text for text in feishu.texts("om_root1"))
+            and any("本轮结束" in text for text in feishu.texts("om_root1"))
         )
     )
 
-    assert runner.conversation == ConversationRef(task.channel_key, task.thread_root_id)
-    assert not any("web turn" in text for text in feishu.texts("om_root1"))
+    assert runner.conversation == main_conversation
+    assert "↪️ 同步自 web：web turn" in feishu.texts("om_root1")
+    assert "↪️ 同步自 web：web turn" not in web.texts("web-thread")
 
     await daemon._sched_send_to_task(task.task_id, "main turn")
     await wait_until(
         lambda: (
             created[0].prompts == ["first", "web turn", "main turn"]
             and any("echo:main turn" in text for text in feishu.texts("om_root1"))
+            and any("echo:main turn" in text for text in web.texts("web-thread"))
         )
     )
-    assert not any("main turn" in text for text in web.texts("web-thread"))
+    assert "↪️ 同步自 feishu：main turn" in web.texts("web-thread")
+    assert "↪️ 同步自 feishu：main turn" not in feishu.texts("om_root1")
     await daemon._shutdown()
 
 
@@ -1492,12 +1566,78 @@ async def test_bound_cross_channel_thread_routes_to_existing_runner():
             created[0].prompts == ["first", "web follow up"]
             and any("echo:web follow up" in text for text in web.texts("web-thread"))
             and any("本轮结束" in text for text in web.texts("web-thread"))
+            and any("echo:web follow up" in text for text in feishu.texts("om_root1"))
+            and any("本轮结束" in text for text in feishu.texts("om_root1"))
         )
     )
 
     assert daemon._runners.get_for_task(task.task_id) is runner
     assert runner.conversation == main_conversation
-    assert not any("web follow up" in text for text in feishu.texts("om_root1"))
+    assert "↪️ 同步自 web：web follow up" in feishu.texts("om_root1")
+    assert "↪️ 同步自 web：web follow up" not in web.texts("web-thread")
+
+    await daemon._handle_channel_message(
+        "web",
+        thread_msg(
+            "/stop",
+            root="web-thread",
+            mid="web-stop",
+            conversation_id="web-room",
+        ),
+    )
+    await wait_until(lambda: daemon.store.get(task.task_id).status == "stopped")
+    await wait_until(
+        lambda: (
+            any("agent 已停止" in text for text in feishu.texts("om_root1"))
+            and any("agent 已停止" in text for text in web.texts("web-thread"))
+        )
+    )
+    await daemon._shutdown()
+
+
+async def test_task_output_creation_failure_keeps_other_conversation_running(caplog):
+    class BrokenOutputBridge(FakeBridge):
+        def open_output(
+            self, target_id: str, title: str, *, footer: str = ""
+        ) -> StreamingOutput:
+            raise RuntimeError("open output boom")
+
+    daemon, feishu, created = make_daemon()
+    broken = BrokenOutputBridge()
+    daemon._channels["broken"] = broken
+    await daemon._handle_message(root_msg("/run demo first"))
+    await wait_until(
+        lambda: (
+            created
+            and created[0].prompts == ["first"]
+            and any("本轮结束" in text for text in feishu.texts("om_root1"))
+        )
+    )
+    task = task_by_thread(daemon.store, "om_root1")
+    broken_conversation = ConversationRef("broken", "broken-thread")
+    daemon._bind_conversation(broken_conversation, task.task_id)
+
+    with caplog.at_level("ERROR"):
+        await daemon._handle_channel_message(
+            "broken",
+            thread_msg(
+                "continue",
+                root="broken-thread",
+                mid="broken-message",
+                conversation_id="broken-room",
+            ),
+        )
+        await wait_until(
+            lambda: (
+                created[0].prompts == ["first", "continue"]
+                and any("echo:continue" in text for text in feishu.texts("om_root1"))
+                and any("本轮结束" in text for text in feishu.texts("om_root1"))
+            )
+        )
+        await wait_until(lambda: daemon.store.get(task.task_id).status == "idle")
+
+    assert daemon.store.get(task.task_id).status == "idle"
+    assert "Task 输出创建失败 channel=broken conversation=broken-thread" in caplog.text
     await daemon._shutdown()
 
 
@@ -1824,7 +1964,7 @@ async def test_recovery_after_restart_uses_file_task_store(tmp_path: Path):
     await d2._shutdown()
 
 
-async def test_recovery_turn_routes_start_and_output_to_request_source():
+async def test_recovery_turn_fans_out_start_and_output():
     store = TaskStore(None)
     task = _seed_task(store, thread="om_main")
     daemon, feishu, created = make_daemon(store=store)
@@ -1849,8 +1989,81 @@ async def test_recovery_turn_routes_start_and_output_to_request_source():
 
     runner = daemon._runners.get_for_task(task.task_id)
     assert runner.conversation == ConversationRef(task.channel_key, task.thread_root_id)
-    assert feishu.texts("om_main") == []
+    assert any("正在恢复任务" in text for text in feishu.texts("om_main"))
+    assert any("已恢复会话" in text for text in feishu.texts("om_main"))
+    assert "↪️ 同步自 web：continue" in feishu.texts("om_main")
+    assert any("echo:continue" in text for text in feishu.texts("om_main"))
+    assert any("本轮结束" in text for text in feishu.texts("om_main"))
+    assert "↪️ 同步自 web：continue" not in web.texts("web-thread")
     await daemon._shutdown()
+
+
+async def test_cross_channel_recovery_start_failure_fans_out():
+    store = TaskStore(None)
+    task = _seed_task(store, thread="om_main")
+    daemon, feishu, created = make_daemon(
+        store=store,
+        agent_cls=StartupFailAgent,
+    )
+    web = FakeBridge()
+    daemon._channels["web"] = web
+    web_conversation = ConversationRef("web", "web-thread")
+
+    await daemon._recover_or_notify(
+        "continue",
+        conversation=web_conversation,
+        task=task,
+    )
+    await wait_until(
+        lambda: (
+            any("会话恢复失败" in text for text in feishu.texts("om_main"))
+            and any("会话恢复失败" in text for text in web.texts("web-thread"))
+        )
+    )
+
+    assert len(created) == 1
+    assert store.get(task.task_id).status == "failed"
+    await wait_until(lambda: daemon._runners.get_for_task(task.task_id) is None)
+    assert daemon._runners.get_for_task(task.task_id) is None
+
+
+async def test_cross_channel_turn_error_fans_out():
+    class CountingFailAgent(FakeAgent):
+        async def prompt(self, text: str) -> str:
+            self.prompts.append(text)
+            raise RuntimeError("boom")
+
+    store = TaskStore(None)
+    task = store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="fail",
+        conversation=ConversationRef("feishu", "oc_1"),
+        thread_root_id="om_main",
+        workspace="C:/tmp/demo",
+    )
+    daemon, feishu, created = make_daemon(store=store, agent_cls=CountingFailAgent)
+    web = FakeBridge()
+    daemon._channels["web"] = web
+    web_conversation = ConversationRef("web", "web-thread")
+    daemon._bind_conversation(web_conversation, task.task_id)
+
+    daemon._launch(
+        task,
+        ["copilot", "--acp"],
+        first_turn=TurnRequest("fail", web_conversation),
+    )
+    await wait_until(
+        lambda: (
+            any("本轮异常" in text for text in feishu.texts("om_main"))
+            and any("本轮异常" in text for text in web.texts("web-thread"))
+        )
+    )
+
+    assert created[0].prompts == ["fail"]
+    assert store.get(task.task_id).status == "failed"
+    await wait_until(lambda: daemon._runners.get_for_task(task.task_id) is None)
+    assert daemon._runners.get_for_task(task.task_id) is None
 
 
 async def test_reply_to_unknown_topic_notifies_not_silent():
@@ -3684,7 +3897,7 @@ async def test_bg_job_completion_enqueues_resume_to_active_agent():
     await daemon._shutdown()
 
 
-async def test_bg_job_completion_uses_task_source_after_cross_channel_turn():
+async def test_bg_job_completion_fans_out_to_bound_conversations():
     store = TaskStore(None)
     daemon, feishu, created = make_daemon(store=store)
     web = FakeBridge()
@@ -3692,8 +3905,10 @@ async def test_bg_job_completion_uses_task_source_after_cross_channel_turn():
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
     runner = current_runner(daemon)
+    web_conversation = ConversationRef("web", "web-thread")
+    daemon._bind_conversation(web_conversation, "t1")
 
-    runner.enqueue(TurnRequest("web turn", ConversationRef("web", "web-thread")))
+    runner.enqueue(TurnRequest("web turn", web_conversation))
     await wait_until(
         lambda: (
             created[0].prompts == ["task", "web turn"]
@@ -3705,10 +3920,12 @@ async def test_bg_job_completion_uses_task_source_after_cross_channel_turn():
     daemon.job_store.update(job.job_id, exit_code=0, finished_at=time.time())
     await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 0)
     await wait_until(
-        lambda: any("echo:<bg_job_done>" in text for text in feishu.texts("om_root1"))
+        lambda: (
+            any("echo:<bg_job_done>" in text for text in feishu.texts("om_root1"))
+            and any("echo:<bg_job_done>" in text for text in web.texts("web-thread"))
+        )
     )
 
-    assert not any("<bg_job_done>" in text for text in web.texts("web-thread"))
     await daemon._shutdown()
 
 
