@@ -8,15 +8,23 @@ import socket
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
 import pytest
 
 import feishu_dispatcher.daemon as daemon_module
-from feishu_dispatcher.config import Config, LLMSettings, Project, ViewerConfig
+from feishu_dispatcher.config import (
+    Config,
+    HttpChannelConfig,
+    LLMSettings,
+    Project,
+    ViewerConfig,
+)
 from feishu_dispatcher.channel import ChannelMessage, ConversationRef, StreamingOutput
 from feishu_dispatcher.daemon import _AgentSession, _CurrentRunnerRegistry, _Daemon
+from feishu_dispatcher.http_channel import HttpChannel
 from feishu_dispatcher.livecard import LiveCard
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
 from feishu_dispatcher.store import ProjectStore, TaskStore
@@ -318,13 +326,33 @@ def make_daemon(
     return daemon, bridge, created
 
 
+def http_channel_request(
+    method: str,
+    url: str,
+    token: str,
+    payload: dict | None = None,
+) -> tuple[int, dict]:
+    headers = {"Authorization": f"Bearer {token}"}
+    data = None
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(payload).encode("utf-8")
+    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("discover", "expected_sender_whitelist"),
     [(False, ["ou-owner"]), (True, [])],
 )
+@pytest.mark.parametrize("http_channel", [None, HttpChannelConfig()])
 async def test_run_builds_default_feishu_channel_and_injects_it(
-    monkeypatch, tmp_path, discover, expected_sender_whitelist
+    monkeypatch, tmp_path, discover, expected_sender_whitelist, http_channel
 ):
     cfg = Config(
         app_id="app-id",
@@ -332,6 +360,7 @@ async def test_run_builds_default_feishu_channel_and_injects_it(
         chat_id="oc-main",
         sender_whitelist=["ou-owner"],
         feishu_qps=3.5,
+        http_channel=http_channel,
     )
     constructed: dict[str, object] = {}
 
@@ -384,8 +413,191 @@ async def test_run_builds_default_feishu_channel_and_injects_it(
     assert constructed["throttle_window"] == 0.5
     channels = constructed["channels"]
     assert isinstance(channels, dict)
+    assert set(channels) == {"feishu"}
     assert isinstance(channels["feishu"], FakeFeishuChannel)
     assert constructed["primary_channel_key"] == "feishu"
+
+
+@pytest.mark.asyncio
+async def test_run_registers_enabled_http_channel_alongside_feishu(
+    monkeypatch, tmp_path
+):
+    cfg = Config(
+        app_id="app-id",
+        app_secret="app-secret",
+        chat_id="oc-main",
+        throttle_window=0.25,
+        http_channel=HttpChannelConfig(enabled=True, bind="127.0.0.2", port=8123),
+    )
+    constructed: dict[str, object] = {}
+
+    class FakeFeishuChannel(FakeBridge):
+        def __init__(self, **_kwargs) -> None:
+            super().__init__()
+
+    class FakeHttpChannel(FakeBridge):
+        def __init__(
+            self,
+            token: str,
+            main_loop,
+            *,
+            host: str,
+            port: int,
+            throttle_window: float,
+        ) -> None:
+            super().__init__()
+            constructed.update(
+                token=token,
+                main_loop=main_loop,
+                host=host,
+                port=port,
+                throttle_window=throttle_window,
+            )
+
+    async def fake_daemon_run(self) -> None:
+        constructed["channels"] = dict(self._channels)
+        constructed["primary_channel_key"] = self._primary_channel_key
+
+    def fake_token(path: Path) -> str:
+        constructed["token_path"] = path
+        return "tok-http"
+
+    monkeypatch.setattr(daemon_module, "FeishuBridge", FakeFeishuChannel)
+    monkeypatch.setattr(daemon_module, "HttpChannel", FakeHttpChannel)
+    monkeypatch.setattr(daemon_module, "ensure_http_channel_token", fake_token)
+    monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
+
+    await daemon_module.run(cfg, store_path=tmp_path / "sessions.json")
+
+    channels = constructed["channels"]
+    assert isinstance(channels, dict)
+    assert set(channels) == {"feishu", "http"}
+    assert isinstance(channels["feishu"], FakeFeishuChannel)
+    assert isinstance(channels["http"], FakeHttpChannel)
+    assert constructed["primary_channel_key"] == "feishu"
+    assert constructed["token"] == "tok-http"
+    assert constructed["token_path"] == tmp_path / "http-channel.token"
+    assert constructed["main_loop"] is asyncio.get_running_loop()
+    assert constructed["host"] == "127.0.0.2"
+    assert constructed["port"] == 8123
+    assert constructed["throttle_window"] == 0.25
+
+
+@pytest.mark.asyncio
+async def test_run_does_not_auto_register_http_for_injected_channel(
+    monkeypatch, tmp_path
+):
+    cfg = Config(
+        app_id="a",
+        app_secret="b",
+        chat_id="oc-main",
+        http_channel=HttpChannelConfig(enabled=True),
+    )
+    constructed: dict[str, object] = {}
+
+    async def fake_daemon_run(self) -> None:
+        constructed["channels"] = dict(self._channels)
+
+    def unexpected_http(*_args, **_kwargs):
+        raise AssertionError("injected Channel path must not auto-register HTTP")
+
+    monkeypatch.setattr(daemon_module, "HttpChannel", unexpected_http)
+    monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
+    injected = FakeBridge()
+
+    await daemon_module.run(
+        cfg,
+        store_path=tmp_path / "sessions.json",
+        channel=injected,
+        channel_key="test",
+    )
+
+    assert constructed["channels"] == {"test": injected}
+
+
+@pytest.mark.asyncio
+async def test_enabled_http_channel_bind_failure_is_explicit(monkeypatch, tmp_path):
+    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    holder.bind(("127.0.0.1", 0))
+    holder.listen(1)
+    occupied_port = holder.getsockname()[1]
+    cfg = Config(
+        app_id="a",
+        app_secret="b",
+        chat_id="oc-main",
+        http_channel=HttpChannelConfig(
+            enabled=True, bind="127.0.0.1", port=occupied_port
+        ),
+    )
+
+    class FakeFeishuChannel(FakeBridge):
+        def __init__(self, **_kwargs) -> None:
+            super().__init__()
+
+    monkeypatch.setattr(daemon_module, "FeishuBridge", FakeFeishuChannel)
+    try:
+        with pytest.raises(OSError):
+            await daemon_module.run(cfg, store_path=tmp_path / "sessions.json")
+    finally:
+        holder.close()
+
+
+@pytest.mark.asyncio
+async def test_http_channel_help_round_trip_stays_in_http_conversation():
+    cfg = Config(app_id="a", app_secret="b", chat_id="oc-main")
+    feishu = FakeBridge()
+    http = HttpChannel(
+        "tok-http",
+        asyncio.get_running_loop(),
+        host="127.0.0.1",
+        port=0,
+        throttle_window=0.01,
+    )
+    daemon = _Daemon(
+        cfg,
+        _channels={"feishu": feishu, "http": http},
+        _primary_channel_key="feishu",
+    )
+    daemon._start_channels()
+    try:
+        status, accepted = await asyncio.to_thread(
+            http_channel_request,
+            "POST",
+            http.base_url + "/api/channel/messages",
+            "tok-http",
+            {
+                "conversation_id": "browser-a",
+                "message_id": "message-a",
+                "thread_id": None,
+                "sender_id": "browser-user",
+                "text": "/help",
+            },
+        )
+        assert status == 202
+        assert accepted == {"accepted": True}
+
+        query = urllib.parse.urlencode({"conversation_id": "browser-a", "after": 0})
+        events_url = http.base_url + "/api/channel/events?" + query
+        deadline = asyncio.get_running_loop().time() + 3
+        while True:
+            event_status, payload = await asyncio.to_thread(
+                http_channel_request, "GET", events_url, "tok-http"
+            )
+            if event_status == 200 and payload["events"]:
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError((event_status, payload))
+            await asyncio.sleep(0.01)
+
+        assert len(payload["events"]) == 1
+        event = payload["events"][0]
+        assert event["type"] == "message.created"
+        assert event["target_id"] == "message-a"
+        assert "用法" in event["text"]
+        assert feishu.replies == []
+        assert feishu.roots == []
+    finally:
+        daemon._stop_channels()
 
 
 @pytest.mark.asyncio
