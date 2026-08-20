@@ -10,6 +10,7 @@ import threading
 from collections import deque
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.resources import files
 from pathlib import Path
 from urllib.parse import parse_qs
 from uuid import uuid4
@@ -48,6 +49,29 @@ class _ConversationState:
     events: deque[dict]
     next_cursor: int = 1
     targets: set[str] = field(default_factory=set)
+
+
+@dataclass(frozen=True)
+class _WebAsset:
+    body: bytes
+    content_type: str
+
+
+def _load_webui_assets() -> dict[str, _WebAsset]:
+    root = files("feishu_dispatcher").joinpath("webui")
+    index = _WebAsset(
+        root.joinpath("index.html").read_bytes(), "text/html; charset=utf-8"
+    )
+    return {
+        "/": index,
+        "/index.html": index,
+        "/webui/app.js": _WebAsset(
+            root.joinpath("app.js").read_bytes(), "text/javascript; charset=utf-8"
+        ),
+        "/webui/style.css": _WebAsset(
+            root.joinpath("style.css").read_bytes(), "text/css; charset=utf-8"
+        ),
+    }
 
 
 def ensure_token(path: Path) -> str:
@@ -97,6 +121,7 @@ class HttpChannel:
         self._conversations: dict[str, _ConversationState] = {}
         self._target_conversations: dict[str, str] = {}
         self._on_message: MessageHandler | None = None
+        self._webui_assets = _load_webui_assets()
         self._server: _HttpServer | None = self._build_server()
         self._thread: threading.Thread | None = None
 
@@ -554,11 +579,42 @@ def _make_handler(channel: HttpChannel):
 
         def _respond(self, status: int, payload: dict) -> None:
             data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self._respond_bytes(
+                status, data, content_type="application/json; charset=utf-8"
+            )
+
+        def _respond_bytes(
+            self,
+            status: int,
+            data: bytes,
+            *,
+            content_type: str,
+            headers: dict[str, str] | None = None,
+        ) -> None:
             self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Type", content_type)
             self.send_header("Content-Length", str(len(data)))
+            for name, value in (headers or {}).items():
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(data)
+
+        def _respond_asset(self, asset: _WebAsset) -> None:
+            self._respond_bytes(
+                200,
+                asset.body,
+                content_type=asset.content_type,
+                headers={
+                    "Cache-Control": "no-store",
+                    "Content-Security-Policy": (
+                        "default-src 'self'; base-uri 'none'; connect-src 'self'; "
+                        "form-action 'self'; frame-ancestors 'none'; object-src 'none'; "
+                        "script-src 'self'; style-src 'self'"
+                    ),
+                    "Referrer-Policy": "no-referrer",
+                    "X-Content-Type-Options": "nosniff",
+                },
+            )
 
         def _split(self) -> tuple[str, str]:
             path, _, query = self.path.partition("?")
@@ -578,6 +634,11 @@ def _make_handler(channel: HttpChannel):
 
         def do_GET(self) -> None:  # noqa: N802
             path, query = self._split()
+            asset = channel._webui_assets.get(path)
+            if asset is not None:
+                logger.info("http-channel GET %s → 200", path)
+                self._respond_asset(asset)
+                return
             if path == "/api/channel/health":
                 status, payload = channel._dispatch_health(self._token())
             elif path == "/api/channel/events":

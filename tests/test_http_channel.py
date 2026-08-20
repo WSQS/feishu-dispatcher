@@ -23,6 +23,12 @@ def _available_port() -> int:
         return holder.getsockname()[1]
 
 
+def _raw_request(url: str) -> tuple[int, dict[str, str], bytes]:
+    request = urllib.request.Request(url, method="GET")
+    with urllib.request.urlopen(request, timeout=10) as response:
+        return response.status, dict(response.headers.items()), response.read()
+
+
 def _request(
     method: str,
     url: str,
@@ -86,6 +92,45 @@ async def _wait_for_events(
         if asyncio.get_running_loop().time() >= deadline:
             raise AssertionError((status, payload))
         await asyncio.sleep(0.01)
+
+
+async def test_webui_assets_are_same_origin_and_do_not_require_token():
+    channel = HttpChannel(
+        "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
+    )
+
+    async def ignore(_message: ChannelMessage) -> None:
+        return None
+
+    channel.start(ignore)
+    try:
+        expected = {
+            "/": "text/html; charset=utf-8",
+            "/webui/app.js": "text/javascript; charset=utf-8",
+            "/webui/style.css": "text/css; charset=utf-8",
+        }
+        assets: dict[str, bytes] = {}
+        for path, content_type in expected.items():
+            status, headers, body = await asyncio.to_thread(
+                _raw_request, channel.base_url + path
+            )
+            assert status == 200
+            assert headers["Content-Type"] == content_type
+            assert headers["Cache-Control"] == "no-store"
+            assert headers["X-Content-Type-Options"] == "nosniff"
+            assert "default-src 'self'" in headers["Content-Security-Policy"]
+            assets[path] = body
+
+        html = assets["/"].decode("utf-8")
+        javascript = assets["/webui/app.js"].decode("utf-8")
+        assert 'src="/webui/app.js"' in html
+        assert 'href="/webui/style.css"' in html
+        assert "/api/channel/messages" in javascript
+        assert "/api/channel/events" in javascript
+        assert "feishu-dispatcher.http-channel.conversation" in javascript
+        assert "feishu-dispatcher.http-channel.cursor" in javascript
+    finally:
+        channel.stop()
 
 
 async def test_health_requires_token_and_returns_channel_version():
