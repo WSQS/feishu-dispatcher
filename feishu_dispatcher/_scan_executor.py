@@ -31,7 +31,7 @@ class ScanExecutor:
     ) -> None:
         self._scan = scan
         self._executor: ThreadPoolExecutor | None = ThreadPoolExecutor(
-            max_workers=max_workers, thread_name_prefix="viewer-scan"
+            max_workers=max_workers, thread_name_prefix="workspace-scan"
         )
         #: 在途（含排队）扫描数上限 = 并发 + 排队；超出则 run() 阻塞等待
         self._slots = asyncio.Semaphore(max_workers + max_pending)

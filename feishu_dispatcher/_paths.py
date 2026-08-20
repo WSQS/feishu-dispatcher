@@ -1,4 +1,4 @@
-"""路径穿越校验工具：供 viewer 的 file/tree/diff 接口校验请求 path。
+"""路径穿越校验工具：供 workspace file/tree/diff 接口校验请求 path。
 
 判定：把请求 path resolve 后，检查是否落在 workspace 根之内（决策 D9）。拒绝：
 - 含 ``..`` 的路径

@@ -31,7 +31,7 @@
 
 - 格式：`<type>(<scope>): <subject>`
 - `type` 取 Angular 集合：`build` / `ci` / `docs` / `feat` / `fix` / `perf` / `refactor` / `style` / `test`（本仓历史里偶见的 `chore` 视为与 `build`/`ci` 同类运维提交，新提交优先用上表）
-- 示例：`feat(android): 导航框架`、`docs(config): 补 [viewer] 段`
+- 示例：`feat(android): 导航框架`、`docs(config): 补 [http_channel] 段`
 - issue 关联写在 **PR body**（`Closes #N` / `Refs #N`），不要塞进代码注释（见下方「注释规范」）。
 
 ### PR 流程

@@ -20,7 +20,6 @@ from feishu_dispatcher.config import (
     HttpChannelConfig,
     LLMSettings,
     Project,
-    ViewerConfig,
 )
 from feishu_dispatcher.channel import ChannelMessage, ConversationRef, StreamingOutput
 from feishu_dispatcher.daemon import (
@@ -450,6 +449,8 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
             *,
             host: str,
             port: int,
+            routes,
+            route_context,
             throttle_window: float,
         ) -> None:
             super().__init__()
@@ -458,6 +459,8 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
                 main_loop=main_loop,
                 host=host,
                 port=port,
+                routes=routes,
+                route_context=route_context,
                 throttle_window=throttle_window,
             )
 
@@ -488,6 +491,20 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
     assert constructed["host"] == "127.0.0.2"
     assert constructed["port"] == 8123
     assert constructed["throttle_window"] == 0.25
+    routes = constructed["routes"]
+    assert isinstance(routes, dict)
+    assert set(routes) == {
+        ("GET", "/api/health"),
+        ("GET", "/api/projects"),
+        ("GET", "/api/projects/{name}/tree"),
+        ("GET", "/api/projects/{name}/tree/children"),
+        ("GET", "/api/projects/{name}/file"),
+    }
+    route_context = constructed["route_context"]
+    assert isinstance(route_context, dict)
+    assert callable(route_context["all_projects"])
+    assert isinstance(route_context["scan_executor"], daemon_module.ScanExecutor)
+    await route_context["scan_executor"].aclose()
 
 
 @pytest.mark.asyncio
@@ -4527,101 +4544,3 @@ async def test_launch_threads_agent_env_into_spawn():
     assert created[0].spawn.env.get("CODEX_PATH") == "codex"
     assert created[0].spawn.env.get("INITIAL_AGENT_MODE") == "agent-full-access"
     await daemon._shutdown()
-
-
-# ---------------------------------------------------------------------- #
-# _start_viewer 集成测试（#118）
-# ---------------------------------------------------------------------- #
-
-
-def _viewer_daemon(tmp_path: Path, viewer: ViewerConfig | None) -> _Daemon:
-    """构造一个带 [viewer] 配置的 _Daemon（不经 run()）。token 落 tmp_path。
-
-    _start_viewer 自包含（只用 cfg.viewer / _viewer_token_path / ensure_token /
-    ViewerServer），不碰 stores/bridge/scheduler，故直接调、无需 mock 重依赖。
-    """
-    cfg = Config(
-        app_id="a",
-        app_secret="b",
-        chat_id="oc_1",
-        agents={"copilot": ["copilot", "--acp"]},
-        viewer=viewer,
-    )
-    daemon = _Daemon(cfg, store=TaskStore(None), project_store=ProjectStore(None))
-    daemon._viewer_token_path = tmp_path / "viewer.token"
-    return daemon
-
-
-def _health_ok(base_url: str, token: str) -> bool:
-    """curl /api/health，带 token，返回是否 200 + ok=true（经线程发出，避免阻塞 loop）。"""
-    req = urllib.request.Request(
-        base_url + "/api/health", headers={"Authorization": f"Bearer {token}"}
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            payload = json.loads(resp.read().decode())
-            return resp.status == 200 and payload.get("ok") is True
-    except (urllib.error.URLError, urllib.error.HTTPError):
-        return False
-
-
-async def test_start_viewer_launches_server_and_persists_token(tmp_path: Path):
-    # enabled=true → 返回 ViewerServer、真绑端口、/api/health 通、token 落 _viewer_token_path。
-    daemon = _viewer_daemon(
-        tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0)
-    )
-    loop = asyncio.get_event_loop()
-    vs = daemon._start_viewer(loop)
-    assert vs is not None
-    try:
-        # token 落到注入的 _viewer_token_path，内容 == 用来请求的那个
-        token = daemon._viewer_token_path.read_text(encoding="utf-8").strip()
-        assert token  # 非空
-        ok = await asyncio.to_thread(_health_ok, vs.base_url, token)
-        assert ok
-    finally:
-        vs.stop()
-
-
-async def test_start_viewer_port_in_use_returns_none(tmp_path: Path, caplog):
-    # 端口被占用 → 返回 None、记 ERROR、不抛（Q3=β：viewer 起不来不拖累 daemon）。
-    # 先占一个端口，再让 _start_viewer 绑同一个。
-    holder = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    holder.bind(("127.0.0.1", 0))
-    holder.listen(1)
-    occupied_port = holder.getsockname()[1]
-    try:
-        daemon = _viewer_daemon(
-            tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=occupied_port)
-        )
-        loop = asyncio.get_event_loop()
-        with caplog.at_level("ERROR"):
-            result = daemon._start_viewer(loop)  # 不应抛
-        assert result is None
-        assert "启动失败" in caplog.text
-    finally:
-        holder.close()
-
-
-async def test_start_viewer_token_idempotent_across_calls(tmp_path: Path):
-    # 两次 _start_viewer（同 token path）→ 同一个 token（ensure_token 幂等，不重新生成）。
-    daemon = _viewer_daemon(
-        tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0)
-    )
-    loop = asyncio.get_event_loop()
-    vs1 = daemon._start_viewer(loop)
-    assert vs1 is not None
-    token1 = daemon._viewer_token_path.read_text(encoding="utf-8").strip()
-    vs1.stop()
-    # 第二次（新端口，避免 TIME_WAIT）：重新构造 daemon 复用同一 token 文件
-    daemon2 = _viewer_daemon(
-        tmp_path, ViewerConfig(enabled=True, bind="127.0.0.1", port=0)
-    )
-    daemon2._viewer_token_path = daemon._viewer_token_path
-    vs2 = daemon2._start_viewer(loop)
-    assert vs2 is not None
-    try:
-        token2 = daemon._viewer_token_path.read_text(encoding="utf-8").strip()
-        assert token1 == token2  # 幂等：读回已有的，不覆盖
-    finally:
-        vs2.stop()

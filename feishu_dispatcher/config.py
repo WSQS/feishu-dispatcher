@@ -50,29 +50,11 @@ class LLMSettings:
 
 
 @dataclass(frozen=True)
-class ViewerConfig:
-    """移动端查看器（viewer）配置：daemon 内嵌的只读 HTTP 服务（#104/#107/#111）。
-
-    默认关闭（``enabled=False``）—— 新功能默认安全，需显式开启（决策 Q2）。
-    ``bind``/``port`` 决定手机经私有网络（局域网/Tailscale/ZeroTier）连过来的地址
-    （决策 D6/Q1）。
-
-    **token 不在配置里**：永远由 daemon 自动生成 + 持久化到
-    ``~/.feishu-dispatcher/viewer.token`` + 启动时日志打印（决策 Q3/Q8）。token 是纯
-    内部管理的鉴权密钥，用户不碰（见 ``_viewer_token.py``）。
-    """
+class HttpChannelConfig:
+    """WebUI 与移动端共用的 HTTP Channel；使用单一全局 Bearer token。"""
 
     enabled: bool = False
     bind: str = "0.0.0.0"
-    port: int = 7321
-
-
-@dataclass(frozen=True)
-class HttpChannelConfig:
-    """可写 HTTP Channel 配置；默认关闭且只监听本机。"""
-
-    enabled: bool = False
-    bind: str = "127.0.0.1"
     port: int = 7322
 
 
@@ -133,9 +115,7 @@ class Config:
     llm_profiles: dict[str, LLMSettings] = field(default_factory=dict)
     #: 启动时激活的 profile 名（运行时 /llm 可切，不持久化，重启回到此值）
     llm_active: str = ""
-    #: 移动端查看器配置；None = 配置里没有 [viewer] 段（默认，viewer 不起）。
-    viewer: ViewerConfig | None = None
-    #: 可写 HTTP Channel；None = 配置里没有 [http_channel] 段（默认不起）。
+    #: WebUI 与移动端共用的 HTTP Channel；None = 配置里没有配置段（默认不起）。
     http_channel: HttpChannelConfig | None = None
 
     @staticmethod
@@ -231,23 +211,11 @@ class Config:
                     p.name,
                     p.default_agent,
                 )
-        # [viewer] 段可选：没有则 viewer=None（默认不起）；有则解析（即使 enabled=false
-        # 也构造 ViewerConfig，让 daemon 按 enabled 字段决定起不起）。
-        viewer_data = data.get("viewer")
-        viewer = (
-            ViewerConfig(
-                enabled=bool(viewer_data.get("enabled", False)),
-                bind=str(viewer_data.get("bind", "0.0.0.0")),
-                port=int(viewer_data.get("port", 7321)),
-            )
-            if viewer_data is not None
-            else None
-        )
         http_channel_data = data.get("http_channel")
         http_channel = (
             HttpChannelConfig(
                 enabled=bool(http_channel_data.get("enabled", False)),
-                bind=str(http_channel_data.get("bind", "127.0.0.1")),
+                bind=str(http_channel_data.get("bind", "0.0.0.0")),
                 port=int(http_channel_data.get("port", 7322)),
             )
             if http_channel_data is not None
@@ -271,6 +239,5 @@ class Config:
             llm=llm,
             llm_profiles=llm_profiles,
             llm_active=llm_active,
-            viewer=viewer,
             http_channel=http_channel,
         )

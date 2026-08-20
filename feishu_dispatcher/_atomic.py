@@ -1,6 +1,6 @@
 """共享原子写工具：temp + fsync + replace + fsync_dir 的持久化原语。
 
-统一了 store（台账 JSON，留 .bak）与 viewer token（纯文本，不留 .bak）两处的原子写。
+统一了 store（台账 JSON，留 .bak）与 HTTP Channel token（纯文本，不留 .bak）的原子写。
 原语本身**不关心格式**：调用方负责序列化（JSON 调 ``json.dumps``，
 纯文本直接传字符串），本模块只拿到已序列化的文本落盘。
 
