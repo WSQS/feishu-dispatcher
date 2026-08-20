@@ -23,7 +23,12 @@ from feishu_dispatcher.config import (
     ViewerConfig,
 )
 from feishu_dispatcher.channel import ChannelMessage, ConversationRef, StreamingOutput
-from feishu_dispatcher.daemon import _AgentSession, _CurrentRunnerRegistry, _Daemon
+from feishu_dispatcher.daemon import (
+    TurnRequest,
+    _AgentSession,
+    _CurrentRunnerRegistry,
+    _Daemon,
+)
 from feishu_dispatcher.http_channel import HttpChannel
 from feishu_dispatcher.livecard import LiveCard
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
@@ -850,8 +855,18 @@ def current_runner(daemon: _Daemon, thread: str = "om_root1"):
 
 def test_current_runner_registry_rejects_occupied_slot():
     registry = _CurrentRunnerRegistry()
-    runner_a = _AgentSession("thread-a", "demo", "copilot", task_id="t1")
-    runner_b = _AgentSession("thread-b", "demo", "copilot", task_id="t1")
+    runner_a = _AgentSession(
+        "demo",
+        "copilot",
+        task_id="t1",
+        conversation=ConversationRef("feishu", "thread-a"),
+    )
+    runner_b = _AgentSession(
+        "demo",
+        "copilot",
+        task_id="t1",
+        conversation=ConversationRef("feishu", "thread-b"),
+    )
 
     registry.register("t1", runner_a)
 
@@ -865,8 +880,18 @@ def test_current_runner_registry_rejects_occupied_slot():
 
 def test_current_runner_registry_remove_is_expected_current_and_repeatable():
     registry = _CurrentRunnerRegistry()
-    runner_a = _AgentSession("thread-a", "demo", "copilot", task_id="t1")
-    runner_b = _AgentSession("thread-b", "demo", "copilot", task_id="t1")
+    runner_a = _AgentSession(
+        "demo",
+        "copilot",
+        task_id="t1",
+        conversation=ConversationRef("feishu", "thread-a"),
+    )
+    runner_b = _AgentSession(
+        "demo",
+        "copilot",
+        task_id="t1",
+        conversation=ConversationRef("feishu", "thread-b"),
+    )
     registry.register("t1", runner_a)
 
     assert not registry.remove_if_current("t1", runner_b)
@@ -1023,8 +1048,18 @@ async def test_run_unknown_agent_errors_no_spawn():
 
 async def test_old_runner_repeated_cleanup_does_not_remove_replacement():
     daemon, _, _ = make_daemon()
-    runner_a = _AgentSession("thread-a", "demo", "copilot", task_id="t1")
-    runner_b = _AgentSession("thread-b", "demo", "copilot", task_id="t1")
+    runner_a = _AgentSession(
+        "demo",
+        "copilot",
+        task_id="t1",
+        conversation=ConversationRef("feishu", "thread-a"),
+    )
+    runner_b = _AgentSession(
+        "demo",
+        "copilot",
+        task_id="t1",
+        conversation=ConversationRef("feishu", "thread-b"),
+    )
     agent_a = FakeAgent(None, lambda text: None)
     runner_a.agent = agent_a
     daemon._runners.register("t1", runner_a)
@@ -1044,7 +1079,7 @@ async def test_thread_reply_routes_through_task_id_to_current_runner():
     await daemon._handle_message(root_msg("/run demo first task"))
     await wait_until(lambda: created and created[0].prompts == ["first task"])
     runner = current_runner(daemon)
-    runner.thread_root_id = "not-the-route-key"
+    runner.conversation = ConversationRef("feishu", "not-the-route-key")
 
     await daemon._handle_message(thread_msg("second task"))
 
@@ -1253,6 +1288,23 @@ async def test_same_message_id_help_replies_on_source_channel():
     assert [target for target, _ in web.plain] == ["om_shared"]
 
 
+async def test_thread_message_uses_thread_conversation_ref():
+    daemon, _, _ = make_daemon()
+    seen: list[ConversationRef] = []
+
+    async def capture(msg: ChannelMessage, *, conversation: ConversationRef) -> None:
+        seen.append(conversation)
+
+    daemon._forward_to_agent = capture  # type: ignore[method-assign]
+
+    await daemon._handle_channel_message(
+        "feishu",
+        thread_msg("continue", root="om_thread", conversation_id="oc_chat"),
+    )
+
+    assert seen == [ConversationRef("feishu", "om_thread")]
+
+
 async def test_non_primary_channel_uses_own_admission_scope():
     daemon, feishu, _ = make_daemon(sender_whitelist=["ou_feishu"])
     web = FakeBridge()
@@ -1318,12 +1370,56 @@ async def test_same_inbound_ids_are_isolated_by_channel():
     await daemon._shutdown()
 
 
+async def test_runner_routes_each_turn_to_its_request_source():
+    daemon, feishu, created = make_daemon()
+    web = FakeBridge()
+    daemon._channels["web"] = web
+    await daemon._handle_message(root_msg("/run demo first"))
+    await wait_until(
+        lambda: (
+            created
+            and created[0].prompts == ["first"]
+            and any("本轮结束" in text for text in feishu.texts("om_root1"))
+        )
+    )
+    task = task_by_thread(daemon.store, "om_root1")
+    runner = current_runner(daemon)
+    web_conversation = ConversationRef("web", "web-thread")
+
+    runner.enqueue(TurnRequest("web turn", web_conversation))
+    await wait_until(
+        lambda: (
+            created[0].prompts == ["first", "web turn"]
+            and any("echo:web turn" in text for text in web.texts("web-thread"))
+            and any("本轮结束" in text for text in web.texts("web-thread"))
+        )
+    )
+
+    assert runner.conversation == ConversationRef(task.channel_key, task.thread_root_id)
+    assert not any("web turn" in text for text in feishu.texts("om_root1"))
+
+    await daemon._sched_send_to_task(task.task_id, "main turn")
+    await wait_until(
+        lambda: (
+            created[0].prompts == ["first", "web turn", "main turn"]
+            and any("echo:main turn" in text for text in feishu.texts("om_root1"))
+        )
+    )
+    assert not any("main turn" in text for text in web.texts("web-thread"))
+    await daemon._shutdown()
+
+
 async def test_replaced_runner_late_completion_does_not_overwrite_current_state():
     daemon, _, created = make_daemon(agent_cls=GatedAgent)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
     runner_a = current_runner(daemon)
-    runner_b = _AgentSession("thread-b", "demo", "copilot", task_id="t1")
+    runner_b = _AgentSession(
+        "demo",
+        "copilot",
+        task_id="t1",
+        conversation=ConversationRef("feishu", "thread-b"),
+    )
     assert daemon._runners.remove_if_current("t1", runner_a)
     daemon._runners.register("t1", runner_b)
     daemon.store.update("t1", status="starting")
@@ -1634,6 +1730,35 @@ async def test_recovery_after_restart_uses_file_task_store(tmp_path: Path):
     assert c2[0].start_count == 1
     assert any("恢复" in t for t in b2.texts("om_root1"))
     await d2._shutdown()
+
+
+async def test_recovery_turn_routes_start_and_output_to_request_source():
+    store = TaskStore(None)
+    task = _seed_task(store, thread="om_main")
+    daemon, feishu, created = make_daemon(store=store)
+    web = FakeBridge()
+    daemon._channels["web"] = web
+    web_conversation = ConversationRef("web", "web-thread")
+
+    await daemon._recover_or_notify(
+        "continue",
+        conversation=web_conversation,
+        task=task,
+    )
+    await wait_until(
+        lambda: (
+            created
+            and created[0].prompts == ["continue"]
+            and any("已恢复会话" in text for text in web.texts("web-thread"))
+            and any("echo:continue" in text for text in web.texts("web-thread"))
+            and any("本轮结束" in text for text in web.texts("web-thread"))
+        )
+    )
+
+    runner = daemon._runners.get_for_task(task.task_id)
+    assert runner.conversation == ConversationRef(task.channel_key, task.thread_root_id)
+    assert feishu.texts("om_main") == []
+    await daemon._shutdown()
 
 
 async def test_reply_to_unknown_topic_notifies_not_silent():
@@ -2620,7 +2745,7 @@ async def test_attach_launch_failure_reports_attach_error():
     daemon._launch(
         task,
         ["opencode", "acp"],
-        first_prompt=None,
+        first_turn=None,
         resume_session_id="ext_sid_1",
         attached=True,
     )
@@ -3459,6 +3584,34 @@ async def test_bg_job_completion_enqueues_resume_to_active_agent():
         lambda: any(p.startswith("<bg_job_done>") for p in created[0].prompts)
     )
     assert any("🔔" in t and "j1" in t and "成功" in t for _, t in bridge.roots)
+    await daemon._shutdown()
+
+
+async def test_bg_job_completion_uses_task_source_after_cross_channel_turn():
+    store = TaskStore(None)
+    daemon, feishu, created = make_daemon(store=store)
+    web = FakeBridge()
+    daemon._channels["web"] = web
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].prompts == ["task"])
+    runner = current_runner(daemon)
+
+    runner.enqueue(TurnRequest("web turn", ConversationRef("web", "web-thread")))
+    await wait_until(
+        lambda: (
+            created[0].prompts == ["task", "web turn"]
+            and any("本轮结束" in text for text in web.texts("web-thread"))
+        )
+    )
+
+    job = daemon.job_store.create(task_id="t1", command=["x"], cwd="C:/tmp/demo")
+    daemon.job_store.update(job.job_id, exit_code=0, finished_at=time.time())
+    await daemon._deliver_bg_result(daemon.job_store.get(job.job_id), 0)
+    await wait_until(
+        lambda: any("echo:<bg_job_done>" in text for text in feishu.texts("om_root1"))
+    )
+
+    assert not any("<bg_job_done>" in text for text in web.texts("web-thread"))
     await daemon._shutdown()
 
 

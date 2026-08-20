@@ -7,7 +7,7 @@ P0 原型范围（设计文档）：
 生命周期模型（review R2/R3 修复后的设计）：
 - 一个 `/run` = 一个 `_AgentSession`：agent 进程与 ACP session **跨 turn 存活**，
   上下文保留在 session 里
-- 每个 session 一个 prompt 队列 + 单消费者 worker task，turn 串行执行
+- 每个 session 一个 Turn 队列 + 单消费者 worker task，turn 串行执行
 - 话题回复只入队；`/stop`（入队 None 哨兵）、执行出错或 daemon 退出才关闭 agent
 """
 
@@ -339,16 +339,23 @@ class _BgBatch:
         return "\n\n".join(self.blocks) + "\n\n" + _BG_GUIDANCE
 
 
+@dataclass(frozen=True)
+class TurnRequest:
+    """一轮 agent 输入及其完整会话引用。"""
+
+    text: str
+    conversation: ConversationRef
+
+
 @dataclass
 class _AgentSession:
     """一个活跃 agent 的运行时状态。"""
 
-    thread_root_id: str
     project_name: str
     agent_label: str
     #: 关联的 Task id（持久台账的主键）
     task_id: str = ""
-    #: Task 的来源 Conversation；所有异步输出据此选择 Channel。
+    #: Task 的主 Thread Conversation；生命周期事件与后台输出据此寻址。
     conversation: ConversationRef = field(
         default_factory=lambda: ConversationRef("", "")
     )
@@ -365,8 +372,10 @@ class _AgentSession:
     agent: "AcpAgent | None" = None
     #: 当前回合的流式输出呈现；回合间为 None
     current_output: StreamingOutput | None = None
-    #: prompt 队列；None 是关闭哨兵（/stop / /done / mark_done），_BgBatch 是后台完成批次
-    queue: "asyncio.Queue[str | _BgBatch | None]" = field(default_factory=asyncio.Queue)
+    #: Turn 队列；None 是关闭哨兵（/stop / /done / mark_done），_BgBatch 是后台完成批次
+    queue: "asyncio.Queue[TurnRequest | _BgBatch | None]" = field(
+        default_factory=asyncio.Queue
+    )
     #: 队尾未消费的后台任务批次（#79）；非 None ⟺ 队尾是可继续合并的 _BgBatch。
     #: 入任何非 bg 项（enqueue）或被 worker 消费即清空——据此判「队尾能否再合并」。
     pending_bg: "_BgBatch | None" = None
@@ -379,11 +388,11 @@ class _AgentSession:
     #: 单消费者 worker，持有 agent 完整生命周期
     worker: "asyncio.Task[None] | None" = None
 
-    def enqueue(self, item: str) -> None:
-        """入队一个普通 prompt（话题回复 / 首轮 / 新指令 / send_to_task），**断开** bg
+    def enqueue(self, request: TurnRequest) -> None:
+        """入队一个普通 Turn（话题回复 / 首轮 / 新指令 / send_to_task），**断开** bg
         合并邻接（清 pending_bg）——之后完成的 bg 不会跨这个普通项去合并，保 FIFO。"""
         self.pending_bg = None
-        self.queue.put_nowait(item)
+        self.queue.put_nowait(request)
 
     def terminate(self) -> None:
         """入队终止哨兵 None，并**丢弃**队列里所有未处理的后台批次（/stop、/done 立即
@@ -667,7 +676,9 @@ class _Daemon:
         channel_key = channel_key.strip()
         if not channel_key:
             raise ValueError("channel_key 不能为空")
-        conversation = ConversationRef(channel_key, msg.conversation_id)
+        conversation = ConversationRef(
+            channel_key, msg.thread_id or msg.conversation_id
+        )
         # 忽略无发送者的系统消息
         if not msg.sender_id:
             return
@@ -1160,7 +1171,13 @@ class _Daemon:
             thread_root_id=thread_root,
             workspace=str(project.path),
         )
-        self._launch(new_task, agent_argv, first_prompt=task)
+        self._launch(
+            new_task,
+            agent_argv,
+            first_turn=TurnRequest(
+                task, ConversationRef(conversation.channel_key, thread_root)
+            ),
+        )
         await self._safe_reply(
             thread_root,
             f"🚀 [{new_task.task_id}] 启动 {agent_label} 处理项目 "
@@ -1305,7 +1322,7 @@ class _Daemon:
         self._launch(
             new_task,
             agent_argv,
-            first_prompt=None,
+            first_turn=None,
             resume_session_id=session_id,
             attached=True,
         )
@@ -1377,24 +1394,23 @@ class _Daemon:
         self,
         task: Task,
         agent_argv: list[str],
-        first_prompt: str | None,
+        first_turn: TurnRequest | None,
         *,
         resume_session_id: str | None = None,
         attached: bool = False,
     ) -> _AgentSession:
-        """按 Task 建 session、接线 on_output、入队首条 prompt、启动 worker。
+        """按 Task 建 session、接线 on_output、入队首个 Turn、启动 worker。
 
         ``resume_session_id`` 非 None 时 agent 用 load_session 恢复（惰性重连）。
-        ``first_prompt=None`` 时只把 agent 拉起来在线（不跑首轮），用于 resume_task。
+        ``first_turn=None`` 时只把 agent 拉起来在线（不跑首轮），用于 resume_task。
         ``attached=True`` 仅由 ``/attach`` 的**首次**拉起置位——附着摘要文案；附着任务
         事后经 ``_try_resume`` 恢复时仍走普通「已恢复」路径（attached 默认 False）。
         """
         sess = _AgentSession(
-            thread_root_id=task.thread_root_id,
             project_name=task.project_name,
             agent_label=task.agent_label,
             task_id=task.task_id,
-            conversation=task.conversation_ref,
+            conversation=ConversationRef(task.channel_key, task.thread_root_id),
             cwd=task.workspace,
             resumed=resume_session_id is not None,
             attached=attached,
@@ -1438,17 +1454,22 @@ class _Daemon:
             on_action,
             resume_session_id=resume_session_id,
         )
-        if first_prompt is not None:
-            sess.enqueue(first_prompt)
+        if first_turn is not None:
+            sess.enqueue(first_turn)
         self._runners.register(task.task_id, sess)
         sess.worker = asyncio.create_task(
-            self._agent_worker(sess), name=f"agent-{task.task_id}"
+            self._agent_worker(sess, first_turn), name=f"agent-{task.task_id}"
         )
         return sess
 
-    async def _agent_worker(self, sess: _AgentSession) -> None:
-        """一个 agent 的完整生命周期：启动 → 串行消费 prompt 队列 → 关闭。"""
-        root = sess.thread_root_id
+    async def _agent_worker(
+        self, sess: _AgentSession, startup_turn: TurnRequest | None
+    ) -> None:
+        """一个 agent 的完整生命周期：启动 → 串行消费 Turn 队列 → 关闭。"""
+        root = sess.conversation.conversation_id
+        startup_conversation = (
+            startup_turn.conversation if startup_turn is not None else sess.conversation
+        )
         try:
             await sess.agent.start()
         except Exception as exc:
@@ -1458,22 +1479,22 @@ class _Daemon:
                 self.store.update(sess.task_id, status="failed", error_message=err)
                 if sess.attached:
                     await self._safe_reply(
-                        root,
+                        startup_conversation.conversation_id,
                         "❌ 附着失败（session 无法恢复或已过期）。"
                         "请确认后重试，或发送 `/run` 新开。",
-                        conversation=sess.conversation,
+                        conversation=startup_conversation,
                     )
                 elif sess.resumed:
                     await self._safe_reply(
-                        root,
+                        startup_conversation.conversation_id,
                         "❌ 会话恢复失败（可能已在 agent 侧过期）。发送 `/run` 重开。",
-                        conversation=sess.conversation,
+                        conversation=startup_conversation,
                     )
                 else:
                     await self._safe_reply(
-                        root,
+                        startup_conversation.conversation_id,
                         f"❌ agent 启动失败: {str(exc)[:200]}",
-                        conversation=sess.conversation,
+                        conversation=startup_conversation,
                     )
             await self._close_session(sess)
             return
@@ -1535,7 +1556,11 @@ class _Daemon:
             base = "▶️ agent 已就绪，开始执行…"
             if model:
                 base += f"（模型：{model}）"
-        await self._safe_reply(root, base, conversation=sess.conversation)
+        await self._safe_reply(
+            startup_conversation.conversation_id,
+            base,
+            conversation=startup_conversation,
+        )
         try:
             while True:
                 # 空闲挂起（坑 1）：超时无新回复就关掉 agent 腾出 max_agents 名额，
@@ -1543,7 +1568,7 @@ class _Daemon:
                 # 话题回复即走 load_session 恢复。<=0 表示不自动挂起。
                 timeout = self.cfg.idle_timeout if self.cfg.idle_timeout > 0 else None
                 try:
-                    prompt = await asyncio.wait_for(sess.queue.get(), timeout=timeout)
+                    queued = await asyncio.wait_for(sess.queue.get(), timeout=timeout)
                 except asyncio.TimeoutError:
                     if not self._runners.is_current(sess.task_id, sess):
                         break
@@ -1560,7 +1585,7 @@ class _Daemon:
                     break
                 if not self._runners.is_current(sess.task_id, sess):
                     break
-                if prompt is None:
+                if queued is None:
                     status = sess.terminate_status  # stopped(/stop) 或 done(/done)
                     self.store.update(sess.task_id, status=status)  # 保留历史
                     await self._safe_reply(
@@ -1571,11 +1596,16 @@ class _Daemon:
                         conversation=sess.conversation,
                     )
                     break
-                if isinstance(prompt, _BgBatch):
+                if isinstance(queued, _BgBatch):
                     # 后台完成批次（#79）：清 pending_bg（队尾不再有可合并批次），
                     # 渲染成本轮 prompt（可能含多个 job 块）。清空须紧接 get、无 await。
                     sess.pending_bg = None
-                    prompt = prompt.render()
+                    request = TurnRequest(queued.render(), sess.conversation)
+                else:
+                    request = queued
+                prompt = request.text
+                turn_conversation = request.conversation
+                turn_root = turn_conversation.conversation_id
                 title = f"{sess.project_name} · {sess.agent_label}"
                 model = getattr(sess.agent, "model", "") or ""
                 # footer 与模型同一行显示项目名（#44）：在任意输出单元都可辨归属
@@ -1585,8 +1615,8 @@ class _Daemon:
                 issue_tag = _issue_tag(sess.issue_url)  # 绑定了 issue 则标 · #N（#63）
                 if issue_tag:
                     footer += f" · {issue_tag}"
-                output = self._channel_for(sess.conversation).open_output(
-                    root, title, footer=footer
+                output = self._channel_for(turn_conversation).open_output(
+                    turn_root, title, footer=footer
                 )
                 sess.current_output = output
                 self.store.update(sess.task_id, status="running")
@@ -1637,9 +1667,9 @@ class _Daemon:
                         error_message="",  # 一轮成功即清掉上次异常诊断（恢复成功）
                     )
                     await self._safe_reply(
-                        root,
+                        turn_root,
                         "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）",
-                        conversation=sess.conversation,
+                        conversation=turn_conversation,
                     )
                     # 完成且已闲下来（无排队）→ 推一条主线通知（带收尾摘要），免得挨个点话题
                     if (
@@ -1668,10 +1698,10 @@ class _Daemon:
                             sess.task_id, status="failed", error_message=err
                         )
                         await self._safe_reply(
-                            root,
+                            turn_root,
                             f"❌ 本轮异常，已暂停：{err}\n"
                             "在话题回复即尝试恢复（load_session 接回上下文），或 `/stop` 结束。",
-                            conversation=sess.conversation,
+                            conversation=turn_conversation,
                         )
                         await self._notify_main(
                             f"❌ {sess.project_name} 本轮异常，已暂停（在其话题回复即尝试恢复）。"
@@ -1722,7 +1752,7 @@ class _Daemon:
         self, msg: ChannelMessage, *, conversation: ConversationRef
     ) -> None:
         """话题内回复 → 入队给对应 agent；agent 不在则尝试跨重启恢复。"""
-        thread_root = msg.thread_id or ""
+        thread_root = conversation.conversation_id
         text = msg.text.strip()
         # /help 先于 session 检查：不依赖 agent 是否在线（挂起的话题里也能查用法），
         # 且绝不入队 / 触发恢复。
@@ -1747,17 +1777,16 @@ class _Daemon:
                 )
                 return
             forward_raw = True
-        task = self.store.by_thread(conversation, thread_root)
+        task_source = ConversationRef(conversation.channel_key, msg.conversation_id)
+        task = self.store.by_thread(task_source, thread_root)
         sess = self._runners.get_for_task(task.task_id) if task is not None else None
         if sess is None:
             # Thread 只负责路由到 Task；无 current runner 时再按 Task 恢复或明确提示。
             await self._recover_or_notify(
-                thread_root or msg.message_id,
-                thread_root,
                 text,
                 conversation=conversation,
-                forward_raw=forward_raw,
                 task=task,
+                forward_raw=forward_raw,
             )
             return
         if not text:
@@ -1770,7 +1799,7 @@ class _Daemon:
             )
             return
         if forward_raw:
-            sess.enqueue(text)  # 逐字直传，跳过保留命令解释
+            sess.enqueue(TurnRequest(text, conversation))  # 逐字直传，跳过保留命令解释
             return
         if text == _STOP_CMD:
             # 终止信号：丢弃未处理 bg 批次 + 入队 None（#79 立即停、不排空后台结果）。
@@ -1788,7 +1817,7 @@ class _Daemon:
                 if new_input:
                     # 排在 cancel 之前：取消让在途 prompt() 返回后，队列里已有新输入 →
                     # worker 的 cancelled 分支 continue 后即取到它，作为新一轮跑。
-                    sess.enqueue(new_input)
+                    sess.enqueue(TurnRequest(new_input, conversation))
                 await self._cancel_turn(sess)
                 await self._safe_reply(
                     thread_root or msg.message_id,
@@ -1799,7 +1828,7 @@ class _Daemon:
                 )
             elif new_input:
                 # 无在途轮：没什么可取消，新输入当普通消息执行
-                sess.enqueue(new_input)
+                sess.enqueue(TurnRequest(new_input, conversation))
             else:
                 await self._safe_reply(
                     thread_root or msg.message_id,
@@ -1815,7 +1844,7 @@ class _Daemon:
                 sess, thread_root, text, conversation=conversation
             )
             return
-        sess.enqueue(text)
+        sess.enqueue(TurnRequest(text, conversation))
 
     async def _handle_model_cmd(
         self,
@@ -1880,20 +1909,18 @@ class _Daemon:
 
     async def _recover_or_notify(
         self,
-        reply_target: str,
-        thread_root: str,
         text: str,
         *,
         conversation: ConversationRef,
+        task: Task | None,
         forward_raw: bool = False,
-        task: Task | None = None,
     ) -> None:
         """话题无活跃 agent：能恢复的 Task 就 load_session 惰性重连，否则明确提示。
 
         ``forward_raw``（来自 ``/raw <文本>``）时跳过 ``/stop``/``/done`` 解释——恢复
         agent 后把 <文本> 当普通首轮转发，即使它恰好是 ``/stop`` 也不误当停止命令。
         """
-        task = task or self.store.by_thread(conversation, thread_root)
+        reply_target = conversation.conversation_id
         if task is None:
             await self._safe_reply(
                 reply_target,
@@ -1926,7 +1953,10 @@ class _Daemon:
             return
         if not text:
             return  # 空回复不触发恢复
-        ok, why = self._try_resume(task, first_prompt=text)
+        ok, why = self._try_resume(
+            task,
+            first_turn=TurnRequest(text, conversation),
+        )
         if not ok:
             await self._safe_reply(reply_target, why, conversation=conversation)
             return
@@ -1936,7 +1966,9 @@ class _Daemon:
             conversation=conversation,
         )
 
-    def _try_resume(self, task: Task, *, first_prompt: str | None) -> tuple[bool, str]:
+    def _try_resume(
+        self, task: Task, *, first_turn: TurnRequest | None
+    ) -> tuple[bool, str]:
         """把一个非活跃任务 load_session 惰性重连；返回 (成功, 失败文案)。
 
         check（agent 配置 / 会话 / max_agents）与 ``_launch`` 登记之间**无 await**，
@@ -1960,7 +1992,7 @@ class _Daemon:
         self._launch(
             task,
             agent_argv,
-            first_prompt=first_prompt,
+            first_turn=first_turn,
             resume_session_id=task.session_id,
         )
         return True, ""
@@ -2243,7 +2275,11 @@ class _Daemon:
             return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
         sess = self._runners.get_for_task(task.task_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
-            sess.enqueue(message)
+            sess.enqueue(
+                TurnRequest(
+                    message, ConversationRef(task.channel_key, task.thread_root_id)
+                )
+            )
             logger.info(
                 "send_to_task[%s] 入队（活跃 session，队列深度=%d，task.status=%s）",
                 task_id,
@@ -2260,7 +2296,12 @@ class _Daemon:
                 f"如需继续，请先 resume_task({task_id})。"
             )
         # 非活跃且可恢复：load_session 惰性重连，把消息作为首轮。check→launch 无 await。
-        ok, why = self._try_resume(task, first_prompt=message)
+        ok, why = self._try_resume(
+            task,
+            first_turn=TurnRequest(
+                message, ConversationRef(task.channel_key, task.thread_root_id)
+            ),
+        )
         logger.info(
             "send_to_task[%s] 非活跃 status=%s → 恢复%s",
             task_id,
@@ -2277,7 +2318,7 @@ class _Daemon:
         sess = self._runners.get_for_task(task.task_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             return f"任务 [{task_id}] 已在运行，无需恢复。"
-        ok, why = self._try_resume(task, first_prompt=None)
+        ok, why = self._try_resume(task, first_turn=None)
         if not ok:
             return why
         return (
@@ -2373,7 +2414,13 @@ class _Daemon:
             issue_url=issue_url,
             model=model,
         )
-        self._launch(new_task, agent_argv, first_prompt=brief)
+        self._launch(
+            new_task,
+            agent_argv,
+            first_turn=TurnRequest(
+                brief, ConversationRef(conversation.channel_key, root)
+            ),
+        )
         bound = f"（brief 来自 issue {issue_url}）" if issue_url else note
         return (
             f"已建任务 [{new_task.task_id}]，在项目 {project_name} 启动 "
@@ -2660,7 +2707,7 @@ class _Daemon:
         await self._safe_reply(
             task.thread_root_id,
             self._bg_result_message(job, rc),
-            conversation=task.conversation_ref,
+            conversation=ConversationRef(task.channel_key, task.thread_root_id),
         )
         sess = self._runners.get_for_task(task.task_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
@@ -2685,7 +2732,13 @@ class _Daemon:
             )
             return
         # 挂起/idle 但无活跃 session：load_session 恢复，把完成 prompt 作为首轮（不合并）
-        ok, why = self._try_resume(task, first_prompt=self._build_bg_prompt(job, rc))
+        ok, why = self._try_resume(
+            task,
+            first_turn=TurnRequest(
+                self._build_bg_prompt(job, rc),
+                ConversationRef(task.channel_key, task.thread_root_id),
+            ),
+        )
         if ok:
             await self._notify_main(
                 f"🔔 {tag} 后台任务 {job.job_id} {verb}，已恢复 agent 继续。"
