@@ -62,6 +62,7 @@ from .viewer import (
 
 logger = logging.getLogger(__name__)
 
+_DISPATCHER_TASK_ID = "dispatcher"
 _DISPATCH_PREFIX = "/run "
 _TASK_PREFIX = "/task "
 _LIST_CMD = "/agents"
@@ -521,11 +522,13 @@ class _Daemon:
     _sched_memory: SchedulerMemory = field(
         default_factory=lambda: SchedulerMemory(None)
     )
+    #: 同一 Task 的 Turn 共用一把锁；跨 Channel / runner 串行，不同 Task 可并行。
+    _task_turn_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     #: 由启动装配层注入；稳定 key → Channel 实例。
     _channels: dict[str, Channel] = field(default_factory=dict)
     #: 控制台主线通知与兼容消息入口使用的主 Channel key。
     _primary_channel_key: str = "feishu"
-    #: 进程内 Conversation → Task 绑定；额外入口不持久化，主入口可由 TaskStore 懒回填。
+    #: 进程内 Conversation → Task 身份绑定；系统 Task 与额外入口不持久化。
     _conversation_task_ids: dict[ConversationRef, str] = field(default_factory=dict)
     #: 每个 Task 的单活 current runner；Thread 只经 Task 路由到这里。
     _runners: _CurrentRunnerRegistry = field(default_factory=_CurrentRunnerRegistry)
@@ -576,16 +579,16 @@ class _Daemon:
             raise RuntimeError(f"Channel 未注册: {channel_key!r}") from exc
 
     def _bind_conversation(self, conversation: ConversationRef, task_id: str) -> None:
-        """把完整 Conversation 绑定到一个现存 Task；重复绑定同一 Task 幂等。"""
+        """把完整 Conversation 绑定到一个已知 Task 身份；重复绑定幂等。"""
         if not conversation.channel_key.strip():
             raise ValueError("ConversationRef.channel_key 不能为空")
         if not conversation.conversation_id.strip():
             raise ValueError("ConversationRef.conversation_id 不能为空")
-        if self.store.get(task_id) is None:
+        if not self._task_identity_exists(task_id):
             raise ValueError(f"Task 不存在: {task_id}")
 
         bound_task_id = self._conversation_task_ids.get(conversation)
-        if bound_task_id is not None and self.store.get(bound_task_id) is None:
+        if bound_task_id is not None and not self._task_identity_exists(bound_task_id):
             self._conversation_task_ids.pop(conversation, None)
             bound_task_id = None
         if bound_task_id is not None and bound_task_id != task_id:
@@ -594,16 +597,33 @@ class _Daemon:
             )
         self._conversation_task_ids[conversation] = task_id
 
-    def _task_for_conversation(self, conversation: ConversationRef) -> Task | None:
-        """按运行时绑定取 Task；Task 已被清理时同步丢弃陈旧绑定。"""
+    def _task_identity_exists(self, task_id: str) -> bool:
+        return task_id == _DISPATCHER_TASK_ID or self.store.get(task_id) is not None
+
+    def _task_turn_lock(self, task_id: str) -> asyncio.Lock:
+        """返回 Task 身份对应的进程内 Turn 锁。"""
+        lock = self._task_turn_locks.get(task_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._task_turn_locks[task_id] = lock
+        return lock
+
+    def _task_id_for_conversation(self, conversation: ConversationRef) -> str | None:
+        """返回 Conversation 绑定的 Task 身份；失效绑定会同步清理。"""
         task_id = self._conversation_task_ids.get(conversation)
         if task_id is None:
             return None
-        task = self.store.get(task_id)
-        if task is not None:
-            return task
+        if self._task_identity_exists(task_id):
+            return task_id
         self._conversation_task_ids.pop(conversation, None)
         return None
+
+    def _task_for_conversation(self, conversation: ConversationRef) -> Task | None:
+        """按运行时绑定解析持久化 Agent Task。"""
+        task_id = self._task_id_for_conversation(conversation)
+        if task_id is None:
+            return None
+        return self.store.get(task_id)
 
     def _conversations_for_task(
         self,
@@ -612,7 +632,7 @@ class _Daemon:
         source: ConversationRef | None = None,
     ) -> tuple[ConversationRef, ...]:
         """返回 Task 当前绑定的 Conversation 快照，来源优先且不重复。"""
-        if self.store.get(task_id) is None:
+        if not self._task_identity_exists(task_id):
             stale = [
                 conversation
                 for conversation, bound_task_id in self._conversation_task_ids.items()
@@ -1786,128 +1806,133 @@ class _Daemon:
                         source=sess.conversation,
                     )
                     break
-                if isinstance(queued, _BgBatch):
-                    # 后台完成批次（#79）：清 pending_bg（队尾不再有可合并批次），
-                    # 渲染成本轮 prompt（可能含多个 job 块）。清空须紧接 get、无 await。
-                    sess.pending_bg = None
-                    request = TurnRequest(queued.render(), sess.conversation)
-                    mirror_input = False
-                else:
-                    request = queued
-                    mirror_input = True
-                prompt = request.text
-                turn_conversation = request.conversation
-                turn_conversations = self._conversations_for_task(
-                    sess.task_id,
-                    source=turn_conversation,
-                )
-                if mirror_input:
-                    await self._mirror_turn_input(request, turn_conversations)
-                title = f"{sess.project_name} · {sess.agent_label}"
-                model = getattr(sess.agent, "model", "") or ""
-                # footer 与模型同一行显示项目名（#44）：在任意输出单元都可辨归属
-                footer = sess.project_name
-                if model:
-                    footer += f" · 模型：{model}"
-                issue_tag = _issue_tag(sess.issue_url)  # 绑定了 issue 则标 · #N（#63）
-                if issue_tag:
-                    footer += f" · {issue_tag}"
-                output = self._open_task_output(
-                    turn_conversations,
-                    title,
-                    footer=footer,
-                )
-                sess.current_output = output
-                self.store.update(sess.task_id, status="running")
-                logger.info(
-                    "任务 %s 开始一轮（%s）: %.80s",
-                    sess.task_id,
-                    sess.agent_label,
-                    prompt,
-                )
-                sess.turn_in_flight = True
-                try:
-                    stop_reason = await sess.agent.prompt(prompt)
-                    await output.flush()
+                async with self._task_turn_lock(sess.task_id):
                     if not self._runners.is_current(sess.task_id, sess):
                         break
-                    if stop_reason == "cancelled":
-                        # 本轮被 /stop 中途取消：不当作正常完成（不 ✅、不计 turn、
-                        # 不发完成通知）。输出置停止态；随后循环取到 None 哨兵即终止。
-                        await output.set_status("stopped")
+                    if isinstance(queued, _BgBatch):
+                        # 后台完成批次（#79）：清 pending_bg（队尾不再有可合并批次），
+                        # 渲染成本轮 prompt（可能含多个 job 块）。清空须紧接 get、无 await。
+                        sess.pending_bg = None
+                        request = TurnRequest(queued.render(), sess.conversation)
+                        mirror_input = False
+                    else:
+                        request = queued
+                        mirror_input = True
+                    prompt = request.text
+                    turn_conversation = request.conversation
+                    turn_conversations = self._conversations_for_task(
+                        sess.task_id,
+                        source=turn_conversation,
+                    )
+                    if mirror_input:
+                        await self._mirror_turn_input(request, turn_conversations)
+                    title = f"{sess.project_name} · {sess.agent_label}"
+                    model = getattr(sess.agent, "model", "") or ""
+                    # footer 与模型同一行显示项目名（#44）：在任意输出单元都可辨归属
+                    footer = sess.project_name
+                    if model:
+                        footer += f" · 模型：{model}"
+                    issue_tag = _issue_tag(
+                        sess.issue_url
+                    )  # 绑定了 issue 则标 · #N（#63）
+                    if issue_tag:
+                        footer += f" · {issue_tag}"
+                    output = self._open_task_output(
+                        turn_conversations,
+                        title,
+                        footer=footer,
+                    )
+                    sess.current_output = output
+                    self.store.update(sess.task_id, status="running")
+                    logger.info(
+                        "任务 %s 开始一轮（%s）: %.80s",
+                        sess.task_id,
+                        sess.agent_label,
+                        prompt,
+                    )
+                    sess.turn_in_flight = True
+                    try:
+                        stop_reason = await sess.agent.prompt(prompt)
+                        await output.flush()
                         if not self._runners.is_current(sess.task_id, sess):
                             break
-                        self.store.update(sess.task_id, status="idle")
-                        logger.info("任务 %s 本轮被取消", sess.task_id)
-                        continue
-                    # footer 追加本轮 token 用量（#53）：取不到就不显示、不报错。
-                    # 只标脏，紧随的 set_status("done") 会把新 footer 一起 emit。
-                    tokens = getattr(sess.agent, "last_usage_tokens", None)
-                    if tokens is not None:
-                        output.set_footer(_with_tokens(footer, tokens))
-                    await output.set_status("done")
-                    if not self._runners.is_current(sess.task_id, sess):
-                        break
-                    # 落 last_output：本轮 agent 的收尾回复（截断），供 get_task/通知摘要
-                    last_output = _clip(sess.agent.last_message, _LAST_OUTPUT_MAX)
-                    cur = self.store.get(sess.task_id)
-                    turns = (cur.turns if cur else 0) + 1
-                    logger.info(
-                        "任务 %s 完成第 %d 轮，回复 %d 字",
-                        sess.task_id,
-                        turns,
-                        len(last_output),
-                    )
-                    self.store.update(
-                        sess.task_id,
-                        status="idle",
-                        turns=turns,
-                        last_output=last_output,
-                        error_message="",  # 一轮成功即清掉上次异常诊断（恢复成功）
-                    )
-                    await self._reply_to_conversations(
-                        turn_conversations,
-                        "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）",
-                    )
-                    # 完成且已闲下来（无排队）→ 推一条主线通知（带收尾摘要），免得挨个点话题
-                    if (
-                        self._runners.is_current(sess.task_id, sess)
-                        and sess.queue.empty()
-                    ):
-                        note = f"🔔 {sess.project_name} 完成第 {turns} 轮"
-                        snippet = _one_line(last_output, 80)
-                        if snippet:
-                            note += f"：{snippet}"
-                        note += "，在其话题里查看/继续。"
-                        await self._notify_main(note)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    logger.exception("agent 执行异常")
-                    err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
-                    try:
-                        await output.set_status("error")
-                    except Exception:
-                        logger.debug("set_status error 失败（忽略）", exc_info=True)
-                    if self._runners.is_current(sess.task_id, sess):
-                        # failed 不再是终止态：本轮失败但 session 已建，多半能 load_session
-                        # 接回——标 failed（可恢复），话题回复即尝试恢复，而非逼用户重开丢上下文。
+                        if stop_reason == "cancelled":
+                            # 本轮被 /stop 中途取消：不当作正常完成（不 ✅、不计 turn、
+                            # 不发完成通知）。输出置停止态；随后循环取到 None 哨兵即终止。
+                            await output.set_status("stopped")
+                            if not self._runners.is_current(sess.task_id, sess):
+                                break
+                            self.store.update(sess.task_id, status="idle")
+                            logger.info("任务 %s 本轮被取消", sess.task_id)
+                            continue
+                        # footer 追加本轮 token 用量（#53）：取不到就不显示、不报错。
+                        # 只标脏，紧随的 set_status("done") 会把新 footer 一起 emit。
+                        tokens = getattr(sess.agent, "last_usage_tokens", None)
+                        if tokens is not None:
+                            output.set_footer(_with_tokens(footer, tokens))
+                        await output.set_status("done")
+                        if not self._runners.is_current(sess.task_id, sess):
+                            break
+                        # 落 last_output：本轮 agent 的收尾回复（截断），供 get_task/通知摘要
+                        last_output = _clip(sess.agent.last_message, _LAST_OUTPUT_MAX)
+                        cur = self.store.get(sess.task_id)
+                        turns = (cur.turns if cur else 0) + 1
+                        logger.info(
+                            "任务 %s 完成第 %d 轮，回复 %d 字",
+                            sess.task_id,
+                            turns,
+                            len(last_output),
+                        )
                         self.store.update(
-                            sess.task_id, status="failed", error_message=err
+                            sess.task_id,
+                            status="idle",
+                            turns=turns,
+                            last_output=last_output,
+                            error_message="",  # 一轮成功即清掉上次异常诊断（恢复成功）
                         )
                         await self._reply_to_conversations(
                             turn_conversations,
-                            f"❌ 本轮异常，已暂停：{err}\n"
-                            "在话题回复即尝试恢复（load_session 接回上下文），或 `/stop` 结束。",
+                            "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）",
                         )
-                        await self._notify_main(
-                            f"❌ {sess.project_name} 本轮异常，已暂停（在其话题回复即尝试恢复）。"
-                        )
-                    break
-                finally:
-                    sess.turn_in_flight = False
-                    await output.aclose()
-                    sess.current_output = None
+                        # 完成且已闲下来（无排队）→ 推一条主线通知（带收尾摘要），免得挨个点话题
+                        if (
+                            self._runners.is_current(sess.task_id, sess)
+                            and sess.queue.empty()
+                        ):
+                            note = f"🔔 {sess.project_name} 完成第 {turns} 轮"
+                            snippet = _one_line(last_output, 80)
+                            if snippet:
+                                note += f"：{snippet}"
+                            note += "，在其话题里查看/继续。"
+                            await self._notify_main(note)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.exception("agent 执行异常")
+                        err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
+                        try:
+                            await output.set_status("error")
+                        except Exception:
+                            logger.debug("set_status error 失败（忽略）", exc_info=True)
+                        if self._runners.is_current(sess.task_id, sess):
+                            # failed 不再是终止态：本轮失败但 session 已建，多半能 load_session
+                            # 接回——标 failed（可恢复），话题回复即尝试恢复，而非逼用户重开丢上下文。
+                            self.store.update(
+                                sess.task_id, status="failed", error_message=err
+                            )
+                            await self._reply_to_conversations(
+                                turn_conversations,
+                                f"❌ 本轮异常，已暂停：{err}\n"
+                                "在话题回复即尝试恢复（load_session 接回上下文），或 `/stop` 结束。",
+                            )
+                            await self._notify_main(
+                                f"❌ {sess.project_name} 本轮异常，已暂停（在其话题回复即尝试恢复）。"
+                            )
+                        break
+                    finally:
+                        sess.turn_in_flight = False
+                        await output.aclose()
+                        sess.current_output = None
         except asyncio.CancelledError:
             logger.debug("agent worker 被取消 root=%s", root)
         finally:
@@ -2330,40 +2355,72 @@ class _Daemon:
     ) -> None:
         """自然语言 → 调度器 LLM 理解并调用工具派发（P2）。"""
         assert self._llm is not None
-        tools = build_scheduler_tools(
-            list_projects=self._sched_list_projects,
-            spawn_agent=partial(self._sched_spawn_agent, conversation=conversation),
-            list_tasks=self._sched_list_tasks,
-            get_task=self._sched_get_task,
-            send_to_task=self._sched_send_to_task,
-            resume_task=self._sched_resume_task,
-            mark_done=self._sched_mark_done,
-            register_project=self._sched_register_project,
-            unregister_project=self._sched_unregister_project,
-            attach_session=partial(
-                self._sched_attach_session, conversation=conversation
-            ),
-            list_forge=self._sched_list_forge,
-            get_forge=self._sched_get_forge,
-            list_models=self._sched_list_models,
-        )
-        turn: list[dict] | None = None
-        try:
-            reply, turn = await run_tool_loop(
-                self._llm, text, tools, history=self._sched_memory.history()
+        main_conversation = self._main_conversation
+        if main_conversation.conversation_id:
+            self._bind_conversation(main_conversation, _DISPATCHER_TASK_ID)
+        self._bind_conversation(conversation, _DISPATCHER_TASK_ID)
+
+        async with self._task_turn_lock(_DISPATCHER_TASK_ID):
+            conversations = self._conversations_for_task(
+                _DISPATCHER_TASK_ID,
+                source=conversation,
             )
-        except Exception as exc:
-            logger.exception("调度器 LLM 失败")
-            reply = (
-                f"调度器出错：{str(exc)[:200]}。可用 `/run <项目> <任务>` 直接派发。"
+            targets = tuple(
+                target for target in conversations if target != conversation
             )
-        reply = reply or "（调度器无输出）"
-        # 无损记忆：存整轮（含真实 tool_calls/结果），避免只存文本训练出「说了不做」的幻觉
-        if turn:
-            self._sched_memory.add_turn(turn)
-        else:
-            self._sched_memory.add_exchange(text, reply)  # 出错兜底：至少存问答对
-        await self._reply_user(msg.message_id, reply, conversation=conversation)
+            if targets:
+                mirrored_input = (
+                    f"↪️ 同步自 {conversation.channel_key or 'unknown'}：{text}"
+                )
+                await asyncio.gather(
+                    *(
+                        self._safe_send_text(mirrored_input, conversation=target)
+                        for target in targets
+                    )
+                )
+
+            tools = build_scheduler_tools(
+                list_projects=self._sched_list_projects,
+                spawn_agent=partial(self._sched_spawn_agent, conversation=conversation),
+                list_tasks=self._sched_list_tasks,
+                get_task=self._sched_get_task,
+                send_to_task=self._sched_send_to_task,
+                resume_task=self._sched_resume_task,
+                mark_done=self._sched_mark_done,
+                register_project=self._sched_register_project,
+                unregister_project=self._sched_unregister_project,
+                attach_session=partial(
+                    self._sched_attach_session, conversation=conversation
+                ),
+                list_forge=self._sched_list_forge,
+                get_forge=self._sched_get_forge,
+                list_models=self._sched_list_models,
+            )
+            turn: list[dict] | None = None
+            try:
+                reply, turn = await run_tool_loop(
+                    self._llm, text, tools, history=self._sched_memory.history()
+                )
+            except Exception as exc:
+                logger.exception("调度器 LLM 失败")
+                reply = f"调度器出错：{str(exc)[:200]}。可用 `/run <项目> <任务>` 直接派发。"
+            reply = reply or "（调度器无输出）"
+            # 无损记忆：存整轮（含真实 tool_calls/结果），避免只存文本训练出「说了不做」的幻觉
+            if turn:
+                self._sched_memory.add_turn(turn)
+            else:
+                self._sched_memory.add_exchange(text, reply)  # 出错兜底：至少存问答对
+            await asyncio.gather(
+                self._reply_user(
+                    msg.message_id,
+                    reply,
+                    conversation=conversation,
+                ),
+                *(
+                    self._safe_send_text(reply, conversation=target)
+                    for target in targets
+                ),
+            )
 
     def _sched_list_projects(self) -> list[dict]:
         return [
@@ -2952,6 +3009,25 @@ class _Daemon:
     # ------------------------------------------------------------------ #
     # 发送辅助
     # ------------------------------------------------------------------ #
+
+    async def _safe_send_text(
+        self,
+        text: str,
+        *,
+        conversation: ConversationRef,
+    ) -> None:
+        """向 Conversation 独立发文本并隔离单个 Channel 失败。"""
+        try:
+            channel = self._channel_for(conversation)
+            await asyncio.to_thread(
+                channel.send_text, conversation.conversation_id, text
+            )
+        except Exception:
+            logger.exception(
+                "Channel 独立文本发送失败 channel=%s conversation=%s",
+                conversation.channel_key,
+                conversation.conversation_id,
+            )
 
     async def _safe_reply(
         self,

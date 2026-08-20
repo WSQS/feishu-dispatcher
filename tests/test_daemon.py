@@ -28,6 +28,7 @@ from feishu_dispatcher.daemon import (
     _AgentSession,
     _CurrentRunnerRegistry,
     _Daemon,
+    _DISPATCHER_TASK_ID,
     _FanoutStreamingOutput,
 )
 from feishu_dispatcher.http_channel import HttpChannel
@@ -952,6 +953,27 @@ def test_conversation_binding_drops_deleted_task():
     assert conversation not in daemon._conversation_task_ids
 
 
+def test_conversation_binding_supports_runtime_task_identity():
+    daemon, _, _ = make_daemon()
+    conversation = ConversationRef("web", "web-root")
+
+    daemon._bind_conversation(conversation, _DISPATCHER_TASK_ID)
+
+    assert daemon._task_id_for_conversation(conversation) == _DISPATCHER_TASK_ID
+    assert daemon._task_for_conversation(conversation) is None
+    assert daemon._task_id_for_conversation(conversation) == _DISPATCHER_TASK_ID
+    assert daemon._conversations_for_task(_DISPATCHER_TASK_ID) == (conversation,)
+
+
+def test_task_turn_lock_is_stable_per_task_identity():
+    daemon, _, _ = make_daemon()
+
+    task_a_lock = daemon._task_turn_lock("t1")
+
+    assert daemon._task_turn_lock("t1") is task_a_lock
+    assert daemon._task_turn_lock("t2") is not task_a_lock
+
+
 def test_fmt_tokens_scales_units():
     from feishu_dispatcher.daemon import _fmt_tokens
 
@@ -979,6 +1001,26 @@ async def test_run_dispatches_and_streams_output():
     assert len(created) == 1
     assert created[0].prompts == ["do stuff"]
     assert created[0].start_count == 1
+
+
+async def test_agent_turn_lock_serializes_only_the_same_task():
+    daemon, _, created = make_daemon()
+    first_task_lock = daemon._task_turn_lock("t1")
+    await first_task_lock.acquire()
+
+    try:
+        await daemon._handle_message(root_msg("/run demo first", mid="om_root1"))
+        await wait_until(lambda: created and created[0].start_count == 1)
+
+        await daemon._handle_message(root_msg("/run demo second", mid="om_root2"))
+        await wait_until(lambda: len(created) == 2 and created[1].prompts == ["second"])
+
+        assert created[0].prompts == []
+    finally:
+        first_task_lock.release()
+
+    await wait_until(lambda: created[0].prompts == ["first"])
+    await daemon._shutdown()
 
 
 async def test_run_uses_text_only_channel_output_lifecycle():
@@ -1403,6 +1445,7 @@ async def test_same_message_id_help_replies_on_source_channel():
     await daemon._handle_channel_message("web", message)
     assert [target for target, _ in feishu.plain] == ["om_shared"]
     assert [target for target, _ in web.plain] == ["om_shared"]
+    assert daemon._task_id_for_conversation(ConversationRef("web", "oc_1")) is None
 
 
 async def test_thread_message_uses_thread_conversation_ref():
@@ -2275,7 +2318,164 @@ async def test_nl_channel_tools_receive_source_conversation():
         "attach_session": conversation,
     }
     assert feishu.plain == []
+    assert feishu.roots == [
+        ("oc_1", "↪️ 同步自 web：dispatch through web"),
+        ("oc_1", "web tools done"),
+    ]
     assert web.plain == [("om_web_nl", "web tools done")]
+
+
+async def test_dispatcher_root_turns_sync_between_channels():
+    daemon, feishu, _ = make_daemon()
+    web = FakeBridge()
+    daemon._channels["web"] = web
+    daemon._llm = ScriptedLLM(
+        [
+            LLMResponse(content="web reply"),
+            LLMResponse(content="feishu reply"),
+        ]
+    )
+
+    await daemon._handle_channel_message(
+        "web",
+        root_msg("web turn", mid="web-message", conversation_id="web-room"),
+    )
+
+    feishu_conversation = ConversationRef("feishu", "oc_1")
+    web_conversation = ConversationRef("web", "web-room")
+    assert daemon._task_id_for_conversation(feishu_conversation) == (
+        _DISPATCHER_TASK_ID
+    )
+    assert daemon._task_id_for_conversation(web_conversation) == _DISPATCHER_TASK_ID
+    assert set(daemon._conversations_for_task(_DISPATCHER_TASK_ID)) == {
+        feishu_conversation,
+        web_conversation,
+    }
+    assert web.plain == [("web-message", "web reply")]
+    assert web.roots == []
+    assert feishu.roots == [
+        ("oc_1", "↪️ 同步自 web：web turn"),
+        ("oc_1", "web reply"),
+    ]
+
+    await daemon._handle_channel_message(
+        "feishu",
+        root_msg("feishu turn", mid="feishu-message"),
+    )
+
+    assert feishu.plain == [("feishu-message", "feishu reply")]
+    assert web.roots == [
+        ("web-room", "↪️ 同步自 feishu：feishu turn"),
+        ("web-room", "feishu reply"),
+    ]
+    assert daemon._sched_memory.history() == [
+        {"role": "user", "content": "web turn"},
+        {"role": "assistant", "content": "web reply"},
+        {"role": "user", "content": "feishu turn"},
+        {"role": "assistant", "content": "feishu reply"},
+    ]
+
+
+async def test_dispatcher_turns_are_serialized_across_channels():
+    daemon, _, _ = make_daemon()
+    daemon._channels["web"] = FakeBridge()
+
+    class BlockingFirstLLM:
+        def __init__(self) -> None:
+            self.calls: list[list[dict]] = []
+            self.first_started = asyncio.Event()
+            self.release_first = asyncio.Event()
+
+        async def chat(self, messages, tools) -> LLMResponse:
+            self.calls.append(list(messages))
+            call_number = len(self.calls)
+            if call_number == 1:
+                self.first_started.set()
+                await self.release_first.wait()
+            return LLMResponse(content=f"reply {call_number}")
+
+    llm = BlockingFirstLLM()
+    daemon._llm = llm
+    first = asyncio.create_task(
+        daemon._handle_channel_message("feishu", root_msg("first", mid="first-message"))
+    )
+    await llm.first_started.wait()
+    second = asyncio.create_task(
+        daemon._handle_channel_message(
+            "web",
+            root_msg("second", mid="second-message", conversation_id="web-room"),
+        )
+    )
+    await asyncio.sleep(0)
+
+    assert (
+        daemon._task_id_for_conversation(ConversationRef("web", "web-room"))
+        == _DISPATCHER_TASK_ID
+    )
+    assert len(llm.calls) == 1
+    llm.release_first.set()
+    await asyncio.gather(first, second)
+
+    second_messages = [
+        (message["role"], message.get("content"))
+        for message in llm.calls[1]
+        if message["role"] != "system"
+    ]
+    assert second_messages == [
+        ("user", "first"),
+        ("assistant", "reply 1"),
+        ("user", "second"),
+    ]
+    assert daemon._sched_memory.history() == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "reply 1"},
+        {"role": "user", "content": "second"},
+        {"role": "assistant", "content": "reply 2"},
+    ]
+
+
+async def test_dispatcher_target_send_failure_does_not_abort_turn(caplog):
+    class BrokenSendBridge(FakeBridge):
+        def send_text(self, conversation_id: str, text: str) -> str:
+            raise RuntimeError("send boom")
+
+    daemon, feishu, _ = make_daemon()
+    broken = BrokenSendBridge()
+    healthy = FakeBridge()
+    daemon._channels["broken"] = broken
+    daemon._channels["healthy"] = healthy
+    daemon._llm = ScriptedLLM(
+        [LLMResponse(content="joined"), LLMResponse(content="still works")]
+    )
+
+    await daemon._handle_channel_message(
+        "broken",
+        root_msg("join", mid="broken-message", conversation_id="broken-room"),
+    )
+    daemon._bind_conversation(
+        ConversationRef("healthy", "healthy-room"), _DISPATCHER_TASK_ID
+    )
+    with caplog.at_level("ERROR"):
+        await daemon._handle_channel_message(
+            "feishu", root_msg("continue", mid="feishu-message")
+        )
+
+    assert broken.plain == [("broken-message", "joined")]
+    assert feishu.plain == [("feishu-message", "still works")]
+    assert daemon._sched_memory.history() == [
+        {"role": "user", "content": "join"},
+        {"role": "assistant", "content": "joined"},
+        {"role": "user", "content": "continue"},
+        {"role": "assistant", "content": "still works"},
+    ]
+    assert healthy.roots == [
+        ("healthy-room", "↪️ 同步自 feishu：continue"),
+        ("healthy-room", "still works"),
+    ]
+    assert (
+        "Channel 独立文本发送失败 channel=broken conversation=broken-room"
+        in caplog.text
+    )
 
 
 async def test_nl_reply_does_not_create_thread():
