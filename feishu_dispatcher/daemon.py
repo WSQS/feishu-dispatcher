@@ -316,6 +316,7 @@ async def run(
                 port=http_channel_config.port,
                 routes={
                     ("GET", "/api/health"): workspace_health,
+                    ("GET", "/api/tasks"): daemon._http_list_tasks,
                     ("GET", "/api/projects"): workspace_list_projects,
                     ("GET", "/api/projects/{name}/tree"): workspace_tree,
                     (
@@ -2446,20 +2447,43 @@ class _Daemon:
             return f"获取 {kind} #{number} 失败：{exc}"
         return json.dumps(data, ensure_ascii=False)
 
+    @staticmethod
+    def _task_summary(task: Task) -> dict:
+        return {
+            "task_id": task.task_id,
+            "project": task.project_name,
+            "agent": task.agent_label,
+            "description": task.description,
+            "status": task.status,
+            "turns": task.turns,
+            "issue_url": task.issue_url,
+        }
+
+    async def _http_list_tasks(
+        self, _context: dict, _request: dict
+    ) -> tuple[int, dict]:
+        tasks = [
+            {
+                "task_id": _DISPATCHER_TASK_ID,
+                "kind": "dispatcher",
+                "description": "Dispatcher",
+                "status": "active",
+                "active": True,
+            }
+        ]
+        for task in self.store.all():
+            summary = self._task_summary(task)
+            summary.update(
+                kind="agent",
+                issue_url=task.issue_url or None,
+                active=self._runners.get_for_task(task.task_id) is not None,
+            )
+            tasks.append(summary)
+        return 200, {"tasks": tasks}
+
     def _sched_list_tasks(self) -> list[dict]:
         # 从任务台账读（含历史），而非只看内存里的活跃 session
-        return [
-            {
-                "task_id": t.task_id,
-                "project": t.project_name,
-                "agent": t.agent_label,
-                "description": t.description,
-                "status": t.status,
-                "turns": t.turns,
-                "issue_url": t.issue_url,  # 关联的 issue（#63）；空 = 未绑定
-            }
-            for t in self.store.all()
-        ]
+        return [self._task_summary(task) for task in self.store.all()]
 
     def _sched_get_task(self, task_id: str) -> dict | None:
         """get_task 工具：单任务详情 + 动作审计（回答「这个 agent 都干了啥」）。"""

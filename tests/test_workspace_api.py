@@ -135,6 +135,36 @@ async def test_handler_exception_becomes_500():
         vs.stop()
 
 
+def test_route_returns_503_when_main_loop_is_unavailable():
+    loop = asyncio.new_event_loop()
+    called = False
+
+    async def should_not_run(_ctx: dict, _request: dict) -> tuple[int, dict]:
+        nonlocal called
+        called = True
+        return 200, {}
+
+    async def ignore(_message: ChannelMessage) -> None:
+        return None
+
+    vs = HttpChannel(
+        "tok-view",
+        loop,
+        routes={("GET", "/api/tasks"): should_not_run},
+        host="127.0.0.1",
+        port=0,
+    )
+    vs.start(ignore)
+    try:
+        status, payload = _get(vs.base_url + "/api/tasks", "tok-view")
+        assert status == 503
+        assert payload == {"error": "channel_unavailable"}
+        assert not called
+    finally:
+        vs.stop()
+        loop.close()
+
+
 async def test_list_projects_returns_items():
     # ctx 注入假的 all_projects：返回一个 project dict
     from feishu_dispatcher.config import Project
