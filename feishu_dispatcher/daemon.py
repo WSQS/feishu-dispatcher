@@ -32,6 +32,7 @@ from .channel import Channel, ChannelMessage, ConversationRef, StreamingOutput
 from .config import DEFAULT_CONFIG_PATH, Config, Project
 from .control import ControlServer
 from .feishu import FeishuBridge
+from .http_channel import HttpChannel, ensure_token as ensure_http_channel_token
 from .llm import build_llm_client
 from .scheduler import (
     LLMClient,
@@ -41,7 +42,7 @@ from .scheduler import (
 )
 from .store import Job, JobStore, ModelStore, ProjectStore, Task, TaskStore
 from ._scan_executor import ScanExecutor
-from ._viewer_token import ensure_token
+from ._viewer_token import ensure_token as ensure_viewer_token
 from .viewer import (
     ViewerServer,
     health as viewer_health,
@@ -254,11 +255,13 @@ async def run(
     ``discover=True`` 时只打印收到消息的 chat_id，不执行任何命令
     （帮助用户发现群 id 后填进配置）。``store_path`` 是会话持久化文件
     （默认 config 同目录的 sessions.json）。``channel`` 未传时装配现有 Feishu
-    Channel；注入其它实现时必须用 ``channel_key`` 指定稳定身份。未注入 Channel
-    时 ``channel_key`` 默认取 ``feishu``。
+    Channel；配置启用 ``[http_channel]`` 时与 Feishu 并行注册。注入其它实现时必须
+    用 ``channel_key`` 指定稳定身份，且不自动装配其它 Channel。未注入 Channel 时
+    ``channel_key`` 默认取 ``feishu``。
 
     返回是否收到 ``/reboot``——cli.py 据此 re-exec 重启进程。
     """
+    default_assembly = channel is None and channel_key is None
     if channel_key is None:
         if channel is not None:
             raise ValueError("注入 Channel 时必须显式提供 channel_key")
@@ -269,17 +272,30 @@ async def run(
             raise ValueError("channel_key 不能为空")
     if store_path is None:
         store_path = DEFAULT_CONFIG_PATH.parent / "sessions.json"
+    loop = asyncio.get_running_loop()
     if channel is None:
         channel = FeishuBridge(
             app_id=cfg.app_id,
             app_secret=cfg.app_secret,
-            main_loop=asyncio.get_running_loop(),
+            main_loop=loop,
             chat_whitelist=cfg.chat_id,
             sender_whitelist=() if discover else cfg.sender_whitelist,
             qps=cfg.feishu_qps,
             stream_mode=cfg.stream_mode,
             throttle_window=cfg.throttle_window,
         )
+    channels = {resolved_channel_key: channel}
+    if default_assembly and cfg.http_channel and cfg.http_channel.enabled:
+        http_token_path = store_path.parent / "http-channel.token"
+        http_channel = cfg.http_channel
+        channels["http"] = HttpChannel(
+            ensure_http_channel_token(http_token_path),
+            loop,
+            host=http_channel.bind,
+            port=http_channel.port,
+            throttle_window=cfg.throttle_window,
+        )
+        logger.info("HTTP Channel token 已存: %s", http_token_path)
     daemon = _Daemon(
         cfg,
         discover=discover,
@@ -294,7 +310,7 @@ async def run(
             # [llm].memory_rounds 可配；未配 [llm] 时记忆不参与派发，取默认即可
             max_turns=cfg.llm.memory_rounds if cfg.llm else 12,
         ),
-        _channels={resolved_channel_key: channel},
+        _channels=channels,
         _primary_channel_key=resolved_channel_key,
     )
     await daemon.run()
@@ -590,7 +606,7 @@ class _Daemon:
         token_path = (
             self._viewer_token_path or DEFAULT_CONFIG_PATH.parent / "viewer.token"
         )
-        token = ensure_token(token_path)
+        token = ensure_viewer_token(token_path)
         logger.info(
             "移动端查看器 token（已存 viewer.token，重启不变；填进手机 App）: %s", token
         )

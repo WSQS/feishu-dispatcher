@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from feishu_dispatcher.config import Config, Project, ViewerConfig
+from feishu_dispatcher.config import Config, HttpChannelConfig, Project, ViewerConfig
 
 SAMPLE = """
 app_id = "cli_abc"
@@ -370,3 +370,27 @@ def test_viewer_section_empty_table_uses_defaults(tmp_path: Path):
     cfg_file = tmp_path / "config.toml"
     cfg_file.write_text(_BASE + "[viewer]\n", encoding="utf-8")
     assert Config.load(cfg_file).viewer == ViewerConfig()
+
+
+def test_http_channel_section_parses_full_values(tmp_path: Path):
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(
+        _BASE + '[http_channel]\nenabled = true\nbind = "127.0.0.2"\nport = 8123\n',
+        encoding="utf-8",
+    )
+    cfg = Config.load(cfg_file)
+    assert cfg.http_channel == HttpChannelConfig(
+        enabled=True, bind="127.0.0.2", port=8123
+    )
+
+
+def test_http_channel_absent_means_none(tmp_path: Path):
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(_BASE, encoding="utf-8")
+    assert Config.load(cfg_file).http_channel is None
+
+
+def test_http_channel_section_defaults_when_fields_omitted(tmp_path: Path):
+    cfg_file = tmp_path / "config.toml"
+    cfg_file.write_text(_BASE + "[http_channel]\n", encoding="utf-8")
+    assert Config.load(cfg_file).http_channel == HttpChannelConfig()

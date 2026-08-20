@@ -67,6 +67,15 @@ class ViewerConfig:
     port: int = 7321
 
 
+@dataclass(frozen=True)
+class HttpChannelConfig:
+    """可写 HTTP Channel 配置；默认关闭且只监听本机。"""
+
+    enabled: bool = False
+    bind: str = "127.0.0.1"
+    port: int = 7322
+
+
 def _parse_llm_profile(pd: dict, *, memory_rounds: int, ctx: str) -> LLMSettings:
     """从一个 profile 表（或 flat ``[llm]``）解析出 :class:`LLMSettings`。
 
@@ -126,6 +135,8 @@ class Config:
     llm_active: str = ""
     #: 移动端查看器配置；None = 配置里没有 [viewer] 段（默认，viewer 不起）。
     viewer: ViewerConfig | None = None
+    #: 可写 HTTP Channel；None = 配置里没有 [http_channel] 段（默认不起）。
+    http_channel: HttpChannelConfig | None = None
 
     @staticmethod
     def load(path: Path | None = None, *, allow_empty_chat_id: bool = False) -> Config:
@@ -232,6 +243,16 @@ class Config:
             if viewer_data is not None
             else None
         )
+        http_channel_data = data.get("http_channel")
+        http_channel = (
+            HttpChannelConfig(
+                enabled=bool(http_channel_data.get("enabled", False)),
+                bind=str(http_channel_data.get("bind", "127.0.0.1")),
+                port=int(http_channel_data.get("port", 7322)),
+            )
+            if http_channel_data is not None
+            else None
+        )
         return Config(
             app_id=data["app_id"],
             app_secret=data["app_secret"],
@@ -251,4 +272,5 @@ class Config:
             llm_profiles=llm_profiles,
             llm_active=llm_active,
             viewer=viewer,
+            http_channel=http_channel,
         )

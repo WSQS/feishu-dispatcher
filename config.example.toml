@@ -171,3 +171,10 @@ default_agent = "copilot"
 enabled = false        # 默认关闭，显式开启
 bind = "0.0.0.0"       # 只走 Tailscale 时填 tailnet 网卡 IP
 port = 7321            # 默认端口
+
+# 可写 HTTP Channel：给本机 WebUI / TUI 等客户端发送消息并轮询回复事件。
+# token 自动生成到 config 同目录的 http-channel.token，不复用 viewer.token。
+[http_channel]
+enabled = false        # 默认关闭，显式开启
+bind = "127.0.0.1"     # 首版默认仅允许本机客户端连接
+port = 7322            # 默认端口
