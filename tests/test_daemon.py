@@ -901,6 +901,56 @@ def test_current_runner_registry_remove_is_expected_current_and_repeatable():
     assert registry.get_for_task("t1") is None
 
 
+def test_conversation_binding_is_idempotent_and_rejects_conflict():
+    store = TaskStore(None)
+    parent = ConversationRef("feishu", "oc_1")
+    task_a = store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="a",
+        conversation=parent,
+        thread_root_id="thread-a",
+        workspace="C:/tmp/demo",
+    )
+    task_b = store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="b",
+        conversation=parent,
+        thread_root_id="thread-b",
+        workspace="C:/tmp/demo",
+    )
+    daemon, _, _ = make_daemon(store=store)
+    conversation = ConversationRef("web", "web-thread")
+
+    daemon._bind_conversation(conversation, task_a.task_id)
+    daemon._bind_conversation(conversation, task_a.task_id)
+
+    assert daemon._task_for_conversation(conversation) is task_a
+    with pytest.raises(RuntimeError, match="已绑定 Task t1"):
+        daemon._bind_conversation(conversation, task_b.task_id)
+
+
+def test_conversation_binding_drops_deleted_task():
+    store = TaskStore(None)
+    task = store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="done",
+        conversation=ConversationRef("feishu", "oc_1"),
+        thread_root_id="thread-done",
+        workspace="C:/tmp/demo",
+        status="done",
+    )
+    daemon, _, _ = make_daemon(store=store)
+    conversation = ConversationRef("web", "web-thread")
+    daemon._bind_conversation(conversation, task.task_id)
+
+    assert store.clear_terminal() == 1
+    assert daemon._task_for_conversation(conversation) is None
+    assert conversation not in daemon._conversation_task_ids
+
+
 def test_fmt_tokens_scales_units():
     from feishu_dispatcher.daemon import _fmt_tokens
 
@@ -1409,6 +1459,48 @@ async def test_runner_routes_each_turn_to_its_request_source():
     await daemon._shutdown()
 
 
+async def test_bound_cross_channel_thread_routes_to_existing_runner():
+    daemon, feishu, created = make_daemon()
+    web = FakeBridge()
+    daemon._channels["web"] = web
+    await daemon._handle_message(root_msg("/run demo first"))
+    await wait_until(
+        lambda: (
+            created
+            and created[0].prompts == ["first"]
+            and any("本轮结束" in text for text in feishu.texts("om_root1"))
+        )
+    )
+    task = task_by_thread(daemon.store, "om_root1")
+    runner = current_runner(daemon)
+    main_conversation = ConversationRef("feishu", "om_root1")
+    web_conversation = ConversationRef("web", "web-thread")
+
+    assert daemon._task_for_conversation(main_conversation) is task
+    daemon._bind_conversation(web_conversation, task.task_id)
+    await daemon._handle_channel_message(
+        "web",
+        thread_msg(
+            "web follow up",
+            root="web-thread",
+            mid="web-message",
+            conversation_id="web-room",
+        ),
+    )
+    await wait_until(
+        lambda: (
+            created[0].prompts == ["first", "web follow up"]
+            and any("echo:web follow up" in text for text in web.texts("web-thread"))
+            and any("本轮结束" in text for text in web.texts("web-thread"))
+        )
+    )
+
+    assert daemon._runners.get_for_task(task.task_id) is runner
+    assert runner.conversation == main_conversation
+    assert not any("web follow up" in text for text in feishu.texts("om_root1"))
+    await daemon._shutdown()
+
+
 async def test_replaced_runner_late_completion_does_not_overwrite_current_state():
     daemon, _, created = make_daemon(agent_cls=GatedAgent)
     await daemon._handle_message(root_msg("/run demo task"))
@@ -1789,11 +1881,16 @@ async def test_recovery_fails_when_agent_unconfigured():
 
 async def test_orphan_stop_marks_stopped_without_recovering():
     store = TaskStore(None)
-    _seed_task(store, thread="om_orphan")
+    task = _seed_task(store, thread="om_orphan")
     daemon, bridge, created = make_daemon(store=store)
+    conversation = ConversationRef("feishu", "om_orphan")
+    assert daemon._task_for_conversation(conversation) is None
+
     await daemon._handle_message(thread_msg("/stop", root="om_orphan", mid="om_z"))
+
     assert created == []  # 没为了停而恢复
     assert task_by_thread(store, "om_orphan").status == "stopped"
+    assert daemon._task_for_conversation(conversation) is task
     assert any("已结束" in t for t in bridge.texts("om_orphan"))
 
 
