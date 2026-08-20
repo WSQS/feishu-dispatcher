@@ -28,7 +28,13 @@ from pathlib import Path
 
 from . import forge
 from .acp_client import AcpAgent, AgentSpawn, OnAction, OnOutput, _resolve_executable
-from .channel import Channel, ChannelMessage, ConversationRef, StreamingOutput
+from .channel import (
+    Channel,
+    ChannelMessage,
+    ConversationRef,
+    OutputStatus,
+    StreamingOutput,
+)
 from .config import DEFAULT_CONFIG_PATH, Config, Project
 from .control import ControlServer
 from .feishu import FeishuBridge
@@ -347,6 +353,62 @@ class TurnRequest:
     conversation: ConversationRef
 
 
+class _FanoutStreamingOutput:
+    """把一个 Task 回合的输出投影到多个 Conversation。"""
+
+    def __init__(self, outputs: list[tuple[ConversationRef, StreamingOutput]]) -> None:
+        self._outputs = outputs
+
+    def feed(self, text: str) -> None:
+        for conversation, output in self._outputs:
+            try:
+                output.feed(text)
+            except Exception:
+                logger.exception(
+                    "Task 流式输出 feed 失败 channel=%s conversation=%s",
+                    conversation.channel_key,
+                    conversation.conversation_id,
+                )
+
+    def set_footer(self, footer: str) -> None:
+        for conversation, output in self._outputs:
+            try:
+                output.set_footer(footer)
+            except Exception:
+                logger.exception(
+                    "Task 流式输出 footer 失败 channel=%s conversation=%s",
+                    conversation.channel_key,
+                    conversation.conversation_id,
+                )
+
+    async def flush(self) -> None:
+        await self._call_all("flush")
+
+    async def set_status(self, status: OutputStatus) -> None:
+        await self._call_all("set_status", status)
+
+    async def aclose(self) -> None:
+        await self._call_all("aclose")
+
+    async def _call_all(self, method: str, *args) -> None:
+        async def call_one(
+            conversation: ConversationRef, output: StreamingOutput
+        ) -> None:
+            try:
+                await getattr(output, method)(*args)
+            except Exception:
+                logger.exception(
+                    "Task 流式输出 %s 失败 channel=%s conversation=%s",
+                    method,
+                    conversation.channel_key,
+                    conversation.conversation_id,
+                )
+
+        await asyncio.gather(
+            *(call_one(conversation, output) for conversation, output in self._outputs)
+        )
+
+
 @dataclass
 class _AgentSession:
     """一个活跃 agent 的运行时状态。"""
@@ -542,6 +604,103 @@ class _Daemon:
             return task
         self._conversation_task_ids.pop(conversation, None)
         return None
+
+    def _conversations_for_task(
+        self,
+        task_id: str,
+        *,
+        source: ConversationRef | None = None,
+    ) -> tuple[ConversationRef, ...]:
+        """返回 Task 当前绑定的 Conversation 快照，来源优先且不重复。"""
+        if self.store.get(task_id) is None:
+            stale = [
+                conversation
+                for conversation, bound_task_id in self._conversation_task_ids.items()
+                if bound_task_id == task_id
+            ]
+            for conversation in stale:
+                self._conversation_task_ids.pop(conversation, None)
+            return ()
+
+        conversations = [
+            conversation
+            for conversation, bound_task_id in self._conversation_task_ids.items()
+            if bound_task_id == task_id
+        ]
+        if source is not None:
+            conversations = [
+                source,
+                *(item for item in conversations if item != source),
+            ]
+        return tuple(conversations)
+
+    async def _reply_to_conversations(
+        self, conversations: tuple[ConversationRef, ...], text: str
+    ) -> None:
+        await asyncio.gather(
+            *(
+                self._safe_reply(
+                    conversation.conversation_id,
+                    text,
+                    conversation=conversation,
+                )
+                for conversation in conversations
+            )
+        )
+
+    async def _reply_to_task(
+        self,
+        task_id: str,
+        text: str,
+        *,
+        source: ConversationRef | None = None,
+    ) -> None:
+        await self._reply_to_conversations(
+            self._conversations_for_task(task_id, source=source), text
+        )
+
+    async def _mirror_turn_input(
+        self,
+        request: TurnRequest,
+        conversations: tuple[ConversationRef, ...],
+    ) -> None:
+        targets = tuple(
+            conversation
+            for conversation in conversations
+            if conversation != request.conversation
+        )
+        if not request.text or not targets:
+            return
+        source = request.conversation.channel_key or "unknown"
+        await self._reply_to_conversations(
+            targets,
+            f"↪️ 同步自 {source}：{request.text}",
+        )
+
+    def _open_task_output(
+        self,
+        conversations: tuple[ConversationRef, ...],
+        title: str,
+        *,
+        footer: str,
+    ) -> StreamingOutput:
+        outputs: list[tuple[ConversationRef, StreamingOutput]] = []
+        for conversation in conversations:
+            try:
+                output = self._channel_for(conversation).open_output(
+                    conversation.conversation_id,
+                    title,
+                    footer=footer,
+                )
+            except Exception:
+                logger.exception(
+                    "Task 输出创建失败 channel=%s conversation=%s",
+                    conversation.channel_key,
+                    conversation.conversation_id,
+                )
+                continue
+            outputs.append((conversation, output))
+        return _FanoutStreamingOutput(outputs)
 
     def _start_channels(self) -> None:
         self._validate_channel_registry()
@@ -1512,24 +1671,21 @@ class _Daemon:
                 err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
                 self.store.update(sess.task_id, status="failed", error_message=err)
                 if sess.attached:
-                    await self._safe_reply(
-                        startup_conversation.conversation_id,
+                    message = (
                         "❌ 附着失败（session 无法恢复或已过期）。"
-                        "请确认后重试，或发送 `/run` 新开。",
-                        conversation=startup_conversation,
+                        "请确认后重试，或发送 `/run` 新开。"
                     )
                 elif sess.resumed:
-                    await self._safe_reply(
-                        startup_conversation.conversation_id,
-                        "❌ 会话恢复失败（可能已在 agent 侧过期）。发送 `/run` 重开。",
-                        conversation=startup_conversation,
+                    message = (
+                        "❌ 会话恢复失败（可能已在 agent 侧过期）。发送 `/run` 重开。"
                     )
                 else:
-                    await self._safe_reply(
-                        startup_conversation.conversation_id,
-                        f"❌ agent 启动失败: {str(exc)[:200]}",
-                        conversation=startup_conversation,
-                    )
+                    message = f"❌ agent 启动失败: {str(exc)[:200]}"
+                await self._reply_to_task(
+                    sess.task_id,
+                    message,
+                    source=startup_conversation,
+                )
             await self._close_session(sess)
             return
         if not self._runners.is_current(sess.task_id, sess):
@@ -1590,10 +1746,10 @@ class _Daemon:
             base = "▶️ agent 已就绪，开始执行…"
             if model:
                 base += f"（模型：{model}）"
-        await self._safe_reply(
-            startup_conversation.conversation_id,
+        await self._reply_to_task(
+            sess.task_id,
             base,
-            conversation=startup_conversation,
+            source=startup_conversation,
         )
         try:
             while True:
@@ -1607,10 +1763,10 @@ class _Daemon:
                     if not self._runners.is_current(sess.task_id, sess):
                         break
                     self.store.update(sess.task_id, status="suspended")
-                    await self._safe_reply(
-                        root,
+                    await self._reply_to_task(
+                        sess.task_id,
                         "💤 空闲超时，已挂起该 agent（在本话题回复即自动恢复）。",
-                        conversation=sess.conversation,
+                        source=sess.conversation,
                     )
                     if self._runners.is_current(sess.task_id, sess):
                         await self._notify_main(
@@ -1622,12 +1778,12 @@ class _Daemon:
                 if queued is None:
                     status = sess.terminate_status  # stopped(/stop) 或 done(/done)
                     self.store.update(sess.task_id, status=status)  # 保留历史
-                    await self._safe_reply(
-                        root,
+                    await self._reply_to_task(
+                        sess.task_id,
                         "✅ 任务已完成并归档。"
                         if status == "done"
                         else "🛑 agent 已停止。",
-                        conversation=sess.conversation,
+                        source=sess.conversation,
                     )
                     break
                 if isinstance(queued, _BgBatch):
@@ -1635,11 +1791,18 @@ class _Daemon:
                     # 渲染成本轮 prompt（可能含多个 job 块）。清空须紧接 get、无 await。
                     sess.pending_bg = None
                     request = TurnRequest(queued.render(), sess.conversation)
+                    mirror_input = False
                 else:
                     request = queued
+                    mirror_input = True
                 prompt = request.text
                 turn_conversation = request.conversation
-                turn_root = turn_conversation.conversation_id
+                turn_conversations = self._conversations_for_task(
+                    sess.task_id,
+                    source=turn_conversation,
+                )
+                if mirror_input:
+                    await self._mirror_turn_input(request, turn_conversations)
                 title = f"{sess.project_name} · {sess.agent_label}"
                 model = getattr(sess.agent, "model", "") or ""
                 # footer 与模型同一行显示项目名（#44）：在任意输出单元都可辨归属
@@ -1649,8 +1812,10 @@ class _Daemon:
                 issue_tag = _issue_tag(sess.issue_url)  # 绑定了 issue 则标 · #N（#63）
                 if issue_tag:
                     footer += f" · {issue_tag}"
-                output = self._channel_for(turn_conversation).open_output(
-                    turn_root, title, footer=footer
+                output = self._open_task_output(
+                    turn_conversations,
+                    title,
+                    footer=footer,
                 )
                 sess.current_output = output
                 self.store.update(sess.task_id, status="running")
@@ -1700,10 +1865,9 @@ class _Daemon:
                         last_output=last_output,
                         error_message="",  # 一轮成功即清掉上次异常诊断（恢复成功）
                     )
-                    await self._safe_reply(
-                        turn_root,
+                    await self._reply_to_conversations(
+                        turn_conversations,
                         "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）",
-                        conversation=turn_conversation,
                     )
                     # 完成且已闲下来（无排队）→ 推一条主线通知（带收尾摘要），免得挨个点话题
                     if (
@@ -1731,11 +1895,10 @@ class _Daemon:
                         self.store.update(
                             sess.task_id, status="failed", error_message=err
                         )
-                        await self._safe_reply(
-                            turn_root,
+                        await self._reply_to_conversations(
+                            turn_conversations,
                             f"❌ 本轮异常，已暂停：{err}\n"
                             "在话题回复即尝试恢复（load_session 接回上下文），或 `/stop` 结束。",
-                            conversation=turn_conversation,
                         )
                         await self._notify_main(
                             f"❌ {sess.project_name} 本轮异常，已暂停（在其话题回复即尝试恢复）。"
@@ -1830,10 +1993,10 @@ class _Daemon:
         if not text:
             return
         if sess.worker is None or sess.worker.done():
-            await self._safe_reply(
-                thread_root or msg.message_id,
+            await self._reply_to_task(
+                sess.task_id,
                 "⚠️ 该 agent 已结束。发送 `/run ...` 新建任务。",
-                conversation=conversation,
+                source=conversation,
             )
             return
         if forward_raw:
@@ -1857,12 +2020,12 @@ class _Daemon:
                     # worker 的 cancelled 分支 continue 后即取到它，作为新一轮跑。
                     sess.enqueue(TurnRequest(new_input, conversation))
                 await self._cancel_turn(sess)
-                await self._safe_reply(
-                    thread_root or msg.message_id,
+                await self._reply_to_task(
+                    sess.task_id,
                     "🛑 已取消当前轮，改执行新指令…"
                     if new_input
                     else "🛑 已取消当前轮（agent 保留，可继续发指令）。",
-                    conversation=conversation,
+                    source=conversation,
                 )
             elif new_input:
                 # 无在途轮：没什么可取消，新输入当普通消息执行
@@ -1939,10 +2102,10 @@ class _Daemon:
             return
         self.store.update(sess.task_id, model=arg)
         logger.info("任务 %s 切换模型 → %s", sess.task_id, arg)
-        await self._safe_reply(
-            reply_target,
+        await self._reply_to_task(
+            sess.task_id,
             f"✅ 已切换模型为 {arg}（下一轮起生效）。",
-            conversation=conversation,
+            source=conversation,
         )
 
     async def _recover_or_notify(
@@ -1975,18 +2138,18 @@ class _Daemon:
             return
         if not forward_raw and text == _STOP_CMD:
             self.store.update(task.task_id, status="stopped")
-            await self._safe_reply(
-                reply_target,
+            await self._reply_to_task(
+                task.task_id,
                 f"🛑 任务 [{task.task_id}] 已结束。",
-                conversation=conversation,
+                source=conversation,
             )
             return
         if not forward_raw and text == _DONE_CMD:
             self.store.update(task.task_id, status="done")
-            await self._safe_reply(
-                reply_target,
+            await self._reply_to_task(
+                task.task_id,
                 f"✅ 任务 [{task.task_id}] 已完成并归档。",
-                conversation=conversation,
+                source=conversation,
             )
             return
         if not text:
@@ -1998,10 +2161,10 @@ class _Daemon:
         if not ok:
             await self._safe_reply(reply_target, why, conversation=conversation)
             return
-        await self._safe_reply(
-            reply_target,
+        await self._reply_to_task(
+            task.task_id,
             f"♻️ 正在恢复任务 [{task.task_id}]…",
-            conversation=conversation,
+            source=conversation,
         )
 
     def _try_resume(
