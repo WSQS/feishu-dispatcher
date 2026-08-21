@@ -1,4 +1,5 @@
 const DISPATCHER_TASK_ID = "dispatcher";
+const TASK_POLL_INTERVAL_MS = 2000;
 const TERMINAL_TASK_STATUSES = new Set(["done", "stopped"]);
 
 const storageKeys = Object.freeze({
@@ -38,7 +39,12 @@ let conversationStarted = storageGet(storageKeys.started(conversationId)) === "1
 let connected = false;
 let pollGeneration = 0;
 let selectedTaskId = DISPATCHER_TASK_ID;
+let statusRevision = 0;
+let statusSource = null;
+let taskPollGeneration = 0;
+let taskRequestTail = Promise.resolve();
 let taskSelectionBusy = false;
+let taskSnapshot = null;
 
 class ApiError extends Error {
   constructor(status, payload) {
@@ -102,7 +108,9 @@ function storedCursor(id) {
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
 }
 
-function setStatus(text, tone = "idle") {
+function setStatus(text, tone = "idle", source = null) {
+  statusRevision += 1;
+  statusSource = source;
   elements.status.textContent = text;
   elements.status.title = text;
   elements.status.dataset.tone = tone;
@@ -399,18 +407,40 @@ function renderTaskList() {
   }
 }
 
-async function loadTasks() {
-  const payload = await apiRequest("/api/tasks");
-  const items = Array.isArray(payload.tasks) ? payload.tasks : [];
-  tasks.clear();
+function normalizeTasks(items) {
+  const normalized = new Map();
   for (const task of items) {
     if (task && typeof task.task_id === "string" && task.task_id) {
-      tasks.set(task.task_id, task);
+      normalized.set(task.task_id, {
+        task_id: task.task_id,
+        project: task.project ?? null,
+        agent: task.agent ?? null,
+        description: task.description ?? null,
+        status: task.status ?? null,
+        turns: task.turns ?? null,
+        issue_url: task.issue_url ?? null,
+        kind: task.kind ?? null,
+        active: task.active ?? null,
+      });
     }
   }
-  if (!tasks.has(DISPATCHER_TASK_ID)) {
+  return normalized;
+}
+
+function applyTasks(nextTasks) {
+  if (!nextTasks.has(DISPATCHER_TASK_ID)) {
     throw new Error("Task 列表缺少 Dispatcher");
   }
+  const nextSnapshot = JSON.stringify([...nextTasks.values()]);
+  if (nextSnapshot === taskSnapshot) {
+    return false;
+  }
+
+  tasks.clear();
+  for (const [taskId, task] of nextTasks) {
+    tasks.set(taskId, task);
+  }
+  taskSnapshot = nextSnapshot;
   const selected = tasks.get(selectedTaskId);
   if (!selected || taskIsTerminal(selected)) {
     selectedTaskId = DISPATCHER_TASK_ID;
@@ -418,15 +448,29 @@ async function loadTasks() {
   renderTaskList();
   ensureTimeline(selectedTaskId);
   renderSelectedTask();
+  return true;
+}
+
+async function fetchTasks() {
+  const request = taskRequestTail.then(() => apiRequest("/api/tasks"));
+  taskRequestTail = request.catch(() => {});
+  const payload = await request;
+  return normalizeTasks(Array.isArray(payload.tasks) ? payload.tasks : []);
+}
+
+async function loadTasks() {
+  applyTasks(await fetchTasks());
 }
 
 async function connect() {
+  taskPollGeneration += 1;
   setStatus("正在验证 token…", "busy");
   await apiRequest("/api/channel/health");
   await loadTasks();
   connected = true;
   setStatus("已连接", "ok");
   elements.connectionSettings.open = false;
+  startTaskPolling();
   if (conversationStarted) {
     startPolling();
   }
@@ -517,9 +561,9 @@ function wait(milliseconds) {
   return new Promise((resolve) => globalThis.setTimeout(resolve, milliseconds));
 }
 
-function showError(error) {
+function showError(error, source = null) {
   const message = error instanceof Error ? error.message : String(error);
-  setStatus(message, "error");
+  setStatus(message, "error", source);
 }
 
 function startPolling() {
@@ -535,6 +579,46 @@ function startPolling() {
         return;
       }
       await wait(700);
+    }
+  };
+  void loop();
+}
+
+async function pollTasksOnce(generation) {
+  const nextTasks = await fetchTasks();
+  if (generation !== taskPollGeneration || taskSelectionBusy) {
+    return;
+  }
+  applyTasks(nextTasks);
+  if (statusSource === "task-poll") {
+    setStatus(conversationStarted ? `已连接 · cursor ${cursor}` : "已连接", "ok");
+  }
+}
+
+function startTaskPolling() {
+  const generation = ++taskPollGeneration;
+  const loop = async () => {
+    while (generation === taskPollGeneration && connected) {
+      await wait(TASK_POLL_INTERVAL_MS);
+      if (generation !== taskPollGeneration || !connected) {
+        return;
+      }
+      if (taskSelectionBusy) {
+        continue;
+      }
+      const statusRevisionAtStart = statusRevision;
+      try {
+        await pollTasksOnce(generation);
+      } catch (error) {
+        if (
+          generation === taskPollGeneration &&
+          statusRevision === statusRevisionAtStart &&
+          (statusSource === "task-poll" ||
+            elements.status.dataset.tone !== "error")
+        ) {
+          showError(error, "task-poll");
+        }
+      }
     }
   };
   void loop();
