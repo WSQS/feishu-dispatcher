@@ -197,6 +197,10 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert "/api/channel/events" in javascript
         assert 'apiRequest("/api/tasks")' in javascript
         assert "elements.connectionSettings.open = false;" in javascript
+        assert (
+            'task.task_id !== DISPATCHER_TASK_ID && task.status === "stopped"'
+            in javascript
+        )
         assert "/conversations`" in javascript
         assert "thread_id: threadId" in javascript
         assert "const taskThreads = new Map();" in javascript

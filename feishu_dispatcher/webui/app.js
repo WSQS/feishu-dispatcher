@@ -345,6 +345,9 @@ function renderTaskList() {
   }
 
   for (const task of tasks.values()) {
+    if (task.task_id !== DISPATCHER_TASK_ID && task.status === "stopped") {
+      continue;
+    }
     const terminal = taskIsTerminal(task);
     const button = document.createElement("button");
     button.type = "button";
