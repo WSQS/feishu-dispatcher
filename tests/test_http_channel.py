@@ -124,6 +124,28 @@ def test_webui_task_description_truncates_only_on_desktop():
         assert declaration in mobile_description["rules"]
 
 
+def test_webui_polls_task_snapshots_independently():
+    javascript = (
+        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "app.js"
+    ).read_text(encoding="utf-8")
+
+    assert "const TASK_POLL_INTERVAL_MS = 2000;" in javascript
+    assert "let taskPollGeneration = 0;" in javascript
+    assert "let taskRequestTail = Promise.resolve();" in javascript
+    assert "let taskSnapshot = null;" in javascript
+    assert "let statusRevision = 0;" in javascript
+    assert "nextSnapshot === taskSnapshot" in javascript
+    assert "taskRequestTail = request.catch(() => {});" in javascript
+    assert "statusRevision === statusRevisionAtStart" in javascript
+    assert 'statusSource === "task-poll"' in javascript
+    assert 'showError(error, "task-poll");' in javascript
+    assert "generation !== taskPollGeneration || taskSelectionBusy" in javascript
+    assert "while (generation === taskPollGeneration && connected)" in javascript
+    assert "await wait(TASK_POLL_INTERVAL_MS);" in javascript
+    assert "startTaskPolling();" in javascript
+    assert "await wait(700);" in javascript
+
+
 async def test_webui_assets_are_same_origin_and_do_not_require_token():
     channel = HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
