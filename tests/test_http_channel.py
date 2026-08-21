@@ -125,8 +125,14 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
 
         html = assets["/"].decode("utf-8")
         javascript = assets["/webui/app.js"].decode("utf-8")
+        stylesheet = assets["/webui/style.css"].decode("utf-8")
         assert 'src="/webui/app.js"' in html
         assert 'href="/webui/style.css"' in html
+        assert 'id="floating-controls"' in html
+        assert '<details id="connection-settings" class="connection-settings">' in html
+        assert 'class="hero"' not in html
+        assert 'class="connection panel"' not in html
+        assert ".floating-controls" in stylesheet
         assert 'id="task-list"' in html
         assert 'id="timelines"' in html
         for element_id in re.findall(
@@ -137,6 +143,7 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert "/api/channel/messages" in javascript
         assert "/api/channel/events" in javascript
         assert 'apiRequest("/api/tasks")' in javascript
+        assert "elements.connectionSettings.open = false;" in javascript
         assert "/conversations`" in javascript
         assert "thread_id: threadId" in javascript
         assert "const taskThreads = new Map();" in javascript
