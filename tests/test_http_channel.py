@@ -138,6 +138,26 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
             r"\.task-panel\s*\{\s*position: sticky;\s*top: 0;",
             stylesheet,
         )
+        assert "max-height: calc(100vh - 210px);" not in stylesheet
+        desktop_layout = re.search(
+            r"@media \(min-width: 641px\) \{(?P<rules>.*)"
+            r"@media \(max-width: 640px\)",
+            stylesheet,
+            re.DOTALL,
+        )
+        assert desktop_layout
+        assert "max-height: 54vh;" not in desktop_layout["rules"]
+        for declaration in (
+            "height: 100%;",
+            "overflow: hidden;",
+            "padding-bottom: 0;",
+            "align-items: stretch;",
+            "grid-template-rows: auto minmax(0, 1fr);",
+            "grid-template-rows: minmax(0, 1fr) auto;",
+            "grid-template-rows: auto auto minmax(0, 1fr);",
+            "min-height: 0;",
+        ):
+            assert declaration in desktop_layout["rules"]
         assert 'id="task-list"' in html
         assert 'id="timelines"' in html
         for element_id in re.findall(
