@@ -6,6 +6,7 @@ import asyncio
 import json
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -335,10 +336,12 @@ def make_daemon(
 def http_channel_request(
     method: str,
     url: str,
-    token: str,
+    token: str | None,
     payload: dict | None = None,
 ) -> tuple[int, dict]:
-    headers = {"Authorization": f"Bearer {token}"}
+    headers = {}
+    if token is not None:
+        headers["Authorization"] = f"Bearer {token}"
     data = None
     if payload is not None:
         headers["Content-Type"] = "application/json"
@@ -495,6 +498,7 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
     assert isinstance(routes, dict)
     assert set(routes) == {
         ("GET", "/api/health"),
+        ("GET", "/api/tasks"),
         ("GET", "/api/projects"),
         ("GET", "/api/projects/{name}/tree"),
         ("GET", "/api/projects/{name}/tree/children"),
@@ -622,6 +626,67 @@ async def test_http_channel_help_round_trip_stays_in_http_conversation():
         assert feishu.roots == []
     finally:
         daemon._stop_channels()
+
+
+@pytest.mark.asyncio
+async def test_http_tasks_route_requires_token_and_runs_on_main_loop():
+    class TrackingTaskStore(TaskStore):
+        def __init__(self) -> None:
+            super().__init__(None)
+            self.read_threads: list[int] = []
+
+        def all(self):
+            self.read_threads.append(threading.get_ident())
+            return super().all()
+
+    store = TrackingTaskStore()
+    daemon, _, _ = make_daemon(store=store)
+    http = HttpChannel(
+        "tok-http",
+        asyncio.get_running_loop(),
+        host="127.0.0.1",
+        port=0,
+        routes={("GET", "/api/tasks"): daemon._http_list_tasks},
+    )
+
+    async def ignore(_message: ChannelMessage) -> None:
+        return None
+
+    main_thread_id = threading.get_ident()
+    http.start(ignore)
+    try:
+        for token in (None, "wrong-token"):
+            bad_status, bad_payload = await asyncio.to_thread(
+                http_channel_request,
+                "GET",
+                http.base_url + "/api/tasks",
+                token,
+            )
+            assert bad_status == 401
+            assert bad_payload == {"error": "invalid_token"}
+            assert store.read_threads == []
+
+        status, payload = await asyncio.to_thread(
+            http_channel_request,
+            "GET",
+            http.base_url + "/api/tasks",
+            "tok-http",
+        )
+        assert status == 200
+        assert payload == {
+            "tasks": [
+                {
+                    "task_id": "dispatcher",
+                    "kind": "dispatcher",
+                    "description": "Dispatcher",
+                    "status": "active",
+                    "active": True,
+                }
+            ]
+        }
+        assert store.read_threads == [main_thread_id]
+    finally:
+        http.stop()
 
 
 @pytest.mark.asyncio
@@ -2620,6 +2685,78 @@ async def test_list_tasks_reports_task_status_and_turns():
     assert info["turns"] == 1
     assert info["description"] == "task"
     await daemon._shutdown()
+
+
+async def test_http_list_tasks_reports_dispatcher_and_agent_runtime_state():
+    daemon, _, _ = make_daemon()
+    active = daemon.store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="active task",
+        conversation=ConversationRef("feishu", "oc_active"),
+        thread_root_id="om_active",
+        workspace="C:/tmp/demo",
+        status="running",
+        issue_url="https://github.com/o/r/issues/7",
+    )
+    daemon.store.update(active.task_id, turns=3)
+    historical = daemon.store.create(
+        project_name="demo",
+        agent_label="opencode",
+        description="done task",
+        conversation=ConversationRef("feishu", "oc_done"),
+        thread_root_id="om_done",
+        workspace="C:/tmp/demo",
+        status="done",
+    )
+    daemon.store.update(historical.task_id, turns=1)
+    daemon._runners.register(
+        active.task_id,
+        _AgentSession(
+            "demo",
+            "copilot",
+            task_id=active.task_id,
+            conversation=active.conversation_ref,
+        ),
+    )
+
+    status, payload = await daemon._http_list_tasks({}, {})
+
+    assert status == 200
+    assert payload == {
+        "tasks": [
+            {
+                "task_id": "dispatcher",
+                "kind": "dispatcher",
+                "description": "Dispatcher",
+                "status": "active",
+                "active": True,
+            },
+            {
+                "task_id": active.task_id,
+                "project": "demo",
+                "agent": "copilot",
+                "description": "active task",
+                "status": "running",
+                "turns": 3,
+                "issue_url": "https://github.com/o/r/issues/7",
+                "kind": "agent",
+                "active": True,
+            },
+            {
+                "task_id": historical.task_id,
+                "project": "demo",
+                "agent": "opencode",
+                "description": "done task",
+                "status": "done",
+                "turns": 1,
+                "issue_url": None,
+                "kind": "agent",
+                "active": False,
+            },
+        ]
+    }
+    assert daemon.store.get("dispatcher") is None
 
 
 async def test_nl_dispatch_unknown_project_reported_to_llm():
