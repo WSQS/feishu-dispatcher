@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -156,6 +157,120 @@ async def test_health_requires_token_and_returns_channel_version():
         assert bad_status == 401
         assert status == 200
         assert payload == {"ok": True, "channel": "http", "version": __version__}
+    finally:
+        channel.stop()
+
+
+async def test_application_post_route_requires_token_and_marshals_body():
+    main_thread_id = threading.get_ident()
+    seen: list[tuple[dict, dict, int]] = []
+
+    async def create_conversation(context: dict, request: dict) -> tuple[int, dict]:
+        seen.append((context, request, threading.get_ident()))
+        return 201, {
+            "task_id": request["segments"]["task_id"],
+            "conversation_id": request["body"]["conversation_id"],
+        }
+
+    channel = HttpChannel(
+        "tok-http",
+        asyncio.get_running_loop(),
+        host="127.0.0.1",
+        port=0,
+        routes={
+            (
+                "POST",
+                "/api/tasks/{task_id}/conversations",
+            ): create_conversation
+        },
+        route_context={"channel_key": "http"},
+    )
+
+    async def ignore(_message: ChannelMessage) -> None:
+        return None
+
+    channel.start(ignore)
+    try:
+        for token in (None, "bad"):
+            status, payload = await asyncio.to_thread(
+                _request,
+                "POST",
+                channel.base_url + "/api/tasks/t1/conversations?source=webui",
+                token,
+                {"conversation_id": "browser-a"},
+            )
+            assert status == 401
+            assert payload == {"error": "invalid_token"}
+            assert seen == []
+
+        status, payload = await asyncio.to_thread(
+            _request,
+            "POST",
+            channel.base_url + "/api/tasks/t1/conversations?source=webui",
+            "tok-http",
+            {"conversation_id": "browser-a"},
+        )
+        assert status == 201
+        assert payload == {
+            "task_id": "t1",
+            "conversation_id": "browser-a",
+        }
+        assert seen == [
+            (
+                {"channel_key": "http"},
+                {
+                    "path": "/api/tasks/t1/conversations",
+                    "query": {"source": "webui"},
+                    "segments": {"task_id": "t1"},
+                    "body": {"conversation_id": "browser-a"},
+                },
+                main_thread_id,
+            )
+        ]
+    finally:
+        channel.stop()
+
+
+async def test_application_post_route_preserves_channel_capacity_error():
+    async def create_conversation(_context: dict, request: dict) -> tuple[int, dict]:
+        thread_id = channel.create_thread(
+            request["body"]["conversation_id"],
+            "task",
+        )
+        return 201, {"thread_id": thread_id}
+
+    channel = HttpChannel(
+        "tok-http",
+        asyncio.get_running_loop(),
+        host="127.0.0.1",
+        port=0,
+        routes={
+            (
+                "POST",
+                "/api/tasks/{task_id}/conversations",
+            ): create_conversation
+        },
+        max_conversations=1,
+    )
+
+    async def ignore(_message: ChannelMessage) -> None:
+        return None
+
+    channel.start(ignore)
+    try:
+        channel.send_text("browser-a", "existing")
+        status, payload = await asyncio.to_thread(
+            _request,
+            "POST",
+            channel.base_url + "/api/tasks/t1/conversations",
+            "tok-http",
+            {"conversation_id": "browser-b"},
+        )
+        assert status == 429
+        assert payload == {
+            "error": "conversation_capacity",
+            "message": "HTTP Channel Conversation 数量已达上限",
+        }
     finally:
         channel.stop()
 

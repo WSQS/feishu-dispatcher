@@ -316,7 +316,12 @@ class HttpChannel:
             return exc.status, exc.payload()
 
     def _dispatch_route(
-        self, token: str, method: str, path: str, query: str
+        self,
+        token: str,
+        method: str,
+        path: str,
+        query: str,
+        body: object | None = None,
     ) -> tuple[int, dict]:
         if not self._authorized(token):
             return 401, {"error": "invalid_token"}
@@ -326,13 +331,21 @@ class HttpChannel:
         if not self._loop.is_running():
             return 503, {"error": "channel_unavailable"}
         handler, segments = match
-        request = {"path": path, "query": _parse_query(query), "segments": segments}
+        request = {
+            "path": path,
+            "query": _parse_query(query),
+            "segments": segments,
+        }
+        if method == "POST":
+            request["body"] = body
         future = None
         try:
             future = asyncio.run_coroutine_threadsafe(
                 handler(self._route_context, request), self._loop
             )
             return future.result(timeout=_DISPATCH_TIMEOUT)
+        except _HttpRequestError as exc:
+            return exc.status, exc.payload()
         except Exception as exc:
             if future is not None and not future.done():
                 future.cancel()
@@ -716,12 +729,24 @@ def _make_handler(channel: HttpChannel):
             self._respond(status, payload)
 
         def do_POST(self) -> None:  # noqa: N802
-            path, _query = self._split()
+            path, query = self._split()
             if path != "/api/channel/messages":
-                if path.startswith("/api/") and not channel._authorized(self._token()):
-                    self._respond(401, {"error": "invalid_token"})
-                else:
+                if not path.startswith("/api/"):
                     self._respond(404, {"error": "not_found"})
+                    return
+                token = self._token()
+                if not channel._authorized(token):
+                    self._respond(401, {"error": "invalid_token"})
+                    return
+                status, payload = channel._dispatch_route(
+                    token,
+                    "POST",
+                    path,
+                    query,
+                    self._read_body(),
+                )
+                logger.info("http-channel POST %s → %d", path, status)
+                self._respond(status, payload)
                 return
             if not channel._authorized(self._token()):
                 self._respond(401, {"error": "invalid_token"})
