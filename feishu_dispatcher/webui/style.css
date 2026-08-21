@@ -323,9 +323,13 @@ textarea:focus {
 }
 
 .task-description {
+  min-width: 0;
+  overflow: hidden;
   color: #c7d0dc;
   font-size: 0.82rem;
   line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .task-detail {
@@ -575,5 +579,11 @@ textarea:focus {
   .composer-actions {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .task-description {
+    overflow: visible;
+    text-overflow: clip;
+    white-space: normal;
   }
 }

@@ -96,6 +96,34 @@ async def _wait_for_events(
         await asyncio.sleep(0.01)
 
 
+def test_webui_task_description_truncates_only_on_desktop():
+    stylesheet = (
+        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "style.css"
+    ).read_text(encoding="utf-8")
+    description = re.search(r"\.task-description\s*\{(?P<rules>[^}]*)\}", stylesheet)
+    assert description
+    for declaration in (
+        "min-width: 0;",
+        "overflow: hidden;",
+        "text-overflow: ellipsis;",
+        "white-space: nowrap;",
+    ):
+        assert declaration in description["rules"]
+
+    mobile = stylesheet.split("@media (max-width: 640px)", maxsplit=1)[1]
+    mobile_description = re.search(
+        r"\.task-description\s*\{(?P<rules>[^}]*)\}",
+        mobile,
+    )
+    assert mobile_description
+    for declaration in (
+        "overflow: visible;",
+        "text-overflow: clip;",
+        "white-space: normal;",
+    ):
+        assert declaration in mobile_description["rules"]
+
+
 async def test_webui_assets_are_same_origin_and_do_not_require_token():
     channel = HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
