@@ -13,6 +13,7 @@ const elements = Object.freeze({
   composer: document.querySelector("#composer"),
   composerTarget: document.querySelector("#composer-target"),
   connect: document.querySelector("#connect"),
+  connectionSettings: document.querySelector("#connection-settings"),
   conversationId: document.querySelector("#conversation-id"),
   currentTask: document.querySelector("#current-task"),
   currentThread: document.querySelector("#current-thread"),
@@ -103,6 +104,7 @@ function storedCursor(id) {
 
 function setStatus(text, tone = "idle") {
   elements.status.textContent = text;
+  elements.status.title = text;
   elements.status.dataset.tone = tone;
 }
 
@@ -421,6 +423,7 @@ async function connect() {
   await loadTasks();
   connected = true;
   setStatus("已连接", "ok");
+  elements.connectionSettings.open = false;
   if (conversationStarted) {
     startPolling();
   }
