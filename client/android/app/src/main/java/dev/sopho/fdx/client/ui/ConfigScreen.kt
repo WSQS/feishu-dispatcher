@@ -84,8 +84,8 @@ fun ConfigScreen(
         OutlinedTextField(
             value = connection.url,
             onValueChange = { connection = connection.copy(url = it); savedMsg = null; testState = TestState.Idle },
-            label = { Text("Viewer 地址") },
-            placeholder = { Text("http://<ip>:7321") },
+            label = { Text("HTTP Channel 地址") },
+            placeholder = { Text("http://<ip>:7322") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
         )

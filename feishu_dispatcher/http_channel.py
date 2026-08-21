@@ -1,4 +1,4 @@
-"""本地 HTTP 交互 Channel：写入消息，按 Conversation 轮询输出事件。"""
+"""HTTP 交互 Channel：承载 WebUI、应用 API 与 Conversation 消息事件。"""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ import logging
 import secrets
 import threading
 from collections import deque
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
@@ -26,6 +27,9 @@ _DEFAULT_MAX_CONVERSATIONS = 128
 _DEFAULT_MAX_EVENTS = 512
 _DEFAULT_MAX_TARGETS = 4096
 _DEFAULT_OUTPUT_CHUNK_CHARS = 4000
+_DISPATCH_TIMEOUT = 30.0
+
+RouteHandler = Callable[[dict, dict], Awaitable[tuple[int, dict]]]
 
 
 class _HttpServer(ThreadingHTTPServer):
@@ -93,8 +97,10 @@ class HttpChannel:
         token: str,
         main_loop: asyncio.AbstractEventLoop,
         *,
-        host: str = "127.0.0.1",
+        host: str = "0.0.0.0",
         port: int = 7322,
+        routes: dict[tuple[str, str], RouteHandler] | None = None,
+        route_context: dict | None = None,
         throttle_window: float = 0.5,
         max_conversations: int = _DEFAULT_MAX_CONVERSATIONS,
         max_events: int = _DEFAULT_MAX_EVENTS,
@@ -112,6 +118,8 @@ class HttpChannel:
         self._loop = main_loop
         self._host = host
         self._port = port
+        self._routes = dict(routes or {})
+        self._route_context = dict(route_context or {})
         self._throttle_window = max(0.0, throttle_window)
         self._max_conversations = max_conversations
         self._max_events = max_events
@@ -306,6 +314,30 @@ class HttpChannel:
             return 200, self._events_after(conversation_id, after)
         except _HttpRequestError as exc:
             return exc.status, exc.payload()
+
+    def _dispatch_route(
+        self, token: str, method: str, path: str, query: str
+    ) -> tuple[int, dict]:
+        if not self._authorized(token):
+            return 401, {"error": "invalid_token"}
+        match = _match_route(self._routes, method, path)
+        if match is None:
+            return 404, {"error": "not_found"}
+        if not self._loop.is_running():
+            return 503, {"error": "channel_unavailable"}
+        handler, segments = match
+        request = {"path": path, "query": _parse_query(query), "segments": segments}
+        future = None
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                handler(self._route_context, request), self._loop
+            )
+            return future.result(timeout=_DISPATCH_TIMEOUT)
+        except Exception as exc:
+            if future is not None and not future.done():
+                future.cancel()
+            logger.exception("HTTP Channel 路由处理失败 %s %s", method, path)
+            return 500, {"error": f"{type(exc).__name__}: {exc}"}
 
     @staticmethod
     def _parse_message(body: object) -> ChannelMessage:
@@ -568,6 +600,37 @@ class _HttpStreamingOutput:
                 )
 
 
+def _match_route(
+    routes: dict[tuple[str, str], RouteHandler], method: str, path: str
+) -> tuple[RouteHandler, dict[str, str]] | None:
+    exact = routes.get((method, path))
+    if exact is not None:
+        return exact, {}
+    path_parts = path.strip("/").split("/")
+    for (route_method, template), handler in routes.items():
+        if route_method != method or "{" not in template:
+            continue
+        template_parts = template.strip("/").split("/")
+        if len(template_parts) != len(path_parts):
+            continue
+        segments: dict[str, str] = {}
+        for template_part, path_part in zip(template_parts, path_parts, strict=True):
+            if template_part.startswith("{") and template_part.endswith("}"):
+                segments[template_part[1:-1]] = path_part
+            elif template_part != path_part:
+                break
+        else:
+            return handler, segments
+    return None
+
+
+def _parse_query(query: str) -> dict[str, str]:
+    if not query:
+        return {}
+    pairs = parse_qs(query, keep_blank_values=True)
+    return {key: values[0] for key, values in pairs.items()}
+
+
 def _make_handler(channel: HttpChannel):
     class _Handler(BaseHTTPRequestHandler):
         def log_message(self, *args) -> None:  # noqa: D401
@@ -643,6 +706,10 @@ def _make_handler(channel: HttpChannel):
                 status, payload = channel._dispatch_health(self._token())
             elif path == "/api/channel/events":
                 status, payload = channel._dispatch_events(self._token(), query)
+            elif path.startswith("/api/"):
+                status, payload = channel._dispatch_route(
+                    self._token(), "GET", path, query
+                )
             else:
                 status, payload = 404, {"error": "not_found"}
             logger.info("http-channel GET %s → %d", path, status)
@@ -651,7 +718,13 @@ def _make_handler(channel: HttpChannel):
         def do_POST(self) -> None:  # noqa: N802
             path, _query = self._split()
             if path != "/api/channel/messages":
-                self._respond(404, {"error": "not_found"})
+                if path.startswith("/api/") and not channel._authorized(self._token()):
+                    self._respond(401, {"error": "invalid_token"})
+                else:
+                    self._respond(404, {"error": "not_found"})
+                return
+            if not channel._authorized(self._token()):
+                self._respond(401, {"error": "invalid_token"})
                 return
             body = self._read_body()
             if body is None:

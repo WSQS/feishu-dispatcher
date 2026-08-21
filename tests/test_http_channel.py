@@ -262,6 +262,12 @@ async def test_invalid_requests_do_not_enter_dispatcher():
 
     channel.start(handle)
     try:
+        unauthenticated_empty, _ = await asyncio.to_thread(
+            _request,
+            "POST",
+            channel.base_url + "/api/channel/messages",
+            None,
+        )
         bad_token, _ = await asyncio.to_thread(
             _request,
             "POST",
@@ -290,6 +296,7 @@ async def test_invalid_requests_do_not_enter_dispatcher():
             "tok-http",
             _message(thread_id="unknown-thread"),
         )
+        assert unauthenticated_empty == 401
         assert bad_token == 401
         assert blank_sender == 400
         assert payload["error"] == "invalid_request"

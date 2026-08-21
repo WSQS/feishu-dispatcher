@@ -1,9 +1,4 @@
-"""移动端查看器 ViewerServer 的 HTTP 往返测试（真起 127.0.0.1 server + urllib 请求）。
-
-照 test_control.py 的模式：HTTP 请求经 asyncio.to_thread 发出，避免阻塞测试 loop。
-本文件只覆盖 M1 的「只读底座」（health + 鉴权 + 404 + 500）；数据接口（projects /
-tree / file / diff）的测试随各自 landing 补。
-"""
+"""HTTP Channel 承载移动端 workspace API 的 HTTP 往返测试。"""
 
 from __future__ import annotations
 
@@ -14,15 +9,16 @@ import urllib.request
 
 from feishu_dispatcher import __version__
 from feishu_dispatcher._scan_executor import ScanExecutor
+from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.config import Project
-from feishu_dispatcher.viewer import (
+from feishu_dispatcher.http_channel import HttpChannel
+from feishu_dispatcher.workspace_api import (
     _MAX_FILE_BYTES,
-    ViewerServer,
-    file as viewer_file,
+    file as workspace_file,
     health,
     list_projects,
-    tree as viewer_tree,
-    tree_children as viewer_tree_children,
+    tree as workspace_tree,
+    tree_children as workspace_tree_children,
 )
 
 
@@ -38,20 +34,42 @@ def _get(url: str, token: str | None) -> tuple[int, dict]:
         return exc.code, json.loads(exc.read().decode())
 
 
-async def _make_server(token: str = "tok-view", routes=None) -> ViewerServer:
+async def _ignore(_message: ChannelMessage) -> None:
+    return None
+
+
+def _make_channel(
+    token: str = "tok-view",
+    routes=None,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 0,
+    ctx: dict | None = None,
+) -> HttpChannel:
+    return HttpChannel(
+        token,
+        asyncio.get_running_loop(),
+        routes=routes,
+        route_context=ctx,
+        host=host,
+        port=port,
+    )
+
+
+async def _make_server(token: str = "tok-view", routes=None) -> HttpChannel:
     routes = routes if routes is not None else {("GET", "/api/health"): health}
-    vs = ViewerServer(token, routes, host="127.0.0.1", port=0)
-    vs.start()
+    vs = _make_channel(token, routes, host="127.0.0.1", port=0)
+    vs.start(_ignore)
     return vs
 
 
-def _children_server(ws, *, scan_executor=None) -> tuple[ViewerServer, ScanExecutor]:
-    """构造带 /tree/children 路由 + 注入 scan_executor 的 ViewerServer。返回 (vs, executor)。"""
+def _children_server(ws, *, scan_executor=None) -> tuple[HttpChannel, ScanExecutor]:
+    """构造带 /tree/children 路由与 scan executor 的 HTTP Channel。"""
     executor = scan_executor if scan_executor is not None else ScanExecutor()
     fake = {"demo": Project(name="demo", path=ws)}
-    vs = ViewerServer(
+    vs = _make_channel(
         "tok-view",
-        routes={("GET", "/api/projects/{name}/tree/children"): viewer_tree_children},
+        routes={("GET", "/api/projects/{name}/tree/children"): workspace_tree_children},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: fake, "scan_executor": executor},
@@ -65,8 +83,17 @@ async def test_health_returns_version():
         status, payload = await asyncio.to_thread(
             _get, vs.base_url + "/api/health", "tok-view"
         )
+        channel_status, channel_payload = await asyncio.to_thread(
+            _get, vs.base_url + "/api/channel/health", "tok-view"
+        )
         assert status == 200
         assert payload == {"ok": True, "version": __version__}
+        assert channel_status == 200
+        assert channel_payload == {
+            "ok": True,
+            "channel": "http",
+            "version": __version__,
+        }
     finally:
         vs.stop()
 
@@ -116,14 +143,14 @@ async def test_list_projects_returns_items():
         "demo": Project(name="demo", path="/tmp/demo"),
         "lib": Project(name="lib", path="/tmp/lib", default_agent="opencode"),
     }
-    vs = ViewerServer(
+    vs = _make_channel(
         "tok-view",
         routes={("GET", "/api/projects"): list_projects},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: fake},
     )
-    vs.start()
+    vs.start(_ignore)
     try:
         status, payload = await asyncio.to_thread(
             _get, vs.base_url + "/api/projects", "tok-view"
@@ -150,14 +177,14 @@ async def test_tree_lists_files():
     (ws / ".git").mkdir(exist_ok=True)
     (ws / ".git" / "config").write_text("x")  # should be skipped
     fake = {"demo": Project(name="demo", path=ws)}
-    vs = ViewerServer(
+    vs = _make_channel(
         "tok-view",
-        routes={("GET", "/api/projects/{name}/tree"): viewer_tree},
+        routes={("GET", "/api/projects/{name}/tree"): workspace_tree},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: fake},
     )
-    vs.start()
+    vs.start(_ignore)
     try:
         status, payload = await asyncio.to_thread(
             _get, vs.base_url + "/api/projects/demo/tree", "tok-view"
@@ -173,14 +200,14 @@ async def test_tree_lists_files():
 
 
 async def test_tree_unknown_project_404():
-    vs = ViewerServer(
+    vs = _make_channel(
         "tok-view",
-        routes={("GET", "/api/projects/{name}/tree"): viewer_tree},
+        routes={("GET", "/api/projects/{name}/tree"): workspace_tree},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: {}},
     )
-    vs.start()
+    vs.start(_ignore)
     try:
         status, payload = await asyncio.to_thread(
             _get, vs.base_url + "/api/projects/nope/tree", "tok-view"
@@ -200,14 +227,14 @@ async def test_file_reads_text():
     # write_bytes 避免 Windows 文本模式把 \n 写成 \r\n
     (ws / "hello.py").write_bytes(b"print('hi')\n")
     fake = {"demo": Project(name="demo", path=ws)}
-    vs = ViewerServer(
+    vs = _make_channel(
         "tok-view",
-        routes={("GET", "/api/projects/{name}/file"): viewer_file},
+        routes={("GET", "/api/projects/{name}/file"): workspace_file},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: fake},
     )
-    vs.start()
+    vs.start(_ignore)
     try:
         url = vs.base_url + "/api/projects/demo/file?path=" + quote("hello.py")
         status, payload = await asyncio.to_thread(_get, url, "tok-view")
@@ -232,14 +259,14 @@ async def test_file_rejects_path_traversal():
     ws.mkdir(exist_ok=True)
     (ws / "ok.txt").write_text("x", encoding="utf-8")
     fake = {"demo": Project(name="demo", path=ws)}
-    vs = ViewerServer(
+    vs = _make_channel(
         "tok-view",
-        routes={("GET", "/api/projects/{name}/file"): viewer_file},
+        routes={("GET", "/api/projects/{name}/file"): workspace_file},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: fake},
     )
-    vs.start()
+    vs.start(_ignore)
     try:
         for bad in ("../ok.txt", "/etc/passwd"):
             url = vs.base_url + "/api/projects/demo/file?path=" + quote(bad)
@@ -259,14 +286,14 @@ async def test_file_binary_flag():
     ws.mkdir(exist_ok=True)
     (ws / "blob.bin").write_bytes(b"\x00\x01\x02\xff")
     fake = {"demo": Project(name="demo", path=ws)}
-    vs = ViewerServer(
+    vs = _make_channel(
         "tok-view",
-        routes={("GET", "/api/projects/{name}/file"): viewer_file},
+        routes={("GET", "/api/projects/{name}/file"): workspace_file},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: fake},
     )
-    vs.start()
+    vs.start(_ignore)
     try:
         url = vs.base_url + "/api/projects/demo/file?path=" + quote("blob.bin")
         status, payload = await asyncio.to_thread(_get, url, "tok-view")
@@ -287,14 +314,14 @@ async def test_file_rejects_oversized_content():
     ws.mkdir(exist_ok=True)
     (ws / "large.txt").write_bytes(b"x" * (_MAX_FILE_BYTES + 1))
     fake = {"demo": Project(name="demo", path=ws)}
-    vs = ViewerServer(
+    vs = _make_channel(
         "tok-view",
-        routes={("GET", "/api/projects/{name}/file"): viewer_file},
+        routes={("GET", "/api/projects/{name}/file"): workspace_file},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: fake},
     )
-    vs.start()
+    vs.start(_ignore)
     try:
         url = vs.base_url + "/api/projects/demo/file?path=" + quote("large.txt")
         status, payload = await asyncio.to_thread(_get, url, "tok-view")
@@ -318,7 +345,7 @@ async def test_tree_children_lists_direct_children():
     (ws / "src").mkdir()
     (ws / "src" / "util.py").write_text("y")  # 间接子项，不应出现在根
     vs, ex = _children_server(ws)
-    vs.start()
+    vs.start(_ignore)
     try:
         status, payload = await asyncio.to_thread(
             _get, vs.base_url + "/api/projects/demo/tree/children?path=", "tok-view"
@@ -347,7 +374,7 @@ async def test_tree_children_nested_prefix():
     (ws / "src").mkdir()
     (ws / "src" / "util.py").write_text("y")
     vs, ex = _children_server(ws)
-    vs.start()
+    vs.start(_ignore)
     try:
         url = vs.base_url + "/api/projects/demo/tree/children?path=" + quote("src")
         status, payload = await asyncio.to_thread(_get, url, "tok-view")
@@ -369,7 +396,7 @@ async def test_tree_children_missing_path_400():
     ws = Path(__file__).parent / "_ws_children_missing"
     ws.mkdir(exist_ok=True)
     vs, ex = _children_server(ws)
-    vs.start()
+    vs.start(_ignore)
     try:
         status, payload = await asyncio.to_thread(
             _get, vs.base_url + "/api/projects/demo/tree/children", "tok-view"
@@ -390,7 +417,7 @@ async def test_tree_children_invalid_path_400():
     ws = Path(__file__).parent / "_ws_children_bad"
     ws.mkdir(exist_ok=True)
     vs, ex = _children_server(ws)
-    vs.start()
+    vs.start(_ignore)
     try:
         for bad in ("../x", "a/../b", "src\\x", "src/"):
             url = vs.base_url + "/api/projects/demo/tree/children?path=" + quote(bad)
@@ -409,7 +436,7 @@ async def test_tree_children_not_found_404():
     ws = Path(__file__).parent / "_ws_children_nf"
     ws.mkdir(exist_ok=True)
     vs, ex = _children_server(ws)
-    vs.start()
+    vs.start(_ignore)
     try:
         status, payload = await asyncio.to_thread(
             _get,
@@ -432,7 +459,7 @@ async def test_tree_children_not_a_directory_400():
     ws.mkdir(exist_ok=True)
     (ws / "f.txt").write_text("x")
     vs, ex = _children_server(ws)
-    vs.start()
+    vs.start(_ignore)
     try:
         status, payload = await asyncio.to_thread(
             _get,
@@ -457,7 +484,7 @@ async def test_tree_children_permission_403():
     ws = Path(__file__).parent / "_ws_children_perm"
     ws.mkdir(exist_ok=True)
     vs, ex = _children_server(ws, scan_executor=ScanExecutor(scan=deny_scan))
-    vs.start()
+    vs.start(_ignore)
     try:
         status, payload = await asyncio.to_thread(
             _get, vs.base_url + "/api/projects/demo/tree/children?path=", "tok-view"
@@ -496,7 +523,7 @@ async def test_tree_children_scan_does_not_block_main_loop():
         "path": "/api/projects/demo/tree/children",
     }
     try:
-        task = asyncio.create_task(viewer_tree_children(ctx, request))
+        task = asyncio.create_task(workspace_tree_children(ctx, request))
         await asyncio.to_thread(started.wait, 5)  # 等扫描真正在 worker 线程启动
         t0 = time.perf_counter()
         status, _ = await health(ctx, {})

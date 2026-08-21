@@ -165,16 +165,9 @@ default_agent = "copilot"
 # default_agent = "opencode"
 # repo = "https://git.corp.com/group/my-other-project"   # 自建 GitLab 示例
 
-# 移动端查看器（viewer）：daemon 内嵌的只读 HTTP 服务，给手机看 workspace 的
-# 文件树/文件/diff。默认关闭——新功能默认安全，需显式开启。
-[viewer]
-enabled = false        # 默认关闭，显式开启
-bind = "0.0.0.0"       # 只走 Tailscale 时填 tailnet 网卡 IP
-port = 7321            # 默认端口
-
-# 可写 HTTP Channel：给本机 WebUI / TUI 等客户端发送消息并轮询回复事件。
-# token 自动生成到 config 同目录的 http-channel.token，不复用 viewer.token。
+# HTTP Channel：统一承载 WebUI、消息事件与移动端 workspace 文件接口。
+# token 自动生成到 config 同目录的 http-channel.token；持有 token 即拥有完整访问权限。
 [http_channel]
 enabled = false        # 默认关闭，显式开启
-bind = "127.0.0.1"     # 首版默认仅允许本机客户端连接
+bind = "0.0.0.0"       # 可按需改为 localhost 或 Tailscale 网卡 IP
 port = 7322            # 默认端口
