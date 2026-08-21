@@ -1,4 +1,4 @@
-"""移动端查看器使用的 workspace 文件树与文件读取 API handler。"""
+"""Workspace 文件树与文件读取 API handler。"""
 
 from __future__ import annotations
 

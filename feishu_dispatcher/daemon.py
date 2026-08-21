@@ -48,12 +48,12 @@ from .scheduler import (
 )
 from .store import Job, JobStore, ModelStore, ProjectStore, Task, TaskStore
 from ._scan_executor import ScanExecutor
-from .viewer import (
-    file as viewer_file,
-    health as viewer_health,
-    list_projects as viewer_list_projects,
-    tree as viewer_tree,
-    tree_children as viewer_tree_children,
+from .workspace_api import (
+    file as workspace_file,
+    health as workspace_health,
+    list_projects as workspace_list_projects,
+    tree as workspace_tree,
+    tree_children as workspace_tree_children,
 )
 
 logger = logging.getLogger(__name__)
@@ -315,14 +315,14 @@ async def run(
                 host=http_channel_config.bind,
                 port=http_channel_config.port,
                 routes={
-                    ("GET", "/api/health"): viewer_health,
-                    ("GET", "/api/projects"): viewer_list_projects,
-                    ("GET", "/api/projects/{name}/tree"): viewer_tree,
+                    ("GET", "/api/health"): workspace_health,
+                    ("GET", "/api/projects"): workspace_list_projects,
+                    ("GET", "/api/projects/{name}/tree"): workspace_tree,
                     (
                         "GET",
                         "/api/projects/{name}/tree/children",
-                    ): viewer_tree_children,
-                    ("GET", "/api/projects/{name}/file"): viewer_file,
+                    ): workspace_tree_children,
+                    ("GET", "/api/projects/{name}/file"): workspace_file,
                 },
                 route_context={
                     "all_projects": daemon._all_projects,

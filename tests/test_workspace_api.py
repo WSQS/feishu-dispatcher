@@ -12,13 +12,13 @@ from feishu_dispatcher._scan_executor import ScanExecutor
 from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.config import Project
 from feishu_dispatcher.http_channel import HttpChannel
-from feishu_dispatcher.viewer import (
+from feishu_dispatcher.workspace_api import (
     _MAX_FILE_BYTES,
-    file as viewer_file,
+    file as workspace_file,
     health,
     list_projects,
-    tree as viewer_tree,
-    tree_children as viewer_tree_children,
+    tree as workspace_tree,
+    tree_children as workspace_tree_children,
 )
 
 
@@ -69,7 +69,7 @@ def _children_server(ws, *, scan_executor=None) -> tuple[HttpChannel, ScanExecut
     fake = {"demo": Project(name="demo", path=ws)}
     vs = _make_channel(
         "tok-view",
-        routes={("GET", "/api/projects/{name}/tree/children"): viewer_tree_children},
+        routes={("GET", "/api/projects/{name}/tree/children"): workspace_tree_children},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: fake, "scan_executor": executor},
@@ -179,7 +179,7 @@ async def test_tree_lists_files():
     fake = {"demo": Project(name="demo", path=ws)}
     vs = _make_channel(
         "tok-view",
-        routes={("GET", "/api/projects/{name}/tree"): viewer_tree},
+        routes={("GET", "/api/projects/{name}/tree"): workspace_tree},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: fake},
@@ -202,7 +202,7 @@ async def test_tree_lists_files():
 async def test_tree_unknown_project_404():
     vs = _make_channel(
         "tok-view",
-        routes={("GET", "/api/projects/{name}/tree"): viewer_tree},
+        routes={("GET", "/api/projects/{name}/tree"): workspace_tree},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: {}},
@@ -229,7 +229,7 @@ async def test_file_reads_text():
     fake = {"demo": Project(name="demo", path=ws)}
     vs = _make_channel(
         "tok-view",
-        routes={("GET", "/api/projects/{name}/file"): viewer_file},
+        routes={("GET", "/api/projects/{name}/file"): workspace_file},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: fake},
@@ -261,7 +261,7 @@ async def test_file_rejects_path_traversal():
     fake = {"demo": Project(name="demo", path=ws)}
     vs = _make_channel(
         "tok-view",
-        routes={("GET", "/api/projects/{name}/file"): viewer_file},
+        routes={("GET", "/api/projects/{name}/file"): workspace_file},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: fake},
@@ -288,7 +288,7 @@ async def test_file_binary_flag():
     fake = {"demo": Project(name="demo", path=ws)}
     vs = _make_channel(
         "tok-view",
-        routes={("GET", "/api/projects/{name}/file"): viewer_file},
+        routes={("GET", "/api/projects/{name}/file"): workspace_file},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: fake},
@@ -316,7 +316,7 @@ async def test_file_rejects_oversized_content():
     fake = {"demo": Project(name="demo", path=ws)}
     vs = _make_channel(
         "tok-view",
-        routes={("GET", "/api/projects/{name}/file"): viewer_file},
+        routes={("GET", "/api/projects/{name}/file"): workspace_file},
         host="127.0.0.1",
         port=0,
         ctx={"all_projects": lambda: fake},
@@ -523,7 +523,7 @@ async def test_tree_children_scan_does_not_block_main_loop():
         "path": "/api/projects/demo/tree/children",
     }
     try:
-        task = asyncio.create_task(viewer_tree_children(ctx, request))
+        task = asyncio.create_task(workspace_tree_children(ctx, request))
         await asyncio.to_thread(started.wait, 5)  # 等扫描真正在 worker 线程启动
         t0 = time.perf_counter()
         status, _ = await health(ctx, {})

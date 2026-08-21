@@ -5,7 +5,7 @@ HTTP Channel，查看 agent 在 workspace 干活时的文件树和文件内容�
 
 > 这是 [feishu-dispatcher](../../..) 的安卓客户端部分，位于仓库 `client/android/`。
 > 服务端由 `feishu_dispatcher/http_channel.py` 统一承载，workspace API handler 位于
-> `feishu_dispatcher/viewer.py`。整体设计见仓库 Issues 中的 viewer 设计 map。
+> `feishu_dispatcher/workspace_api.py`。整体设计见仓库 Issues 中的 viewer 设计 map。
 
 ## 功能
 
