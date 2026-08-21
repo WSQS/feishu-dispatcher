@@ -1,3 +1,6 @@
+const DISPATCHER_TASK_ID = "dispatcher";
+const TERMINAL_TASK_STATUSES = new Set(["done", "stopped"]);
+
 const storageKeys = Object.freeze({
   conversation: "feishu-dispatcher.http-channel.conversation",
   cursor: (conversationId) =>
@@ -8,23 +11,33 @@ const storageKeys = Object.freeze({
 
 const elements = Object.freeze({
   composer: document.querySelector("#composer"),
+  composerTarget: document.querySelector("#composer-target"),
   connect: document.querySelector("#connect"),
   conversationId: document.querySelector("#conversation-id"),
+  currentTask: document.querySelector("#current-task"),
+  currentThread: document.querySelector("#current-thread"),
   cursor: document.querySelector("#cursor"),
   message: document.querySelector("#message"),
   resetConversation: document.querySelector("#reset-conversation"),
   send: document.querySelector("#send"),
   status: document.querySelector("#status"),
-  timeline: document.querySelector("#timeline"),
+  taskList: document.querySelector("#task-list"),
+  timelines: document.querySelector("#timelines"),
   token: document.querySelector("#token"),
 });
 
 const outputs = new Map();
+const tasks = new Map();
+const taskThreads = new Map();
+const targetTasks = new Map();
+const taskTimelines = new Map();
 let conversationId = storedConversationId();
 let cursor = storedCursor(conversationId);
 let conversationStarted = storageGet(storageKeys.started(conversationId)) === "1";
 let connected = false;
 let pollGeneration = 0;
+let selectedTaskId = DISPATCHER_TASK_ID;
+let taskSelectionBusy = false;
 
 class ApiError extends Error {
   constructor(status, payload) {
@@ -93,21 +106,87 @@ function setStatus(text, tone = "idle") {
   elements.status.dataset.tone = tone;
 }
 
+function taskName(task) {
+  if (!task || task.task_id === DISPATCHER_TASK_ID) {
+    return "Dispatcher";
+  }
+  return `${task.task_id} · ${task.project || "未命名项目"}`;
+}
+
+function taskIsTerminal(task) {
+  return TERMINAL_TASK_STATUSES.has(task?.status);
+}
+
 function renderMetadata() {
   elements.conversationId.textContent = conversationId;
   elements.cursor.textContent = String(cursor);
 }
 
-function revealTimeline() {
-  elements.timeline.querySelector("#empty-state")?.remove();
+function createEmptyState(taskId) {
+  const empty = document.createElement("div");
+  empty.className = "empty-state";
+  const title = document.createElement("p");
+  const detail = document.createElement("span");
+  if (taskId === DISPATCHER_TASK_ID) {
+    title.textContent = "还没有 Dispatcher 事件。";
+    detail.textContent = "发送 /help 开始。";
+  } else {
+    title.textContent = "这个 Task 还没有页面事件。";
+    detail.textContent = "发送消息后，输入与流式输出会显示在这里。";
+  }
+  empty.append(title, detail);
+  return empty;
 }
 
-function scrollTimeline() {
-  elements.timeline.scrollTop = elements.timeline.scrollHeight;
+function ensureTimeline(taskId) {
+  const existing = taskTimelines.get(taskId);
+  if (existing) {
+    return existing;
+  }
+  const timeline = document.createElement("div");
+  timeline.className = "task-timeline";
+  timeline.dataset.taskId = taskId;
+  timeline.hidden = taskId !== selectedTaskId;
+  timeline.append(createEmptyState(taskId));
+  elements.timelines.append(timeline);
+  taskTimelines.set(taskId, timeline);
+  return timeline;
 }
 
-function appendEvent({ role = "assistant", label, text, detail = "" }) {
-  revealTimeline();
+function renderSelectedTask() {
+  const task = tasks.get(selectedTaskId);
+  const threadId =
+    selectedTaskId === DISPATCHER_TASK_ID
+      ? null
+      : taskThreads.get(selectedTaskId) || null;
+  elements.currentTask.textContent = taskName(task);
+  elements.currentThread.textContent = threadId || "root";
+  elements.composerTarget.textContent = `发送给 ${taskName(task)}`;
+  for (const [taskId, timeline] of taskTimelines) {
+    timeline.hidden = taskId !== selectedTaskId;
+  }
+  scrollTimeline(selectedTaskId);
+}
+
+function revealTimeline(taskId) {
+  ensureTimeline(taskId).querySelector(".empty-state")?.remove();
+}
+
+function scrollTimeline(taskId) {
+  const timeline = taskTimelines.get(taskId);
+  if (timeline && !timeline.hidden) {
+    timeline.scrollTop = timeline.scrollHeight;
+  }
+}
+
+function appendEvent({
+  taskId = selectedTaskId,
+  role = "assistant",
+  label,
+  text,
+  detail = "",
+}) {
+  revealTimeline(taskId);
   const article = document.createElement("article");
   article.className = "event";
   article.dataset.role = role;
@@ -124,17 +203,17 @@ function appendEvent({ role = "assistant", label, text, detail = "" }) {
   content.className = "event-text";
   content.textContent = text;
   article.append(meta, content);
-  elements.timeline.append(article);
-  scrollTimeline();
+  ensureTimeline(taskId).append(article);
+  scrollTimeline(taskId);
 }
 
-function ensureOutput(event) {
+function ensureOutput(event, taskId) {
   const existing = outputs.get(event.output_id);
   if (existing) {
     return existing;
   }
 
-  revealTimeline();
+  revealTimeline(taskId);
   const article = document.createElement("article");
   article.className = "event output";
   article.dataset.role = "assistant";
@@ -154,25 +233,50 @@ function ensureOutput(event) {
   footer.className = "output-footer";
   footer.textContent = event.footer || "";
   article.append(header, body, footer);
-  elements.timeline.append(article);
+  ensureTimeline(taskId).append(article);
 
-  const output = { article, body, footer, status };
+  const output = { article, body, footer, status, taskId };
   outputs.set(event.output_id, output);
-  scrollTimeline();
+  scrollTimeline(taskId);
   return output;
 }
 
+function rememberTarget(targetId, taskId) {
+  if (typeof targetId === "string" && targetId) {
+    targetTasks.set(targetId, taskId);
+  }
+}
+
+function taskForEvent(event) {
+  if (event.type === "output.delta" || event.type === "output.updated") {
+    return outputs.get(event.output_id)?.taskId || DISPATCHER_TASK_ID;
+  }
+  const targetIds = [event.target_id, event.thread_id, event.output_id, event.message_id];
+  for (const targetId of targetIds) {
+    const taskId = targetTasks.get(targetId);
+    if (taskId) {
+      return taskId;
+    }
+  }
+  return DISPATCHER_TASK_ID;
+}
+
 function renderEvent(event) {
+  const taskId = taskForEvent(event);
   switch (event.type) {
     case "message.created":
+      rememberTarget(event.message_id, taskId);
       appendEvent({
+        taskId,
         label: event.threaded ? "Thread reply" : "Reply",
         text: event.text || "",
         detail: `cursor ${event.cursor}`,
       });
       break;
     case "thread.created":
+      rememberTarget(event.thread_id, taskId);
       appendEvent({
+        taskId,
         role: "system",
         label: "Thread created",
         text: event.text || "",
@@ -180,16 +284,17 @@ function renderEvent(event) {
       });
       break;
     case "output.started":
-      ensureOutput(event);
+      rememberTarget(event.output_id, taskId);
+      ensureOutput(event, taskId);
       break;
     case "output.delta": {
-      const output = ensureOutput(event);
+      const output = ensureOutput(event, taskId);
       output.body.textContent += event.text || "";
-      scrollTimeline();
+      scrollTimeline(output.taskId);
       break;
     }
     case "output.updated": {
-      const output = ensureOutput(event);
+      const output = ensureOutput(event, taskId);
       output.footer.textContent = event.footer || "";
       output.status.textContent = event.status || "running";
       output.article.dataset.status = event.status || "running";
@@ -197,6 +302,7 @@ function renderEvent(event) {
     }
     default:
       appendEvent({
+        taskId,
         role: "system",
         label: event.type || "Unknown event",
         text: JSON.stringify(event),
@@ -225,13 +331,151 @@ async function apiRequest(path, options = {}) {
   return payload;
 }
 
+function renderTaskList() {
+  elements.taskList.replaceChildren();
+  elements.resetConversation.disabled = taskSelectionBusy;
+  if (tasks.size === 0) {
+    const empty = document.createElement("p");
+    empty.className = "task-list-empty";
+    empty.textContent = "连接后加载 Task。";
+    elements.taskList.append(empty);
+    return;
+  }
+
+  for (const task of tasks.values()) {
+    const terminal = taskIsTerminal(task);
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "task-item";
+    button.dataset.selected = String(task.task_id === selectedTaskId);
+    button.dataset.terminal = String(terminal);
+    button.disabled = taskSelectionBusy || terminal;
+    button.setAttribute("aria-pressed", String(task.task_id === selectedTaskId));
+
+    const header = document.createElement("span");
+    header.className = "task-item-header";
+    const name = document.createElement("span");
+    name.className = "task-name";
+    name.textContent = taskName(task);
+    const status = document.createElement("span");
+    status.className = "task-status";
+    status.textContent = task.status || "unknown";
+    header.append(name, status);
+
+    const description = document.createElement("span");
+    description.className = "task-description";
+    description.textContent = task.description || "无描述";
+
+    const detail = document.createElement("span");
+    detail.className = "task-detail";
+    const identity = document.createElement("span");
+    identity.textContent =
+      task.task_id === DISPATCHER_TASK_ID
+        ? "root conversation"
+        : `${task.agent || "agent"} · ${task.turns ?? 0} turns`;
+    const binding = document.createElement("span");
+    binding.className = "task-binding";
+    if (task.task_id === DISPATCHER_TASK_ID) {
+      binding.textContent = "根会话";
+    } else if (terminal) {
+      binding.textContent = "已终止";
+    } else if (taskThreads.has(task.task_id)) {
+      binding.textContent = "已打开";
+    } else {
+      binding.textContent = "点击打开";
+    }
+    detail.append(identity, binding);
+
+    button.append(header, description, detail);
+    button.addEventListener("click", () => {
+      void selectTask(task.task_id).catch(showError);
+    });
+    elements.taskList.append(button);
+  }
+}
+
+async function loadTasks() {
+  const payload = await apiRequest("/api/tasks");
+  const items = Array.isArray(payload.tasks) ? payload.tasks : [];
+  tasks.clear();
+  for (const task of items) {
+    if (task && typeof task.task_id === "string" && task.task_id) {
+      tasks.set(task.task_id, task);
+    }
+  }
+  if (!tasks.has(DISPATCHER_TASK_ID)) {
+    throw new Error("Task 列表缺少 Dispatcher");
+  }
+  const selected = tasks.get(selectedTaskId);
+  if (!selected || taskIsTerminal(selected)) {
+    selectedTaskId = DISPATCHER_TASK_ID;
+  }
+  renderTaskList();
+  ensureTimeline(selectedTaskId);
+  renderSelectedTask();
+}
+
 async function connect() {
   setStatus("正在验证 token…", "busy");
   await apiRequest("/api/channel/health");
+  await loadTasks();
   connected = true;
   setStatus("已连接", "ok");
   if (conversationStarted) {
     startPolling();
+  }
+}
+
+async function createTaskConversation(task) {
+  const payload = await apiRequest(
+    `/api/tasks/${encodeURIComponent(task.task_id)}/conversations`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ conversation_id: conversationId }),
+    },
+  );
+  if (typeof payload.thread_id !== "string" || !payload.thread_id.trim()) {
+    throw new Error("创建 Task Conversation 未返回 thread_id");
+  }
+  const threadId = payload.thread_id.trim();
+  taskThreads.set(task.task_id, threadId);
+  rememberTarget(threadId, task.task_id);
+  conversationStarted = true;
+  storageSet(storageKeys.started(conversationId), "1");
+  return threadId;
+}
+
+async function selectTask(taskId) {
+  const task = tasks.get(taskId);
+  if (!task || taskSelectionBusy) {
+    return;
+  }
+  if (taskIsTerminal(task)) {
+    setStatus(`${taskName(task)} 已终止，不能打开`, "error");
+    return;
+  }
+
+  taskSelectionBusy = true;
+  renderTaskList();
+  let pollingPaused = false;
+  try {
+    if (taskId !== DISPATCHER_TASK_ID && !taskThreads.has(taskId)) {
+      pollGeneration += 1;
+      pollingPaused = true;
+      setStatus(`正在打开 ${taskName(task)}…`, "busy");
+      await createTaskConversation(task);
+    }
+    selectedTaskId = taskId;
+    ensureTimeline(taskId);
+    renderSelectedTask();
+    setStatus(`已选择 ${taskName(task)}`, "ok");
+  } finally {
+    taskSelectionBusy = false;
+    renderTaskList();
+    if (pollingPaused && conversationStarted) {
+      startPolling();
+    }
   }
 }
 
@@ -291,14 +535,32 @@ function startPolling() {
 }
 
 async function sendMessage(text) {
+  if (taskSelectionBusy) {
+    throw new Error("正在打开 Task Conversation，请稍候");
+  }
   if (!connected) {
     await connect();
   }
+  const taskId = selectedTaskId;
+  const task = tasks.get(taskId);
+  if (!task) {
+    throw new Error("当前 Task 不存在");
+  }
+  let threadId = null;
+  if (taskId !== DISPATCHER_TASK_ID) {
+    threadId = taskThreads.get(taskId) || null;
+    if (!threadId) {
+      throw new Error("当前 Task Conversation 尚未打开");
+    }
+  }
+
   const targetConversationId = conversationId;
+  const messageId = newId("webui-message");
+  rememberTarget(messageId, taskId);
   const payload = {
     conversation_id: targetConversationId,
-    message_id: newId("webui-message"),
-    thread_id: null,
+    message_id: messageId,
+    thread_id: threadId,
     sender_id: `webui:${targetConversationId}`,
     text,
   };
@@ -309,6 +571,9 @@ async function sendMessage(text) {
       body: JSON.stringify(payload),
     });
   } catch (error) {
+    if (targetTasks.get(messageId) === taskId) {
+      targetTasks.delete(messageId);
+    }
     if (targetConversationId === conversationId) {
       throw error;
     }
@@ -317,7 +582,13 @@ async function sendMessage(text) {
   if (targetConversationId !== conversationId) {
     return;
   }
-  appendEvent({ role: "user", label: "You", text, detail: "accepted" });
+  appendEvent({
+    taskId,
+    role: "user",
+    label: "You",
+    text,
+    detail: "accepted",
+  });
   conversationStarted = true;
   storageSet(storageKeys.started(conversationId), "1");
   setStatus("消息已接收，等待事件…", "busy");
@@ -325,25 +596,30 @@ async function sendMessage(text) {
 }
 
 function resetConversation() {
+  if (taskSelectionBusy) {
+    setStatus("正在打开 Task Conversation，暂时不能重置", "error");
+    return;
+  }
   pollGeneration += 1;
   storageRemove(storageKeys.cursor(conversationId));
   storageRemove(storageKeys.started(conversationId));
   conversationId = newId("webui-conversation");
   cursor = 0;
   conversationStarted = false;
+  selectedTaskId = DISPATCHER_TASK_ID;
   storageSet(storageKeys.conversation, conversationId);
   outputs.clear();
-  elements.timeline.replaceChildren();
-  const empty = document.createElement("div");
-  empty.id = "empty-state";
-  empty.className = "empty-state";
-  const title = document.createElement("p");
-  title.textContent = "这是一个新的 Conversation。";
-  const detail = document.createElement("span");
-  detail.textContent = "发送 /help 开始。";
-  empty.append(title, detail);
-  elements.timeline.append(empty);
-  setStatus(connected ? "已连接，新 Conversation" : "请输入 token", connected ? "ok" : "idle");
+  taskThreads.clear();
+  targetTasks.clear();
+  taskTimelines.clear();
+  elements.timelines.replaceChildren();
+  ensureTimeline(selectedTaskId);
+  renderTaskList();
+  renderSelectedTask();
+  setStatus(
+    connected ? "已连接，新 Conversation" : "请输入 token",
+    connected ? "ok" : "idle",
+  );
   renderMetadata();
 }
 
@@ -397,4 +673,6 @@ elements.token.addEventListener("keydown", (event) => {
   }
 });
 
+ensureTimeline(selectedTaskId);
+renderSelectedTask();
 renderMetadata();
