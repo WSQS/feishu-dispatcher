@@ -133,6 +133,11 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert 'class="hero"' not in html
         assert 'class="connection panel"' not in html
         assert ".floating-controls" in stylesheet
+        assert "padding: 0 0 56px;" in stylesheet
+        assert re.search(
+            r"\.task-panel\s*\{\s*position: sticky;\s*top: 0;",
+            stylesheet,
+        )
         assert 'id="task-list"' in html
         assert 'id="timelines"' in html
         for element_id in re.findall(

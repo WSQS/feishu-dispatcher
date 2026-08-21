@@ -39,7 +39,7 @@ code,
 .shell {
   width: min(1180px, calc(100% - 28px));
   margin: 0 auto;
-  padding: 72px 0 56px;
+  padding: 0 0 56px;
 }
 
 .section-heading,
@@ -256,7 +256,7 @@ textarea:focus {
 
 .task-panel {
   position: sticky;
-  top: 10px;
+  top: 0;
 }
 
 .task-list {
