@@ -13,7 +13,7 @@
         <div>
           <p class="eyebrow">feishu-dispatcher</p>
           <h1>HTTP Channel</h1>
-          <p class="subtitle">一个本地 Conversation 的最小文本交互窗口</p>
+          <p class="subtitle">一个 HTTP Channel 内的多 Task 交互窗口</p>
         </div>
         <div id="status" class="status" data-tone="idle" role="status">
           请输入 token
@@ -55,32 +55,54 @@
         <p class="hint">token 仅保存在当前页面内存；刷新后需要重新输入。</p>
       </section>
 
-      <section class="timeline-panel panel" aria-labelledby="timeline-title">
-        <div class="section-heading">
-          <div>
-            <p class="section-kicker">Events</p>
-            <h2 id="timeline-title">当前页面事件</h2>
+      <div class="workspace">
+        <section class="task-panel panel" aria-labelledby="task-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-kicker">Tasks</p>
+              <h2 id="task-title">选择会话目标</h2>
+            </div>
           </div>
-          <span class="live-dot"><span></span> cursor polling</span>
-        </div>
-        <div id="timeline" class="timeline" aria-live="polite" aria-relevant="additions">
-          <div id="empty-state" class="empty-state">
-            <p>还没有事件。</p>
-            <span>连接后发送 <code>/help</code> 开始。</span>
+          <div id="task-list" class="task-list">
+            <p class="task-list-empty">连接后加载 Task。</p>
           </div>
-        </div>
-      </section>
+        </section>
 
-      <form id="composer" class="composer panel">
-        <label class="field" for="message">
-          <span>发送根消息</span>
-          <textarea id="message" name="message" rows="3" required>/help</textarea>
-        </label>
-        <div class="composer-actions">
-          <span>Ctrl / ⌘ + Enter 发送</span>
-          <button id="send" class="button button-primary" type="submit">发送</button>
+        <div class="conversation-column">
+          <section class="timeline-panel panel" aria-labelledby="timeline-title">
+            <div class="section-heading">
+              <div>
+                <p class="section-kicker">Events</p>
+                <h2 id="timeline-title">当前 Task</h2>
+              </div>
+              <span class="live-dot"><span></span> cursor polling</span>
+            </div>
+            <div class="current-target">
+              <strong id="current-task">Dispatcher</strong>
+              <code id="current-thread">root</code>
+            </div>
+            <div
+              id="timelines"
+              class="timelines"
+              aria-live="polite"
+              aria-relevant="additions"
+            ></div>
+          </section>
+
+          <form id="composer" class="composer panel">
+            <label class="field" for="message">
+              <span id="composer-target">发送给 Dispatcher</span>
+              <textarea id="message" name="message" rows="3" required>/help</textarea>
+            </label>
+            <div class="composer-actions">
+              <span>Ctrl / ⌘ + Enter 发送</span>
+              <button id="send" class="button button-primary" type="submit">
+                发送
+              </button>
+            </div>
+          </form>
         </div>
-      </form>
+      </div>
     </main>
 
     <script type="module" src="/webui/app.js"></script>

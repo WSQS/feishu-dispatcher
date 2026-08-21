@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import socket
 import threading
 import urllib.error
@@ -126,10 +127,22 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         javascript = assets["/webui/app.js"].decode("utf-8")
         assert 'src="/webui/app.js"' in html
         assert 'href="/webui/style.css"' in html
+        assert 'id="task-list"' in html
+        assert 'id="timelines"' in html
+        for element_id in re.findall(
+            r'document\.querySelector\("#([^"]+)"\)',
+            javascript,
+        ):
+            assert f'id="{element_id}"' in html
         assert "/api/channel/messages" in javascript
         assert "/api/channel/events" in javascript
+        assert 'apiRequest("/api/tasks")' in javascript
+        assert "/conversations`" in javascript
+        assert "thread_id: threadId" in javascript
+        assert "const taskThreads = new Map();" in javascript
         assert "feishu-dispatcher.http-channel.conversation" in javascript
         assert "feishu-dispatcher.http-channel.cursor" in javascript
+        assert "feishu-dispatcher.http-channel.thread" not in javascript
     finally:
         channel.stop()
 

@@ -37,7 +37,7 @@ code,
 }
 
 .shell {
-  width: min(920px, calc(100% - 28px));
+  width: min(1180px, calc(100% - 28px));
   margin: 0 auto;
   padding: 40px 0 56px;
 }
@@ -208,6 +208,118 @@ textarea:focus {
   color: #d7e0ea;
 }
 
+.workspace {
+  display: grid;
+  grid-template-columns: minmax(240px, 300px) minmax(0, 1fr);
+  align-items: start;
+  gap: 16px;
+}
+
+.task-panel {
+  position: sticky;
+  top: 10px;
+}
+
+.task-list {
+  display: grid;
+  gap: 9px;
+  max-height: calc(100vh - 210px);
+  overflow-y: auto;
+}
+
+.task-list-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.task-item {
+  display: grid;
+  gap: 7px;
+  width: 100%;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 11px;
+  background: #0d141c;
+  color: #e8edf3;
+  text-align: left;
+}
+
+.task-item:hover:not(:disabled),
+.task-item[data-selected="true"] {
+  border-color: var(--accent);
+}
+
+.task-item[data-selected="true"] {
+  background: #10221d;
+}
+
+.task-item:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.task-item-header,
+.task-detail,
+.current-target {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.task-name {
+  overflow-wrap: anywhere;
+  font-weight: 750;
+}
+
+.task-status {
+  flex: none;
+  color: var(--accent);
+  font-size: 0.7rem;
+  text-transform: uppercase;
+}
+
+.task-item[data-terminal="true"] .task-status {
+  color: var(--muted);
+}
+
+.task-description {
+  color: #c7d0dc;
+  font-size: 0.82rem;
+  line-height: 1.35;
+}
+
+.task-detail {
+  align-items: flex-start;
+  color: var(--muted);
+  font-size: 0.7rem;
+}
+
+.task-binding {
+  color: var(--warning);
+}
+
+.conversation-column {
+  min-width: 0;
+}
+
+.current-target {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  margin: -4px 0 14px;
+}
+
+.current-target strong {
+  color: #e8edf3;
+}
+
+.current-target code {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+  font-size: 0.74rem;
+}
+
 .hint {
   margin: 10px 0 0;
   font-size: 0.76rem;
@@ -227,12 +339,20 @@ textarea:focus {
   background: var(--accent);
 }
 
-.timeline {
+.timelines {
+  min-height: 200px;
+}
+
+.task-timeline {
   display: grid;
   gap: 10px;
   min-height: 200px;
   max-height: 54vh;
   overflow-y: auto;
+}
+
+.task-timeline[hidden] {
+  display: none;
 }
 
 .empty-state {
@@ -300,8 +420,6 @@ textarea:focus {
 }
 
 .composer {
-  position: sticky;
-  bottom: 10px;
   margin-bottom: 0;
 }
 
@@ -331,6 +449,18 @@ textarea:focus {
 
   .connection-grid {
     grid-template-columns: 1fr;
+  }
+
+  .workspace {
+    grid-template-columns: 1fr;
+  }
+
+  .task-panel {
+    position: static;
+  }
+
+  .task-list {
+    max-height: none;
   }
 
   .connection-grid .button,
