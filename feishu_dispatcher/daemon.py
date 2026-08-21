@@ -317,6 +317,10 @@ async def run(
                 routes={
                     ("GET", "/api/health"): workspace_health,
                     ("GET", "/api/tasks"): daemon._http_list_tasks,
+                    (
+                        "POST",
+                        "/api/tasks/{task_id}/conversations",
+                    ): daemon._http_create_task_conversation,
                     ("GET", "/api/projects"): workspace_list_projects,
                     ("GET", "/api/projects/{name}/tree"): workspace_tree,
                     (
@@ -327,6 +331,7 @@ async def run(
                 },
                 route_context={
                     "all_projects": daemon._all_projects,
+                    "channel_key": "http",
                     "scan_executor": scan_executor,
                 },
                 throttle_window=cfg.throttle_window,
@@ -2480,6 +2485,62 @@ class _Daemon:
             )
             tasks.append(summary)
         return 200, {"tasks": tasks}
+
+    async def _http_create_task_conversation(
+        self, context: dict, request: dict
+    ) -> tuple[int, dict]:
+        body = request.get("body")
+        if not isinstance(body, dict):
+            return 400, {
+                "error": "invalid_request",
+                "message": "请求体必须是 JSON object",
+            }
+        raw_conversation_id = body.get("conversation_id")
+        if not isinstance(raw_conversation_id, str) or not raw_conversation_id.strip():
+            return 400, {
+                "error": "invalid_request",
+                "message": "conversation_id 必须是非空字符串",
+            }
+
+        task_id = request["segments"]["task_id"]
+        task = self.store.get(task_id)
+        if task is None:
+            return 404, {"error": "task_not_found", "task_id": task_id}
+        if task.is_terminal:
+            return 409, {
+                "error": "task_terminal",
+                "task_id": task.task_id,
+                "status": task.status,
+            }
+
+        channel_key = context.get("channel_key")
+        if not isinstance(channel_key, str) or not channel_key.strip():
+            return 503, {"error": "channel_unavailable"}
+        parent_conversation_id = raw_conversation_id.strip()
+        parent = ConversationRef(channel_key.strip(), parent_conversation_id)
+        try:
+            channel = self._channel_for(parent)
+        except RuntimeError as exc:
+            return 503, {
+                "error": "channel_unavailable",
+                "message": str(exc),
+            }
+        thread_id = channel.create_thread(
+            parent_conversation_id,
+            f"[{task.task_id}] {task.description}",
+        )
+        if not isinstance(thread_id, str) or not thread_id.strip():
+            return 503, {"error": "channel_unavailable"}
+        thread_id = thread_id.strip()
+        self._bind_conversation(
+            ConversationRef(parent.channel_key, thread_id),
+            task.task_id,
+        )
+        return 201, {
+            "task_id": task.task_id,
+            "conversation_id": parent_conversation_id,
+            "thread_id": thread_id,
+        }
 
     def _sched_list_tasks(self) -> list[dict]:
         # 从任务台账读（含历史），而非只看内存里的活跃 session

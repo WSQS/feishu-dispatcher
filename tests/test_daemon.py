@@ -499,6 +499,7 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
     assert set(routes) == {
         ("GET", "/api/health"),
         ("GET", "/api/tasks"),
+        ("POST", "/api/tasks/{task_id}/conversations"),
         ("GET", "/api/projects"),
         ("GET", "/api/projects/{name}/tree"),
         ("GET", "/api/projects/{name}/tree/children"),
@@ -507,6 +508,7 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
     route_context = constructed["route_context"]
     assert isinstance(route_context, dict)
     assert callable(route_context["all_projects"])
+    assert route_context["channel_key"] == "http"
     assert isinstance(route_context["scan_executor"], daemon_module.ScanExecutor)
     await route_context["scan_executor"].aclose()
 
@@ -687,6 +689,256 @@ async def test_http_tasks_route_requires_token_and_runs_on_main_loop():
         assert store.read_threads == [main_thread_id]
     finally:
         http.stop()
+
+
+@pytest.mark.asyncio
+async def test_http_create_task_conversation_validates_request_and_task_state():
+    store = TaskStore(None)
+    active = store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="active task",
+        conversation=ConversationRef("feishu", "oc_active"),
+        thread_root_id="om_active",
+        workspace="C:/tmp/demo",
+        status="idle",
+    )
+    terminal = store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="done task",
+        conversation=ConversationRef("feishu", "oc_done"),
+        thread_root_id="om_done",
+        workspace="C:/tmp/demo",
+        status="done",
+    )
+    daemon, http, _ = make_daemon(store=store, channel_key="http")
+
+    cases = [
+        (
+            {"segments": {"task_id": active.task_id}, "body": None},
+            400,
+            {
+                "error": "invalid_request",
+                "message": "请求体必须是 JSON object",
+            },
+        ),
+        (
+            {
+                "segments": {"task_id": active.task_id},
+                "body": {"conversation_id": " "},
+            },
+            400,
+            {
+                "error": "invalid_request",
+                "message": "conversation_id 必须是非空字符串",
+            },
+        ),
+        (
+            {
+                "segments": {"task_id": "missing"},
+                "body": {"conversation_id": "browser-a"},
+            },
+            404,
+            {"error": "task_not_found", "task_id": "missing"},
+        ),
+        (
+            {
+                "segments": {"task_id": _DISPATCHER_TASK_ID},
+                "body": {"conversation_id": "browser-a"},
+            },
+            404,
+            {"error": "task_not_found", "task_id": _DISPATCHER_TASK_ID},
+        ),
+        (
+            {
+                "segments": {"task_id": terminal.task_id},
+                "body": {"conversation_id": "browser-a"},
+            },
+            409,
+            {
+                "error": "task_terminal",
+                "task_id": terminal.task_id,
+                "status": "done",
+            },
+        ),
+    ]
+
+    for request, expected_status, expected_payload in cases:
+        status, payload = await daemon._http_create_task_conversation(
+            {"channel_key": "http"},
+            request,
+        )
+        assert status == expected_status
+        assert payload == expected_payload
+    unavailable_status, unavailable = await daemon._http_create_task_conversation(
+        {},
+        {
+            "segments": {"task_id": active.task_id},
+            "body": {"conversation_id": "browser-a"},
+        },
+    )
+    assert unavailable_status == 503
+    assert unavailable == {"error": "channel_unavailable"}
+    assert http.created_threads == []
+    assert daemon._conversations_for_task(active.task_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_http_create_task_conversation_creates_thread_and_binds_task():
+    store = TaskStore(None)
+    task = store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="review changes",
+        conversation=ConversationRef("feishu", "oc_1"),
+        thread_root_id="om_root",
+        workspace="C:/tmp/demo",
+        status="idle",
+    )
+    daemon, http, _ = make_daemon(store=store, channel_key="http")
+
+    status, payload = await daemon._http_create_task_conversation(
+        {"channel_key": "http"},
+        {
+            "segments": {"task_id": task.task_id},
+            "body": {"conversation_id": " browser-a "},
+        },
+    )
+
+    assert status == 201
+    assert payload == {
+        "task_id": task.task_id,
+        "conversation_id": "browser-a",
+        "thread_id": "om_newroot_1",
+    }
+    assert http.created_threads == [("browser-a", "[t1] review changes")]
+    task_conversation = ConversationRef("http", "om_newroot_1")
+    assert daemon._task_for_conversation(task_conversation) is task
+    assert task.conversation_ref == ConversationRef("feishu", "oc_1")
+    assert task.thread_root_id == "om_root"
+
+    second_status, second_payload = await daemon._http_create_task_conversation(
+        {"channel_key": "http"},
+        {
+            "segments": {"task_id": task.task_id},
+            "body": {"conversation_id": "browser-a"},
+        },
+    )
+    assert second_status == 201
+    assert second_payload["thread_id"] == "om_newroot_2"
+    assert (
+        daemon._task_for_conversation(ConversationRef("http", "om_newroot_2")) is task
+    )
+
+
+@pytest.mark.asyncio
+async def test_http_task_conversation_round_trip_routes_to_existing_runner():
+    daemon, feishu, created = make_daemon()
+    await daemon._handle_message(root_msg("/run demo first"))
+    await wait_until(
+        lambda: (
+            created
+            and created[0].prompts == ["first"]
+            and any("本轮结束" in text for text in feishu.texts("om_root1"))
+        )
+    )
+    task = task_by_thread(daemon.store, "om_root1")
+    http = HttpChannel(
+        "tok-http",
+        asyncio.get_running_loop(),
+        host="127.0.0.1",
+        port=0,
+        routes={
+            (
+                "POST",
+                "/api/tasks/{task_id}/conversations",
+            ): daemon._http_create_task_conversation
+        },
+        route_context={"channel_key": "http"},
+        throttle_window=0.01,
+    )
+    daemon._channels["http"] = http
+
+    async def handle(message: ChannelMessage) -> None:
+        await daemon._handle_channel_message("http", message)
+
+    http.start(handle)
+    try:
+        status, opened = await asyncio.to_thread(
+            http_channel_request,
+            "POST",
+            http.base_url + f"/api/tasks/{task.task_id}/conversations",
+            "tok-http",
+            {"conversation_id": "browser-a"},
+        )
+        assert status == 201
+        thread_id = opened["thread_id"]
+        assert daemon._task_for_conversation(ConversationRef("http", thread_id)) is task
+
+        event_status, events = await asyncio.to_thread(
+            http_channel_request,
+            "GET",
+            http.base_url + "/api/channel/events?conversation_id=browser-a&after=0",
+            "tok-http",
+        )
+        assert event_status == 200
+        assert events["events"] == [
+            {
+                "cursor": 1,
+                "type": "thread.created",
+                "thread_id": thread_id,
+                "text": f"[{task.task_id}] first",
+            }
+        ]
+
+        accepted_status, accepted = await asyncio.to_thread(
+            http_channel_request,
+            "POST",
+            http.base_url + "/api/channel/messages",
+            "tok-http",
+            {
+                "conversation_id": "browser-a",
+                "message_id": "web-message",
+                "thread_id": thread_id,
+                "sender_id": "web-user",
+                "text": "web follow up",
+            },
+        )
+        assert accepted_status == 202
+        assert accepted == {"accepted": True}
+        await wait_until(
+            lambda: (
+                created[0].prompts == ["first", "web follow up"]
+                and any(
+                    "↪️ 同步自 http：web follow up" in text
+                    for text in feishu.texts("om_root1")
+                )
+            )
+        )
+        deadline = asyncio.get_running_loop().time() + 3
+        while True:
+            output_status, output_events = await asyncio.to_thread(
+                http_channel_request,
+                "GET",
+                http.base_url + "/api/channel/events?conversation_id=browser-a&after=1",
+                "tok-http",
+            )
+            if output_status == 200 and any(
+                event["type"] == "output.delta"
+                and "echo:web follow up" in event["text"]
+                for event in output_events["events"]
+            ):
+                break
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError((output_status, output_events))
+            await asyncio.sleep(0.01)
+        assert any(
+            event["type"] == "output.started" and event["target_id"] == thread_id
+            for event in output_events["events"]
+        )
+    finally:
+        await daemon._shutdown()
 
 
 @pytest.mark.asyncio
