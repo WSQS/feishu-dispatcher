@@ -256,7 +256,7 @@ textarea:focus {
     var(--tasks-w) auto minmax(0, 1fr) auto var(--tree-w) auto
     var(--preview-w);
   align-items: start;
-  gap: 16px;
+  gap: 8px;
 }
 
 .divider {
