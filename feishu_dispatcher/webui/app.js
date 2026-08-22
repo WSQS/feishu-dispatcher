@@ -1046,7 +1046,9 @@ function bindDivider(divider) {
     document.body.classList.add("dragging");
     const onMove = (moveEvent) => {
       const delta = moveEvent.clientX - startX;
-      columnWidths[edge] = clampColumnWidth(edge, startWidth + delta);
+      const nextWidth =
+        edge === "tasks" ? startWidth + delta : startWidth - delta;
+      columnWidths[edge] = clampColumnWidth(edge, nextWidth);
       applyColumnWidths();
     };
     const onUp = () => {
