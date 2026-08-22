@@ -39,29 +39,6 @@ async def list_projects(ctx: dict, _request: dict) -> tuple[int, dict]:
     return 200, {"items": items}
 
 
-async def tree(ctx: dict, request: dict) -> tuple[int, dict]:
-    """``GET /api/projects/{name}/tree``：列 project workspace 的文件树（os.walk）。"""
-    name = request["segments"]["name"]
-    ws = _resolve_workspace(ctx, name)
-    if isinstance(ws, tuple):
-        return ws
-    ignore = {".git", ".venv", "build", "node_modules", "__pycache__"}
-    entries = []
-    for root, dirs, fnames in ws.walk():
-        dirs[:] = [d for d in dirs if d not in ignore]
-        for f in fnames:
-            full = root / f
-            entries.append(
-                {
-                    "path": full.relative_to(ws).as_posix(),
-                    "type": "file",
-                    "size": full.stat().st_size,
-                }
-            )
-    entries.sort(key=lambda x: x["path"])
-    return 200, {"entries": entries}
-
-
 async def tree_children(ctx: dict, request: dict) -> tuple[int, dict]:
     """``GET /api/projects/{name}/tree/children?path=``：列指定目录的直接子项（按目录加载）。
 

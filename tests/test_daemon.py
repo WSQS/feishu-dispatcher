@@ -501,7 +501,6 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
         ("GET", "/api/tasks"),
         ("POST", "/api/tasks/{task_id}/conversations"),
         ("GET", "/api/projects"),
-        ("GET", "/api/projects/{name}/tree"),
         ("GET", "/api/projects/{name}/tree/children"),
         ("GET", "/api/projects/{name}/file"),
     }

@@ -17,7 +17,6 @@ from feishu_dispatcher.workspace_api import (
     file as workspace_file,
     health,
     list_projects,
-    tree as workspace_tree,
     tree_children as workspace_tree_children,
 )
 
@@ -191,58 +190,6 @@ async def test_list_projects_returns_items():
         # default_agent 兜底 copilot + 显式 opencode 都正确
         agents = {p["name"]: p["default_agent"] for p in payload["items"]}
         assert agents == {"demo": "copilot", "lib": "opencode"}
-    finally:
-        vs.stop()
-
-
-async def test_tree_lists_files():
-    import shutil
-    from pathlib import Path
-
-    ws = Path(__file__).parent / "_ws_tree"
-    ws.mkdir(exist_ok=True)
-    (ws / "main.py").write_text("print(1)")
-    (ws / "docs").mkdir(exist_ok=True)
-    (ws / "docs" / "readme.md").write_text("# demo")
-    (ws / ".git").mkdir(exist_ok=True)
-    (ws / ".git" / "config").write_text("x")  # should be skipped
-    fake = {"demo": Project(name="demo", path=ws)}
-    vs = _make_channel(
-        "tok-view",
-        routes={("GET", "/api/projects/{name}/tree"): workspace_tree},
-        host="127.0.0.1",
-        port=0,
-        ctx={"all_projects": lambda: fake},
-    )
-    vs.start(_ignore)
-    try:
-        status, payload = await asyncio.to_thread(
-            _get, vs.base_url + "/api/projects/demo/tree", "tok-view"
-        )
-        assert status == 200
-        paths = {e["path"] for e in payload["entries"]}
-        assert "main.py" in paths
-        assert "docs/readme.md" in paths
-        assert not any(".git" in p for p in paths)  # .git skipped
-    finally:
-        vs.stop()
-        shutil.rmtree(ws, ignore_errors=True)
-
-
-async def test_tree_unknown_project_404():
-    vs = _make_channel(
-        "tok-view",
-        routes={("GET", "/api/projects/{name}/tree"): workspace_tree},
-        host="127.0.0.1",
-        port=0,
-        ctx={"all_projects": lambda: {}},
-    )
-    vs.start(_ignore)
-    try:
-        status, payload = await asyncio.to_thread(
-            _get, vs.base_url + "/api/projects/nope/tree", "tok-view"
-        )
-        assert status == 404
     finally:
         vs.stop()
 

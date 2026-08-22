@@ -52,7 +52,6 @@ from .workspace_api import (
     file as workspace_file,
     health as workspace_health,
     list_projects as workspace_list_projects,
-    tree as workspace_tree,
     tree_children as workspace_tree_children,
 )
 
@@ -322,7 +321,6 @@ async def run(
                         "/api/tasks/{task_id}/conversations",
                     ): daemon._http_create_task_conversation,
                     ("GET", "/api/projects"): workspace_list_projects,
-                    ("GET", "/api/projects/{name}/tree"): workspace_tree,
                     (
                         "GET",
                         "/api/projects/{name}/tree/children",
