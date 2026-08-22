@@ -113,6 +113,35 @@
             </div>
           </form>
         </div>
+
+        <section class="file-panel panel" aria-labelledby="file-tree-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-kicker">Files</p>
+              <h2 id="file-tree-title">项目文件</h2>
+            </div>
+          </div>
+          <div id="project-bar" class="project-bar">
+            <select id="project-select" class="project-select" aria-label="选择项目">
+              <option value="">未选择项目</option>
+            </select>
+          </div>
+          <div id="file-tree" class="file-tree" aria-label="项目文件树">
+            <p class="file-tree-empty">连接后选择项目，浏览文件。</p>
+          </div>
+        </section>
+
+        <section class="preview-panel panel" aria-labelledby="file-preview-title">
+          <div class="section-heading">
+            <div>
+              <p class="section-kicker">Preview</p>
+              <h2 id="file-preview-title">文件预览</h2>
+            </div>
+          </div>
+          <div id="file-preview" class="file-preview">
+            <p class="preview-placeholder">在文件树中选择文件查看内容。</p>
+          </div>
+        </section>
       </div>
     </main>
 
