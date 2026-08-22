@@ -955,16 +955,22 @@ class _Daemon:
         - 某一级拼错/不存在 → 指出从哪一级断开，并列出其父目录下的子目录（截断防刷屏）。
         """
         p = Path(path)
-        if p.is_dir():
-            return None
-        if p.exists():  # 存在但不是目录
-            return f"这是文件不是目录：{path}"
+        try:
+            if p.is_dir():
+                return None
+            if p.exists():  # 存在但不是目录
+                return f"这是文件不是目录：{path}"
+        except OSError:
+            return f"路径不可访问：{path}"
         # 逐级向上找最后一个存在的祖先目录，定位断点在哪一级
         missing_segments: list[str] = []
         ancestor = p
-        while not ancestor.exists() and ancestor != ancestor.parent:
-            missing_segments.append(ancestor.name)
-            ancestor = ancestor.parent
+        try:
+            while not ancestor.exists() and ancestor != ancestor.parent:
+                missing_segments.append(ancestor.name)
+                ancestor = ancestor.parent
+        except OSError:
+            return f"路径不可访问：{path}"
         missing_segments.reverse()  # 自顶向下：先断的那一级在最前
         # 列出祖先下的子目录，方便用户对照纠正拼写（截断防刷屏）
         siblings: list[str] = []
