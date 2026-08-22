@@ -3,6 +3,7 @@ const TASK_POLL_INTERVAL_MS = 2000;
 const TERMINAL_TASK_STATUSES = new Set(["done", "stopped"]);
 
 const storageKeys = Object.freeze({
+  columnWidths: "feishu-dispatcher.webui.column-widths",
   conversation: "feishu-dispatcher.http-channel.conversation",
   cursor: (conversationId) =>
     `feishu-dispatcher.http-channel.cursor.${conversationId}`,
@@ -967,6 +968,106 @@ function resetConversation() {
   renderMetadata();
 }
 
+const COLUMN_DEFAULTS = Object.freeze({ tasks: 240, tree: 260, preview: 360 });
+const COLUMN_RANGES = Object.freeze({
+  tasks: Object.freeze([160, 360]),
+  tree: Object.freeze([180, 480]),
+  preview: Object.freeze([240, 720]),
+});
+
+function clampColumnWidth(edge, value) {
+  const [min, max] = COLUMN_RANGES[edge];
+  return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+function storedColumnWidths() {
+  const raw = storageGet(storageKeys.columnWidths);
+  if (!raw) {
+    return {};
+  }
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch (_error) {
+    return {};
+  }
+}
+
+const columnWidths = (() => {
+  const stored = storedColumnWidths();
+  const widths = {};
+  for (const edge of Object.keys(COLUMN_DEFAULTS)) {
+    const value = Number(stored[edge]);
+    widths[edge] = Number.isFinite(value)
+      ? clampColumnWidth(edge, value)
+      : COLUMN_DEFAULTS[edge];
+  }
+  return widths;
+})();
+
+function applyColumnWidths() {
+  const rootStyle = document.documentElement.style;
+  for (const edge of Object.keys(columnWidths)) {
+    rootStyle.setProperty(`--${edge}-w`, `${columnWidths[edge]}px`);
+  }
+}
+
+function persistColumnWidths() {
+  storageSet(storageKeys.columnWidths, JSON.stringify(columnWidths));
+}
+
+function insertDividers() {
+  const workspace = document.querySelector(".workspace");
+  const conversation = document.querySelector(".conversation-column");
+  const filePanel = document.querySelector(".file-panel");
+  const previewPanel = document.querySelector(".preview-panel");
+  const makeDivider = (edge) => {
+    const divider = document.createElement("div");
+    divider.className = "divider";
+    divider.dataset.edge = edge;
+    divider.setAttribute("role", "separator");
+    divider.setAttribute("aria-orientation", "vertical");
+    divider.title = "拖拽调整宽度 · 双击重置";
+    return divider;
+  };
+  workspace.insertBefore(makeDivider("tasks"), conversation);
+  workspace.insertBefore(makeDivider("tree"), filePanel);
+  workspace.insertBefore(makeDivider("preview"), previewPanel);
+}
+
+function bindDivider(divider) {
+  divider.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) {
+      return;
+    }
+    const edge = divider.dataset.edge;
+    const startX = event.clientX;
+    const startWidth = columnWidths[edge];
+    document.body.classList.add("dragging");
+    const onMove = (moveEvent) => {
+      const delta = moveEvent.clientX - startX;
+      columnWidths[edge] = clampColumnWidth(edge, startWidth + delta);
+      applyColumnWidths();
+    };
+    const onUp = () => {
+      document.removeEventListener("pointermove", onMove);
+      document.removeEventListener("pointerup", onUp);
+      document.body.classList.remove("dragging");
+      persistColumnWidths();
+    };
+    document.addEventListener("pointermove", onMove);
+    document.addEventListener("pointerup", onUp);
+    event.preventDefault();
+  });
+
+  divider.addEventListener("dblclick", () => {
+    const edge = divider.dataset.edge;
+    columnWidths[edge] = COLUMN_DEFAULTS[edge];
+    applyColumnWidths();
+    persistColumnWidths();
+  });
+}
+
 elements.connect.addEventListener("click", async () => {
   elements.connect.disabled = true;
   try {
@@ -1023,3 +1124,6 @@ elements.token.addEventListener("keydown", (event) => {
 ensureTimeline(selectedTaskId);
 renderSelectedTask();
 renderMetadata();
+applyColumnWidths();
+insertDividers();
+document.querySelectorAll(".divider").forEach(bindDivider);
