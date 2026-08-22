@@ -19,7 +19,10 @@ const elements = Object.freeze({
   currentTask: document.querySelector("#current-task"),
   currentThread: document.querySelector("#current-thread"),
   cursor: document.querySelector("#cursor"),
+  filePreview: document.querySelector("#file-preview"),
+  fileTree: document.querySelector("#file-tree"),
   message: document.querySelector("#message"),
+  projectSelect: document.querySelector("#project-select"),
   resetConversation: document.querySelector("#reset-conversation"),
   send: document.querySelector("#send"),
   status: document.querySelector("#status"),
@@ -45,6 +48,11 @@ let taskPollGeneration = 0;
 let taskRequestTail = Promise.resolve();
 let taskSelectionBusy = false;
 let taskSnapshot = null;
+
+let selectedProject = null;
+const treeChildrenCache = new Map();
+const expandedDirs = new Set();
+let selectedFilePath = null;
 
 class ApiError extends Error {
   constructor(status, payload) {
@@ -176,6 +184,7 @@ function renderSelectedTask() {
     timeline.hidden = taskId !== selectedTaskId;
   }
   scrollTimeline(selectedTaskId);
+  syncProjectFromTask();
 }
 
 function revealTimeline(taskId) {
@@ -462,11 +471,256 @@ async function loadTasks() {
   applyTasks(await fetchTasks());
 }
 
+async function loadProjects() {
+  const payload = await apiRequest("/api/projects");
+  const items = Array.isArray(payload.items) ? payload.items : [];
+  const previous = elements.projectSelect.value;
+  elements.projectSelect.replaceChildren();
+  const none = document.createElement("option");
+  none.value = "";
+  none.textContent = "未选择项目";
+  elements.projectSelect.append(none);
+  for (const item of items) {
+    if (!item || typeof item.name !== "string" || !item.name) {
+      continue;
+    }
+    const option = document.createElement("option");
+    option.value = item.name;
+    option.textContent = item.name;
+    elements.projectSelect.append(option);
+  }
+  if (selectedProject) {
+    elements.projectSelect.value = selectedProject;
+  } else if (previous && previous !== "") {
+    elements.projectSelect.value = previous;
+  }
+}
+
+function syncProjectFromTask() {
+  const task = tasks.get(selectedTaskId);
+  const project = task?.project || null;
+  if (project && project !== selectedProject) {
+    void setProject(project);
+  }
+}
+
+function treeChildrenKey(dirPath) {
+  return `${selectedProject ?? ""}\u0000${dirPath}`;
+}
+
+async function loadChildren(dirPath) {
+  if (!selectedProject) {
+    return;
+  }
+  const query = new URLSearchParams({ path: dirPath });
+  const payload = await apiRequest(
+    `/api/projects/${encodeURIComponent(selectedProject)}/tree/children?${query}`,
+  );
+  treeChildrenCache.set(
+    treeChildrenKey(dirPath),
+    Array.isArray(payload.entries) ? payload.entries : [],
+  );
+}
+
+function renderEntry(entry) {
+  const path = entry.path;
+  const node = document.createElement("div");
+  node.className = "tree-node";
+
+  const row = document.createElement("button");
+  row.type = "button";
+  row.className = "tree-row";
+  row.dataset.type = entry.type;
+  row.dataset.path = path;
+
+  const name = document.createElement("span");
+  name.className = "tree-name";
+  name.textContent = entry.name;
+
+  if (entry.type === "directory") {
+    const toggle = document.createElement("span");
+    toggle.className = "tree-toggle";
+    toggle.setAttribute("aria-hidden", "true");
+    if (expandedDirs.has(path)) {
+      toggle.dataset.expanded = "true";
+    }
+    row.append(toggle, name);
+    row.addEventListener("click", () => {
+      void toggleDir(path);
+    });
+  } else {
+    row.dataset.selected = String(path === selectedFilePath);
+    row.append(name);
+    row.addEventListener("click", () => {
+      void openFile(path);
+    });
+  }
+
+  node.append(row);
+
+  if (entry.type === "directory" && expandedDirs.has(path)) {
+    const childBox = document.createElement("div");
+    childBox.className = "tree-children";
+    const children = treeChildrenCache.get(treeChildrenKey(path));
+    if (children) {
+      for (const child of children) {
+        childBox.append(renderEntry(child));
+      }
+    } else {
+      const loading = document.createElement("p");
+      loading.className = "file-tree-empty";
+      loading.textContent = "加载中…";
+      childBox.append(loading);
+    }
+    node.append(childBox);
+  }
+  return node;
+}
+
+function renderTree() {
+  elements.fileTree.replaceChildren();
+  if (!selectedProject) {
+    const empty = document.createElement("p");
+    empty.className = "file-tree-empty";
+    empty.textContent = "连接后选择项目，浏览文件。";
+    elements.fileTree.append(empty);
+    return;
+  }
+  const rootChildren = treeChildrenCache.get(treeChildrenKey(""));
+  if (!rootChildren) {
+    const empty = document.createElement("p");
+    empty.className = "file-tree-empty";
+    empty.textContent = "选择项目后加载文件树。";
+    elements.fileTree.append(empty);
+    return;
+  }
+  const rootBox = document.createElement("div");
+  rootBox.className = "tree-children";
+  for (const entry of rootChildren) {
+    rootBox.append(renderEntry(entry));
+  }
+  elements.fileTree.append(rootBox);
+}
+
+async function setProject(name) {
+  const normalized = name || null;
+  const changed = normalized !== selectedProject;
+  selectedProject = normalized;
+  treeChildrenCache.clear();
+  expandedDirs.clear();
+  selectedFilePath = null;
+  elements.projectSelect.value = normalized || "";
+  renderTree();
+  renderFilePreviewPlaceholder();
+  if (!changed || !normalized) {
+    return;
+  }
+  elements.fileTree.replaceChildren();
+  const loading = document.createElement("p");
+  loading.className = "file-tree-empty";
+  loading.textContent = "加载中…";
+  elements.fileTree.append(loading);
+  try {
+    await loadChildren("");
+    renderTree();
+  } catch (error) {
+    elements.fileTree.replaceChildren();
+    const failed = document.createElement("p");
+    failed.className = "preview-error";
+    failed.textContent = error.message || "加载文件树失败";
+    elements.fileTree.append(failed);
+  }
+}
+
+async function toggleDir(path) {
+  if (!selectedProject) {
+    return;
+  }
+  if (expandedDirs.has(path)) {
+    expandedDirs.delete(path);
+    renderTree();
+    return;
+  }
+  expandedDirs.add(path);
+  if (!treeChildrenCache.has(treeChildrenKey(path))) {
+    try {
+      await loadChildren(path);
+    } catch (error) {
+      expandedDirs.delete(path);
+      showError(error);
+      renderTree();
+      return;
+    }
+  }
+  renderTree();
+}
+
+function renderFilePreviewPlaceholder() {
+  elements.filePreview.replaceChildren();
+  const placeholder = document.createElement("p");
+  placeholder.className = "preview-placeholder";
+  placeholder.textContent = "在文件树中选择文件查看内容。";
+  elements.filePreview.append(placeholder);
+}
+
+function renderFilePreview(state) {
+  elements.filePreview.replaceChildren();
+  if (state.loading) {
+    const loading = document.createElement("p");
+    loading.className = "preview-placeholder";
+    loading.textContent = `加载 ${state.path}…`;
+    elements.filePreview.append(loading);
+    return;
+  }
+  if (state.error) {
+    const failed = document.createElement("p");
+    failed.className = "preview-error";
+    failed.textContent = state.error;
+    elements.filePreview.append(failed);
+    return;
+  }
+  const header = document.createElement("div");
+  header.className = "preview-header";
+  const code = document.createElement("code");
+  code.textContent = state.path;
+  const meta = document.createElement("span");
+  if (state.binary) {
+    meta.textContent = "binary";
+  } else {
+    const lines = state.content.split("\n").length;
+    meta.textContent = `${lines} 行`;
+  }
+  header.append(code, meta);
+  const body = document.createElement("pre");
+  body.className = "preview-body";
+  body.textContent = state.binary ? "（二进制文件，不可预览）" : state.content || "（空文件）";
+  elements.filePreview.append(header, body);
+}
+
+async function openFile(path) {
+  if (!selectedProject) {
+    return;
+  }
+  selectedFilePath = path;
+  renderTree();
+  renderFilePreview({ loading: true, path });
+  try {
+    const query = new URLSearchParams({ path, rev: "work" });
+    const payload = await apiRequest(
+      `/api/projects/${encodeURIComponent(selectedProject)}/file?${query}`,
+    );
+    renderFilePreview(payload);
+  } catch (error) {
+    renderFilePreview({ error: error.message || "加载文件失败" });
+  }
+}
+
 async function connect() {
   taskPollGeneration += 1;
   setStatus("正在验证 token…", "busy");
   await apiRequest("/api/channel/health");
   await loadTasks();
+  await loadProjects();
   connected = true;
   setStatus("已连接", "ok");
   elements.connectionSettings.open = false;
@@ -756,6 +1010,9 @@ elements.message.addEventListener("keydown", (event) => {
 });
 
 elements.resetConversation.addEventListener("click", resetConversation);
+elements.projectSelect.addEventListener("change", () => {
+  void setProject(elements.projectSelect.value);
+});
 elements.token.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     event.preventDefault();
