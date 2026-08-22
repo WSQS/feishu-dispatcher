@@ -30,16 +30,6 @@ class ViewerClientHttpErrorTest {
         assertHttpErrorKind(HttpStatusCode.InternalServerError, ViewerException.Kind.PROTOCOL) { projects() }
     }
 
-    @Test
-    fun `tree_classifies_401_as_auth`() = runTest {
-        assertHttpErrorKind(HttpStatusCode.Unauthorized, ViewerException.Kind.AUTH) { tree("proj") }
-    }
-
-    @Test
-    fun `tree_classifies_500_as_protocol`() = runTest {
-        assertHttpErrorKind(HttpStatusCode.InternalServerError, ViewerException.Kind.PROTOCOL) { tree("proj") }
-    }
-
     private suspend fun assertHttpErrorKind(
         status: HttpStatusCode,
         expectedKind: ViewerException.Kind,

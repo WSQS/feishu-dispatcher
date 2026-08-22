@@ -36,14 +36,6 @@ data class ProjectItem(
 @Serializable
 data class ListProjectsResponse(val items: List<ProjectItem>)
 
-/** /api/projects/{name}/tree 返回的单个文件条目。 */
-@Serializable
-data class TreeEntry(val path: String, val type: String, val size: Long)
-
-/** /api/projects/{name}/tree 的响应体。 */
-@Serializable
-data class TreeResponse(val entries: List<TreeEntry>)
-
 /** /api/projects/{name}/tree/children 返回的单个直接子项（目录或文件，无 size）。 */
 @Serializable
 data class TreeChildrenEntry(val name: String, val path: String, val type: String)
@@ -115,25 +107,6 @@ class ViewerClient(
             r
         } catch (e: Exception) {
             Log.w(TAG, "projects: failed in ${(System.nanoTime() - t) / 1_000_000}ms", e)
-            throw ViewerException.from(e)
-        }
-    }
-
-    /** GET /api/projects/{name}/tree —— 列文件树。失败抛 [ViewerException]。 */
-    suspend fun tree(projectName: String): TreeResponse = withContext(Dispatchers.IO) {
-        val t = System.nanoTime()
-        try {
-            val r = http.get {
-                url.takeFrom(
-                    URLBuilder(baseUrl).apply { pathSegments = listOf("api", "projects", projectName, "tree") }.build(),
-                )
-                bearerAuth(token)
-                expectSuccess = true
-            }.body<TreeResponse>()
-            Log.i(TAG, "tree: ${(System.nanoTime() - t) / 1_000_000}ms (${r.entries.size} files)")
-            r
-        } catch (e: Exception) {
-            Log.w(TAG, "tree: failed in ${(System.nanoTime() - t) / 1_000_000}ms", e)
             throw ViewerException.from(e)
         }
     }
