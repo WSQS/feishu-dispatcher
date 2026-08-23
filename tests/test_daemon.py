@@ -3190,7 +3190,7 @@ async def test_get_task_returns_detail():
 
 
 # ---------------------------------------------------------------------- #
-# 审计 A：agent 动作日志（ACP tool_call → Task.actions → get_task / /task）
+# 审计 A：agent 动作日志（ACP tool_call → Session.actions → get_task / /task）
 # ---------------------------------------------------------------------- #
 
 
@@ -3349,7 +3349,7 @@ async def test_model_pinned_as_card_footer():
 
 
 async def test_no_model_agent_leaves_blank():
-    # 默认 FakeAgent 不上报模型（似 copilot）→ Task.model 空、就绪消息无模型后缀
+    # 默认 FakeAgent 不上报模型（似 copilot）→ Session.model 空、就绪消息无模型后缀
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo build"))
@@ -3437,7 +3437,7 @@ async def test_model_command_switches_and_persists():
 async def test_model_choice_survives_suspend_resume():
     # 复现 bug：/model 切换后任务挂起，load_session 恢复时模型被还原回默认。
     # ModelAgent.start() 每次都上报默认模型（模拟 opencode 重载后会话配置回默认）——
-    # 恢复不应把用户切过的 Task.model 覆盖回去，且应把选择重新 apply 回 agent。
+    # 恢复不应把用户切过的 Session.model 覆盖回去，且应把选择重新 apply 回 agent。
     store = TaskStore(None)  # 跨两个 daemon 实例共享 store = 模拟挂起 + 恢复
     d1, b1, c1 = make_daemon(store=store, agent_cls=ModelAgent)
     await d1._handle_message(root_msg("/run demo build"))
@@ -3448,7 +3448,7 @@ async def test_model_choice_survives_suspend_resume():
     assert store.get("t1").model == "zhipuai/glm-5"
     saved_sid = task_by_thread(store, "om_root1").agent_session_id
 
-    # 挂起：任务标 suspended、记录保留，Task.model 应仍是 glm-5
+    # 挂起：任务标 suspended、记录保留，Session.model 应仍是 glm-5
     await d1._shutdown()
     assert task_by_thread(store, "om_root1").status == "suspended"
     assert store.get("t1").model == "zhipuai/glm-5"
