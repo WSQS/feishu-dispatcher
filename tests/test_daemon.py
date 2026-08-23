@@ -1198,16 +1198,18 @@ def test_current_runner_registry_rejects_occupied_slot():
     runner_a = _AgentSessionRunner(
         "demo",
         "copilot",
-        task_id="t1",
+        session_id="t1",
         conversation=ConversationRef("feishu", "thread-a"),
     )
     runner_b = _AgentSessionRunner(
         "demo",
         "copilot",
-        task_id="t1",
+        session_id="t1",
         conversation=ConversationRef("feishu", "thread-b"),
     )
 
+    assert runner_a.session_id == "t1"
+    assert not hasattr(runner_a, "task_id")
     registry.register("t1", runner_a)
 
     assert registry.get_for_session("t1") is runner_a
@@ -1223,13 +1225,13 @@ def test_current_runner_registry_remove_is_expected_current_and_repeatable():
     runner_a = _AgentSessionRunner(
         "demo",
         "copilot",
-        task_id="t1",
+        session_id="t1",
         conversation=ConversationRef("feishu", "thread-a"),
     )
     runner_b = _AgentSessionRunner(
         "demo",
         "copilot",
-        task_id="t1",
+        session_id="t1",
         conversation=ConversationRef("feishu", "thread-b"),
     )
     registry.register("t1", runner_a)
@@ -1572,13 +1574,13 @@ async def test_old_runner_repeated_cleanup_does_not_remove_replacement():
     runner_a = _AgentSessionRunner(
         "demo",
         "copilot",
-        task_id="t1",
+        session_id="t1",
         conversation=ConversationRef("feishu", "thread-a"),
     )
     runner_b = _AgentSessionRunner(
         "demo",
         "copilot",
-        task_id="t1",
+        session_id="t1",
         conversation=ConversationRef("feishu", "thread-b"),
     )
     agent_a = FakeAgent(None, lambda text: None)
@@ -2058,7 +2060,7 @@ async def test_replaced_runner_late_completion_does_not_overwrite_current_state(
     runner_b = _AgentSessionRunner(
         "demo",
         "copilot",
-        task_id="t1",
+        session_id="t1",
         conversation=ConversationRef("feishu", "thread-b"),
     )
     assert daemon._runners.remove_if_current("t1", runner_a)
@@ -2367,7 +2369,7 @@ async def test_recovery_after_restart_uses_file_session_store(tmp_path: Path):
     await d2._handle_message(thread_msg("follow up", root="om_root1", mid="om_t2"))
     await wait_until(lambda: c2 and c2[0].prompts == ["follow up"])
     assert c2[0].resume_session_id == saved_sid
-    assert current_runner(d2).task_id == task_by_thread(store2, "om_root1").task_id
+    assert current_runner(d2).session_id == task_by_thread(store2, "om_root1").task_id
     assert c2[0].start_count == 1
     assert any("恢复" in t for t in b2.texts("om_root1"))
     await d2._shutdown()
@@ -3001,7 +3003,7 @@ async def test_http_list_tasks_reports_dispatcher_and_agent_runtime_state():
         _AgentSessionRunner(
             "demo",
             "copilot",
-            task_id=active.task_id,
+            session_id=active.task_id,
             conversation=active.conversation_ref,
         ),
     )
