@@ -124,6 +124,7 @@ class HttpChannel:
         self._max_conversations = max_conversations
         self._max_events = max_events
         self._max_targets = max_targets
+        self._instance_id = uuid4().hex
         self._state_lock = threading.Lock()
         self._lifecycle_lock = threading.Lock()
         self._conversations: dict[str, _ConversationState] = {}
@@ -271,7 +272,12 @@ class HttpChannel:
     def _dispatch_health(self, token: str) -> tuple[int, dict]:
         if not self._authorized(token):
             return 401, {"error": "invalid_token"}
-        return 200, {"ok": True, "channel": "http", "version": __version__}
+        return 200, {
+            "ok": True,
+            "channel": "http",
+            "version": __version__,
+            "instance_id": self._instance_id,
+        }
 
     def _dispatch_message(self, token: str, body: object) -> tuple[int, dict]:
         if not self._authorized(token):
@@ -311,9 +317,15 @@ class HttpChannel:
                 ) from exc
             if after < 0:
                 raise _HttpRequestError(400, "invalid_cursor", "after 必须是非负整数")
-            return 200, self._events_after(conversation_id, after)
+            return 200, {
+                "instance_id": self._instance_id,
+                **self._events_after(conversation_id, after),
+            }
         except _HttpRequestError as exc:
-            return exc.status, exc.payload()
+            return exc.status, {
+                "instance_id": self._instance_id,
+                **exc.payload(),
+            }
 
     def _dispatch_route(
         self,

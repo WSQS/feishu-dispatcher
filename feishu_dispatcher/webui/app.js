@@ -1,8 +1,10 @@
 const DISPATCHER_TASK_ID = "dispatcher";
+const MAX_POLL_RECOVERY_ATTEMPTS = 2;
 const TASK_POLL_INTERVAL_MS = 2000;
 const TERMINAL_TASK_STATUSES = new Set(["done", "stopped"]);
 
 const storageKeys = Object.freeze({
+  channelInstance: "feishu-dispatcher.http-channel.instance",
   columnWidths: "feishu-dispatcher.webui.column-widths",
   conversation: "feishu-dispatcher.http-channel.conversation",
   cursor: (conversationId) =>
@@ -39,7 +41,9 @@ const targetTasks = new Map();
 const taskTimelines = new Map();
 let conversationId = storedConversationId();
 let cursor = storedCursor(conversationId);
+let renderedCursor = 0;
 let conversationStarted = storageGet(storageKeys.started(conversationId)) === "1";
+let channelInstanceId = storedChannelInstanceId();
 let connected = false;
 let pollGeneration = 0;
 let selectedTaskId = DISPATCHER_TASK_ID;
@@ -115,6 +119,11 @@ function storedConversationId() {
 function storedCursor(id) {
   const value = Number.parseInt(storageGet(storageKeys.cursor(id)) || "0", 10);
   return Number.isSafeInteger(value) && value >= 0 ? value : 0;
+}
+
+function storedChannelInstanceId() {
+  const value = storageGet(storageKeys.channelInstance)?.trim();
+  return value || null;
 }
 
 function setStatus(text, tone = "idle", source = null) {
@@ -472,6 +481,46 @@ async function loadTasks() {
   applyTasks(await fetchTasks());
 }
 
+function clearChannelRuntimeState() {
+  pollGeneration += 1;
+  storageRemove(storageKeys.cursor(conversationId));
+  storageRemove(storageKeys.started(conversationId));
+  cursor = 0;
+  renderedCursor = 0;
+  conversationStarted = false;
+  selectedTaskId = DISPATCHER_TASK_ID;
+  outputs.clear();
+  taskThreads.clear();
+  targetTasks.clear();
+  ensureTimeline(selectedTaskId);
+  renderTaskList();
+  renderSelectedTask();
+  renderMetadata();
+}
+
+function acceptChannelInstance(payload, required = true) {
+  const raw = payload?.instance_id;
+  if (typeof raw !== "string" || !raw.trim()) {
+    if (required) {
+      throw new Error("HTTP Channel 未返回 instance_id");
+    }
+    return "missing";
+  }
+  const nextInstanceId = raw.trim();
+  if (nextInstanceId === channelInstanceId) {
+    return "same";
+  }
+  const result = channelInstanceId === null ? "initial" : "changed";
+  channelInstanceId = nextInstanceId;
+  storageSet(storageKeys.channelInstance, channelInstanceId);
+  clearChannelRuntimeState();
+  return result;
+}
+
+async function refreshChannelInstance() {
+  return acceptChannelInstance(await apiRequest("/api/channel/health"));
+}
+
 async function loadProjects() {
   const payload = await apiRequest("/api/projects");
   const items = Array.isArray(payload.items) ? payload.items : [];
@@ -719,19 +768,26 @@ async function openFile(path) {
 async function connect() {
   taskPollGeneration += 1;
   setStatus("正在验证 token…", "busy");
-  await apiRequest("/api/channel/health");
+  const instanceState = await refreshChannelInstance();
   await loadTasks();
   await loadProjects();
   connected = true;
-  setStatus("已连接", "ok");
+  setStatus(
+    instanceState === "changed"
+      ? "已连接 · 服务已重启，请重新打开 Task"
+      : "已连接",
+    "ok",
+  );
   elements.connectionSettings.open = false;
   startTaskPolling();
   if (conversationStarted) {
     startPolling();
   }
+  return instanceState;
 }
 
 async function createTaskConversation(task) {
+  await refreshChannelInstance();
   const payload = await apiRequest(
     `/api/tasks/${encodeURIComponent(task.task_id)}/conversations`,
     {
@@ -797,12 +853,26 @@ async function pollOnce(generation) {
   });
   const payload = await apiRequest(`/api/channel/events?${query}`);
   if (generation !== pollGeneration || targetConversationId !== conversationId) {
-    return;
+    return false;
+  }
+  const instanceState = acceptChannelInstance(payload);
+  if (instanceState !== "same") {
+    if (instanceState === "changed") {
+      setStatus("服务已重启，请重新打开 Task", "busy");
+    }
+    return false;
   }
   for (const event of payload.events || []) {
-    renderEvent(event);
-    if (Number.isSafeInteger(event.cursor) && event.cursor > cursor) {
-      cursor = event.cursor;
+    if (Number.isSafeInteger(event.cursor)) {
+      if (event.cursor > renderedCursor) {
+        renderEvent(event);
+        renderedCursor = event.cursor;
+      }
+      if (event.cursor > cursor) {
+        cursor = event.cursor;
+      }
+    } else {
+      renderEvent(event);
     }
   }
   if (Number.isSafeInteger(payload.next_cursor) && payload.next_cursor > cursor) {
@@ -810,6 +880,7 @@ async function pollOnce(generation) {
   }
   persistCursor();
   setStatus(`已连接 · cursor ${cursor}`, "ok");
+  return true;
 }
 
 function wait(milliseconds) {
@@ -821,16 +892,90 @@ function showError(error, source = null) {
   setStatus(message, "error", source);
 }
 
+function recoverPollingError(error) {
+  if (!(error instanceof ApiError)) {
+    return "unhandled";
+  }
+  const errorCode = error.payload?.error;
+  if (
+    !["unknown_conversation", "cursor_invalid", "cursor_expired"].includes(
+      errorCode,
+    )
+  ) {
+    return "unhandled";
+  }
+  const instanceState = acceptChannelInstance(error.payload, false);
+  if (instanceState === "changed" || instanceState === "initial") {
+    if (instanceState === "changed") {
+      setStatus("服务已重启，请重新打开 Task", "busy");
+    }
+    return "handled";
+  }
+  switch (errorCode) {
+    case "unknown_conversation":
+      clearChannelRuntimeState();
+      setStatus("Conversation 已失效，请重新打开 Task", "busy");
+      return "handled";
+    case "cursor_invalid": {
+      const latestCursor = error.payload.latest_cursor;
+      if (!Number.isSafeInteger(latestCursor) || latestCursor < 0) {
+        return "unhandled";
+      }
+      cursor = 0;
+      persistCursor();
+      setStatus(`cursor 已重置（服务端最新 ${latestCursor}）`, "busy");
+      return "retry";
+    }
+    case "cursor_expired": {
+      const oldestCursor = error.payload.oldest_cursor;
+      if (!Number.isSafeInteger(oldestCursor) || oldestCursor < 1) {
+        return "unhandled";
+      }
+      cursor = oldestCursor - 1;
+      persistCursor();
+      appendEvent({
+        role: "system",
+        label: "Event stream",
+        text: `较早事件已被淘汰，从 cursor ${cursor} 继续。`,
+      });
+      setStatus("较早事件已截断，正在继续接收", "busy");
+      return "retry";
+    }
+    default:
+      return "unhandled";
+  }
+}
+
 function startPolling() {
   const generation = ++pollGeneration;
   const loop = async () => {
+    let recoveryAttempts = 0;
     while (generation === pollGeneration && connected && conversationStarted) {
       try {
-        await pollOnce(generation);
-      } catch (error) {
-        if (generation === pollGeneration) {
-          showError(error);
+        if (!(await pollOnce(generation))) {
+          return;
         }
+        recoveryAttempts = 0;
+      } catch (error) {
+        if (generation !== pollGeneration) {
+          return;
+        }
+        const recovery = recoverPollingError(error);
+        if (
+          recovery === "retry" &&
+          recoveryAttempts < MAX_POLL_RECOVERY_ATTEMPTS
+        ) {
+          recoveryAttempts += 1;
+          continue;
+        }
+        if (recovery === "handled") {
+          return;
+        }
+        showError(
+          recovery === "retry"
+            ? new Error("事件 cursor 自动恢复次数已达上限")
+            : error,
+        );
         return;
       }
       await wait(700);
@@ -880,16 +1025,32 @@ function startTaskPolling() {
 }
 
 async function sendMessage(text) {
+  const requestedTaskId = selectedTaskId;
+  let instanceState = "same";
   if (taskSelectionBusy) {
     throw new Error("正在打开 Task Conversation，请稍候");
   }
   if (!connected) {
-    await connect();
+    instanceState = await connect();
+  } else {
+    instanceState = await refreshChannelInstance();
   }
-  const taskId = selectedTaskId;
+  if (
+    instanceState !== "same" &&
+    requestedTaskId !== DISPATCHER_TASK_ID
+  ) {
+    throw new Error("HTTP Channel 运行态已刷新，请重新打开 Task 后再发送");
+  }
+  if (taskSelectionBusy || selectedTaskId !== requestedTaskId) {
+    throw new Error("当前 Task 已变化，请确认后重新发送");
+  }
+  const taskId = requestedTaskId;
   const task = tasks.get(taskId);
   if (!task) {
     throw new Error("当前 Task 不存在");
+  }
+  if (taskIsTerminal(task)) {
+    throw new Error("当前 Task 已终止，不能发送");
   }
   let threadId = null;
   if (taskId !== DISPATCHER_TASK_ID) {
@@ -950,6 +1111,7 @@ function resetConversation() {
   storageRemove(storageKeys.started(conversationId));
   conversationId = newId("webui-conversation");
   cursor = 0;
+  renderedCursor = 0;
   conversationStarted = false;
   selectedTaskId = DISPATCHER_TASK_ID;
   storageSet(storageKeys.conversation, conversationId);

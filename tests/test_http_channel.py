@@ -146,6 +146,80 @@ def test_webui_polls_task_snapshots_independently():
     assert "await wait(700);" in javascript
 
 
+def test_webui_recovers_http_channel_instance_and_cursor():
+    javascript = (
+        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "app.js"
+    ).read_text(encoding="utf-8")
+
+    def section(start: str, end: str) -> str:
+        return javascript.split(start, maxsplit=1)[1].split(end, maxsplit=1)[0]
+
+    clear_state = section(
+        "function clearChannelRuntimeState()",
+        "function acceptChannelInstance",
+    )
+    accept_instance = section(
+        "function acceptChannelInstance",
+        "async function refreshChannelInstance",
+    )
+    connect = section(
+        "async function connect()", "async function createTaskConversation"
+    )
+    poll_once = section("async function pollOnce", "function wait")
+    recovery = section("function recoverPollingError", "function startPolling")
+    polling = section("function startPolling", "async function pollTasksOnce")
+    send = section("async function sendMessage", "function resetConversation")
+    reset = section("function resetConversation", "const COLUMN_DEFAULTS")
+
+    assert 'channelInstance: "feishu-dispatcher.http-channel.instance"' in javascript
+    assert "const MAX_POLL_RECOVERY_ATTEMPTS = 2;" in javascript
+    for expected in (
+        "pollGeneration += 1;",
+        "storageRemove(storageKeys.cursor(conversationId));",
+        "storageRemove(storageKeys.started(conversationId));",
+        "taskThreads.clear();",
+        "targetTasks.clear();",
+        "outputs.clear();",
+    ):
+        assert expected in clear_state
+    assert (
+        "storageSet(storageKeys.channelInstance, channelInstanceId);" in accept_instance
+    )
+    assert "clearChannelRuntimeState();" in accept_instance
+    assert "const instanceState = await refreshChannelInstance();" in connect
+    assert "return instanceState;" in connect
+    assert "const instanceState = acceptChannelInstance(payload);" in poll_once
+    assert "event.cursor > renderedCursor" in poll_once
+    for expected in (
+        'case "unknown_conversation":',
+        'case "cursor_invalid":',
+        'case "cursor_expired":',
+        '"unknown_conversation", "cursor_invalid", "cursor_expired"',
+        "cursor = oldestCursor - 1;",
+    ):
+        assert expected in recovery
+    for expected in (
+        "const generation = ++pollGeneration;",
+        "if (!(await pollOnce(generation)))",
+        "recoveryAttempts < MAX_POLL_RECOVERY_ATTEMPTS",
+    ):
+        assert expected in polling
+    for expected in (
+        "instanceState = await connect();",
+        "instanceState = await refreshChannelInstance();",
+        'instanceState !== "same"',
+        "requestedTaskId !== DISPATCHER_TASK_ID",
+        "selectedTaskId !== requestedTaskId",
+        "const taskId = requestedTaskId;",
+        "if (taskIsTerminal(task))",
+    ):
+        assert expected in send
+    assert send.index("selectedTaskId !== requestedTaskId") < send.index(
+        "const taskId = requestedTaskId;"
+    )
+    assert "renderedCursor = 0;" in reset
+
+
 async def test_webui_assets_are_same_origin_and_do_not_require_token():
     channel = HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
@@ -255,7 +329,12 @@ async def test_health_requires_token_and_returns_channel_version():
         assert missing_status == 401
         assert bad_status == 401
         assert status == 200
-        assert payload == {"ok": True, "channel": "http", "version": __version__}
+        assert payload == {
+            "ok": True,
+            "channel": "http",
+            "version": __version__,
+            "instance_id": channel._instance_id,
+        }
     finally:
         channel.stop()
 
@@ -538,6 +617,12 @@ async def test_cursor_expiry_invalid_cursor_and_conversation_capacity():
 
     channel.start(ignore)
     try:
+        unknown_status, unknown = await asyncio.to_thread(
+            _request,
+            "GET",
+            _events_url(channel, "missing"),
+            "tok-http",
+        )
         channel.send_text("browser-a", "one")
         channel.send_text("browser-a", "two")
         channel.send_text("browser-a", "three")
@@ -566,12 +651,18 @@ async def test_cursor_expiry_invalid_cursor_and_conversation_capacity():
             "tok-http",
             _message("browser-b", "message-b"),
         )
+        assert unknown_status == 404
+        assert unknown["error"] == "unknown_conversation"
+        assert unknown["instance_id"] == channel._instance_id
         assert expired_status == 409
         assert expired["error"] == "cursor_expired"
+        assert expired["instance_id"] == channel._instance_id
         assert valid_status == 200
+        assert valid["instance_id"] == channel._instance_id
         assert [event["text"] for event in valid["events"]] == ["two", "three"]
         assert invalid_status == 409
         assert invalid["error"] == "cursor_invalid"
+        assert invalid["instance_id"] == channel._instance_id
         assert capacity_status == 429
         assert capacity["error"] == "conversation_capacity"
     finally:
@@ -616,6 +707,7 @@ async def test_thread_reply_streaming_output_and_restart():
         assert events["events"][4]["status"] == "done"
 
         first_thread = channel._thread
+        first_instance_id = channel._instance_id
         assert first_thread is not None
         channel.stop()
         assert not channel.is_alive()
@@ -626,18 +718,33 @@ async def test_thread_reply_streaming_output_and_restart():
         second_thread = channel._thread
         assert second_thread is not None
         assert second_thread is not first_thread
-        health_status, _ = await asyncio.to_thread(
+        health_status, health = await asyncio.to_thread(
             _request,
             "GET",
             channel.base_url + "/api/channel/health",
             "tok-http",
         )
         assert health_status == 200
+        assert health["instance_id"] == first_instance_id
     finally:
         final_thread = channel._thread
         channel.stop()
         if final_thread is not None:
             assert not final_thread.is_alive()
+
+
+async def test_new_http_channel_object_gets_new_instance_id():
+    first = HttpChannel(
+        "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
+    )
+    second = HttpChannel(
+        "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
+    )
+    try:
+        assert first._instance_id != second._instance_id
+    finally:
+        first.stop()
+        second.stop()
 
 
 async def test_start_failure_releases_listener(monkeypatch):
