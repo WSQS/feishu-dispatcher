@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import socket
 import sys
@@ -1189,6 +1190,13 @@ async def wait_until(cond, timeout: float = 2.0) -> None:
 def current_runner(daemon: _Daemon, thread: str = "om_root1"):
     task = task_by_thread(daemon.store, thread)
     return daemon._runners.get_for_session(task.task_id) if task is not None else None
+
+
+def test_launch_uses_session_parameter_name():
+    parameters = inspect.signature(_Daemon._launch).parameters
+
+    assert "session" in parameters
+    assert "task" not in parameters
 
 
 def test_current_runner_registry_rejects_occupied_slot():
