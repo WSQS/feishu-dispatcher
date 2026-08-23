@@ -1305,13 +1305,15 @@ def test_conversation_binding_supports_runtime_dispatcher_session_identity():
     assert daemon._conversations_for_task(_DISPATCHER_SESSION_ID) == (conversation,)
 
 
-def test_task_turn_lock_is_stable_per_task_identity():
+def test_session_turn_lock_is_stable_per_session_identity():
     daemon, _, _ = make_daemon()
 
-    task_a_lock = daemon._task_turn_lock("t1")
+    session_a_lock = daemon._session_turn_lock("t1")
 
-    assert daemon._task_turn_lock("t1") is task_a_lock
-    assert daemon._task_turn_lock("t2") is not task_a_lock
+    assert not hasattr(daemon, "_task_turn_lock")
+    assert not hasattr(daemon, "_task_turn_locks")
+    assert daemon._session_turn_lock("t1") is session_a_lock
+    assert daemon._session_turn_lock("t2") is not session_a_lock
 
 
 def test_fmt_tokens_scales_units():
@@ -1343,10 +1345,10 @@ async def test_run_dispatches_and_streams_output():
     assert created[0].start_count == 1
 
 
-async def test_agent_turn_lock_serializes_only_the_same_task():
+async def test_agent_turn_lock_serializes_only_the_same_session():
     daemon, _, created = make_daemon()
-    first_task_lock = daemon._task_turn_lock("t1")
-    await first_task_lock.acquire()
+    first_session_lock = daemon._session_turn_lock("t1")
+    await first_session_lock.acquire()
 
     try:
         await daemon._handle_message(root_msg("/run demo first", mid="om_root1"))
@@ -1357,7 +1359,7 @@ async def test_agent_turn_lock_serializes_only_the_same_task():
 
         assert created[0].prompts == []
     finally:
-        first_task_lock.release()
+        first_session_lock.release()
 
     await wait_until(lambda: created[0].prompts == ["first"])
     await daemon._shutdown()
