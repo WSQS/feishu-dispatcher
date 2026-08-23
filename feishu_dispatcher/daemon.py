@@ -375,7 +375,7 @@ class TurnRequest:
 
 
 class _FanoutStreamingOutput:
-    """把一个 Task 回合的输出投影到多个 Conversation。"""
+    """把一个 Session 回合的输出投影到多个 Conversation。"""
 
     def __init__(self, outputs: list[tuple[ConversationRef, StreamingOutput]]) -> None:
         self._outputs = outputs
@@ -386,7 +386,7 @@ class _FanoutStreamingOutput:
                 output.feed(text)
             except Exception:
                 logger.exception(
-                    "Task 流式输出 feed 失败 channel=%s conversation=%s",
+                    "Session 流式输出 feed 失败 channel=%s conversation=%s",
                     conversation.channel_key,
                     conversation.conversation_id,
                 )
@@ -397,7 +397,7 @@ class _FanoutStreamingOutput:
                 output.set_footer(footer)
             except Exception:
                 logger.exception(
-                    "Task 流式输出 footer 失败 channel=%s conversation=%s",
+                    "Session 流式输出 footer 失败 channel=%s conversation=%s",
                     conversation.channel_key,
                     conversation.conversation_id,
                 )
@@ -419,7 +419,7 @@ class _FanoutStreamingOutput:
                 await getattr(output, method)(*args)
             except Exception:
                 logger.exception(
-                    "Task 流式输出 %s 失败 channel=%s conversation=%s",
+                    "Session 流式输出 %s 失败 channel=%s conversation=%s",
                     method,
                     conversation.channel_key,
                     conversation.conversation_id,
@@ -650,18 +650,18 @@ class _Daemon:
             return None
         return self.store.get(session_id)
 
-    def _conversations_for_task(
+    def _conversations_for_session(
         self,
-        task_id: str,
+        session_id: str,
         *,
         source: ConversationRef | None = None,
     ) -> tuple[ConversationRef, ...]:
-        """返回 Task 当前绑定的 Conversation 快照，来源优先且不重复。"""
-        if not self._session_identity_exists(task_id):
+        """返回 Session 当前绑定的 Conversation 快照，来源优先且不重复。"""
+        if not self._session_identity_exists(session_id):
             stale = [
                 conversation
                 for conversation, bound_session_id in self._conversation_session_ids.items()
-                if bound_session_id == task_id
+                if bound_session_id == session_id
             ]
             for conversation in stale:
                 self._conversation_session_ids.pop(conversation, None)
@@ -670,7 +670,7 @@ class _Daemon:
         conversations = [
             conversation
             for conversation, bound_session_id in self._conversation_session_ids.items()
-            if bound_session_id == task_id
+            if bound_session_id == session_id
         ]
         if source is not None:
             conversations = [
@@ -693,15 +693,15 @@ class _Daemon:
             )
         )
 
-    async def _reply_to_task(
+    async def _reply_to_session(
         self,
-        task_id: str,
+        session_id: str,
         text: str,
         *,
         source: ConversationRef | None = None,
     ) -> None:
         await self._reply_to_conversations(
-            self._conversations_for_task(task_id, source=source), text
+            self._conversations_for_session(session_id, source=source), text
         )
 
     async def _mirror_turn_input(
@@ -722,7 +722,7 @@ class _Daemon:
             f"↪️ 同步自 {source}：{request.text}",
         )
 
-    def _open_task_output(
+    def _open_session_output(
         self,
         conversations: tuple[ConversationRef, ...],
         title: str,
@@ -739,7 +739,7 @@ class _Daemon:
                 )
             except Exception:
                 logger.exception(
-                    "Task 输出创建失败 channel=%s conversation=%s",
+                    "Session 输出创建失败 channel=%s conversation=%s",
                     conversation.channel_key,
                     conversation.conversation_id,
                 )
@@ -1674,7 +1674,7 @@ class _Daemon:
                     )
                 else:
                     message = f"❌ agent 启动失败: {str(exc)[:200]}"
-                await self._reply_to_task(
+                await self._reply_to_session(
                     sess.task_id,
                     message,
                     source=startup_conversation,
@@ -1739,7 +1739,7 @@ class _Daemon:
             base = "▶️ agent 已就绪，开始执行…"
             if model:
                 base += f"（模型：{model}）"
-        await self._reply_to_task(
+        await self._reply_to_session(
             sess.task_id,
             base,
             source=startup_conversation,
@@ -1756,7 +1756,7 @@ class _Daemon:
                     if not self._runners.is_current(sess.task_id, sess):
                         break
                     self.store.update(sess.task_id, status="suspended")
-                    await self._reply_to_task(
+                    await self._reply_to_session(
                         sess.task_id,
                         "💤 空闲超时，已挂起该 agent（在本话题回复即自动恢复）。",
                         source=sess.conversation,
@@ -1771,7 +1771,7 @@ class _Daemon:
                 if queued is None:
                     status = sess.terminate_status  # stopped(/stop) 或 done(/done)
                     self.store.update(sess.task_id, status=status)  # 保留历史
-                    await self._reply_to_task(
+                    await self._reply_to_session(
                         sess.task_id,
                         "✅ 任务已完成并归档。"
                         if status == "done"
@@ -1793,7 +1793,7 @@ class _Daemon:
                         mirror_input = True
                     prompt = request.text
                     turn_conversation = request.conversation
-                    turn_conversations = self._conversations_for_task(
+                    turn_conversations = self._conversations_for_session(
                         sess.task_id,
                         source=turn_conversation,
                     )
@@ -1810,7 +1810,7 @@ class _Daemon:
                     )  # 绑定了 issue 则标 · #N（#63）
                     if issue_tag:
                         footer += f" · {issue_tag}"
-                    output = self._open_task_output(
+                    output = self._open_session_output(
                         turn_conversations,
                         title,
                         footer=footer,
@@ -1991,7 +1991,7 @@ class _Daemon:
         if not text:
             return
         if sess.worker is None or sess.worker.done():
-            await self._reply_to_task(
+            await self._reply_to_session(
                 sess.task_id,
                 "⚠️ 该 agent 已结束。发送 `/run ...` 新建任务。",
                 source=conversation,
@@ -2018,7 +2018,7 @@ class _Daemon:
                     # worker 的 cancelled 分支 continue 后即取到它，作为新一轮跑。
                     sess.enqueue(TurnRequest(new_input, conversation))
                 await self._cancel_turn(sess)
-                await self._reply_to_task(
+                await self._reply_to_session(
                     sess.task_id,
                     "🛑 已取消当前轮，改执行新指令…"
                     if new_input
@@ -2100,7 +2100,7 @@ class _Daemon:
             return
         self.store.update(sess.task_id, model=arg)
         logger.info("任务 %s 切换模型 → %s", sess.task_id, arg)
-        await self._reply_to_task(
+        await self._reply_to_session(
             sess.task_id,
             f"✅ 已切换模型为 {arg}（下一轮起生效）。",
             source=conversation,
@@ -2136,7 +2136,7 @@ class _Daemon:
             return
         if not forward_raw and text == _STOP_CMD:
             self.store.update(task.task_id, status="stopped")
-            await self._reply_to_task(
+            await self._reply_to_session(
                 task.task_id,
                 f"🛑 任务 [{task.task_id}] 已结束。",
                 source=conversation,
@@ -2144,7 +2144,7 @@ class _Daemon:
             return
         if not forward_raw and text == _DONE_CMD:
             self.store.update(task.task_id, status="done")
-            await self._reply_to_task(
+            await self._reply_to_session(
                 task.task_id,
                 f"✅ 任务 [{task.task_id}] 已完成并归档。",
                 source=conversation,
@@ -2159,7 +2159,7 @@ class _Daemon:
         if not ok:
             await self._safe_reply(reply_target, why, conversation=conversation)
             return
-        await self._reply_to_task(
+        await self._reply_to_session(
             task.task_id,
             f"♻️ 正在恢复任务 [{task.task_id}]…",
             source=conversation,
@@ -2336,7 +2336,7 @@ class _Daemon:
         self._bind_conversation(conversation, _DISPATCHER_SESSION_ID)
 
         async with self._session_turn_lock(_DISPATCHER_SESSION_ID):
-            conversations = self._conversations_for_task(
+            conversations = self._conversations_for_session(
                 _DISPATCHER_SESSION_ID,
                 source=conversation,
             )

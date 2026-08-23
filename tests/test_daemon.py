@@ -780,7 +780,7 @@ async def test_http_create_task_conversation_validates_request_and_task_state():
     assert unavailable_status == 503
     assert unavailable == {"error": "channel_unavailable"}
     assert http.created_threads == []
-    assert daemon._conversations_for_task(active.task_id) == ()
+    assert daemon._conversations_for_session(active.task_id) == ()
 
 
 @pytest.mark.asyncio
@@ -1314,7 +1314,15 @@ def test_conversation_binding_supports_runtime_dispatcher_session_identity():
     assert daemon._session_id_for_conversation(conversation) == _DISPATCHER_SESSION_ID
     assert daemon._session_for_conversation(conversation) is None
     assert daemon._session_id_for_conversation(conversation) == _DISPATCHER_SESSION_ID
-    assert daemon._conversations_for_task(_DISPATCHER_SESSION_ID) == (conversation,)
+    assert daemon._conversations_for_session(_DISPATCHER_SESSION_ID) == (conversation,)
+
+
+def test_session_fanout_helpers_have_no_task_named_aliases():
+    daemon, _, _ = make_daemon()
+
+    assert not hasattr(daemon, "_conversations_for_task")
+    assert not hasattr(daemon, "_reply_to_task")
+    assert not hasattr(daemon, "_open_task_output")
 
 
 def test_session_turn_lock_is_stable_per_session_identity():
@@ -1992,7 +2000,9 @@ async def test_bound_cross_channel_thread_routes_to_existing_runner():
     await daemon._shutdown()
 
 
-async def test_task_output_creation_failure_keeps_other_conversation_running(caplog):
+async def test_session_output_creation_failure_keeps_other_conversation_running(
+    caplog,
+):
     class BrokenOutputBridge(FakeBridge):
         def open_output(
             self, target_id: str, title: str, *, footer: str = ""
@@ -2034,7 +2044,9 @@ async def test_task_output_creation_failure_keeps_other_conversation_running(cap
         await wait_until(lambda: daemon.store.get(task.task_id).status == "idle")
 
     assert daemon.store.get(task.task_id).status == "idle"
-    assert "Task 输出创建失败 channel=broken conversation=broken-thread" in caplog.text
+    assert (
+        "Session 输出创建失败 channel=broken conversation=broken-thread" in caplog.text
+    )
     await daemon._shutdown()
 
 
@@ -2703,7 +2715,7 @@ async def test_dispatcher_root_turns_sync_between_channels():
     assert (
         daemon._session_id_for_conversation(web_conversation) == _DISPATCHER_SESSION_ID
     )
-    assert set(daemon._conversations_for_task(_DISPATCHER_SESSION_ID)) == {
+    assert set(daemon._conversations_for_session(_DISPATCHER_SESSION_ID)) == {
         feishu_conversation,
         web_conversation,
     }
