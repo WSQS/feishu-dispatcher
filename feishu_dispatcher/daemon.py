@@ -46,7 +46,7 @@ from .scheduler import (
     build_scheduler_tools,
     run_tool_loop,
 )
-from .store import Job, JobStore, ModelStore, ProjectStore, Session, TaskStore
+from .store import Job, JobStore, ModelStore, ProjectStore, Session, SessionStore
 from ._scan_executor import ScanExecutor
 from .workspace_api import (
     file as workspace_file,
@@ -290,7 +290,7 @@ async def run(
     daemon = _Daemon(
         cfg,
         discover=discover,
-        store=TaskStore(store_path.parent / "tasks.json"),
+        store=SessionStore(store_path.parent / "tasks.json"),
         project_store=ProjectStore(store_path.parent / "projects.json"),
         model_store=ModelStore(store_path.parent / "models.json"),
         job_store=JobStore(store_path.parent / "jobs.json"),
@@ -526,7 +526,7 @@ class _Daemon:
     cfg: Config
     discover: bool = False
     #: 任务台账（默认纯内存，不写盘）；run() 注入文件版（tasks.json）
-    store: TaskStore = field(default_factory=lambda: TaskStore(None))
+    store: SessionStore = field(default_factory=lambda: SessionStore(None))
     #: 运行时注册的项目台账（默认纯内存）；run() 注入文件版（projects.json）。
     #: 有效项目 = config.toml 种子（cfg.projects）+ 这里注册的，见 _all_projects
     project_store: ProjectStore = field(default_factory=lambda: ProjectStore(None))

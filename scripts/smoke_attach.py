@@ -22,7 +22,7 @@ from feishu_dispatcher.acp_client import AcpAgent, AgentSpawn
 from feishu_dispatcher.config import Config, Project
 from feishu_dispatcher.daemon import _Daemon
 from feishu_dispatcher.feishu import IncomingMessage
-from feishu_dispatcher.store import ProjectStore, TaskStore
+from feishu_dispatcher.store import ProjectStore, SessionStore
 
 REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 SECRET = "4287"
@@ -92,7 +92,7 @@ async def _wait_for(cond, timeout: float, what: str) -> None:
         raise TimeoutError(f"等待超时：{what}")
 
 
-def _attach_root(store: TaskStore) -> str | None:
+def _attach_root(store: SessionStore) -> str | None:
     tasks = store.all()
     return tasks[0].thread_root_id if tasks else None
 
@@ -143,7 +143,7 @@ async def main() -> int:
         stream_mode="text",
         agent_start_timeout=60.0,
     )
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon = _Daemon(cfg, store=store, project_store=ProjectStore(None))
     bridge = Bridge()
     daemon._bridge = bridge

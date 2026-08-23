@@ -186,7 +186,7 @@ def _task_to_record(task: Session) -> dict:
     return record
 
 
-class TaskStore:
+class SessionStore:
     """task_id → Task 台账 + Channel-scoped thread 路由 + 单调计数器。
 
     只被单个 daemon 实例（单线程 event loop）读写，无需加锁。
@@ -383,7 +383,7 @@ class ProjectStore:
     改配置文件才能动），这里是用户在飞书里 ``/project add`` / ``register_project``
     注册的、可增删的项目。daemon 加载时把两者合并成有效项目表（种子 + 注册）。
 
-    ``path=None`` 为纯内存（测试）。原子写 + 读损坏容错，与 TaskStore 一致。
+    ``path=None`` 为纯内存（测试）。原子写 + 读损坏容错，与 SessionStore 一致。
     只被单个 daemon 实例（单线程 event loop）读写，无需加锁。
     """
 
@@ -501,7 +501,7 @@ class JobStore:
     """job_id → Job 台账（落盘 jobs.json），供后台任务追踪、``bg list/logs`` 与
     完成后路由回 Task。按 ``j<N>`` 短自增、持久单调计数器、**永不复用**。
 
-    ``path=None`` 为纯内存（测试）。原子写 + 读损坏容错，与 TaskStore 一套。
+    ``path=None`` 为纯内存（测试）。原子写 + 读损坏容错，与 SessionStore 一套。
     只被单个 daemon 实例（单线程 event loop）读写，无需加锁。
     v1 不做重启穿越——daemon 重启会丢在飞的 Job 的 await（记录仍在盘上，标记为
     running 的历史 Job 视为「结果未知」，不自动恢复，见 #68）。
