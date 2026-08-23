@@ -2,7 +2,7 @@
 
 一个 Session = 派发在某项目上的一个工作单元，持有它的 agent_session_id（agent 侧记忆）、
 ConversationRef + thread_root_id（交互入口）、workspace（工作目录）。落盘到 tasks.json，
-按 `task_id`（短自增 `t<N>`，持久单调计数器、**永不复用**）索引；按
+按 `session_id`（短自增 `t<N>`，持久单调计数器、**永不复用**）索引；按
 ConversationRef + thread_root_id 路由交互线程。
 
 status 生命周期：
@@ -37,7 +37,7 @@ logger = logging.getLogger(__name__)
 # 「写临时文件 + replace」只挡**应用层**崩溃——数据先进 OS page cache，replace 改的是
 # 目录项；机器硬崩时可能改名已生效、数据块还没落盘 → 重启得到 0 字节/半截文件。
 # 三件事把这个窗口关掉：写临时文件后 fsync 让数据真正落盘、保留 .bak 作回退源、读
-# 损坏时存档而非静默清空（守住 task_id/seq 单调，避免撞回旧 id）。
+# 损坏时存档而非静默清空（守住 session_id/seq 单调，避免撞回旧 id）。
 #
 # 持久化原语（temp+fsync+replace+fsync_dir）已抽到 ``_atomic.py`` 共享。
 
@@ -72,7 +72,7 @@ def _read_json(path: Path) -> dict | None:
     主文件 OK → 返回其 payload；主文件损坏 → 存档 .corrupt-<ts> 再回退 .bak；
     主文件缺失 → 直接试 .bak；主/备都不可用 → None（调用方空起）。
 
-    关键：损坏时**不再静默清空**——先存档主文件、再尽力从 .bak 恢复，守住 task_id/seq
+    关键：损坏时**不再静默清空**——先存档主文件、再尽力从 .bak 恢复，守住 session_id/seq
     的单调（丢台账 + seq 归零会让新 task 撞回飞书话题仍引用的旧 id）。
     """
     if path.exists():
@@ -105,12 +105,12 @@ TERMINAL_STATES = frozenset({"done", "stopped"})
 _MAX_ACTIONS = 200
 
 _SESSION_RECORD_FIELDS = (
-    "task_id",
+    "session_id",
     "project_name",
     "agent_label",
     "description",
     "status",
-    "session_id",
+    "agent_session_id",
     "channel_key",
     "conversation_id",
     "thread_root_id",
@@ -129,7 +129,7 @@ _SESSION_RECORD_FIELDS = (
 
 @dataclass
 class Session:
-    task_id: str
+    session_id: str
     project_name: str
     agent_label: str
     description: str
@@ -175,19 +175,18 @@ class Session:
 
 
 def _session_from_record(record: dict) -> Session:
+    if "task_id" in record:
+        raise ValueError("不支持旧版 Session 记录字段 task_id")
     values = {key: record[key] for key in _SESSION_RECORD_FIELDS if key in record}
-    values["agent_session_id"] = values.pop("session_id", "")
     return Session(**values)
 
 
 def _session_to_record(session: Session) -> dict:
-    record = asdict(session)
-    record["session_id"] = record.pop("agent_session_id")
-    return record
+    return asdict(session)
 
 
 class SessionStore:
-    """task_id → Session 台账 + Channel-scoped thread 路由 + 单调计数器。
+    """session_id → Session 台账 + Channel-scoped thread 路由 + 单调计数器。
 
     只被单个 daemon 实例（单线程 event loop）读写，无需加锁。
     ``keep_terminal`` 限制终止 Session 的历史条数，防 tasks.json 无限涨。
@@ -210,8 +209,14 @@ class SessionStore:
             return
         try:
             self._seq = int(data.get("seq", 0))
-            for tid, d in (data.get("tasks") or {}).items():
-                self._sessions[tid] = _session_from_record(d)
+            for session_id, record in (data.get("tasks") or {}).items():
+                session = _session_from_record(record)
+                if session.session_id != session_id:
+                    raise ValueError(
+                        "Session 记录主键不一致: "
+                        f"{session_id!r} != {session.session_id!r}"
+                    )
+                self._sessions[session_id] = session
             logger.info("已加载 %d 个任务: %s", len(self._sessions), self._path)
         except Exception:
             logger.warning("任务台账解析失败，忽略: %s", self._path, exc_info=True)
@@ -224,8 +229,8 @@ class SessionStore:
         payload = {
             "seq": self._seq,
             "tasks": {
-                tid: _session_to_record(session)
-                for tid, session in self._sessions.items()
+                session_id: _session_to_record(session)
+                for session_id, session in self._sessions.items()
             },
         }
         try:
@@ -239,8 +244,8 @@ class SessionStore:
 
     # ---- 读 ---- #
 
-    def get(self, task_id: str) -> Session | None:
-        return self._sessions.get(task_id)
+    def get(self, session_id: str) -> Session | None:
+        return self._sessions.get(session_id)
 
     def by_thread(
         self, conversation: ConversationRef, thread_root_id: str
@@ -302,18 +307,22 @@ class SessionStore:
             raise ValueError("ConversationRef.channel_key 不能为空")
         if not conversation.conversation_id.strip():
             raise ValueError("ConversationRef.conversation_id 不能为空")
-        # 铸号自愈守卫（#81）：不只信持久化的 seq——同时从现有 task id 推出下界，
+        # 铸号自愈守卫（#81）：不只信持久化的 seq——同时从现有 session id 推出下界，
         # 取两者较大再 +1。即使 seq 因故被回退/污染（多实例踩踏、手工改 tasks.json、
-        # 半截原子写），也绝不落到已存在的 id 上，守住「task_id 永不复用」不变量。
+        # 半截原子写），也绝不落到已存在的 id 上，守住「session_id 永不复用」不变量。
         floor = max(
-            (int(tid[1:]) for tid in self._sessions if tid[1:].isdigit()),
+            (
+                int(session_id[1:])
+                for session_id in self._sessions
+                if session_id[1:].isdigit()
+            ),
             default=0,
         )
         self._seq = max(self._seq, floor) + 1
-        assert f"t{self._seq}" not in self._sessions, f"task_id 冲突: t{self._seq}"
+        assert f"t{self._seq}" not in self._sessions, f"session_id 冲突: t{self._seq}"
         now = self._now()
         session = Session(
-            task_id=f"t{self._seq}",
+            session_id=f"t{self._seq}",
             project_name=project_name,
             agent_label=agent_label,
             description=description,
@@ -329,16 +338,16 @@ class SessionStore:
             model=model,
             origin=origin,
         )
-        self._sessions[session.task_id] = session
+        self._sessions[session.session_id] = session
         self._flush()
         return session
 
-    def update(self, task_id: str, **changes) -> Session | None:
+    def update(self, session_id: str, **changes) -> Session | None:
         """就地更新 Session 字段（status/agent_session_id/turns…），刷新 updated_at 并落盘。
 
         改成终止态时顺带修剪历史。
         """
-        session = self._sessions.get(task_id)
+        session = self._sessions.get(session_id)
         if session is None:
             return None
         for k, v in changes.items():
@@ -349,13 +358,13 @@ class SessionStore:
         self._flush()
         return session
 
-    def add_action(self, task_id: str, action: dict) -> None:
+    def add_action(self, session_id: str, action: dict) -> None:
         """追加一条动作到 Session 的审计日志（超 ``_MAX_ACTIONS`` 丢最旧），落盘。
 
         写透式：每条 tool_call 都刷一次盘，与 store 其余部分一致；chatty agent
         的写量对个人工具可接受（max_agents 默认 3），需要再批量化。
         """
-        session = self._sessions.get(task_id)
+        session = self._sessions.get(session_id)
         if session is None:
             return
         session.actions.append(action)
@@ -371,13 +380,17 @@ class SessionStore:
             key=lambda session: session.updated_at,
         )
         for session in terminal[: -self._keep] if self._keep else terminal:
-            del self._sessions[session.task_id]
+            del self._sessions[session.session_id]
 
     def clear_terminal(self) -> int:
         """清空所有终止 Session（/clear），返回清掉的条数。"""
-        gone = [tid for tid, session in self._sessions.items() if session.is_terminal]
-        for tid in gone:
-            del self._sessions[tid]
+        gone = [
+            session_id
+            for session_id, session in self._sessions.items()
+            if session.is_terminal
+        ]
+        for session_id in gone:
+            del self._sessions[session_id]
         if gone:
             self._flush()
         return len(gone)

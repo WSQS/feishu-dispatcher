@@ -42,14 +42,16 @@ def test_create_assigns_incrementing_ids():
     s = SessionStore(None)
     t1 = make(s, thread="om_1")
     t2 = make(s, thread="om_2")
-    assert t1.task_id == "t1"
-    assert t2.task_id == "t2"
+    assert t1.session_id == "t1"
+    assert t2.session_id == "t2"
     assert t1.status == "starting"
 
 
 def test_session_store_returns_session_without_legacy_aliases():
     session = make(SessionStore(None))
     assert isinstance(session, Session)
+    assert session.session_id == "t1"
+    assert not hasattr(session, "task_id")
     assert not hasattr(store_module, "Task")
     assert not hasattr(store_module, "TaskStore")
 
@@ -76,7 +78,7 @@ def test_create_rejects_blank_conversation_ref_without_consuming_id(
             workspace="C:/x",
         )
 
-    assert make(s).task_id == "t1"
+    assert make(s).session_id == "t1"
 
 
 def test_get_and_by_thread():
@@ -120,7 +122,7 @@ def test_task_conversation_ref_persists_and_reloads(tmp_path: Path):
     )
 
     assert task.conversation_ref == conversation
-    assert SessionStore(p).get(task.task_id).conversation_ref == conversation
+    assert SessionStore(p).get(task.session_id).conversation_ref == conversation
 
 
 def test_update_mutates_and_bumps():
@@ -133,7 +135,7 @@ def test_update_mutates_and_bumps():
     assert t.agent_session_id == "ses_x"
 
 
-def test_agent_session_id_persists_with_legacy_disk_key(tmp_path: Path):
+def test_session_identity_fields_persist_with_new_disk_keys(tmp_path: Path):
     import json
 
     p = tmp_path / "tasks.json"
@@ -148,15 +150,18 @@ def test_agent_session_id_persists_with_legacy_disk_key(tmp_path: Path):
         agent_session_id="ses_x",
     )
 
+    assert task.session_id == "t1"
     assert task.agent_session_id == "ses_x"
-    assert not hasattr(task, "session_id")
+    assert not hasattr(task, "task_id")
     record = json.loads(p.read_text(encoding="utf-8"))["tasks"]["t1"]
-    assert record["session_id"] == "ses_x"
-    assert "agent_session_id" not in record
+    assert record["session_id"] == "t1"
+    assert record["agent_session_id"] == "ses_x"
+    assert "task_id" not in record
 
     loaded = SessionStore(p).get("t1")
+    assert loaded.session_id == "t1"
     assert loaded.agent_session_id == "ses_x"
-    assert not hasattr(loaded, "session_id")
+    assert not hasattr(loaded, "task_id")
 
 
 def test_persists_and_counter_never_reuses(tmp_path: Path):
@@ -167,9 +172,9 @@ def test_persists_and_counter_never_reuses(tmp_path: Path):
     s1.update("t1", status="idle")
     s2 = SessionStore(p)  # reload
     assert s2.get("t1").status == "idle"
-    assert s2.by_thread(_TEST_CONVERSATION, "om_2").task_id == "t2"
+    assert s2.by_thread(_TEST_CONVERSATION, "om_2").session_id == "t2"
     # 计数器随之持久化 → 下一个是 t3，不复用
-    assert make(s2, thread="om_3").task_id == "t3"
+    assert make(s2, thread="om_3").session_id == "t3"
 
 
 def test_prune_keeps_recent_terminal_but_counter_monotonic():
@@ -180,7 +185,7 @@ def test_prune_keeps_recent_terminal_but_counter_monotonic():
     s.update("t2", status="done")  # keep_terminal=1 → t1 被修剪
     assert s.get("t1") is None
     assert s.get("t2") is not None
-    assert make(s, thread="om_3").task_id == "t3"  # 永不复用 t1
+    assert make(s, thread="om_3").session_id == "t3"  # 永不复用 t1
 
 
 def test_create_self_heals_reverted_seq_never_reuses_id():
@@ -192,9 +197,11 @@ def test_create_self_heals_reverted_seq_never_reuses_id():
     # 模拟多实例踩踏 / 台账被回退：计数器倒退到 1
     s._seq = 1
     t = make(s, thread="om_4")
-    assert t.task_id == "t4"  # 不是 t2/t3——现有最大 id 是 3，跳到 4
-    assert s.by_thread(_TEST_CONVERSATION, "om_1").task_id == "t1"  # 老任务映射未被覆盖
-    assert s.by_thread(_TEST_CONVERSATION, "om_4").task_id == "t4"
+    assert t.session_id == "t4"  # 不是 t2/t3——现有最大 id 是 3，跳到 4
+    assert (
+        s.by_thread(_TEST_CONVERSATION, "om_1").session_id == "t1"
+    )  # 老任务映射未被覆盖
+    assert s.by_thread(_TEST_CONVERSATION, "om_4").session_id == "t4"
 
 
 def test_create_reload_with_tampered_seq_does_not_clobber(tmp_path: Path):
@@ -211,9 +218,9 @@ def test_create_reload_with_tampered_seq_does_not_clobber(tmp_path: Path):
     p.write_text(json.dumps(data), encoding="utf-8")
     s2 = SessionStore(p)  # 重载：seq=0，但仍有 t1/t2
     t = make(s2, thread="om_3")
-    assert t.task_id == "t3"  # 不复用 t1
-    assert s2.by_thread(_TEST_CONVERSATION, "om_1").task_id == "t1"  # 历史未被清空
-    assert s2.by_thread(_TEST_CONVERSATION, "om_2").task_id == "t2"
+    assert t.session_id == "t3"  # 不复用 t1
+    assert s2.by_thread(_TEST_CONVERSATION, "om_1").session_id == "t1"  # 历史未被清空
+    assert s2.by_thread(_TEST_CONVERSATION, "om_2").session_id == "t2"
 
 
 def test_failed_is_resumable_not_terminal_and_error_persists(tmp_path: Path):
@@ -244,7 +251,7 @@ def test_active_split():
     make(s, thread="om_1")  # starting → active
     make(s, thread="om_2")
     s.update("t2", status="stopped")  # terminal
-    assert [t.task_id for t in s.active()] == ["t1"]
+    assert [t.session_id for t in s.active()] == ["t1"]
 
 
 def test_corrupt_file_tolerated(tmp_path: Path):
@@ -309,11 +316,11 @@ def test_corrupt_primary_recovers_from_backup_not_wiped(tmp_path: Path):
     make(s1, thread="om_3")  # t3；.bak = {t1, t2}
     p.write_text("truncated{", encoding="utf-8")  # 系统崩溃把主文件写花
     s2 = SessionStore(p)  # 主损坏 → 回退 .bak（含 t1、t2）
-    assert s2.by_thread(_TEST_CONVERSATION, "om_1").task_id == "t1"
-    assert s2.by_thread(_TEST_CONVERSATION, "om_2").task_id == "t2"
+    assert s2.by_thread(_TEST_CONVERSATION, "om_1").session_id == "t1"
+    assert s2.by_thread(_TEST_CONVERSATION, "om_2").session_id == "t2"
     nxt = make(s2, thread="om_4")  # seq 从 .bak 恢复 → 不落回 t1
-    assert nxt.task_id not in {"t1", "t2"}
-    assert int(nxt.task_id[1:]) >= 3  # 旧行为会给 t1（清空+seq 归零）
+    assert nxt.session_id not in {"t1", "t2"}
+    assert int(nxt.session_id[1:]) >= 3  # 旧行为会给 t1（清空+seq 归零）
 
 
 def test_corrupt_primary_without_backup_archives_and_empties(tmp_path: Path):
@@ -334,7 +341,7 @@ def test_missing_primary_recovers_from_backup(tmp_path: Path):
     make(s1, thread="om_2")  # .bak = {t1}
     p.unlink()
     s2 = SessionStore(p)
-    assert s2.by_thread(_TEST_CONVERSATION, "om_1").task_id == "t1"
+    assert s2.by_thread(_TEST_CONVERSATION, "om_1").session_id == "t1"
 
 
 def test_clear_terminal():
@@ -602,7 +609,7 @@ def test_task_origin_persists_and_reloads(tmp_path: Path):
 
 
 def test_old_tasks_json_without_origin_reads_spawn(tmp_path: Path):
-    # 旧台账没有 origin 键：读入时缺省补 spawn（向后兼容）。
+    # 新身份 schema 中没有 origin 键：读入时仍缺省补 spawn。
     import json
 
     p = tmp_path / "tasks.json"
@@ -610,12 +617,12 @@ def test_old_tasks_json_without_origin_reads_spawn(tmp_path: Path):
         "seq": 1,
         "tasks": {
             "t1": {
-                "task_id": "t1",
+                "session_id": "t1",
                 "project_name": "demo",
                 "agent_label": "copilot",
                 "description": "旧任务",
                 "status": "suspended",
-                "session_id": "old_sid",
+                "agent_session_id": "old_sid",
                 "thread_root_id": "om_1",
                 "workspace": "C:/x",
                 "turns": 3,
@@ -633,9 +640,32 @@ def test_old_tasks_json_without_origin_reads_spawn(tmp_path: Path):
     s = SessionStore(p)
     assert s.get("t1").origin == "spawn"  # 缺省补齐
     assert s.get("t1").agent_session_id == "old_sid"
-    assert not hasattr(s.get("t1"), "session_id")
+    assert s.get("t1").session_id == "t1"
+    assert not hasattr(s.get("t1"), "task_id")
     assert s.get("t1").conversation_ref == ConversationRef("", "")
     assert s.by_thread(_TEST_CONVERSATION, "om_1") is None
+
+
+def test_old_session_identity_schema_is_rejected(tmp_path: Path):
+    import json
+
+    p = tmp_path / "tasks.json"
+    payload = {
+        "seq": 1,
+        "tasks": {
+            "t1": {
+                "task_id": "t1",
+                "project_name": "demo",
+                "agent_label": "copilot",
+                "description": "旧任务",
+                "status": "suspended",
+                "session_id": "old_sid",
+            }
+        },
+    }
+    p.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert SessionStore(p).all() == []
 
 
 def test_by_agent_session_matches_agent_and_session():
@@ -644,8 +674,8 @@ def test_by_agent_session_matches_agent_and_session():
     s.update("t1", agent_session_id="sid_a", agent_label="copilot")
     make(s, thread="om_2", project="other")
     s.update("t2", agent_session_id="sid_b", agent_label="opencode")
-    assert s.by_agent_session("copilot", "sid_a").task_id == "t1"
-    assert s.by_agent_session("opencode", "sid_b").task_id == "t2"
+    assert s.by_agent_session("copilot", "sid_a").session_id == "t1"
+    assert s.by_agent_session("opencode", "sid_b").session_id == "t2"
     assert s.by_agent_session("copilot", "sid_b") is None  # agent 不匹配
     assert s.by_agent_session("opencode", "sid_a") is None  # session 不匹配
 

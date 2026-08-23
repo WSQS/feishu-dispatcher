@@ -436,7 +436,7 @@ class _AgentSessionRunner:
 
     project_name: str
     agent_label: str
-    #: 关联的 Session id（当前值来自持久台账主键 Session.task_id）
+    #: 关联的 Session id（当前值来自持久台账主键 Session.session_id）
     session_id: str = ""
     #: Task 的主 Thread Conversation；生命周期事件与后台输出据此寻址。
     conversation: ConversationRef = field(
@@ -1331,7 +1331,7 @@ class _Daemon:
         existing = self.store.by_thread(conversation, thread_root)
         if (
             existing is not None
-            and self._runners.get_for_session(existing.task_id) is not None
+            and self._runners.get_for_session(existing.session_id) is not None
         ):
             logger.info("根消息 %s 已有 agent session，忽略重复 spawn", thread_root)
             return
@@ -1364,7 +1364,7 @@ class _Daemon:
         )
         await self._safe_reply(
             thread_root,
-            f"🚀 [{new_task.task_id}] 启动 {agent_label} 处理项目 "
+            f"🚀 [{new_task.session_id}] 启动 {agent_label} 处理项目 "
             f"{project_name}…\n任务: {task}",
             conversation=conversation,
         )
@@ -1448,7 +1448,7 @@ class _Daemon:
                 None,
                 "",
                 (
-                    f"⚠️ 该会话已由任务 [{existing.task_id}] 附着（agent={agent_label}）。"
+                    f"⚠️ 该会话已由任务 [{existing.session_id}] 附着（agent={agent_label}）。"
                     "请回到其话题继续，勿重复附着。"
                 ),
             )
@@ -1513,7 +1513,7 @@ class _Daemon:
         return (
             new_task,
             root,
-            f"已附着外部会话 {agent_label}/{sid} 为任务 [{new_task.task_id}]。",
+            f"已附着外部会话 {agent_label}/{sid} 为任务 [{new_task.session_id}]。",
         )
 
     async def _probe_attach(
@@ -1593,11 +1593,11 @@ class _Daemon:
         session_conversation = ConversationRef(
             session.channel_key, session.thread_root_id
         )
-        self._bind_conversation(session_conversation, session.task_id)
+        self._bind_conversation(session_conversation, session.session_id)
         sess = _AgentSessionRunner(
             project_name=session.project_name,
             agent_label=session.agent_label,
-            session_id=session.task_id,
+            session_id=session.session_id,
             conversation=session_conversation,
             cwd=session.workspace,
             resumed=resume_session_id is not None,
@@ -1627,13 +1627,13 @@ class _Daemon:
         # 透传到 agent 跑的 shell → fdx）。有控制面才注入（测试无控制面时不注入）。
         if self._control is not None:
             token = secrets.token_urlsafe(16)
-            self._bg_tokens[token] = session.task_id
+            self._bg_tokens[token] = session.session_id
             sess.bg_token = token
             env.update(
                 {
                     "FEISHU_DISPATCHER_URL": self._control.base_url,
                     "FEISHU_DISPATCHER_TOKEN": token,
-                    "FEISHU_DISPATCHER_TASK_ID": session.task_id,
+                    "FEISHU_DISPATCHER_TASK_ID": session.session_id,
                 }
             )
         sess.agent = self._make_agent(
@@ -1644,9 +1644,9 @@ class _Daemon:
         )
         if first_turn is not None:
             sess.enqueue(first_turn)
-        self._runners.register(session.task_id, sess)
+        self._runners.register(session.session_id, sess)
         sess.worker = asyncio.create_task(
-            self._agent_worker(sess, first_turn), name=f"agent-{session.task_id}"
+            self._agent_worker(sess, first_turn), name=f"agent-{session.session_id}"
         )
         return sess
 
@@ -1979,8 +1979,10 @@ class _Daemon:
             task_source = ConversationRef(conversation.channel_key, msg.conversation_id)
             task = self.store.by_thread(task_source, thread_root)
             if task is not None:
-                self._bind_conversation(conversation, task.task_id)
-        sess = self._runners.get_for_session(task.task_id) if task is not None else None
+                self._bind_conversation(conversation, task.session_id)
+        sess = (
+            self._runners.get_for_session(task.session_id) if task is not None else None
+        )
         if sess is None:
             # Thread 只负责路由到 Task；无 current runner 时再按 Task 恢复或明确提示。
             await self._recover_or_notify(
@@ -2132,23 +2134,23 @@ class _Daemon:
         if task.is_terminal:
             await self._safe_reply(
                 reply_target,
-                f"⚠️ 任务 [{task.task_id}] 已结束（{task.status}）。发送 `/run` 新开一个。",
+                f"⚠️ 任务 [{task.session_id}] 已结束（{task.status}）。发送 `/run` 新开一个。",
                 conversation=conversation,
             )
             return
         if not forward_raw and text == _STOP_CMD:
-            self.store.update(task.task_id, status="stopped")
+            self.store.update(task.session_id, status="stopped")
             await self._reply_to_session(
-                task.task_id,
-                f"🛑 任务 [{task.task_id}] 已结束。",
+                task.session_id,
+                f"🛑 任务 [{task.session_id}] 已结束。",
                 source=conversation,
             )
             return
         if not forward_raw and text == _DONE_CMD:
-            self.store.update(task.task_id, status="done")
+            self.store.update(task.session_id, status="done")
             await self._reply_to_session(
-                task.task_id,
-                f"✅ 任务 [{task.task_id}] 已完成并归档。",
+                task.session_id,
+                f"✅ 任务 [{task.session_id}] 已完成并归档。",
                 source=conversation,
             )
             return
@@ -2162,8 +2164,8 @@ class _Daemon:
             await self._safe_reply(reply_target, why, conversation=conversation)
             return
         await self._reply_to_session(
-            task.task_id,
-            f"♻️ 正在恢复任务 [{task.task_id}]…",
+            task.session_id,
+            f"♻️ 正在恢复任务 [{task.session_id}]…",
             source=conversation,
         )
 
@@ -2176,14 +2178,14 @@ class _Daemon:
         保证并发下不突破 max_agents（TOCTOU，同 _spawn_for_root）。调用点务必也别
         在 check 与本调用之间插入 await。
         """
-        if self._runners.get_for_session(task.task_id) is not None:
-            return False, f"任务 [{task.task_id}] 已在运行，无需恢复。"
+        if self._runners.get_for_session(task.session_id) is not None:
+            return False, f"任务 [{task.session_id}] 已在运行，无需恢复。"
         agent_argv = self.cfg.agents.get(task.agent_label)
         if not agent_argv or not task.agent_session_id:
-            self.store.update(task.task_id, status="failed")
+            self.store.update(task.session_id, status="failed")
             why = "agent 未配置" if not agent_argv else "无可恢复的会话"
             return False, (
-                f"⚠️ 无法恢复任务 [{task.task_id}]（{why}）。发送 `/run` 重开。"
+                f"⚠️ 无法恢复任务 [{task.session_id}]（{why}）。发送 `/run` 重开。"
             )
         if self._runners.count() >= self.cfg.max_agents:
             return False, (
@@ -2207,7 +2209,7 @@ class _Daemon:
         task = self.store.get(task_id)
         if task is None:
             return False
-        sess = self._runners.get_for_session(task.task_id)
+        sess = self._runners.get_for_session(task.session_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             sess.terminate_status = status
             sess.terminate()  # 丢弃未处理 bg 批次 + 入队 None（#79，与 /stop 同机制）
@@ -2228,7 +2230,7 @@ class _Daemon:
             parts.append(
                 "活跃任务:\n"
                 + "\n".join(
-                    f"• [{t.task_id}] {t.project_name} · {t.status}"
+                    f"• [{t.session_id}] {t.project_name} · {t.status}"
                     f"（{t.turns} 轮）：{t.description[:24]}"
                     for t in active
                 )
@@ -2237,7 +2239,7 @@ class _Daemon:
             parts.append(
                 "⚠️ 异常暂停（在话题回复即尝试恢复，或 `/stop` 结束）:\n"
                 + "\n".join(
-                    f"• [{t.task_id}] {t.project_name}：{t.error_message or '本轮异常'}"
+                    f"• [{t.session_id}] {t.project_name}：{t.error_message or '本轮异常'}"
                     for t in paused
                 )
             )
@@ -2245,7 +2247,7 @@ class _Daemon:
             parts.append(
                 "历史（近 5）:\n"
                 + "\n".join(
-                    f"• [{t.task_id}] {t.project_name} · {t.status}：{t.description[:24]}"
+                    f"• [{t.session_id}] {t.project_name} · {t.status}：{t.description[:24]}"
                     for t in terminal[-5:]
                 )
             )
@@ -2272,7 +2274,7 @@ class _Daemon:
             )
             return
         head = (
-            f"[{t.task_id}] {t.project_name} · {t.agent_label} · {t.status}"
+            f"[{t.session_id}] {t.project_name} · {t.agent_label} · {t.status}"
             f"（{t.turns} 轮）"
         )
         if t.model:
@@ -2466,7 +2468,7 @@ class _Daemon:
     @staticmethod
     def _task_summary(task: Session) -> dict:
         return {
-            "task_id": task.task_id,
+            "task_id": task.session_id,
             "project": task.project_name,
             "agent": task.agent_label,
             "description": task.description,
@@ -2492,7 +2494,7 @@ class _Daemon:
             summary.update(
                 kind="agent",
                 issue_url=task.issue_url or None,
-                active=self._runners.get_for_session(task.task_id) is not None,
+                active=self._runners.get_for_session(task.session_id) is not None,
             )
             tasks.append(summary)
         return 200, {"tasks": tasks}
@@ -2520,7 +2522,7 @@ class _Daemon:
         if task.is_terminal:
             return 409, {
                 "error": "task_terminal",
-                "task_id": task.task_id,
+                "task_id": task.session_id,
                 "status": task.status,
             }
 
@@ -2538,17 +2540,17 @@ class _Daemon:
             }
         thread_id = channel.create_thread(
             parent_conversation_id,
-            f"[{task.task_id}] {task.description}",
+            f"[{task.session_id}] {task.description}",
         )
         if not isinstance(thread_id, str) or not thread_id.strip():
             return 503, {"error": "channel_unavailable"}
         thread_id = thread_id.strip()
         self._bind_conversation(
             ConversationRef(parent.channel_key, thread_id),
-            task.task_id,
+            task.session_id,
         )
         return 201, {
-            "task_id": task.task_id,
+            "task_id": task.session_id,
             "conversation_id": parent_conversation_id,
             "thread_id": thread_id,
         }
@@ -2563,7 +2565,7 @@ class _Daemon:
         if t is None:
             return None
         return {
-            "task_id": t.task_id,
+            "task_id": t.session_id,
             "project": t.project_name,
             "agent": t.agent_label,
             "description": t.description,
@@ -2571,7 +2573,7 @@ class _Daemon:
             "turns": t.turns,
             "has_session": bool(t.agent_session_id),
             "origin": t.origin,  # 会话来源 spawn/attach
-            "active": self._runners.get_for_session(t.task_id) is not None,
+            "active": self._runners.get_for_session(t.session_id) is not None,
             "model": t.model,  # agent 当前模型（copilot 不暴露则为空）
             "issue_url": t.issue_url,  # 关联的 issue（#63）；空 = 未绑定
             "created_at": t.created_at,
@@ -2587,7 +2589,7 @@ class _Daemon:
         task = self.store.get(task_id)
         if task is None:
             return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
-        sess = self._runners.get_for_session(task.task_id)
+        sess = self._runners.get_for_session(task.session_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             sess.enqueue(
                 TurnRequest(
@@ -2629,7 +2631,7 @@ class _Daemon:
         task = self.store.get(task_id)
         if task is None:
             return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
-        sess = self._runners.get_for_session(task.task_id)
+        sess = self._runners.get_for_session(task.session_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             return f"任务 [{task_id}] 已在运行，无需恢复。"
         ok, why = self._try_resume(task, first_turn=None)
@@ -2737,7 +2739,7 @@ class _Daemon:
         )
         bound = f"（brief 来自 issue {issue_url}）" if issue_url else note
         return (
-            f"已建任务 [{new_task.task_id}]，在项目 {project_name} 启动 "
+            f"已建任务 [{new_task.session_id}]，在项目 {project_name} 启动 "
             f"{agent_label} 处理：{task}{bound}{model_note}"
         )
 
@@ -3023,7 +3025,7 @@ class _Daemon:
             self._bg_result_message(job, rc),
             conversation=ConversationRef(task.channel_key, task.thread_root_id),
         )
-        sess = self._runners.get_for_session(task.task_id)
+        sess = self._runners.get_for_session(task.session_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
             # check-set 之间无 await：单线程原子，并发完成的 job 不会漏合并/重复入队。
             if sess.pending_bg is not None:
