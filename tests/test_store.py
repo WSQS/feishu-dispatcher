@@ -1,4 +1,4 @@
-"""任务台账 TaskStore 的单元测试。"""
+"""任务台账 SessionStore 的单元测试。"""
 
 from __future__ import annotations
 
@@ -15,14 +15,18 @@ from feishu_dispatcher.store import (
     ModelStore,
     ProjectStore,
     Session,
-    TaskStore,
+    SessionStore,
 )
 
 _TEST_CONVERSATION = ConversationRef("feishu", "oc_main")
 
 
 def make(
-    store: TaskStore, *, thread: str = "om_1", project: str = "demo", desc: str = "做 X"
+    store: SessionStore,
+    *,
+    thread: str = "om_1",
+    project: str = "demo",
+    desc: str = "做 X",
 ):
     return store.create(
         project_name=project,
@@ -35,7 +39,7 @@ def make(
 
 
 def test_create_assigns_incrementing_ids():
-    s = TaskStore(None)
+    s = SessionStore(None)
     t1 = make(s, thread="om_1")
     t2 = make(s, thread="om_2")
     assert t1.task_id == "t1"
@@ -43,10 +47,11 @@ def test_create_assigns_incrementing_ids():
     assert t1.status == "starting"
 
 
-def test_task_store_returns_session_without_task_alias():
-    session = make(TaskStore(None))
+def test_session_store_returns_session_without_legacy_aliases():
+    session = make(SessionStore(None))
     assert isinstance(session, Session)
     assert not hasattr(store_module, "Task")
+    assert not hasattr(store_module, "TaskStore")
 
 
 @pytest.mark.parametrize(
@@ -59,7 +64,7 @@ def test_task_store_returns_session_without_task_alias():
 def test_create_rejects_blank_conversation_ref_without_consuming_id(
     conversation: ConversationRef, field: str
 ):
-    s = TaskStore(None)
+    s = SessionStore(None)
 
     with pytest.raises(ValueError, match=field):
         s.create(
@@ -75,7 +80,7 @@ def test_create_rejects_blank_conversation_ref_without_consuming_id(
 
 
 def test_get_and_by_thread():
-    s = TaskStore(None)
+    s = SessionStore(None)
     t = make(s, thread="om_1")
     assert s.get("t1") is t
     assert s.by_thread(_TEST_CONVERSATION, "om_1") is t
@@ -83,7 +88,7 @@ def test_get_and_by_thread():
 
 
 def test_by_thread_is_scoped_to_conversation():
-    s = TaskStore(None)
+    s = SessionStore(None)
     feishu_task = make(s, thread="shared-thread")
     web_conversation = ConversationRef("web", "oc_main")
     web_task = s.create(
@@ -103,7 +108,7 @@ def test_by_thread_is_scoped_to_conversation():
 
 def test_task_conversation_ref_persists_and_reloads(tmp_path: Path):
     p = tmp_path / "tasks.json"
-    s1 = TaskStore(p)
+    s1 = SessionStore(p)
     conversation = ConversationRef("web", "workspace-main")
     task = s1.create(
         project_name="demo",
@@ -115,11 +120,11 @@ def test_task_conversation_ref_persists_and_reloads(tmp_path: Path):
     )
 
     assert task.conversation_ref == conversation
-    assert TaskStore(p).get(task.task_id).conversation_ref == conversation
+    assert SessionStore(p).get(task.task_id).conversation_ref == conversation
 
 
 def test_update_mutates_and_bumps():
-    s = TaskStore(None)
+    s = SessionStore(None)
     make(s)
     s.update("t1", status="idle", turns=2, agent_session_id="ses_x")
     t = s.get("t1")
@@ -132,7 +137,7 @@ def test_agent_session_id_persists_with_legacy_disk_key(tmp_path: Path):
     import json
 
     p = tmp_path / "tasks.json"
-    s = TaskStore(p)
+    s = SessionStore(p)
     task = s.create(
         project_name="demo",
         agent_label="copilot",
@@ -149,18 +154,18 @@ def test_agent_session_id_persists_with_legacy_disk_key(tmp_path: Path):
     assert record["session_id"] == "ses_x"
     assert "agent_session_id" not in record
 
-    loaded = TaskStore(p).get("t1")
+    loaded = SessionStore(p).get("t1")
     assert loaded.agent_session_id == "ses_x"
     assert not hasattr(loaded, "session_id")
 
 
 def test_persists_and_counter_never_reuses(tmp_path: Path):
     p = tmp_path / "tasks.json"
-    s1 = TaskStore(p)
+    s1 = SessionStore(p)
     make(s1, thread="om_1")
     make(s1, thread="om_2")
     s1.update("t1", status="idle")
-    s2 = TaskStore(p)  # reload
+    s2 = SessionStore(p)  # reload
     assert s2.get("t1").status == "idle"
     assert s2.by_thread(_TEST_CONVERSATION, "om_2").task_id == "t2"
     # 计数器随之持久化 → 下一个是 t3，不复用
@@ -168,7 +173,7 @@ def test_persists_and_counter_never_reuses(tmp_path: Path):
 
 
 def test_prune_keeps_recent_terminal_but_counter_monotonic():
-    s = TaskStore(None, keep_terminal=1)
+    s = SessionStore(None, keep_terminal=1)
     make(s, thread="om_1")
     make(s, thread="om_2")
     s.update("t1", status="done")
@@ -180,7 +185,7 @@ def test_prune_keeps_recent_terminal_but_counter_monotonic():
 
 def test_create_self_heals_reverted_seq_never_reuses_id():
     """#81：即使 seq 被回退到已存在 id 之下，create() 也从现有 id 推下界、不复用。"""
-    s = TaskStore(None)
+    s = SessionStore(None)
     make(s, thread="om_1")  # t1
     make(s, thread="om_2")  # t2
     make(s, thread="om_3")  # t3
@@ -197,14 +202,14 @@ def test_create_reload_with_tampered_seq_does_not_clobber(tmp_path: Path):
     import json
 
     p = tmp_path / "tasks.json"
-    s1 = TaskStore(p)
+    s1 = SessionStore(p)
     make(s1, thread="om_1")  # t1
     make(s1, thread="om_2")  # t2
     # 把落盘的 seq 篡改回退（模拟另一进程写了个旧 seq）
     data = json.loads(p.read_text(encoding="utf-8"))
     data["seq"] = 0
     p.write_text(json.dumps(data), encoding="utf-8")
-    s2 = TaskStore(p)  # 重载：seq=0，但仍有 t1/t2
+    s2 = SessionStore(p)  # 重载：seq=0，但仍有 t1/t2
     t = make(s2, thread="om_3")
     assert t.task_id == "t3"  # 不复用 t1
     assert s2.by_thread(_TEST_CONVERSATION, "om_1").task_id == "t1"  # 历史未被清空
@@ -213,20 +218,20 @@ def test_create_reload_with_tampered_seq_does_not_clobber(tmp_path: Path):
 
 def test_failed_is_resumable_not_terminal_and_error_persists(tmp_path: Path):
     p = tmp_path / "tasks.json"
-    s1 = TaskStore(p)
+    s1 = SessionStore(p)
     make(s1, thread="om_1")
     s1.update("t1", status="failed", error_message="RuntimeError: boom")
     t = s1.get("t1")
     assert t.is_resumable and not t.is_terminal  # failed 可恢复、非终止
     # 持久化往返：error_message 落盘并读回
-    s2 = TaskStore(p)
+    s2 = SessionStore(p)
     assert s2.get("t1").status == "failed"
     assert s2.get("t1").error_message == "RuntimeError: boom"
 
 
 def test_failed_not_pruned(tmp_path: Path):
     # failed 不进历史修剪（同 suspended，可恢复态不清）
-    s = TaskStore(None, keep_terminal=1)
+    s = SessionStore(None, keep_terminal=1)
     make(s, thread="om_1")
     make(s, thread="om_2")
     s.update("t1", status="failed")
@@ -235,7 +240,7 @@ def test_failed_not_pruned(tmp_path: Path):
 
 
 def test_active_split():
-    s = TaskStore(None)
+    s = SessionStore(None)
     make(s, thread="om_1")  # starting → active
     make(s, thread="om_2")
     s.update("t2", status="stopped")  # terminal
@@ -245,15 +250,15 @@ def test_active_split():
 def test_corrupt_file_tolerated(tmp_path: Path):
     p = tmp_path / "tasks.json"
     p.write_text("not json{", encoding="utf-8")
-    s = TaskStore(p)
+    s = SessionStore(p)
     assert s.all() == []
     make(s, thread="om_1")
-    assert TaskStore(p).get("t1") is not None
+    assert SessionStore(p).get("t1") is not None
 
 
 def test_atomic_write_leaves_no_tmp(tmp_path: Path):
     p = tmp_path / "tasks.json"
-    s = TaskStore(p)
+    s = SessionStore(p)
     make(s)
     assert p.exists()
     assert not (tmp_path / "tasks.json.tmp").exists()
@@ -278,7 +283,7 @@ def test_flush_fsyncs_data(tmp_path: Path, monkeypatch):
         return real_fsync(fd)
 
     monkeypatch.setattr(atomic_mod.os, "fsync", spy)
-    make(TaskStore(tmp_path / "tasks.json"))
+    make(SessionStore(tmp_path / "tasks.json"))
     assert calls  # 至少 fsync 了临时文件
 
 
@@ -286,7 +291,7 @@ def test_flush_keeps_backup_of_previous_version(tmp_path: Path):
     import json
 
     p = tmp_path / "tasks.json"
-    s = TaskStore(p)
+    s = SessionStore(p)
     make(s, thread="om_1")  # 首次落盘：此前无主文件 → 无 .bak
     assert not (tmp_path / "tasks.json.bak").exists()
     make(s, thread="om_2")  # 二次落盘：上一版本降级为 .bak
@@ -298,12 +303,12 @@ def test_flush_keeps_backup_of_previous_version(tmp_path: Path):
 def test_corrupt_primary_recovers_from_backup_not_wiped(tmp_path: Path):
     """主文件损坏时从 .bak 恢复历史（不再静默清空），seq 不归零 → 不复用已恢复的 id。"""
     p = tmp_path / "tasks.json"
-    s1 = TaskStore(p)
+    s1 = SessionStore(p)
     make(s1, thread="om_1")  # t1
     make(s1, thread="om_2")  # t2；.bak = {t1}
     make(s1, thread="om_3")  # t3；.bak = {t1, t2}
     p.write_text("truncated{", encoding="utf-8")  # 系统崩溃把主文件写花
-    s2 = TaskStore(p)  # 主损坏 → 回退 .bak（含 t1、t2）
+    s2 = SessionStore(p)  # 主损坏 → 回退 .bak（含 t1、t2）
     assert s2.by_thread(_TEST_CONVERSATION, "om_1").task_id == "t1"
     assert s2.by_thread(_TEST_CONVERSATION, "om_2").task_id == "t2"
     nxt = make(s2, thread="om_4")  # seq 从 .bak 恢复 → 不落回 t1
@@ -315,7 +320,7 @@ def test_corrupt_primary_without_backup_archives_and_empties(tmp_path: Path):
     """无 .bak 可退时空起，但损坏主文件被改名存档（.corrupt-*），不再挡下次启动。"""
     p = tmp_path / "tasks.json"
     p.write_text("not json{", encoding="utf-8")
-    s = TaskStore(p)
+    s = SessionStore(p)
     assert s.all() == []
     assert len(list(tmp_path.glob("tasks.json.corrupt-*"))) == 1
     assert not p.exists()  # 损坏主文件已移走
@@ -324,16 +329,16 @@ def test_corrupt_primary_without_backup_archives_and_empties(tmp_path: Path):
 def test_missing_primary_recovers_from_backup(tmp_path: Path):
     """主文件丢失（.bak 尚在）时也从备份恢复，而非当作全新空台账。"""
     p = tmp_path / "tasks.json"
-    s1 = TaskStore(p)
+    s1 = SessionStore(p)
     make(s1, thread="om_1")
     make(s1, thread="om_2")  # .bak = {t1}
     p.unlink()
-    s2 = TaskStore(p)
+    s2 = SessionStore(p)
     assert s2.by_thread(_TEST_CONVERSATION, "om_1").task_id == "t1"
 
 
 def test_clear_terminal():
-    s = TaskStore(None)
+    s = SessionStore(None)
     make(s, thread="om_1")
     make(s, thread="om_2")
     s.update("t2", status="done")
@@ -344,17 +349,17 @@ def test_clear_terminal():
 
 def test_add_action_appends_and_persists(tmp_path: Path):
     p = tmp_path / "tasks.json"
-    s = TaskStore(p)
+    s = SessionStore(p)
     make(s, thread="om_1")
     s.add_action("t1", {"turn": 1, "kind": "edit", "title": "Editing a.py"})
     s.add_action("t1", {"turn": 1, "kind": "execute", "title": "pytest"})
     assert [a["title"] for a in s.get("t1").actions] == ["Editing a.py", "pytest"]
     # 持久化：重载后动作还在
-    assert len(TaskStore(p).get("t1").actions) == 2
+    assert len(SessionStore(p).get("t1").actions) == 2
 
 
 def test_add_action_caps_at_max_dropping_oldest():
-    s = TaskStore(None)
+    s = SessionStore(None)
     make(s, thread="om_1")
     for i in range(_MAX_ACTIONS + 5):
         s.add_action("t1", {"turn": 1, "kind": "edit", "title": f"edit {i}"})
@@ -365,7 +370,7 @@ def test_add_action_caps_at_max_dropping_oldest():
 
 
 def test_add_action_unknown_task_is_noop():
-    s = TaskStore(None)
+    s = SessionStore(None)
     s.add_action("t404", {"turn": 1, "kind": "edit", "title": "x"})  # 不抛
     assert s.get("t404") is None
 
@@ -444,7 +449,7 @@ def test_project_store_memory_mode_writes_nothing(tmp_path: Path):
 
 
 def test_task_create_records_model():
-    s = TaskStore(None)
+    s = SessionStore(None)
     t = s.create(
         project_name="p",
         agent_label="opencode",
@@ -557,13 +562,13 @@ def test_job_store_memory_mode_writes_nothing(tmp_path: Path):
 
 
 def test_task_origin_defaults_to_spawn():
-    s = TaskStore(None)
+    s = SessionStore(None)
     t = make(s, thread="om_1")
     assert t.origin == "spawn"
 
 
 def test_task_create_with_origin_attach():
-    s = TaskStore(None)
+    s = SessionStore(None)
     t = s.create(
         project_name="p",
         agent_label="opencode",
@@ -579,7 +584,7 @@ def test_task_create_with_origin_attach():
 
 def test_task_origin_persists_and_reloads(tmp_path: Path):
     p = tmp_path / "tasks.json"
-    s1 = TaskStore(p)
+    s1 = SessionStore(p)
     make(s1, thread="om_1")
     s1.create(
         project_name="p",
@@ -591,7 +596,7 @@ def test_task_origin_persists_and_reloads(tmp_path: Path):
         agent_session_id="ext_sid_1",
         origin="attach",
     )
-    s2 = TaskStore(p)
+    s2 = SessionStore(p)
     assert s2.by_thread(_TEST_CONVERSATION, "om_1").origin == "spawn"
     assert s2.by_thread(_TEST_CONVERSATION, "om_2").origin == "attach"
 
@@ -625,7 +630,7 @@ def test_old_tasks_json_without_origin_reads_spawn(tmp_path: Path):
         },
     }
     p.write_text(json.dumps(payload), encoding="utf-8")
-    s = TaskStore(p)
+    s = SessionStore(p)
     assert s.get("t1").origin == "spawn"  # 缺省补齐
     assert s.get("t1").agent_session_id == "old_sid"
     assert not hasattr(s.get("t1"), "session_id")
@@ -634,7 +639,7 @@ def test_old_tasks_json_without_origin_reads_spawn(tmp_path: Path):
 
 
 def test_by_agent_session_matches_agent_and_session():
-    s = TaskStore(None)
+    s = SessionStore(None)
     make(s, thread="om_1")
     s.update("t1", agent_session_id="sid_a", agent_label="copilot")
     make(s, thread="om_2", project="other")
@@ -647,7 +652,7 @@ def test_by_agent_session_matches_agent_and_session():
 
 def test_by_agent_session_cross_agent_same_session_id_no_conflict():
     # 跨 agent 同名 session_id 不冲突：不同 backend 的 session 命名空间独立。
-    s = TaskStore(None)
+    s = SessionStore(None)
     s.create(
         project_name="p",
         agent_label="copilot",
@@ -671,7 +676,7 @@ def test_by_agent_session_cross_agent_same_session_id_no_conflict():
 
 
 def test_by_agent_session_empty_keys_never_match():
-    s = TaskStore(None)
+    s = SessionStore(None)
     make(s, thread="om_1")
     s.update("t1", agent_session_id="sid_a", agent_label="copilot")
     assert s.by_agent_session("", "sid_a") is None

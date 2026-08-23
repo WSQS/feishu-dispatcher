@@ -34,7 +34,7 @@ from feishu_dispatcher.daemon import (
 from feishu_dispatcher.http_channel import HttpChannel
 from feishu_dispatcher.livecard import LiveCard
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
-from feishu_dispatcher.store import ProjectStore, TaskStore
+from feishu_dispatcher.store import ProjectStore, SessionStore
 from feishu_dispatcher.throttler import StreamThrottler
 
 
@@ -292,7 +292,7 @@ def make_daemon(
     agent_cls: type[FakeAgent] = FakeAgent,
     *,
     stream_mode: str = "text",
-    store: TaskStore | None = None,
+    store: SessionStore | None = None,
     project_store: ProjectStore | None = None,
     idle_timeout: float = 1800.0,
     channel_key: str = "feishu",
@@ -315,7 +315,7 @@ def make_daemon(
     )
     daemon = _Daemon(
         cfg,
-        store=store or TaskStore(None),
+        store=store or SessionStore(None),
         project_store=project_store or ProjectStore(None),
         _channels={channel_key: bridge},
         _primary_channel_key=channel_key,
@@ -631,7 +631,7 @@ async def test_http_channel_help_round_trip_stays_in_http_conversation():
 
 @pytest.mark.asyncio
 async def test_http_tasks_route_requires_token_and_runs_on_main_loop():
-    class TrackingTaskStore(TaskStore):
+    class TrackingSessionStore(SessionStore):
         def __init__(self) -> None:
             super().__init__(None)
             self.read_threads: list[int] = []
@@ -640,7 +640,7 @@ async def test_http_tasks_route_requires_token_and_runs_on_main_loop():
             self.read_threads.append(threading.get_ident())
             return super().all()
 
-    store = TrackingTaskStore()
+    store = TrackingSessionStore()
     daemon, _, _ = make_daemon(store=store)
     http = HttpChannel(
         "tok-http",
@@ -692,7 +692,7 @@ async def test_http_tasks_route_requires_token_and_runs_on_main_loop():
 
 @pytest.mark.asyncio
 async def test_http_create_task_conversation_validates_request_and_task_state():
-    store = TaskStore(None)
+    store = SessionStore(None)
     active = store.create(
         project_name="demo",
         agent_label="copilot",
@@ -785,7 +785,7 @@ async def test_http_create_task_conversation_validates_request_and_task_state():
 
 @pytest.mark.asyncio
 async def test_http_create_task_conversation_creates_thread_and_binds_task():
-    store = TaskStore(None)
+    store = SessionStore(None)
     task = store.create(
         project_name="demo",
         agent_label="copilot",
@@ -1168,7 +1168,7 @@ _TEST_CONVERSATION = ConversationRef("feishu", "oc_1")
 
 
 def task_by_thread(
-    store: TaskStore,
+    store: SessionStore,
     thread: str,
     conversation: ConversationRef = _TEST_CONVERSATION,
 ):
@@ -1237,7 +1237,7 @@ def test_current_runner_registry_remove_is_expected_current_and_repeatable():
 
 
 def test_conversation_binding_is_idempotent_and_rejects_conflict():
-    store = TaskStore(None)
+    store = SessionStore(None)
     parent = ConversationRef("feishu", "oc_1")
     task_a = store.create(
         project_name="demo",
@@ -1267,7 +1267,7 @@ def test_conversation_binding_is_idempotent_and_rejects_conflict():
 
 
 def test_conversation_binding_drops_deleted_task():
-    store = TaskStore(None)
+    store = SessionStore(None)
     task = store.create(
         project_name="demo",
         agent_label="copilot",
@@ -1735,7 +1735,7 @@ async def test_raw_forwards_stop_literally_keeps_agent():
 
 
 async def test_raw_in_dormant_thread_recovers_not_stops():
-    store = TaskStore(None)
+    store = SessionStore(None)
     _seed_task(store, thread="om_orphan")  # 可恢复的挂起任务
     daemon, bridge, created = make_daemon(store=store)
     # 挂起话题里 /raw /stop：恢复 agent 并把 /stop 当首轮转发，不当停止命令
@@ -2126,7 +2126,7 @@ def make_daemon_with_limit(
     max_agents: int,
     agent_cls: type[FakeAgent] = FakeAgent,
     *,
-    store: TaskStore | None = None,
+    store: SessionStore | None = None,
 ) -> tuple[_Daemon, FakeBridge, list[FakeAgent]]:
     cfg = Config(
         app_id="a",
@@ -2138,7 +2138,7 @@ def make_daemon_with_limit(
         max_agents=max_agents,
         stream_mode="text",
     )
-    daemon = _Daemon(cfg, store=store or TaskStore(None))
+    daemon = _Daemon(cfg, store=store or SessionStore(None))
     bridge = FakeBridge()
     daemon._channels[daemon._primary_channel_key] = bridge
     created: list[FakeAgent] = []
@@ -2294,7 +2294,7 @@ def _seed_task(
 
 
 async def test_run_creates_task():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store, channel_key="test")
     conversation = ConversationRef("test", "oc_1")
     await daemon._handle_message(root_msg("/run demo task"))
@@ -2313,9 +2313,9 @@ async def test_run_creates_task():
     await daemon._shutdown()
 
 
-async def test_recovery_after_restart_uses_file_task_store(tmp_path: Path):
+async def test_recovery_after_restart_uses_file_session_store(tmp_path: Path):
     store_path = tmp_path / "tasks.json"
-    store1 = TaskStore(store_path)
+    store1 = SessionStore(store_path)
     d1, _, _ = make_daemon(store=store1)
     await d1._handle_message(root_msg("/run demo task1"))
     await wait_until(
@@ -2328,7 +2328,7 @@ async def test_recovery_after_restart_uses_file_task_store(tmp_path: Path):
     await d1._shutdown()
     assert task_by_thread(store1, "om_root1").status == "suspended"
 
-    store2 = TaskStore(store_path)
+    store2 = SessionStore(store_path)
     d2, b2, c2 = make_daemon(store=store2)
     assert d2._runners.count() == 0
     await d2._handle_message(thread_msg("follow up", root="om_root1", mid="om_t2"))
@@ -2341,7 +2341,7 @@ async def test_recovery_after_restart_uses_file_task_store(tmp_path: Path):
 
 
 async def test_recovery_turn_fans_out_start_and_output():
-    store = TaskStore(None)
+    store = SessionStore(None)
     task = _seed_task(store, thread="om_main")
     daemon, feishu, created = make_daemon(store=store)
     web = FakeBridge()
@@ -2375,7 +2375,7 @@ async def test_recovery_turn_fans_out_start_and_output():
 
 
 async def test_cross_channel_recovery_start_failure_fans_out():
-    store = TaskStore(None)
+    store = SessionStore(None)
     task = _seed_task(store, thread="om_main")
     daemon, feishu, created = make_daemon(
         store=store,
@@ -2409,7 +2409,7 @@ async def test_cross_channel_turn_error_fans_out():
             self.prompts.append(text)
             raise RuntimeError("boom")
 
-    store = TaskStore(None)
+    store = SessionStore(None)
     task = store.create(
         project_name="demo",
         agent_label="copilot",
@@ -2450,7 +2450,7 @@ async def test_reply_to_unknown_topic_notifies_not_silent():
 
 
 async def test_stop_marks_task_stopped():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: task_by_thread(store, "om_root1") is not None)
@@ -2459,7 +2459,7 @@ async def test_stop_marks_task_stopped():
 
 
 async def test_recovery_fails_when_agent_unconfigured():
-    store = TaskStore(None)
+    store = SessionStore(None)
     _seed_task(store, thread="om_orphan", agent="ghost")  # agent 已不在配置
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(thread_msg("hello", root="om_orphan", mid="om_y"))
@@ -2469,7 +2469,7 @@ async def test_recovery_fails_when_agent_unconfigured():
 
 
 async def test_orphan_stop_marks_stopped_without_recovering():
-    store = TaskStore(None)
+    store = SessionStore(None)
     task = _seed_task(store, thread="om_orphan")
     daemon, bridge, created = make_daemon(store=store)
     conversation = ConversationRef("feishu", "om_orphan")
@@ -2484,7 +2484,7 @@ async def test_orphan_stop_marks_stopped_without_recovering():
 
 
 async def test_terminal_task_reply_not_auto_resumed():
-    store = TaskStore(None)
+    store = SessionStore(None)
     _seed_task(store, thread="om_done", status="done")
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(thread_msg("continue", root="om_done", mid="om_d"))
@@ -2493,7 +2493,7 @@ async def test_terminal_task_reply_not_auto_resumed():
 
 
 async def test_recovery_respects_max_agents():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon_with_limit(max_agents=1, store=store)
     await daemon._handle_message(root_msg("/run demo task1", mid="om_r1"))
     await wait_until(lambda: created and created[0].prompts == ["task1"])
@@ -2510,7 +2510,7 @@ async def test_recovery_respects_max_agents():
 
 
 async def test_idle_timeout_suspends_but_keeps_record_recoverable():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store, idle_timeout=0.1)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
@@ -3041,7 +3041,7 @@ async def test_nl_without_llm_falls_back_to_usage():
 
 
 async def test_send_to_task_enqueues_to_running_task():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo first"))
     await wait_until(lambda: created and created[0].prompts == ["first"])
@@ -3053,7 +3053,7 @@ async def test_send_to_task_enqueues_to_running_task():
 
 
 async def test_send_to_task_resumes_suspended_task():
-    store = TaskStore(None)
+    store = SessionStore(None)
     _seed_task(store, thread="om_s", session_id="sid_s", status="suspended")
     daemon, bridge, created = make_daemon(store=store)
     out = await daemon._sched_send_to_task("t1", "继续")
@@ -3064,7 +3064,7 @@ async def test_send_to_task_resumes_suspended_task():
 
 
 async def test_send_to_task_terminal_points_to_resume():
-    store = TaskStore(None)
+    store = SessionStore(None)
     _seed_task(store, thread="om_d", status="done")
     daemon, bridge, created = make_daemon(store=store)
     out = await daemon._sched_send_to_task("t1", "继续")
@@ -3080,7 +3080,7 @@ async def test_send_to_task_unknown_id():
 
 
 async def test_resume_task_revives_suspended_without_running_a_turn():
-    store = TaskStore(None)
+    store = SessionStore(None)
     _seed_task(store, thread="om_s", session_id="sid_s", status="suspended")
     daemon, bridge, created = make_daemon(store=store)
     out = await daemon._sched_resume_task("t1")
@@ -3093,7 +3093,7 @@ async def test_resume_task_revives_suspended_without_running_a_turn():
 
 
 async def test_resume_task_already_running_is_noop():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
@@ -3104,7 +3104,7 @@ async def test_resume_task_already_running_is_noop():
 
 
 async def test_mark_done_active_archives_and_closes_agent():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
@@ -3118,7 +3118,7 @@ async def test_mark_done_active_archives_and_closes_agent():
 
 
 async def test_mark_done_inactive_task_updates_ledger():
-    store = TaskStore(None)
+    store = SessionStore(None)
     _seed_task(store, thread="om_s", status="suspended")
     daemon, bridge, created = make_daemon(store=store)
     out = await daemon._sched_mark_done("t1")
@@ -3134,7 +3134,7 @@ async def test_mark_done_unknown_id():
 
 
 async def test_done_command_in_thread_archives_and_closes():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
@@ -3145,7 +3145,7 @@ async def test_done_command_in_thread_archives_and_closes():
 
 
 async def test_done_command_on_suspended_task_without_recovering():
-    store = TaskStore(None)
+    store = SessionStore(None)
     _seed_task(store, thread="om_s", status="suspended")
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(thread_msg("/done", root="om_s", mid="om_dn"))
@@ -3155,7 +3155,7 @@ async def test_done_command_on_suspended_task_without_recovering():
 
 
 async def test_clear_command_clears_terminal_history():
-    store = TaskStore(None)
+    store = SessionStore(None)
     _seed_task(store, thread="om_old", status="stopped")  # 终止历史
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/clear", mid="om_c"))
@@ -3174,7 +3174,7 @@ async def test_reboot_command_requests_restart_and_replies():
 
 
 async def test_get_task_returns_detail():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo do it"))
     await wait_until(lambda: store.get("t1") and store.get("t1").agent_session_id)
@@ -3206,7 +3206,7 @@ class ActionAgent(FakeAgent):
 
 
 async def test_tool_call_actions_logged_to_task_with_turn():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store, agent_cls=ActionAgent)
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and len(store.get("t1").actions) == 2)
@@ -3217,7 +3217,7 @@ async def test_tool_call_actions_logged_to_task_with_turn():
 
 
 async def test_actions_tagged_with_incrementing_turn():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store, agent_cls=ActionAgent)
     await daemon._handle_message(root_msg("/run demo first"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
@@ -3229,7 +3229,7 @@ async def test_actions_tagged_with_incrementing_turn():
 
 
 async def test_get_task_includes_action_log():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store, agent_cls=ActionAgent)
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
@@ -3243,7 +3243,7 @@ async def test_get_task_includes_action_log():
 
 
 async def test_task_command_shows_detail_and_actions():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store, agent_cls=ActionAgent)
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
@@ -3260,7 +3260,7 @@ async def test_task_command_unknown_id_replies_not_found():
 
 
 async def test_last_output_captured_from_agent_reply():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
@@ -3269,7 +3269,7 @@ async def test_last_output_captured_from_agent_reply():
 
 
 async def test_get_task_includes_last_output():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
@@ -3287,7 +3287,7 @@ async def test_completion_notification_includes_reply_snippet():
 
 
 async def test_task_command_shows_last_output():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
@@ -3303,7 +3303,7 @@ async def test_task_command_shows_last_output():
 
 
 async def test_model_captured_and_surfaced():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store, agent_cls=ModelAgent)
     await daemon._handle_message(root_msg("/run demo build"))
     # 等一轮跑完：此时 start（含采集模型）+ 就绪消息都已落地，避开采集/发消息竞态
@@ -3317,7 +3317,7 @@ async def test_model_captured_and_surfaced():
 
 
 async def test_task_command_shows_model():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store, agent_cls=ModelAgent)
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
@@ -3328,7 +3328,7 @@ async def test_task_command_shows_model():
 
 
 async def test_model_pinned_as_card_footer():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(
         store=store, agent_cls=ModelAgent, stream_mode="card"
     )
@@ -3350,7 +3350,7 @@ async def test_model_pinned_as_card_footer():
 
 async def test_no_model_agent_leaves_blank():
     # 默认 FakeAgent 不上报模型（似 copilot）→ Session.model 空、就绪消息无模型后缀
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
@@ -3362,7 +3362,7 @@ async def test_no_model_agent_leaves_blank():
 
 async def test_card_footer_shows_project_and_model():
     # #44：卡片 footer 与模型同一行显示项目名，滚到任意卡片都可辨这条话题的归属
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(
         store=store, agent_cls=ModelAgent, stream_mode="card"
     )
@@ -3385,7 +3385,7 @@ async def test_card_footer_shows_project_and_model():
 
 async def test_card_footer_project_only_when_no_model():
     # 无模型（似 copilot）：footer 仍显示项目名（不带「模型：」）
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store, stream_mode="card")
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
@@ -3415,7 +3415,7 @@ async def _run_model_agent(store):
 
 
 async def test_model_command_lists_current_and_available():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = await _run_model_agent(store)
     await daemon._handle_message(thread_msg("/model", mid="om_m"))
     reply = "\n".join(bridge.texts("om_root1"))
@@ -3425,7 +3425,7 @@ async def test_model_command_lists_current_and_available():
 
 
 async def test_model_command_switches_and_persists():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = await _run_model_agent(store)
     await daemon._handle_message(thread_msg("/model zhipuai/glm-5", mid="om_m"))
     assert created[0].set_model_calls == ["zhipuai/glm-5"]  # 调了 ACP set_config_option
@@ -3438,7 +3438,7 @@ async def test_model_choice_survives_suspend_resume():
     # 复现 bug：/model 切换后任务挂起，load_session 恢复时模型被还原回默认。
     # ModelAgent.start() 每次都上报默认模型（模拟 opencode 重载后会话配置回默认）——
     # 恢复不应把用户切过的 Session.model 覆盖回去，且应把选择重新 apply 回 agent。
-    store = TaskStore(None)  # 跨两个 daemon 实例共享 store = 模拟挂起 + 恢复
+    store = SessionStore(None)  # 跨两个 daemon 实例共享 store = 模拟挂起 + 恢复
     d1, b1, c1 = make_daemon(store=store, agent_cls=ModelAgent)
     await d1._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
@@ -3467,7 +3467,7 @@ async def test_model_choice_survives_suspend_resume():
 
 
 async def test_model_command_rejects_unknown():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = await _run_model_agent(store)
     await daemon._handle_message(thread_msg("/model no-such-model", mid="om_m"))
     assert created[0].set_model_calls == []  # 未知模型不下发
@@ -3477,7 +3477,7 @@ async def test_model_command_rejects_unknown():
 
 async def test_model_command_unsupported_agent():
     # 默认 FakeAgent 无 available_models（似 copilot）→ 提示不支持
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
@@ -3537,7 +3537,7 @@ def test_attach_probe_error_distinguishes_causes():
 
 
 async def test_attach_creates_task_and_resumes_external_session():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(
         root_msg("/attach demo opencode ext_sid_1 继续之前的活", mid="om_att")
@@ -3571,7 +3571,7 @@ async def test_attach_creates_task_and_resumes_external_session():
 
 
 async def test_attach_backend_unsupported_leaves_no_task():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(
         store=store, agent_cls=LoadSessionUnsupportedAgent
     )
@@ -3585,7 +3585,7 @@ async def test_attach_backend_unsupported_leaves_no_task():
 
 
 async def test_attach_invalid_session_leaves_no_task():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store, agent_cls=SessionExpiredAgent)
     await daemon._handle_message(
         root_msg("/attach demo opencode ext_sid_1", mid="om_att")
@@ -3597,7 +3597,7 @@ async def test_attach_invalid_session_leaves_no_task():
 
 
 async def test_attach_duplicate_rejected_and_guides_to_existing():
-    store = TaskStore(None)
+    store = SessionStore(None)
     # 已有一个同 (agent, session_id) 的附着任务
     store.create(
         project_name="demo",
@@ -3631,7 +3631,7 @@ async def test_attach_unknown_project_or_agent_errors_no_probe():
 
 async def test_attach_respects_max_agents_replies_to_original_no_orphan_thread():
     # 已达上限时：回原消息、不建新话题（create_thread 不被调用）、不落 Task。
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon_with_limit(max_agents=1, store=store)
     await daemon._handle_message(root_msg("/run demo task1", mid="om_r1"))
     await wait_until(lambda: created and created[0].prompts == ["task1"])
@@ -3645,7 +3645,7 @@ async def test_attach_respects_max_agents_replies_to_original_no_orphan_thread()
 
 
 async def test_attach_launch_failure_reports_attach_error():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store, agent_cls=StartupFailAgent)
     task = store.create(
         project_name="demo",
@@ -3671,7 +3671,7 @@ async def test_attach_launch_failure_reports_attach_error():
 
 async def test_attach_after_restart_recovers_via_load_session(tmp_path: Path):
     store_path = tmp_path / "tasks.json"
-    store1 = TaskStore(store_path)
+    store1 = SessionStore(store_path)
     d1, b1, c1 = make_daemon(store=store1)
     await d1._handle_message(root_msg("/attach demo opencode ext_sid_1", mid="om_att"))
     root = "om_newroot_1"
@@ -3684,7 +3684,7 @@ async def test_attach_after_restart_recovers_via_load_session(tmp_path: Path):
     assert task_by_thread(store1, root).status == "suspended"
 
     # 新 daemon（共享台账）→ 话题回复 → 普通 load_session 恢复（走「已恢复」而非「附着」）
-    store2 = TaskStore(store_path)
+    store2 = SessionStore(store_path)
     d2, b2, c2 = make_daemon(store=store2)
     await d2._handle_message(thread_msg("继续", root=root, mid="om_t2"))
     await wait_until(lambda: c2 and c2[0].prompts == ["继续"])
@@ -3695,7 +3695,7 @@ async def test_attach_after_restart_recovers_via_load_session(tmp_path: Path):
 
 async def test_run_still_works_after_attach_feature():
     # 回归保护：/run 新会话路径不受 /attach 影响（origin 仍为 spawn）
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo do stuff"))
     await wait_until(lambda: created and created[0].prompts == ["do stuff"])
@@ -3710,7 +3710,7 @@ async def test_run_still_works_after_attach_feature():
 
 
 async def test_sched_attach_session_creates_task_and_resumes_external_session():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     out = await daemon._sched_attach_session(
         "demo",
@@ -3743,7 +3743,7 @@ async def test_sched_attach_session_creates_task_and_resumes_external_session():
 
 
 async def test_sched_attach_session_routes_thread_and_output_to_source_channel():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, feishu, created = make_daemon(store=store)
     web = FakeBridge()
     daemon._channels["web"] = web
@@ -3788,7 +3788,7 @@ async def test_sched_attach_session_routes_thread_and_output_to_source_channel()
 
 
 async def test_sched_attach_session_uses_default_agent_when_omitted():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, _ = make_daemon(store=store)
     out = await daemon._sched_attach_session(
         "demo", "ext_sid_1", conversation=_TEST_CONVERSATION
@@ -3803,7 +3803,7 @@ async def test_sched_attach_session_uses_default_agent_when_omitted():
 
 
 async def test_sched_attach_session_unknown_project_or_agent_errors():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     out_p = await daemon._sched_attach_session(
         "nope", "ext_sid_1", conversation=_TEST_CONVERSATION
@@ -3818,7 +3818,7 @@ async def test_sched_attach_session_unknown_project_or_agent_errors():
 
 
 async def test_sched_attach_session_duplicate_rejected():
-    store = TaskStore(None)
+    store = SessionStore(None)
     store.create(
         project_name="demo",
         agent_label="opencode",
@@ -3842,7 +3842,7 @@ async def test_sched_attach_session_duplicate_rejected():
 
 
 async def test_sched_attach_session_backend_unsupported_returns_error():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(
         store=store, agent_cls=LoadSessionUnsupportedAgent
     )
@@ -4488,7 +4488,7 @@ async def test_launch_injects_bg_identity_env_and_revokes_on_close():
 
 
 async def test_bg_job_completion_enqueues_resume_to_active_agent():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
@@ -4503,7 +4503,7 @@ async def test_bg_job_completion_enqueues_resume_to_active_agent():
 
 
 async def test_bg_job_completion_fans_out_to_bound_conversations():
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, feishu, created = make_daemon(store=store)
     web = FakeBridge()
     daemon._channels["web"] = web
@@ -4535,7 +4535,7 @@ async def test_bg_job_completion_fans_out_to_bound_conversations():
 
 
 async def test_bg_job_completion_posts_visible_result_to_thread(tmp_path: Path):
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
@@ -4554,7 +4554,7 @@ async def test_bg_job_completion_posts_visible_result_to_thread(tmp_path: Path):
 
 
 async def test_bg_job_visible_result_uses_task_channel(tmp_path: Path):
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, feishu, _ = make_daemon(store=store)
     web = FakeBridge()
     daemon._channels["web"] = web
@@ -4583,7 +4583,7 @@ async def test_bg_job_visible_result_uses_task_channel(tmp_path: Path):
 
 
 async def test_bg_job_completion_resumes_suspended_task():
-    store = TaskStore(None)
+    store = SessionStore(None)
     _seed_task(store, thread="om_s", session_id="sid_s", status="suspended")
     daemon, bridge, created = make_daemon(store=store)
     job = daemon.job_store.create(task_id="t1", command=["x"], cwd="c")
@@ -4600,7 +4600,7 @@ async def test_bg_job_completion_resumes_suspended_task():
 
 
 async def test_bg_job_completion_terminal_task_notifies_only():
-    store = TaskStore(None)
+    store = SessionStore(None)
     _seed_task(store, thread="om_x", status="done")
     daemon, bridge, created = make_daemon(store=store)
     job = daemon.job_store.create(task_id="t1", command=["x"], cwd="c")
@@ -4611,7 +4611,7 @@ async def test_bg_job_completion_terminal_task_notifies_only():
 
 async def test_bg_completions_merge_into_single_batch_and_one_turn():
     # #79：turn 在途时相继完成的多个 job 合并进同一批次，只唤回一轮
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(GatedAgent, store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
@@ -4639,7 +4639,7 @@ async def test_bg_completions_merge_into_single_batch_and_one_turn():
 
 async def test_normal_reply_between_bg_completions_prevents_merge():
     # #79：两个 bg 完成之间夹了用户话题回复 → 断开合并邻接，保 FIFO（不 reorder）
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(GatedAgent, store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
@@ -4661,7 +4661,7 @@ async def test_normal_reply_between_bg_completions_prevents_merge():
 
 async def test_stop_drops_pending_bg_batch():
     # #79：/stop 立即停、丢弃未处理的 bg 批次（不排空后台结果再停）
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(CancelableAgent, store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await created[0].in_prompt.wait()  # 首轮在途
@@ -4679,7 +4679,7 @@ async def test_stop_drops_pending_bg_batch():
 
 
 async def test_watch_bg_job_updates_status_and_delivers(tmp_path: Path):
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
@@ -4697,7 +4697,7 @@ async def test_watch_bg_job_updates_status_and_delivers(tmp_path: Path):
 
 
 async def test_watch_bg_job_timeout_kills_marks_and_still_resumes(tmp_path: Path):
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
@@ -4746,7 +4746,7 @@ async def test_launch_bg_job_uses_devnull_stdin(monkeypatch, tmp_path: Path):
 
 async def test_launch_bg_job_keeps_watcher_reference(tmp_path: Path):
     # 回归 #68：asyncio 只对 task 持弱引用，必须自存强引用否则 watcher 会被 GC
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     daemon._bg_logs_dir = tmp_path / "bg"
     await daemon._handle_message(root_msg("/run demo task"))
@@ -4782,7 +4782,7 @@ def test_build_bg_prompt_formats_block(tmp_path: Path):
 
 
 async def test_launch_bg_job_real_subprocess_roundtrip(tmp_path: Path):
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     daemon._bg_logs_dir = tmp_path / "bg-logs"
     await daemon._handle_message(root_msg("/run demo task"))
@@ -4870,7 +4870,7 @@ async def test_ctl_bg_kill_running_cross_task_and_not_running():
 
 
 async def test_launch_then_kill_real_subprocess(tmp_path: Path):
-    store = TaskStore(None)
+    store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store)
     daemon._bg_logs_dir = tmp_path / "bg-logs"
     await daemon._handle_message(root_msg("/run demo task"))
@@ -4914,7 +4914,7 @@ async def test_launch_threads_agent_env_into_spawn():
         throttle_window=0.01,
         stream_mode="text",
     )
-    daemon = _Daemon(cfg, store=TaskStore(None), project_store=ProjectStore(None))
+    daemon = _Daemon(cfg, store=SessionStore(None), project_store=ProjectStore(None))
     bridge = FakeBridge()
     daemon._channels[daemon._primary_channel_key] = bridge
     created: list[FakeAgent] = []
