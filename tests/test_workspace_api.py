@@ -92,6 +92,7 @@ async def test_health_returns_version():
             "ok": True,
             "channel": "http",
             "version": __version__,
+            "instance_id": vs._instance_id,
         }
     finally:
         vs.stop()
