@@ -436,8 +436,8 @@ class _AgentSessionRunner:
 
     project_name: str
     agent_label: str
-    #: 关联的 Task id（持久台账的主键）
-    task_id: str = ""
+    #: 关联的 Session id（当前值来自持久台账主键 Session.task_id）
+    session_id: str = ""
     #: Task 的主 Thread Conversation；生命周期事件与后台输出据此寻址。
     conversation: ConversationRef = field(
         default_factory=lambda: ConversationRef("", "")
@@ -1595,7 +1595,7 @@ class _Daemon:
         sess = _AgentSessionRunner(
             project_name=task.project_name,
             agent_label=task.agent_label,
-            task_id=task.task_id,
+            session_id=task.task_id,
             conversation=task_conversation,
             cwd=task.workspace,
             resumed=resume_session_id is not None,
@@ -1605,7 +1605,7 @@ class _Daemon:
 
         async def on_output(text: str) -> None:
             if (
-                self._runners.is_current(sess.task_id, sess)
+                self._runners.is_current(sess.session_id, sess)
                 and sess.current_output is not None
             ):
                 sess.current_output.feed(text)
@@ -1613,11 +1613,11 @@ class _Daemon:
         async def on_action(action: dict) -> None:
             # 审计（A）：只有 current runner 能把 tool_call 记进 Task；旧代 runner
             # 的迟到 callback 仍可收尾自身资源，但不能再代表 Task 写当前运行态。
-            if not self._runners.is_current(sess.task_id, sess):
+            if not self._runners.is_current(sess.session_id, sess):
                 return
-            cur = self.store.get(sess.task_id)
+            cur = self.store.get(sess.session_id)
             turn = (cur.turns if cur else 0) + 1
-            self.store.add_action(sess.task_id, {"turn": turn, **action})
+            self.store.add_action(sess.session_id, {"turn": turn, **action})
 
         # 配置里给该后端声明的追加 env（[agents.<名>].env，如 codex 的 CODEX_PATH）打底。
         env: dict[str, str] = dict(self.cfg.agent_env.get(task.agent_label, {}))
@@ -1660,9 +1660,9 @@ class _Daemon:
             await sess.agent.start()
         except Exception as exc:
             logger.exception("agent 启动失败")
-            if self._runners.is_current(sess.task_id, sess):
+            if self._runners.is_current(sess.session_id, sess):
                 err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
-                self.store.update(sess.task_id, status="failed", error_message=err)
+                self.store.update(sess.session_id, status="failed", error_message=err)
                 if sess.attached:
                     message = (
                         "❌ 附着失败（session 无法恢复或已过期）。"
@@ -1675,13 +1675,13 @@ class _Daemon:
                 else:
                     message = f"❌ agent 启动失败: {str(exc)[:200]}"
                 await self._reply_to_session(
-                    sess.task_id,
+                    sess.session_id,
                     message,
                     source=startup_conversation,
                 )
             await self._close_session(sess)
             return
-        if not self._runners.is_current(sess.task_id, sess):
+        if not self._runners.is_current(sess.session_id, sess):
             await self._close_session(sess)
             return
         # 启动成功：把 agent_session_id + 模型落进 Task 并置 idle（供重启后恢复）
@@ -1691,7 +1691,7 @@ class _Daemon:
         # 报回的 current_value 即是默认——若直接采信就会把用户此前 /model 切过的模型覆盖掉
         # （台账 + 实际都还原）。故：Session 若记着用户切过的模型且后端仍支持，就重新下发一次，
         # 保证「切模型 → 挂起 → 恢复」后仍用用户选的模型。后端已持久化（reported==pinned）时跳过。
-        task = self.store.get(sess.task_id)
+        task = self.store.get(sess.session_id)
         pinned = (task.model if task else "") or ""
         available = getattr(sess.agent, "available_models", None) or []
         # 被动刷新模型缓存：真实 agent 一启动就把它报的 available_models 存下来，
@@ -1701,24 +1701,24 @@ class _Daemon:
             try:
                 await sess.agent.set_model(pinned)
                 model = pinned
-                logger.info("恢复后重新应用模型 task=%s → %s", sess.task_id, pinned)
+                logger.info("恢复后重新应用模型 task=%s → %s", sess.session_id, pinned)
             except Exception:
                 logger.exception(
-                    "恢复后重新应用模型失败 task=%s → %s", sess.task_id, pinned
+                    "恢复后重新应用模型失败 task=%s → %s", sess.session_id, pinned
                 )
                 model = reported  # 应用失败：如实保留后端报回的模型，不谎报
         elif pinned and pinned != reported and pinned not in available:
             logger.warning(
                 "恢复后无法保持模型 task=%s：后端已不提供 %s（回退 %s）",
-                sess.task_id,
+                sess.session_id,
                 pinned,
                 reported or "默认",
             )
-        if not self._runners.is_current(sess.task_id, sess):
+        if not self._runners.is_current(sess.session_id, sess):
             await self._close_session(sess)
             return
         self.store.update(
-            sess.task_id,
+            sess.session_id,
             agent_session_id=sess.agent.session_id or "",
             status="idle",
             model=model,
@@ -1740,7 +1740,7 @@ class _Daemon:
             if model:
                 base += f"（模型：{model}）"
         await self._reply_to_session(
-            sess.task_id,
+            sess.session_id,
             base,
             source=startup_conversation,
         )
@@ -1753,34 +1753,34 @@ class _Daemon:
                 try:
                     queued = await asyncio.wait_for(sess.queue.get(), timeout=timeout)
                 except asyncio.TimeoutError:
-                    if not self._runners.is_current(sess.task_id, sess):
+                    if not self._runners.is_current(sess.session_id, sess):
                         break
-                    self.store.update(sess.task_id, status="suspended")
+                    self.store.update(sess.session_id, status="suspended")
                     await self._reply_to_session(
-                        sess.task_id,
+                        sess.session_id,
                         "💤 空闲超时，已挂起该 agent（在本话题回复即自动恢复）。",
                         source=sess.conversation,
                     )
-                    if self._runners.is_current(sess.task_id, sess):
+                    if self._runners.is_current(sess.session_id, sess):
                         await self._notify_main(
                             f"💤 {sess.project_name} 已空闲挂起（在其话题回复即自动恢复）。"
                         )
                     break
-                if not self._runners.is_current(sess.task_id, sess):
+                if not self._runners.is_current(sess.session_id, sess):
                     break
                 if queued is None:
                     status = sess.terminate_status  # stopped(/stop) 或 done(/done)
-                    self.store.update(sess.task_id, status=status)  # 保留历史
+                    self.store.update(sess.session_id, status=status)  # 保留历史
                     await self._reply_to_session(
-                        sess.task_id,
+                        sess.session_id,
                         "✅ 任务已完成并归档。"
                         if status == "done"
                         else "🛑 agent 已停止。",
                         source=sess.conversation,
                     )
                     break
-                async with self._session_turn_lock(sess.task_id):
-                    if not self._runners.is_current(sess.task_id, sess):
+                async with self._session_turn_lock(sess.session_id):
+                    if not self._runners.is_current(sess.session_id, sess):
                         break
                     if isinstance(queued, _BgBatch):
                         # 后台完成批次（#79）：清 pending_bg（队尾不再有可合并批次），
@@ -1794,7 +1794,7 @@ class _Daemon:
                     prompt = request.text
                     turn_conversation = request.conversation
                     turn_conversations = self._conversations_for_session(
-                        sess.task_id,
+                        sess.session_id,
                         source=turn_conversation,
                     )
                     if mirror_input:
@@ -1816,10 +1816,10 @@ class _Daemon:
                         footer=footer,
                     )
                     sess.current_output = output
-                    self.store.update(sess.task_id, status="running")
+                    self.store.update(sess.session_id, status="running")
                     logger.info(
                         "任务 %s 开始一轮（%s）: %.80s",
-                        sess.task_id,
+                        sess.session_id,
                         sess.agent_label,
                         prompt,
                     )
@@ -1827,16 +1827,16 @@ class _Daemon:
                     try:
                         stop_reason = await sess.agent.prompt(prompt)
                         await output.flush()
-                        if not self._runners.is_current(sess.task_id, sess):
+                        if not self._runners.is_current(sess.session_id, sess):
                             break
                         if stop_reason == "cancelled":
                             # 本轮被 /stop 中途取消：不当作正常完成（不 ✅、不计 turn、
                             # 不发完成通知）。输出置停止态；随后循环取到 None 哨兵即终止。
                             await output.set_status("stopped")
-                            if not self._runners.is_current(sess.task_id, sess):
+                            if not self._runners.is_current(sess.session_id, sess):
                                 break
-                            self.store.update(sess.task_id, status="idle")
-                            logger.info("任务 %s 本轮被取消", sess.task_id)
+                            self.store.update(sess.session_id, status="idle")
+                            logger.info("任务 %s 本轮被取消", sess.session_id)
                             continue
                         # footer 追加本轮 token 用量（#53）：取不到就不显示、不报错。
                         # 只标脏，紧随的 set_status("done") 会把新 footer 一起 emit。
@@ -1844,20 +1844,20 @@ class _Daemon:
                         if tokens is not None:
                             output.set_footer(_with_tokens(footer, tokens))
                         await output.set_status("done")
-                        if not self._runners.is_current(sess.task_id, sess):
+                        if not self._runners.is_current(sess.session_id, sess):
                             break
                         # 落 last_output：本轮 agent 的收尾回复（截断），供 get_task/通知摘要
                         last_output = _clip(sess.agent.last_message, _LAST_OUTPUT_MAX)
-                        cur = self.store.get(sess.task_id)
+                        cur = self.store.get(sess.session_id)
                         turns = (cur.turns if cur else 0) + 1
                         logger.info(
                             "任务 %s 完成第 %d 轮，回复 %d 字",
-                            sess.task_id,
+                            sess.session_id,
                             turns,
                             len(last_output),
                         )
                         self.store.update(
-                            sess.task_id,
+                            sess.session_id,
                             status="idle",
                             turns=turns,
                             last_output=last_output,
@@ -1869,7 +1869,7 @@ class _Daemon:
                         )
                         # 完成且已闲下来（无排队）→ 推一条主线通知（带收尾摘要），免得挨个点话题
                         if (
-                            self._runners.is_current(sess.task_id, sess)
+                            self._runners.is_current(sess.session_id, sess)
                             and sess.queue.empty()
                         ):
                             note = f"🔔 {sess.project_name} 完成第 {turns} 轮"
@@ -1887,11 +1887,11 @@ class _Daemon:
                             await output.set_status("error")
                         except Exception:
                             logger.debug("set_status error 失败（忽略）", exc_info=True)
-                        if self._runners.is_current(sess.task_id, sess):
+                        if self._runners.is_current(sess.session_id, sess):
                             # failed 不再是终止态：本轮失败但 session 已建，多半能 load_session
                             # 接回——标 failed（可恢复），话题回复即尝试恢复，而非逼用户重开丢上下文。
                             self.store.update(
-                                sess.task_id, status="failed", error_message=err
+                                sess.session_id, status="failed", error_message=err
                             )
                             await self._reply_to_conversations(
                                 turn_conversations,
@@ -1913,7 +1913,7 @@ class _Daemon:
 
     async def _close_session(self, sess: _AgentSessionRunner) -> None:
         """收尾 runner：仅按 identity 移除自身槽位，但始终关闭自身资源。"""
-        self._runners.remove_if_current(sess.task_id, sess)
+        self._runners.remove_if_current(sess.session_id, sess)
         if sess.bg_token:  # 作废该 session 的后台任务 token（#68）
             self._bg_tokens.pop(sess.bg_token, None)
             sess.bg_token = ""
@@ -1939,9 +1939,9 @@ class _Daemon:
             return
         try:
             await agent.cancel()
-            logger.info("已请求取消任务 %s 的当前轮", sess.task_id)
+            logger.info("已请求取消任务 %s 的当前轮", sess.session_id)
         except Exception:
-            logger.exception("取消当前轮失败 task=%s", sess.task_id)
+            logger.exception("取消当前轮失败 task=%s", sess.session_id)
 
     async def _forward_to_agent(
         self, msg: ChannelMessage, *, conversation: ConversationRef
@@ -1992,7 +1992,7 @@ class _Daemon:
             return
         if sess.worker is None or sess.worker.done():
             await self._reply_to_session(
-                sess.task_id,
+                sess.session_id,
                 "⚠️ 该 agent 已结束。发送 `/run ...` 新建任务。",
                 source=conversation,
             )
@@ -2019,7 +2019,7 @@ class _Daemon:
                     sess.enqueue(TurnRequest(new_input, conversation))
                 await self._cancel_turn(sess)
                 await self._reply_to_session(
-                    sess.task_id,
+                    sess.session_id,
                     "🛑 已取消当前轮，改执行新指令…"
                     if new_input
                     else "🛑 已取消当前轮（agent 保留，可继续发指令）。",
@@ -2036,7 +2036,7 @@ class _Daemon:
                 )
             return
         if text == _DONE_CMD:
-            self._finish_task(sess.task_id, "done")  # 优雅收尾，worker 发完成消息
+            self._finish_task(sess.session_id, "done")  # 优雅收尾，worker 发完成消息
             return
         if text == _MODEL_CMD or text.startswith(_MODEL_CMD + " "):
             await self._handle_model_cmd(
@@ -2088,20 +2088,20 @@ class _Daemon:
         try:
             await agent.set_model(arg)
         except Exception as exc:
-            logger.exception("切换模型失败 task=%s model=%s", sess.task_id, arg)
-            if self._runners.is_current(sess.task_id, sess):
+            logger.exception("切换模型失败 task=%s model=%s", sess.session_id, arg)
+            if self._runners.is_current(sess.session_id, sess):
                 await self._safe_reply(
                     reply_target,
                     f"❌ 切换模型失败：{str(exc)[:200]}",
                     conversation=conversation,
                 )
             return
-        if not self._runners.is_current(sess.task_id, sess):
+        if not self._runners.is_current(sess.session_id, sess):
             return
-        self.store.update(sess.task_id, model=arg)
-        logger.info("任务 %s 切换模型 → %s", sess.task_id, arg)
+        self.store.update(sess.session_id, model=arg)
+        logger.info("任务 %s 切换模型 → %s", sess.session_id, arg)
         await self._reply_to_session(
-            sess.task_id,
+            sess.session_id,
             f"✅ 已切换模型为 {arg}（下一轮起生效）。",
             source=conversation,
         )
@@ -3164,9 +3164,9 @@ class _Daemon:
         self._stop_channels()
         # 把仍活跃的任务标记为 suspended，让重启后台账状态准确（且可 load_session 恢复）
         for sess in self._runners.values():
-            task = self.store.get(sess.task_id)
+            task = self.store.get(sess.session_id)
             if task is not None and not task.is_terminal:
-                self.store.update(sess.task_id, status="suspended")
+                self.store.update(sess.session_id, status="suspended")
         workers = [
             s.worker
             for s in self._runners.values()
