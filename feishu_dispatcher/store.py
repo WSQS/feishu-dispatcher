@@ -1,6 +1,6 @@
-"""任务台账持久化：Task 是 daemon 拥有的核心实体。
+"""任务台账持久化：Session 是 daemon 拥有的内存模型。
 
-一个 Task = 派发在某项目上的一个工作单元，持有它的 agent_session_id（agent 侧记忆）、
+一个 Session = 派发在某项目上的一个工作单元，持有它的 agent_session_id（agent 侧记忆）、
 ConversationRef + thread_root_id（交互入口）、workspace（工作目录）。落盘到 tasks.json，
 按 `task_id`（短自增 `t<N>`，持久单调计数器、**永不复用**）索引；按
 ConversationRef + thread_root_id 路由交互线程。
@@ -128,7 +128,7 @@ _TASK_FIELDS = (
 
 
 @dataclass
-class Task:
+class Session:
     task_id: str
     project_name: str
     agent_label: str
@@ -174,13 +174,13 @@ class Task:
         return self.status in TERMINAL_STATES
 
 
-def _task_from_record(record: dict) -> Task:
+def _task_from_record(record: dict) -> Session:
     values = {key: record[key] for key in _TASK_FIELDS if key in record}
     values["agent_session_id"] = values.pop("session_id", "")
-    return Task(**values)
+    return Session(**values)
 
 
-def _task_to_record(task: Task) -> dict:
+def _task_to_record(task: Session) -> dict:
     record = asdict(task)
     record["session_id"] = record.pop("agent_session_id")
     return record
@@ -196,7 +196,7 @@ class TaskStore:
     def __init__(self, path: Path | None, *, keep_terminal: int = 50) -> None:
         self._path = path
         self._keep = keep_terminal
-        self._tasks: dict[str, Task] = {}
+        self._tasks: dict[str, Session] = {}
         self._seq = 0  # 单调计数器，永不复用
         if path is not None:
             self._load()
@@ -236,12 +236,12 @@ class TaskStore:
 
     # ---- 读 ---- #
 
-    def get(self, task_id: str) -> Task | None:
+    def get(self, task_id: str) -> Session | None:
         return self._tasks.get(task_id)
 
     def by_thread(
         self, conversation: ConversationRef, thread_root_id: str
-    ) -> Task | None:
+    ) -> Session | None:
         if (
             not conversation.channel_key.strip()
             or not conversation.conversation_id.strip()
@@ -256,13 +256,13 @@ class TaskStore:
                 return t
         return None
 
-    def all(self) -> list[Task]:
+    def all(self) -> list[Session]:
         return list(self._tasks.values())
 
-    def active(self) -> list[Task]:
+    def active(self) -> list[Session]:
         return [t for t in self._tasks.values() if t.is_active]
 
-    def by_agent_session(self, agent_label: str, session_id: str) -> Task | None:
+    def by_agent_session(self, agent_label: str, session_id: str) -> Session | None:
         """按 ``(agent, session_id)`` 组合查已附着的任务（/attach 去重，#99）。
 
         二者**同时**匹配才算重复：不同 agent 的 session 命名空间互相独立，同名
@@ -291,7 +291,7 @@ class TaskStore:
         issue_url: str = "",
         model: str = "",
         origin: str = "spawn",
-    ) -> Task:
+    ) -> Session:
         if not conversation.channel_key.strip():
             raise ValueError("ConversationRef.channel_key 不能为空")
         if not conversation.conversation_id.strip():
@@ -305,7 +305,7 @@ class TaskStore:
         self._seq = max(self._seq, floor) + 1
         assert f"t{self._seq}" not in self._tasks, f"task_id 冲突: t{self._seq}"
         now = self._now()
-        task = Task(
+        task = Session(
             task_id=f"t{self._seq}",
             project_name=project_name,
             agent_label=agent_label,
@@ -326,7 +326,7 @@ class TaskStore:
         self._flush()
         return task
 
-    def update(self, task_id: str, **changes) -> Task | None:
+    def update(self, task_id: str, **changes) -> Session | None:
         """就地更新任务字段（status/agent_session_id/turns…），刷新 updated_at 并落盘。
 
         改成终止态时顺带修剪历史。

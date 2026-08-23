@@ -46,7 +46,7 @@ from .scheduler import (
     build_scheduler_tools,
     run_tool_loop,
 )
-from .store import Job, JobStore, ModelStore, ProjectStore, Task, TaskStore
+from .store import Job, JobStore, ModelStore, ProjectStore, Session, TaskStore
 from ._scan_executor import ScanExecutor
 from .workspace_api import (
     file as workspace_file,
@@ -114,10 +114,10 @@ _THREAD_USAGE = (
     "（`/run`、`/agents`、`/task` 等控制台命令请回到群主线发送）"
 )
 
-#: Task.last_output 截断上限（收尾回复只留精华，防 tasks.json 涨）
+#: Session.last_output 截断上限（收尾回复只留精华，防 tasks.json 涨）
 _LAST_OUTPUT_MAX = 800
 
-#: Task.error_message 截断上限（turn 异常诊断，异常类型 + 片段）
+#: Session.error_message 截断上限（turn 异常诊断，异常类型 + 片段）
 _ERROR_MSG_MAX = 200
 
 
@@ -442,14 +442,14 @@ class _AgentSessionRunner:
     conversation: ConversationRef = field(
         default_factory=lambda: ConversationRef("", "")
     )
-    #: agent 工作目录（= Task.workspace）
+    #: agent 工作目录（= Session.workspace）
     cwd: str = ""
     #: 是否由 load_session 恢复而来（影响启动失败时的提示文案）
     resumed: bool = False
-    #: 是否由 /attach 附着外部会话而来（= Task.origin == "attach"）；
+    #: 是否由 /attach 附着外部会话而来（= Session.origin == "attach"）；
     #: 影响启动成功/失败的提示文案（区别于普通恢复的「已恢复」）。
     attached: bool = False
-    #: 关联的 forge issue URL（= Task.issue_url，#63）；供 footer/展示标归属，空 = 未绑定
+    #: 关联的 forge issue URL（= Session.issue_url，#63）；供 footer/展示标归属，空 = 未绑定
     issue_url: str = ""
     #: agent 实例（先建 session、再建 agent，故允许 None）
     agent: "AcpAgent | None" = None
@@ -634,7 +634,7 @@ class _Daemon:
         self._conversation_task_ids.pop(conversation, None)
         return None
 
-    def _task_for_conversation(self, conversation: ConversationRef) -> Task | None:
+    def _task_for_conversation(self, conversation: ConversationRef) -> Session | None:
         """按运行时绑定解析持久化 Agent Task。"""
         task_id = self._task_id_for_conversation(conversation)
         if task_id is None:
@@ -1407,7 +1407,7 @@ class _Daemon:
         description: str = "",
         *,
         conversation: ConversationRef,
-    ) -> tuple["Task | None", str, str]:
+    ) -> tuple["Session | None", str, str]:
         """附着外部会话为新 Task 的共用底层（``/attach`` 与 ``attach_session`` 工具都调它）。
 
         流程：校验→去重→先 load_session 探测→建 Task + 在来源 Channel 新建话题→
@@ -1567,7 +1567,7 @@ class _Daemon:
 
     def _launch(
         self,
-        task: Task,
+        task: Session,
         agent_argv: list[str],
         first_turn: TurnRequest | None,
         *,
@@ -1680,7 +1680,7 @@ class _Daemon:
         model = reported
         # 模型黏住（恢复后）：agent 后端重载会话（load_session）时可能把模型重置回默认，
         # 报回的 current_value 即是默认——若直接采信就会把用户此前 /model 切过的模型覆盖掉
-        # （台账 + 实际都还原）。故：Task 若记着用户切过的模型且后端仍支持，就重新下发一次，
+        # （台账 + 实际都还原）。故：Session 若记着用户切过的模型且后端仍支持，就重新下发一次，
         # 保证「切模型 → 挂起 → 恢复」后仍用用户选的模型。后端已持久化（reported==pinned）时跳过。
         task = self.store.get(sess.task_id)
         pinned = (task.model if task else "") or ""
@@ -2102,7 +2102,7 @@ class _Daemon:
         text: str,
         *,
         conversation: ConversationRef,
-        task: Task | None,
+        task: Session | None,
         forward_raw: bool = False,
     ) -> None:
         """话题无活跃 agent：能恢复的 Task 就 load_session 惰性重连，否则明确提示。
@@ -2157,7 +2157,7 @@ class _Daemon:
         )
 
     def _try_resume(
-        self, task: Task, *, first_turn: TurnRequest | None
+        self, task: Session, *, first_turn: TurnRequest | None
     ) -> tuple[bool, str]:
         """把一个非活跃任务 load_session 惰性重连；返回 (成功, 失败文案)。
 
@@ -2453,7 +2453,7 @@ class _Daemon:
         return json.dumps(data, ensure_ascii=False)
 
     @staticmethod
-    def _task_summary(task: Task) -> dict:
+    def _task_summary(task: Session) -> dict:
         return {
             "task_id": task.task_id,
             "project": task.project_name,

@@ -65,7 +65,7 @@ class _ClientImpl:
         self._fmt = _StreamFormatter()
         self._suppress = False
         #: 本轮 agent 的最终 message 文本（只攒 agent_message，不含思考/工具行），
-        #: 供上层落 Task.last_output；每轮 reset_formatter 时清空
+        #: 供上层落 Session.last_output；每轮 reset_formatter 时清空
         self._message_buf: list[str] = []
         #: 本轮流式 usage_update 报的「当前 context 占用 token 数」（used），
         #: 作为 PromptResponse.usage 缺失时的回退；每轮 reset_formatter 时清空
@@ -82,7 +82,7 @@ class _ClientImpl:
         self._usage_used = None
 
     def last_message(self) -> str:
-        """本轮 agent 的最终 message 文本（收尾回复），供 Task.last_output。"""
+        """本轮 agent 的最终 message 文本（收尾回复），供 Session.last_output。"""
         return "".join(self._message_buf)
 
     def usage_tokens(self) -> int | None:

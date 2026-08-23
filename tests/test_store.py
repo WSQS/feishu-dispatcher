@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from feishu_dispatcher import store as store_module
 from feishu_dispatcher.channel import ConversationRef
 from feishu_dispatcher.config import Project
 from feishu_dispatcher.store import (
@@ -13,6 +14,7 @@ from feishu_dispatcher.store import (
     JobStore,
     ModelStore,
     ProjectStore,
+    Session,
     TaskStore,
 )
 
@@ -39,6 +41,12 @@ def test_create_assigns_incrementing_ids():
     assert t1.task_id == "t1"
     assert t2.task_id == "t2"
     assert t1.status == "starting"
+
+
+def test_task_store_returns_session_without_task_alias():
+    session = make(TaskStore(None))
+    assert isinstance(session, Session)
+    assert not hasattr(store_module, "Task")
 
 
 @pytest.mark.parametrize(
@@ -544,7 +552,7 @@ def test_job_store_memory_mode_writes_nothing(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------- #
-# Task.origin（spawn/attach）与 (agent, session_id) 查重（#99 前置）
+# Session.origin（spawn/attach）与 (agent, session_id) 查重（#99 前置）
 # ---------------------------------------------------------------------- #
 
 
