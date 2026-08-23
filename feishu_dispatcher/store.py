@@ -1,4 +1,4 @@
-"""任务台账持久化：Session 是 daemon 拥有的内存模型。
+"""Session 台账持久化：Session 是 daemon 拥有的内存模型。
 
 一个 Session = 派发在某项目上的一个工作单元，持有它的 agent_session_id（agent 侧记忆）、
 ConversationRef + thread_root_id（交互入口）、workspace（工作目录）。落盘到 tasks.json，
@@ -11,7 +11,7 @@ status 生命周期：
 `suspended`/`idle`/`failed` 都可 load_session 惰性恢复——failed = turn 中途异常「卡住等
 恢复」而非「死了」：turn 失败时 session 已建，多半能接回；恢复失败才真停在 failed
 （startup 失败无 session，天然挡回 `/run`）。failed 不自动清理（同 suspended，可恢复态
-不进历史修剪）。历史留最近 N 个终止任务。
+不进历史修剪）。历史留最近 N 个终止 Session。
 
 ``path=None`` 为纯内存（测试）。原子写 + 读损坏容错。
 """
@@ -101,10 +101,10 @@ RESUMABLE_STATES = frozenset({"idle", "suspended", "failed"})
 #: 终止状态（移出活跃，进历史；只剩人/调度器主动结束的）
 TERMINAL_STATES = frozenset({"done", "stopped"})
 
-#: 每个 Task 最多保留的动作条数（审计日志，超出丢最旧，防 tasks.json 无限涨）
+#: 每个 Session 最多保留的动作条数（审计日志，超出丢最旧，防 tasks.json 无限涨）
 _MAX_ACTIONS = 200
 
-_TASK_FIELDS = (
+_SESSION_RECORD_FIELDS = (
     "task_id",
     "project_name",
     "agent_label",
@@ -174,29 +174,29 @@ class Session:
         return self.status in TERMINAL_STATES
 
 
-def _task_from_record(record: dict) -> Session:
-    values = {key: record[key] for key in _TASK_FIELDS if key in record}
+def _session_from_record(record: dict) -> Session:
+    values = {key: record[key] for key in _SESSION_RECORD_FIELDS if key in record}
     values["agent_session_id"] = values.pop("session_id", "")
     return Session(**values)
 
 
-def _task_to_record(task: Session) -> dict:
-    record = asdict(task)
+def _session_to_record(session: Session) -> dict:
+    record = asdict(session)
     record["session_id"] = record.pop("agent_session_id")
     return record
 
 
 class SessionStore:
-    """task_id → Task 台账 + Channel-scoped thread 路由 + 单调计数器。
+    """task_id → Session 台账 + Channel-scoped thread 路由 + 单调计数器。
 
     只被单个 daemon 实例（单线程 event loop）读写，无需加锁。
-    ``keep_terminal`` 限制终止任务的历史条数，防 tasks.json 无限涨。
+    ``keep_terminal`` 限制终止 Session 的历史条数，防 tasks.json 无限涨。
     """
 
     def __init__(self, path: Path | None, *, keep_terminal: int = 50) -> None:
         self._path = path
         self._keep = keep_terminal
-        self._tasks: dict[str, Session] = {}
+        self._sessions: dict[str, Session] = {}
         self._seq = 0  # 单调计数器，永不复用
         if path is not None:
             self._load()
@@ -211,11 +211,11 @@ class SessionStore:
         try:
             self._seq = int(data.get("seq", 0))
             for tid, d in (data.get("tasks") or {}).items():
-                self._tasks[tid] = _task_from_record(d)
-            logger.info("已加载 %d 个任务: %s", len(self._tasks), self._path)
+                self._sessions[tid] = _session_from_record(d)
+            logger.info("已加载 %d 个任务: %s", len(self._sessions), self._path)
         except Exception:
             logger.warning("任务台账解析失败，忽略: %s", self._path, exc_info=True)
-            self._tasks = {}
+            self._sessions = {}
             self._seq = 0
 
     def _flush(self) -> None:
@@ -223,7 +223,10 @@ class SessionStore:
             return
         payload = {
             "seq": self._seq,
-            "tasks": {tid: _task_to_record(t) for tid, t in self._tasks.items()},
+            "tasks": {
+                tid: _session_to_record(session)
+                for tid, session in self._sessions.items()
+            },
         }
         try:
             _atomic_write_json(self._path, payload)
@@ -237,7 +240,7 @@ class SessionStore:
     # ---- 读 ---- #
 
     def get(self, task_id: str) -> Session | None:
-        return self._tasks.get(task_id)
+        return self._sessions.get(task_id)
 
     def by_thread(
         self, conversation: ConversationRef, thread_root_id: str
@@ -248,31 +251,34 @@ class SessionStore:
             or not thread_root_id
         ):
             return None
-        for t in self._tasks.values():
+        for session in self._sessions.values():
             if (
-                t.conversation_ref == conversation
-                and t.thread_root_id == thread_root_id
+                session.conversation_ref == conversation
+                and session.thread_root_id == thread_root_id
             ):
-                return t
+                return session
         return None
 
     def all(self) -> list[Session]:
-        return list(self._tasks.values())
+        return list(self._sessions.values())
 
     def active(self) -> list[Session]:
-        return [t for t in self._tasks.values() if t.is_active]
+        return [session for session in self._sessions.values() if session.is_active]
 
     def by_agent_session(self, agent_label: str, session_id: str) -> Session | None:
-        """按 ``(agent, session_id)`` 组合查已附着的任务（/attach 去重，#99）。
+        """按 ``(agent, session_id)`` 组合查已附着的 Session，供 /attach 去重。
 
         二者**同时**匹配才算重复：不同 agent 的 session 命名空间互相独立，同名
         session_id 跨 agent 不冲突。空值（无 agent 或无 session）视为不匹配。
         """
         if not agent_label or not session_id:
             return None
-        for t in self._tasks.values():
-            if t.agent_label == agent_label and t.agent_session_id == session_id:
-                return t
+        for session in self._sessions.values():
+            if (
+                session.agent_label == agent_label
+                and session.agent_session_id == session_id
+            ):
+                return session
         return None
 
     # ---- 写 ---- #
@@ -300,12 +306,13 @@ class SessionStore:
         # 取两者较大再 +1。即使 seq 因故被回退/污染（多实例踩踏、手工改 tasks.json、
         # 半截原子写），也绝不落到已存在的 id 上，守住「task_id 永不复用」不变量。
         floor = max(
-            (int(tid[1:]) for tid in self._tasks if tid[1:].isdigit()), default=0
+            (int(tid[1:]) for tid in self._sessions if tid[1:].isdigit()),
+            default=0,
         )
         self._seq = max(self._seq, floor) + 1
-        assert f"t{self._seq}" not in self._tasks, f"task_id 冲突: t{self._seq}"
+        assert f"t{self._seq}" not in self._sessions, f"task_id 冲突: t{self._seq}"
         now = self._now()
-        task = Session(
+        session = Session(
             task_id=f"t{self._seq}",
             project_name=project_name,
             agent_label=agent_label,
@@ -322,55 +329,55 @@ class SessionStore:
             model=model,
             origin=origin,
         )
-        self._tasks[task.task_id] = task
+        self._sessions[session.task_id] = session
         self._flush()
-        return task
+        return session
 
     def update(self, task_id: str, **changes) -> Session | None:
-        """就地更新任务字段（status/agent_session_id/turns…），刷新 updated_at 并落盘。
+        """就地更新 Session 字段（status/agent_session_id/turns…），刷新 updated_at 并落盘。
 
         改成终止态时顺带修剪历史。
         """
-        task = self._tasks.get(task_id)
-        if task is None:
+        session = self._sessions.get(task_id)
+        if session is None:
             return None
         for k, v in changes.items():
-            setattr(task, k, v)
-        task.updated_at = self._now()
-        if task.is_terminal:
+            setattr(session, k, v)
+        session.updated_at = self._now()
+        if session.is_terminal:
             self._prune()
         self._flush()
-        return task
+        return session
 
     def add_action(self, task_id: str, action: dict) -> None:
-        """追加一条动作到任务的审计日志（超 ``_MAX_ACTIONS`` 丢最旧），落盘。
+        """追加一条动作到 Session 的审计日志（超 ``_MAX_ACTIONS`` 丢最旧），落盘。
 
         写透式：每条 tool_call 都刷一次盘，与 store 其余部分一致；chatty agent
         的写量对个人工具可接受（max_agents 默认 3），需要再批量化。
         """
-        task = self._tasks.get(task_id)
-        if task is None:
+        session = self._sessions.get(task_id)
+        if session is None:
             return
-        task.actions.append(action)
-        if len(task.actions) > _MAX_ACTIONS:
-            del task.actions[:-_MAX_ACTIONS]
-        task.updated_at = self._now()
+        session.actions.append(action)
+        if len(session.actions) > _MAX_ACTIONS:
+            del session.actions[:-_MAX_ACTIONS]
+        session.updated_at = self._now()
         self._flush()
 
     def _prune(self) -> None:
-        """只保留最近 ``keep_terminal`` 个终止任务。"""
+        """只保留最近 ``keep_terminal`` 个终止 Session。"""
         terminal = sorted(
-            (t for t in self._tasks.values() if t.is_terminal),
-            key=lambda t: t.updated_at,
+            (session for session in self._sessions.values() if session.is_terminal),
+            key=lambda session: session.updated_at,
         )
-        for t in terminal[: -self._keep] if self._keep else terminal:
-            del self._tasks[t.task_id]
+        for session in terminal[: -self._keep] if self._keep else terminal:
+            del self._sessions[session.task_id]
 
     def clear_terminal(self) -> int:
-        """清空所有终止任务（/clear），返回清掉的条数。"""
-        gone = [tid for tid, t in self._tasks.items() if t.is_terminal]
+        """清空所有终止 Session（/clear），返回清掉的条数。"""
+        gone = [tid for tid, session in self._sessions.items() if session.is_terminal]
         for tid in gone:
-            del self._tasks[tid]
+            del self._sessions[tid]
         if gone:
             self._flush()
         return len(gone)
