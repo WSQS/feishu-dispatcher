@@ -28,7 +28,7 @@ from feishu_dispatcher.daemon import (
     _AgentSessionRunner,
     _CurrentRunnerRegistry,
     _Daemon,
-    _DISPATCHER_TASK_ID,
+    _DISPATCHER_SESSION_ID,
     _FanoutStreamingOutput,
 )
 from feishu_dispatcher.http_channel import HttpChannel
@@ -743,11 +743,11 @@ async def test_http_create_task_conversation_validates_request_and_task_state():
         ),
         (
             {
-                "segments": {"task_id": _DISPATCHER_TASK_ID},
+                "segments": {"task_id": _DISPATCHER_SESSION_ID},
                 "body": {"conversation_id": "browser-a"},
             },
             404,
-            {"error": "task_not_found", "task_id": _DISPATCHER_TASK_ID},
+            {"error": "task_not_found", "task_id": _DISPATCHER_SESSION_ID},
         ),
         (
             {
@@ -1288,16 +1288,21 @@ def test_conversation_binding_drops_deleted_task():
     assert conversation not in daemon._conversation_task_ids
 
 
-def test_conversation_binding_supports_runtime_task_identity():
+def test_dispatcher_session_identity_constant_has_no_task_alias():
+    assert _DISPATCHER_SESSION_ID == "dispatcher"
+    assert not hasattr(daemon_module, "_DISPATCHER_TASK_ID")
+
+
+def test_conversation_binding_supports_runtime_dispatcher_session_identity():
     daemon, _, _ = make_daemon()
     conversation = ConversationRef("web", "web-root")
 
-    daemon._bind_conversation(conversation, _DISPATCHER_TASK_ID)
+    daemon._bind_conversation(conversation, _DISPATCHER_SESSION_ID)
 
-    assert daemon._task_id_for_conversation(conversation) == _DISPATCHER_TASK_ID
+    assert daemon._task_id_for_conversation(conversation) == _DISPATCHER_SESSION_ID
     assert daemon._task_for_conversation(conversation) is None
-    assert daemon._task_id_for_conversation(conversation) == _DISPATCHER_TASK_ID
-    assert daemon._conversations_for_task(_DISPATCHER_TASK_ID) == (conversation,)
+    assert daemon._task_id_for_conversation(conversation) == _DISPATCHER_SESSION_ID
+    assert daemon._conversations_for_task(_DISPATCHER_SESSION_ID) == (conversation,)
 
 
 def test_task_turn_lock_is_stable_per_task_identity():
@@ -2679,10 +2684,10 @@ async def test_dispatcher_root_turns_sync_between_channels():
     feishu_conversation = ConversationRef("feishu", "oc_1")
     web_conversation = ConversationRef("web", "web-room")
     assert daemon._task_id_for_conversation(feishu_conversation) == (
-        _DISPATCHER_TASK_ID
+        _DISPATCHER_SESSION_ID
     )
-    assert daemon._task_id_for_conversation(web_conversation) == _DISPATCHER_TASK_ID
-    assert set(daemon._conversations_for_task(_DISPATCHER_TASK_ID)) == {
+    assert daemon._task_id_for_conversation(web_conversation) == _DISPATCHER_SESSION_ID
+    assert set(daemon._conversations_for_task(_DISPATCHER_SESSION_ID)) == {
         feishu_conversation,
         web_conversation,
     }
@@ -2745,7 +2750,7 @@ async def test_dispatcher_turns_are_serialized_across_channels():
 
     assert (
         daemon._task_id_for_conversation(ConversationRef("web", "web-room"))
-        == _DISPATCHER_TASK_ID
+        == _DISPATCHER_SESSION_ID
     )
     assert len(llm.calls) == 1
     llm.release_first.set()
@@ -2788,7 +2793,7 @@ async def test_dispatcher_target_send_failure_does_not_abort_turn(caplog):
         root_msg("join", mid="broken-message", conversation_id="broken-room"),
     )
     daemon._bind_conversation(
-        ConversationRef("healthy", "healthy-room"), _DISPATCHER_TASK_ID
+        ConversationRef("healthy", "healthy-room"), _DISPATCHER_SESSION_ID
     )
     with caplog.at_level("ERROR"):
         await daemon._handle_channel_message(

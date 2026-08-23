@@ -57,7 +57,7 @@ from .workspace_api import (
 
 logger = logging.getLogger(__name__)
 
-_DISPATCHER_TASK_ID = "dispatcher"
+_DISPATCHER_SESSION_ID = "dispatcher"
 _DISPATCH_PREFIX = "/run "
 _TASK_PREFIX = "/task "
 _LIST_CMD = "/agents"
@@ -614,7 +614,7 @@ class _Daemon:
         self._conversation_task_ids[conversation] = task_id
 
     def _task_identity_exists(self, task_id: str) -> bool:
-        return task_id == _DISPATCHER_TASK_ID or self.store.get(task_id) is not None
+        return task_id == _DISPATCHER_SESSION_ID or self.store.get(task_id) is not None
 
     def _task_turn_lock(self, task_id: str) -> asyncio.Lock:
         """返回 Task 身份对应的进程内 Turn 锁。"""
@@ -2323,12 +2323,12 @@ class _Daemon:
         assert self._llm is not None
         main_conversation = self._main_conversation
         if main_conversation.conversation_id:
-            self._bind_conversation(main_conversation, _DISPATCHER_TASK_ID)
-        self._bind_conversation(conversation, _DISPATCHER_TASK_ID)
+            self._bind_conversation(main_conversation, _DISPATCHER_SESSION_ID)
+        self._bind_conversation(conversation, _DISPATCHER_SESSION_ID)
 
-        async with self._task_turn_lock(_DISPATCHER_TASK_ID):
+        async with self._task_turn_lock(_DISPATCHER_SESSION_ID):
             conversations = self._conversations_for_task(
-                _DISPATCHER_TASK_ID,
+                _DISPATCHER_SESSION_ID,
                 source=conversation,
             )
             targets = tuple(
@@ -2469,7 +2469,7 @@ class _Daemon:
     ) -> tuple[int, dict]:
         tasks = [
             {
-                "task_id": _DISPATCHER_TASK_ID,
+                "task_id": _DISPATCHER_SESSION_ID,
                 "kind": "dispatcher",
                 "description": "Dispatcher",
                 "status": "active",
