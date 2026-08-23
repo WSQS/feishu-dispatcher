@@ -1491,7 +1491,7 @@ class _Daemon:
             conversation=conversation,
             thread_root_id=root,
             workspace=str(project.path),
-            session_id=session_id,
+            agent_session_id=session_id,
             origin="attach",
         )
         self._launch(
@@ -1675,7 +1675,7 @@ class _Daemon:
         if not self._runners.is_current(sess.task_id, sess):
             await self._close_session(sess)
             return
-        # 启动成功：把 session_id + 模型落进 Task 并置 idle（供重启后 load_session 恢复）
+        # 启动成功：把 agent_session_id + 模型落进 Task 并置 idle（供重启后恢复）
         reported = getattr(sess.agent, "model", "") or ""
         model = reported
         # 模型黏住（恢复后）：agent 后端重载会话（load_session）时可能把模型重置回默认，
@@ -1710,7 +1710,7 @@ class _Daemon:
             return
         self.store.update(
             sess.task_id,
-            session_id=sess.agent.session_id or "",
+            agent_session_id=sess.agent.session_id or "",
             status="idle",
             model=model,
         )
@@ -2168,7 +2168,7 @@ class _Daemon:
         if self._runners.get_for_task(task.task_id) is not None:
             return False, f"任务 [{task.task_id}] 已在运行，无需恢复。"
         agent_argv = self.cfg.agents.get(task.agent_label)
-        if not agent_argv or not task.session_id:
+        if not agent_argv or not task.agent_session_id:
             self.store.update(task.task_id, status="failed")
             why = "agent 未配置" if not agent_argv else "无可恢复的会话"
             return False, (
@@ -2183,7 +2183,7 @@ class _Daemon:
             task,
             agent_argv,
             first_turn=first_turn,
-            resume_session_id=task.session_id,
+            resume_session_id=task.agent_session_id,
         )
         return True, ""
 
@@ -2268,7 +2268,9 @@ class _Daemon:
             head += f"\n模型: {t.model}"
         lines = [head, f"任务: {t.description}"]
         if t.origin == "attach":
-            lines.append(f"来源: 附着外部会话（session: {_short_sid(t.session_id)}）")
+            lines.append(
+                f"来源: 附着外部会话（session: {_short_sid(t.agent_session_id)}）"
+            )
         if t.issue_url:
             lines.append(f"issue: {t.issue_url}")
         if t.status == "failed" and t.error_message:
@@ -2556,7 +2558,7 @@ class _Daemon:
             "description": t.description,
             "status": t.status,
             "turns": t.turns,
-            "has_session": bool(t.session_id),
+            "has_session": bool(t.agent_session_id),
             "origin": t.origin,  # 会话来源 spawn/attach
             "active": self._runners.get_for_task(t.task_id) is not None,
             "model": t.model,  # agent 当前模型（copilot 不暴露则为空）

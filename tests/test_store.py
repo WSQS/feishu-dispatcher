@@ -113,11 +113,37 @@ def test_task_conversation_ref_persists_and_reloads(tmp_path: Path):
 def test_update_mutates_and_bumps():
     s = TaskStore(None)
     make(s)
-    s.update("t1", status="idle", turns=2, session_id="ses_x")
+    s.update("t1", status="idle", turns=2, agent_session_id="ses_x")
     t = s.get("t1")
     assert t.status == "idle"
     assert t.turns == 2
-    assert t.session_id == "ses_x"
+    assert t.agent_session_id == "ses_x"
+
+
+def test_agent_session_id_persists_with_legacy_disk_key(tmp_path: Path):
+    import json
+
+    p = tmp_path / "tasks.json"
+    s = TaskStore(p)
+    task = s.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="做 X",
+        conversation=_TEST_CONVERSATION,
+        thread_root_id="om_1",
+        workspace="C:/x",
+        agent_session_id="ses_x",
+    )
+
+    assert task.agent_session_id == "ses_x"
+    assert not hasattr(task, "session_id")
+    record = json.loads(p.read_text(encoding="utf-8"))["tasks"]["t1"]
+    assert record["session_id"] == "ses_x"
+    assert "agent_session_id" not in record
+
+    loaded = TaskStore(p).get("t1")
+    assert loaded.agent_session_id == "ses_x"
+    assert not hasattr(loaded, "session_id")
 
 
 def test_persists_and_counter_never_reuses(tmp_path: Path):
@@ -537,7 +563,7 @@ def test_task_create_with_origin_attach():
         conversation=_TEST_CONVERSATION,
         thread_root_id="om_1",
         workspace="C:/x",
-        session_id="ext_sid_1",
+        agent_session_id="ext_sid_1",
         origin="attach",
     )
     assert t.origin == "attach"
@@ -554,7 +580,7 @@ def test_task_origin_persists_and_reloads(tmp_path: Path):
         conversation=_TEST_CONVERSATION,
         thread_root_id="om_2",
         workspace="C:/x",
-        session_id="ext_sid_1",
+        agent_session_id="ext_sid_1",
         origin="attach",
     )
     s2 = TaskStore(p)
@@ -593,6 +619,8 @@ def test_old_tasks_json_without_origin_reads_spawn(tmp_path: Path):
     p.write_text(json.dumps(payload), encoding="utf-8")
     s = TaskStore(p)
     assert s.get("t1").origin == "spawn"  # 缺省补齐
+    assert s.get("t1").agent_session_id == "old_sid"
+    assert not hasattr(s.get("t1"), "session_id")
     assert s.get("t1").conversation_ref == ConversationRef("", "")
     assert s.by_thread(_TEST_CONVERSATION, "om_1") is None
 
@@ -600,9 +628,9 @@ def test_old_tasks_json_without_origin_reads_spawn(tmp_path: Path):
 def test_by_agent_session_matches_agent_and_session():
     s = TaskStore(None)
     make(s, thread="om_1")
-    s.update("t1", session_id="sid_a", agent_label="copilot")
+    s.update("t1", agent_session_id="sid_a", agent_label="copilot")
     make(s, thread="om_2", project="other")
-    s.update("t2", session_id="sid_b", agent_label="opencode")
+    s.update("t2", agent_session_id="sid_b", agent_label="opencode")
     assert s.by_agent_session("copilot", "sid_a").task_id == "t1"
     assert s.by_agent_session("opencode", "sid_b").task_id == "t2"
     assert s.by_agent_session("copilot", "sid_b") is None  # agent 不匹配
@@ -619,7 +647,7 @@ def test_by_agent_session_cross_agent_same_session_id_no_conflict():
         conversation=_TEST_CONVERSATION,
         thread_root_id="om_1",
         workspace="C:/x",
-        session_id="shared_sid",
+        agent_session_id="shared_sid",
     )
     s.create(
         project_name="p",
@@ -628,7 +656,7 @@ def test_by_agent_session_cross_agent_same_session_id_no_conflict():
         conversation=_TEST_CONVERSATION,
         thread_root_id="om_2",
         workspace="C:/x",
-        session_id="shared_sid",
+        agent_session_id="shared_sid",
     )
     assert s.by_agent_session("copilot", "shared_sid").thread_root_id == "om_1"
     assert s.by_agent_session("opencode", "shared_sid").thread_root_id == "om_2"
@@ -637,7 +665,7 @@ def test_by_agent_session_cross_agent_same_session_id_no_conflict():
 def test_by_agent_session_empty_keys_never_match():
     s = TaskStore(None)
     make(s, thread="om_1")
-    s.update("t1", session_id="sid_a", agent_label="copilot")
+    s.update("t1", agent_session_id="sid_a", agent_label="copilot")
     assert s.by_agent_session("", "sid_a") is None
     assert s.by_agent_session("copilot", "") is None
     assert s.by_agent_session("", "") is None

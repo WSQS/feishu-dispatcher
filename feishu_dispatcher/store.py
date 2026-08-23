@@ -1,6 +1,6 @@
 """任务台账持久化：Task 是 daemon 拥有的核心实体。
 
-一个 Task = 派发在某项目上的一个工作单元，持有它的 session_id（agent 侧记忆）、
+一个 Task = 派发在某项目上的一个工作单元，持有它的 agent_session_id（agent 侧记忆）、
 ConversationRef + thread_root_id（交互入口）、workspace（工作目录）。落盘到 tasks.json，
 按 `task_id`（短自增 `t<N>`，持久单调计数器、**永不复用**）索引；按
 ConversationRef + thread_root_id 路由交互线程。
@@ -134,7 +134,7 @@ class Task:
     agent_label: str
     description: str
     status: str  # starting/running/idle/suspended/done/stopped/failed
-    session_id: str = ""
+    agent_session_id: str = ""
     channel_key: str = ""
     conversation_id: str = ""
     thread_root_id: str = ""
@@ -174,6 +174,18 @@ class Task:
         return self.status in TERMINAL_STATES
 
 
+def _task_from_record(record: dict) -> Task:
+    values = {key: record[key] for key in _TASK_FIELDS if key in record}
+    values["agent_session_id"] = values.pop("session_id", "")
+    return Task(**values)
+
+
+def _task_to_record(task: Task) -> dict:
+    record = asdict(task)
+    record["session_id"] = record.pop("agent_session_id")
+    return record
+
+
 class TaskStore:
     """task_id → Task 台账 + Channel-scoped thread 路由 + 单调计数器。
 
@@ -199,7 +211,7 @@ class TaskStore:
         try:
             self._seq = int(data.get("seq", 0))
             for tid, d in (data.get("tasks") or {}).items():
-                self._tasks[tid] = Task(**{k: d[k] for k in _TASK_FIELDS if k in d})
+                self._tasks[tid] = _task_from_record(d)
             logger.info("已加载 %d 个任务: %s", len(self._tasks), self._path)
         except Exception:
             logger.warning("任务台账解析失败，忽略: %s", self._path, exc_info=True)
@@ -211,7 +223,7 @@ class TaskStore:
             return
         payload = {
             "seq": self._seq,
-            "tasks": {tid: asdict(t) for tid, t in self._tasks.items()},
+            "tasks": {tid: _task_to_record(t) for tid, t in self._tasks.items()},
         }
         try:
             _atomic_write_json(self._path, payload)
@@ -259,7 +271,7 @@ class TaskStore:
         if not agent_label or not session_id:
             return None
         for t in self._tasks.values():
-            if t.agent_label == agent_label and t.session_id == session_id:
+            if t.agent_label == agent_label and t.agent_session_id == session_id:
                 return t
         return None
 
@@ -274,7 +286,7 @@ class TaskStore:
         conversation: ConversationRef,
         thread_root_id: str,
         workspace: str,
-        session_id: str = "",
+        agent_session_id: str = "",
         status: str = "starting",
         issue_url: str = "",
         model: str = "",
@@ -299,7 +311,7 @@ class TaskStore:
             agent_label=agent_label,
             description=description,
             status=status,
-            session_id=session_id,
+            agent_session_id=agent_session_id,
             channel_key=conversation.channel_key,
             conversation_id=conversation.conversation_id,
             thread_root_id=thread_root_id,
@@ -315,7 +327,7 @@ class TaskStore:
         return task
 
     def update(self, task_id: str, **changes) -> Task | None:
-        """就地更新任务字段（status/session_id/turns…），刷新 updated_at 并落盘。
+        """就地更新任务字段（status/agent_session_id/turns…），刷新 updated_at 并落盘。
 
         改成终止态时顺带修剪历史。
         """
