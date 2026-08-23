@@ -542,8 +542,8 @@ class _Daemon:
     _sched_memory: SchedulerMemory = field(
         default_factory=lambda: SchedulerMemory(None)
     )
-    #: 同一 Task 的 Turn 共用一把锁；跨 Channel / runner 串行，不同 Task 可并行。
-    _task_turn_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    #: 同一 Session 的 Turn 共用一把锁；跨 Channel / runner 串行，不同 Session 可并行。
+    _session_turn_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     #: 由启动装配层注入；稳定 key → Channel 实例。
     _channels: dict[str, Channel] = field(default_factory=dict)
     #: 控制台主线通知与兼容消息入口使用的主 Channel key。
@@ -616,12 +616,12 @@ class _Daemon:
     def _task_identity_exists(self, task_id: str) -> bool:
         return task_id == _DISPATCHER_SESSION_ID or self.store.get(task_id) is not None
 
-    def _task_turn_lock(self, task_id: str) -> asyncio.Lock:
-        """返回 Task 身份对应的进程内 Turn 锁。"""
-        lock = self._task_turn_locks.get(task_id)
+    def _session_turn_lock(self, session_id: str) -> asyncio.Lock:
+        """返回 Session 身份对应的进程内 Turn 锁。"""
+        lock = self._session_turn_locks.get(session_id)
         if lock is None:
             lock = asyncio.Lock()
-            self._task_turn_locks[task_id] = lock
+            self._session_turn_locks[session_id] = lock
         return lock
 
     def _task_id_for_conversation(self, conversation: ConversationRef) -> str | None:
@@ -1770,7 +1770,7 @@ class _Daemon:
                         source=sess.conversation,
                     )
                     break
-                async with self._task_turn_lock(sess.task_id):
+                async with self._session_turn_lock(sess.task_id):
                     if not self._runners.is_current(sess.task_id, sess):
                         break
                     if isinstance(queued, _BgBatch):
@@ -2326,7 +2326,7 @@ class _Daemon:
             self._bind_conversation(main_conversation, _DISPATCHER_SESSION_ID)
         self._bind_conversation(conversation, _DISPATCHER_SESSION_ID)
 
-        async with self._task_turn_lock(_DISPATCHER_SESSION_ID):
+        async with self._session_turn_lock(_DISPATCHER_SESSION_ID):
             conversations = self._conversations_for_task(
                 _DISPATCHER_SESSION_ID,
                 source=conversation,
