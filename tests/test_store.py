@@ -1,4 +1,4 @@
-"""任务台账 SessionStore 的单元测试。"""
+"""SessionStore 的单元测试。"""
 
 from __future__ import annotations
 
