@@ -1576,31 +1576,33 @@ class _Daemon:
 
     def _launch(
         self,
-        task: Session,
+        session: Session,
         agent_argv: list[str],
         first_turn: TurnRequest | None,
         *,
         resume_session_id: str | None = None,
         attached: bool = False,
     ) -> _AgentSessionRunner:
-        """按 Task 建 session、接线 on_output、入队首个 Turn、启动 worker。
+        """按 Session 创建 ``_AgentSessionRunner``、接线输出、入队首个 Turn、启动 worker。
 
         ``resume_session_id`` 非 None 时 agent 用 load_session 恢复（惰性重连）。
         ``first_turn=None`` 时只把 agent 拉起来在线（不跑首轮），用于 resume_task。
-        ``attached=True`` 仅由 ``/attach`` 的**首次**拉起置位——附着摘要文案；附着任务
+        ``attached=True`` 仅由 ``/attach`` 的**首次**拉起置位——附着摘要文案；该 Session
         事后经 ``_try_resume`` 恢复时仍走普通「已恢复」路径（attached 默认 False）。
         """
-        task_conversation = ConversationRef(task.channel_key, task.thread_root_id)
-        self._bind_conversation(task_conversation, task.task_id)
+        session_conversation = ConversationRef(
+            session.channel_key, session.thread_root_id
+        )
+        self._bind_conversation(session_conversation, session.task_id)
         sess = _AgentSessionRunner(
-            project_name=task.project_name,
-            agent_label=task.agent_label,
-            session_id=task.task_id,
-            conversation=task_conversation,
-            cwd=task.workspace,
+            project_name=session.project_name,
+            agent_label=session.agent_label,
+            session_id=session.task_id,
+            conversation=session_conversation,
+            cwd=session.workspace,
             resumed=resume_session_id is not None,
             attached=attached,
-            issue_url=task.issue_url,
+            issue_url=session.issue_url,
         )
 
         async def on_output(text: str) -> None:
@@ -1620,31 +1622,31 @@ class _Daemon:
             self.store.add_action(sess.session_id, {"turn": turn, **action})
 
         # 配置里给该后端声明的追加 env（[agents.<名>].env，如 codex 的 CODEX_PATH）打底。
-        env: dict[str, str] = dict(self.cfg.agent_env.get(task.agent_label, {}))
+        env: dict[str, str] = dict(self.cfg.agent_env.get(session.agent_label, {}))
         # 身份注入（#68）：给 agent 子进程一份一次性 token + 控制面 URL（经 env 逐层
         # 透传到 agent 跑的 shell → fdx）。有控制面才注入（测试无控制面时不注入）。
         if self._control is not None:
             token = secrets.token_urlsafe(16)
-            self._bg_tokens[token] = task.task_id
+            self._bg_tokens[token] = session.task_id
             sess.bg_token = token
             env.update(
                 {
                     "FEISHU_DISPATCHER_URL": self._control.base_url,
                     "FEISHU_DISPATCHER_TOKEN": token,
-                    "FEISHU_DISPATCHER_TASK_ID": task.task_id,
+                    "FEISHU_DISPATCHER_TASK_ID": session.task_id,
                 }
             )
         sess.agent = self._make_agent(
-            AgentSpawn(command=list(agent_argv), cwd=task.workspace, env=env),
+            AgentSpawn(command=list(agent_argv), cwd=session.workspace, env=env),
             on_output,
             on_action,
             resume_session_id=resume_session_id,
         )
         if first_turn is not None:
             sess.enqueue(first_turn)
-        self._runners.register(task.task_id, sess)
+        self._runners.register(session.task_id, sess)
         sess.worker = asyncio.create_task(
-            self._agent_worker(sess, first_turn), name=f"agent-{task.task_id}"
+            self._agent_worker(sess, first_turn), name=f"agent-{session.task_id}"
         )
         return sess
 
