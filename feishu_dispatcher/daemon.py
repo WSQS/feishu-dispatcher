@@ -5,7 +5,7 @@ P0 原型范围（设计文档）：
 - 根消息 `/run` 触发 spawn，话题回复排队追加给同一 agent
 
 生命周期模型（review R2/R3 修复后的设计）：
-- 一个 `/run` = 一个 `_AgentSession`：agent 进程与 ACP session **跨 turn 存活**，
+- 一个 `/run` = 一个 `_AgentSessionRunner`：agent 进程与 ACP session **跨 turn 存活**，
   上下文保留在 session 里
 - 每个 session 一个 Turn 队列 + 单消费者 worker task，turn 串行执行
 - 话题回复只入队；`/stop`（入队 None 哨兵）、执行出错或 daemon 退出才关闭 agent
@@ -431,7 +431,7 @@ class _FanoutStreamingOutput:
 
 
 @dataclass
-class _AgentSession:
+class _AgentSessionRunner:
     """一个活跃 agent 的运行时状态。"""
 
     project_name: str
@@ -495,26 +495,26 @@ class _CurrentRunnerRegistry:
     """Task 的单活 current-runner 槽位；task_id 只是 lookup key。"""
 
     def __init__(self) -> None:
-        self._by_task: dict[str, _AgentSession] = {}
+        self._by_task: dict[str, _AgentSessionRunner] = {}
 
-    def get_for_task(self, task_id: str) -> _AgentSession | None:
+    def get_for_task(self, task_id: str) -> _AgentSessionRunner | None:
         return self._by_task.get(task_id)
 
-    def register(self, task_id: str, runner: _AgentSession) -> None:
+    def register(self, task_id: str, runner: _AgentSessionRunner) -> None:
         if task_id in self._by_task:
             raise RuntimeError(f"task {task_id} 已有 current runner")
         self._by_task[task_id] = runner
 
-    def is_current(self, task_id: str, runner: _AgentSession) -> bool:
+    def is_current(self, task_id: str, runner: _AgentSessionRunner) -> bool:
         return self._by_task.get(task_id) is runner
 
-    def remove_if_current(self, task_id: str, runner: _AgentSession) -> bool:
+    def remove_if_current(self, task_id: str, runner: _AgentSessionRunner) -> bool:
         if not self.is_current(task_id, runner):
             return False
         del self._by_task[task_id]
         return True
 
-    def values(self) -> list[_AgentSession]:
+    def values(self) -> list[_AgentSessionRunner]:
         return list(self._by_task.values())
 
     def count(self) -> int:
@@ -1573,7 +1573,7 @@ class _Daemon:
         *,
         resume_session_id: str | None = None,
         attached: bool = False,
-    ) -> _AgentSession:
+    ) -> _AgentSessionRunner:
         """按 Task 建 session、接线 on_output、入队首个 Turn、启动 worker。
 
         ``resume_session_id`` 非 None 时 agent 用 load_session 恢复（惰性重连）。
@@ -1583,7 +1583,7 @@ class _Daemon:
         """
         task_conversation = ConversationRef(task.channel_key, task.thread_root_id)
         self._bind_conversation(task_conversation, task.task_id)
-        sess = _AgentSession(
+        sess = _AgentSessionRunner(
             project_name=task.project_name,
             agent_label=task.agent_label,
             task_id=task.task_id,
@@ -1640,7 +1640,7 @@ class _Daemon:
         return sess
 
     async def _agent_worker(
-        self, sess: _AgentSession, startup_turn: TurnRequest | None
+        self, sess: _AgentSessionRunner, startup_turn: TurnRequest | None
     ) -> None:
         """一个 agent 的完整生命周期：启动 → 串行消费 Turn 队列 → 关闭。"""
         root = sess.conversation.conversation_id
@@ -1902,7 +1902,7 @@ class _Daemon:
         finally:
             await self._close_session(sess)
 
-    async def _close_session(self, sess: _AgentSession) -> None:
+    async def _close_session(self, sess: _AgentSessionRunner) -> None:
         """收尾 runner：仅按 identity 移除自身槽位，但始终关闭自身资源。"""
         self._runners.remove_if_current(sess.task_id, sess)
         if sess.bg_token:  # 作废该 session 的后台任务 token（#68）
@@ -1923,7 +1923,7 @@ class _Daemon:
             except Exception:
                 logger.debug("agent aclose 异常（忽略）", exc_info=True)
 
-    async def _cancel_turn(self, sess: _AgentSession) -> None:
+    async def _cancel_turn(self, sess: _AgentSessionRunner) -> None:
         """协作式取消 session 当前在途的 turn（ACP session/cancel）。失败不致命。"""
         agent = sess.agent
         if agent is None:
@@ -2038,7 +2038,7 @@ class _Daemon:
 
     async def _handle_model_cmd(
         self,
-        sess: _AgentSession,
+        sess: _AgentSessionRunner,
         reply_target: str,
         text: str,
         *,

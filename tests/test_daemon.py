@@ -25,7 +25,7 @@ from feishu_dispatcher.config import (
 from feishu_dispatcher.channel import ChannelMessage, ConversationRef, StreamingOutput
 from feishu_dispatcher.daemon import (
     TurnRequest,
-    _AgentSession,
+    _AgentSessionRunner,
     _CurrentRunnerRegistry,
     _Daemon,
     _DISPATCHER_TASK_ID,
@@ -1190,13 +1190,13 @@ def current_runner(daemon: _Daemon, thread: str = "om_root1"):
 
 def test_current_runner_registry_rejects_occupied_slot():
     registry = _CurrentRunnerRegistry()
-    runner_a = _AgentSession(
+    runner_a = _AgentSessionRunner(
         "demo",
         "copilot",
         task_id="t1",
         conversation=ConversationRef("feishu", "thread-a"),
     )
-    runner_b = _AgentSession(
+    runner_b = _AgentSessionRunner(
         "demo",
         "copilot",
         task_id="t1",
@@ -1215,13 +1215,13 @@ def test_current_runner_registry_rejects_occupied_slot():
 
 def test_current_runner_registry_remove_is_expected_current_and_repeatable():
     registry = _CurrentRunnerRegistry()
-    runner_a = _AgentSession(
+    runner_a = _AgentSessionRunner(
         "demo",
         "copilot",
         task_id="t1",
         conversation=ConversationRef("feishu", "thread-a"),
     )
-    runner_b = _AgentSession(
+    runner_b = _AgentSessionRunner(
         "demo",
         "copilot",
         task_id="t1",
@@ -1540,13 +1540,13 @@ async def test_run_unknown_agent_errors_no_spawn():
 
 async def test_old_runner_repeated_cleanup_does_not_remove_replacement():
     daemon, _, _ = make_daemon()
-    runner_a = _AgentSession(
+    runner_a = _AgentSessionRunner(
         "demo",
         "copilot",
         task_id="t1",
         conversation=ConversationRef("feishu", "thread-a"),
     )
-    runner_b = _AgentSession(
+    runner_b = _AgentSessionRunner(
         "demo",
         "copilot",
         task_id="t1",
@@ -2022,7 +2022,7 @@ async def test_replaced_runner_late_completion_does_not_overwrite_current_state(
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
     runner_a = current_runner(daemon)
-    runner_b = _AgentSession(
+    runner_b = _AgentSessionRunner(
         "demo",
         "copilot",
         task_id="t1",
@@ -2963,7 +2963,7 @@ async def test_http_list_tasks_reports_dispatcher_and_agent_runtime_state():
     daemon.store.update(historical.task_id, turns=1)
     daemon._runners.register(
         active.task_id,
-        _AgentSession(
+        _AgentSessionRunner(
             "demo",
             "copilot",
             task_id=active.task_id,
