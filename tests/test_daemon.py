@@ -813,7 +813,7 @@ async def test_http_create_task_conversation_creates_thread_and_binds_task():
     }
     assert http.created_threads == [("browser-a", "[t1] review changes")]
     task_conversation = ConversationRef("http", "om_newroot_1")
-    assert daemon._task_for_conversation(task_conversation) is task
+    assert daemon._session_for_conversation(task_conversation) is task
     assert task.conversation_ref == ConversationRef("feishu", "oc_1")
     assert task.thread_root_id == "om_root"
 
@@ -827,7 +827,8 @@ async def test_http_create_task_conversation_creates_thread_and_binds_task():
     assert second_status == 201
     assert second_payload["thread_id"] == "om_newroot_2"
     assert (
-        daemon._task_for_conversation(ConversationRef("http", "om_newroot_2")) is task
+        daemon._session_for_conversation(ConversationRef("http", "om_newroot_2"))
+        is task
     )
 
 
@@ -873,7 +874,9 @@ async def test_http_task_conversation_round_trip_routes_to_existing_runner():
         )
         assert status == 201
         thread_id = opened["thread_id"]
-        assert daemon._task_for_conversation(ConversationRef("http", thread_id)) is task
+        assert (
+            daemon._session_for_conversation(ConversationRef("http", thread_id)) is task
+        )
 
         event_status, events = await asyncio.to_thread(
             http_channel_request,
@@ -1263,12 +1266,21 @@ def test_conversation_binding_is_idempotent_and_rejects_conflict():
     daemon._bind_conversation(conversation, task_a.task_id)
     daemon._bind_conversation(conversation, task_a.task_id)
 
-    assert daemon._task_for_conversation(conversation) is task_a
+    assert daemon._session_for_conversation(conversation) is task_a
     with pytest.raises(RuntimeError, match="已绑定 Task t1"):
         daemon._bind_conversation(conversation, task_b.task_id)
 
 
-def test_conversation_binding_drops_deleted_task():
+def test_conversation_binding_has_no_task_named_private_aliases():
+    daemon, _, _ = make_daemon()
+
+    assert not hasattr(daemon, "_conversation_task_ids")
+    assert not hasattr(daemon, "_task_identity_exists")
+    assert not hasattr(daemon, "_task_id_for_conversation")
+    assert not hasattr(daemon, "_task_for_conversation")
+
+
+def test_conversation_binding_drops_deleted_session():
     store = SessionStore(None)
     task = store.create(
         project_name="demo",
@@ -1284,8 +1296,8 @@ def test_conversation_binding_drops_deleted_task():
     daemon._bind_conversation(conversation, task.task_id)
 
     assert store.clear_terminal() == 1
-    assert daemon._task_for_conversation(conversation) is None
-    assert conversation not in daemon._conversation_task_ids
+    assert daemon._session_for_conversation(conversation) is None
+    assert conversation not in daemon._conversation_session_ids
 
 
 def test_dispatcher_session_identity_constant_has_no_task_alias():
@@ -1299,9 +1311,9 @@ def test_conversation_binding_supports_runtime_dispatcher_session_identity():
 
     daemon._bind_conversation(conversation, _DISPATCHER_SESSION_ID)
 
-    assert daemon._task_id_for_conversation(conversation) == _DISPATCHER_SESSION_ID
-    assert daemon._task_for_conversation(conversation) is None
-    assert daemon._task_id_for_conversation(conversation) == _DISPATCHER_SESSION_ID
+    assert daemon._session_id_for_conversation(conversation) == _DISPATCHER_SESSION_ID
+    assert daemon._session_for_conversation(conversation) is None
+    assert daemon._session_id_for_conversation(conversation) == _DISPATCHER_SESSION_ID
     assert daemon._conversations_for_task(_DISPATCHER_SESSION_ID) == (conversation,)
 
 
@@ -1787,7 +1799,7 @@ async def test_same_message_id_help_replies_on_source_channel():
     await daemon._handle_channel_message("web", message)
     assert [target for target, _ in feishu.plain] == ["om_shared"]
     assert [target for target, _ in web.plain] == ["om_shared"]
-    assert daemon._task_id_for_conversation(ConversationRef("web", "oc_1")) is None
+    assert daemon._session_id_for_conversation(ConversationRef("web", "oc_1")) is None
 
 
 async def test_thread_message_uses_thread_conversation_ref():
@@ -1935,7 +1947,7 @@ async def test_bound_cross_channel_thread_routes_to_existing_runner():
     main_conversation = ConversationRef("feishu", "om_root1")
     web_conversation = ConversationRef("web", "web-thread")
 
-    assert daemon._task_for_conversation(main_conversation) is task
+    assert daemon._session_for_conversation(main_conversation) is task
     daemon._bind_conversation(web_conversation, task.task_id)
     await daemon._handle_channel_message(
         "web",
@@ -2482,13 +2494,13 @@ async def test_orphan_stop_marks_stopped_without_recovering():
     task = _seed_task(store, thread="om_orphan")
     daemon, bridge, created = make_daemon(store=store)
     conversation = ConversationRef("feishu", "om_orphan")
-    assert daemon._task_for_conversation(conversation) is None
+    assert daemon._session_for_conversation(conversation) is None
 
     await daemon._handle_message(thread_msg("/stop", root="om_orphan", mid="om_z"))
 
     assert created == []  # 没为了停而恢复
     assert task_by_thread(store, "om_orphan").status == "stopped"
-    assert daemon._task_for_conversation(conversation) is task
+    assert daemon._session_for_conversation(conversation) is task
     assert any("已结束" in t for t in bridge.texts("om_orphan"))
 
 
@@ -2685,10 +2697,12 @@ async def test_dispatcher_root_turns_sync_between_channels():
 
     feishu_conversation = ConversationRef("feishu", "oc_1")
     web_conversation = ConversationRef("web", "web-room")
-    assert daemon._task_id_for_conversation(feishu_conversation) == (
+    assert daemon._session_id_for_conversation(feishu_conversation) == (
         _DISPATCHER_SESSION_ID
     )
-    assert daemon._task_id_for_conversation(web_conversation) == _DISPATCHER_SESSION_ID
+    assert (
+        daemon._session_id_for_conversation(web_conversation) == _DISPATCHER_SESSION_ID
+    )
     assert set(daemon._conversations_for_task(_DISPATCHER_SESSION_ID)) == {
         feishu_conversation,
         web_conversation,
@@ -2751,7 +2765,7 @@ async def test_dispatcher_turns_are_serialized_across_channels():
     await asyncio.sleep(0)
 
     assert (
-        daemon._task_id_for_conversation(ConversationRef("web", "web-room"))
+        daemon._session_id_for_conversation(ConversationRef("web", "web-room"))
         == _DISPATCHER_SESSION_ID
     )
     assert len(llm.calls) == 1

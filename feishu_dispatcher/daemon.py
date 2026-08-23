@@ -548,8 +548,8 @@ class _Daemon:
     _channels: dict[str, Channel] = field(default_factory=dict)
     #: 控制台主线通知与兼容消息入口使用的主 Channel key。
     _primary_channel_key: str = "feishu"
-    #: 进程内 Conversation → Task 身份绑定；系统 Task 与额外入口不持久化。
-    _conversation_task_ids: dict[ConversationRef, str] = field(default_factory=dict)
+    #: 进程内 Conversation → Session 身份绑定；Dispatcher Session 与额外入口不持久化。
+    _conversation_session_ids: dict[ConversationRef, str] = field(default_factory=dict)
     #: 每个 Session 的单活 current runner；Thread 只经 Session 路由到这里。
     _runners: _CurrentRunnerRegistry = field(default_factory=_CurrentRunnerRegistry)
     _seen_message_keys: OrderedDict[tuple[ConversationRef, str], None] = field(
@@ -594,27 +594,34 @@ class _Daemon:
         except KeyError as exc:
             raise RuntimeError(f"Channel 未注册: {channel_key!r}") from exc
 
-    def _bind_conversation(self, conversation: ConversationRef, task_id: str) -> None:
-        """把完整 Conversation 绑定到一个已知 Task 身份；重复绑定幂等。"""
+    def _bind_conversation(
+        self, conversation: ConversationRef, session_id: str
+    ) -> None:
+        """把完整 Conversation 绑定到一个已知 Session 身份；重复绑定幂等。"""
         if not conversation.channel_key.strip():
             raise ValueError("ConversationRef.channel_key 不能为空")
         if not conversation.conversation_id.strip():
             raise ValueError("ConversationRef.conversation_id 不能为空")
-        if not self._task_identity_exists(task_id):
-            raise ValueError(f"Task 不存在: {task_id}")
+        if not self._session_identity_exists(session_id):
+            raise ValueError(f"Task 不存在: {session_id}")
 
-        bound_task_id = self._conversation_task_ids.get(conversation)
-        if bound_task_id is not None and not self._task_identity_exists(bound_task_id):
-            self._conversation_task_ids.pop(conversation, None)
-            bound_task_id = None
-        if bound_task_id is not None and bound_task_id != task_id:
+        bound_session_id = self._conversation_session_ids.get(conversation)
+        if bound_session_id is not None and not self._session_identity_exists(
+            bound_session_id
+        ):
+            self._conversation_session_ids.pop(conversation, None)
+            bound_session_id = None
+        if bound_session_id is not None and bound_session_id != session_id:
             raise RuntimeError(
-                f"Conversation {conversation!r} 已绑定 Task {bound_task_id}"
+                f"Conversation {conversation!r} 已绑定 Task {bound_session_id}"
             )
-        self._conversation_task_ids[conversation] = task_id
+        self._conversation_session_ids[conversation] = session_id
 
-    def _task_identity_exists(self, task_id: str) -> bool:
-        return task_id == _DISPATCHER_SESSION_ID or self.store.get(task_id) is not None
+    def _session_identity_exists(self, session_id: str) -> bool:
+        return (
+            session_id == _DISPATCHER_SESSION_ID
+            or self.store.get(session_id) is not None
+        )
 
     def _session_turn_lock(self, session_id: str) -> asyncio.Lock:
         """返回 Session 身份对应的进程内 Turn 锁。"""
@@ -624,22 +631,24 @@ class _Daemon:
             self._session_turn_locks[session_id] = lock
         return lock
 
-    def _task_id_for_conversation(self, conversation: ConversationRef) -> str | None:
-        """返回 Conversation 绑定的 Task 身份；失效绑定会同步清理。"""
-        task_id = self._conversation_task_ids.get(conversation)
-        if task_id is None:
+    def _session_id_for_conversation(self, conversation: ConversationRef) -> str | None:
+        """返回 Conversation 绑定的 Session 身份；失效绑定会同步清理。"""
+        session_id = self._conversation_session_ids.get(conversation)
+        if session_id is None:
             return None
-        if self._task_identity_exists(task_id):
-            return task_id
-        self._conversation_task_ids.pop(conversation, None)
+        if self._session_identity_exists(session_id):
+            return session_id
+        self._conversation_session_ids.pop(conversation, None)
         return None
 
-    def _task_for_conversation(self, conversation: ConversationRef) -> Session | None:
-        """按运行时绑定解析持久化 Agent Task。"""
-        task_id = self._task_id_for_conversation(conversation)
-        if task_id is None:
+    def _session_for_conversation(
+        self, conversation: ConversationRef
+    ) -> Session | None:
+        """按运行时绑定解析持久化 Session。"""
+        session_id = self._session_id_for_conversation(conversation)
+        if session_id is None:
             return None
-        return self.store.get(task_id)
+        return self.store.get(session_id)
 
     def _conversations_for_task(
         self,
@@ -648,20 +657,20 @@ class _Daemon:
         source: ConversationRef | None = None,
     ) -> tuple[ConversationRef, ...]:
         """返回 Task 当前绑定的 Conversation 快照，来源优先且不重复。"""
-        if not self._task_identity_exists(task_id):
+        if not self._session_identity_exists(task_id):
             stale = [
                 conversation
-                for conversation, bound_task_id in self._conversation_task_ids.items()
-                if bound_task_id == task_id
+                for conversation, bound_session_id in self._conversation_session_ids.items()
+                if bound_session_id == task_id
             ]
             for conversation in stale:
-                self._conversation_task_ids.pop(conversation, None)
+                self._conversation_session_ids.pop(conversation, None)
             return ()
 
         conversations = [
             conversation
-            for conversation, bound_task_id in self._conversation_task_ids.items()
-            if bound_task_id == task_id
+            for conversation, bound_session_id in self._conversation_session_ids.items()
+            if bound_session_id == task_id
         ]
         if source is not None:
             conversations = [
@@ -1963,7 +1972,7 @@ class _Daemon:
                 )
                 return
             forward_raw = True
-        task = self._task_for_conversation(conversation)
+        task = self._session_for_conversation(conversation)
         if task is None:
             task_source = ConversationRef(conversation.channel_key, msg.conversation_id)
             task = self.store.by_thread(task_source, thread_root)
