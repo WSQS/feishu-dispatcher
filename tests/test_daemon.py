@@ -1185,11 +1185,13 @@ async def wait_until(cond, timeout: float = 2.0) -> None:
 
 def current_runner(daemon: _Daemon, thread: str = "om_root1"):
     task = task_by_thread(daemon.store, thread)
-    return daemon._runners.get_for_task(task.task_id) if task is not None else None
+    return daemon._runners.get_for_session(task.task_id) if task is not None else None
 
 
 def test_current_runner_registry_rejects_occupied_slot():
     registry = _CurrentRunnerRegistry()
+    assert not hasattr(registry, "get_for_task")
+    assert not hasattr(registry, "_by_task")
     runner_a = _AgentSessionRunner(
         "demo",
         "copilot",
@@ -1205,7 +1207,7 @@ def test_current_runner_registry_rejects_occupied_slot():
 
     registry.register("t1", runner_a)
 
-    assert registry.get_for_task("t1") is runner_a
+    assert registry.get_for_session("t1") is runner_a
     assert registry.is_current("t1", runner_a)
     assert registry.count() == 1
     assert registry.values() == [runner_a]
@@ -1230,10 +1232,10 @@ def test_current_runner_registry_remove_is_expected_current_and_repeatable():
     registry.register("t1", runner_a)
 
     assert not registry.remove_if_current("t1", runner_b)
-    assert registry.get_for_task("t1") is runner_a
+    assert registry.get_for_session("t1") is runner_a
     assert registry.remove_if_current("t1", runner_a)
     assert not registry.remove_if_current("t1", runner_a)
-    assert registry.get_for_task("t1") is None
+    assert registry.get_for_session("t1") is None
 
 
 def test_conversation_binding_is_idempotent_and_rejects_conflict():
@@ -1561,7 +1563,7 @@ async def test_old_runner_repeated_cleanup_does_not_remove_replacement():
     await daemon._close_session(runner_a)
     await daemon._close_session(runner_a)
 
-    assert daemon._runners.get_for_task("t1") is runner_b
+    assert daemon._runners.get_for_session("t1") is runner_b
     assert agent_a.closed
     assert runner_a.agent is None
 
@@ -1947,7 +1949,7 @@ async def test_bound_cross_channel_thread_routes_to_existing_runner():
         )
     )
 
-    assert daemon._runners.get_for_task(task.task_id) is runner
+    assert daemon._runners.get_for_session(task.task_id) is runner
     assert runner.conversation == main_conversation
     assert "↪️ 同步自 web：web follow up" in feishu.texts("om_root1")
     assert "↪️ 同步自 web：web follow up" not in web.texts("web-thread")
@@ -2038,7 +2040,7 @@ async def test_replaced_runner_late_completion_does_not_overwrite_current_state(
     task = daemon.store.get("t1")
     assert task.status == "starting"
     assert task.turns == 0
-    assert daemon._runners.get_for_task("t1") is runner_b
+    assert daemon._runners.get_for_session("t1") is runner_b
     await daemon._close_session(runner_b)
 
 
@@ -2363,7 +2365,7 @@ async def test_recovery_turn_fans_out_start_and_output():
         )
     )
 
-    runner = daemon._runners.get_for_task(task.task_id)
+    runner = daemon._runners.get_for_session(task.task_id)
     assert runner.conversation == ConversationRef(task.channel_key, task.thread_root_id)
     assert any("正在恢复任务" in text for text in feishu.texts("om_main"))
     assert any("已恢复会话" in text for text in feishu.texts("om_main"))
@@ -2399,8 +2401,8 @@ async def test_cross_channel_recovery_start_failure_fans_out():
 
     assert len(created) == 1
     assert store.get(task.task_id).status == "failed"
-    await wait_until(lambda: daemon._runners.get_for_task(task.task_id) is None)
-    assert daemon._runners.get_for_task(task.task_id) is None
+    await wait_until(lambda: daemon._runners.get_for_session(task.task_id) is None)
+    assert daemon._runners.get_for_session(task.task_id) is None
 
 
 async def test_cross_channel_turn_error_fans_out():
@@ -2438,8 +2440,8 @@ async def test_cross_channel_turn_error_fans_out():
 
     assert created[0].prompts == ["fail"]
     assert store.get(task.task_id).status == "failed"
-    await wait_until(lambda: daemon._runners.get_for_task(task.task_id) is None)
-    assert daemon._runners.get_for_task(task.task_id) is None
+    await wait_until(lambda: daemon._runners.get_for_session(task.task_id) is None)
+    assert daemon._runners.get_for_session(task.task_id) is None
 
 
 async def test_reply_to_unknown_topic_notifies_not_silent():
