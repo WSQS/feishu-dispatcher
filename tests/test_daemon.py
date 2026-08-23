@@ -2289,7 +2289,7 @@ def _seed_task(
         thread_root_id=thread,
         workspace="C:/tmp/demo",
     )
-    store.update(t.task_id, session_id=session_id, status=status)
+    store.update(t.task_id, agent_session_id=session_id, status=status)
     return t
 
 
@@ -2301,13 +2301,13 @@ async def test_run_creates_task():
     await wait_until(
         lambda: (
             task_by_thread(store, "om_root1", conversation)
-            and task_by_thread(store, "om_root1", conversation).session_id
+            and task_by_thread(store, "om_root1", conversation).agent_session_id
         )
     )
     t = task_by_thread(store, "om_root1", conversation)
     assert t.project_name == "demo"
     assert t.agent_label == "copilot"
-    assert t.session_id == created[0].session_id
+    assert t.agent_session_id == created[0].session_id
     assert t.description == "task"
     assert t.conversation_ref == ConversationRef("test", "oc_1")
     await daemon._shutdown()
@@ -2321,10 +2321,10 @@ async def test_recovery_after_restart_uses_file_task_store(tmp_path: Path):
     await wait_until(
         lambda: (
             task_by_thread(store1, "om_root1")
-            and task_by_thread(store1, "om_root1").session_id
+            and task_by_thread(store1, "om_root1").agent_session_id
         )
     )
-    saved_sid = task_by_thread(store1, "om_root1").session_id
+    saved_sid = task_by_thread(store1, "om_root1").agent_session_id
     await d1._shutdown()
     assert task_by_thread(store1, "om_root1").status == "suspended"
 
@@ -2890,7 +2890,7 @@ async def test_failed_task_resumes_on_thread_reply():
     await wait_until(lambda: current_runner(daemon) is None)
     assert task_by_thread(
         daemon.store, "om_root1"
-    ).session_id  # turn 失败时 session 已建
+    ).agent_session_id  # turn 失败时 session 已建
     # 话题回复 → load_session 恢复（起第二个 agent，带 resume_session_id）→ 成功
     await daemon._handle_message(thread_msg("再试一次"))
     await wait_until(lambda: len(created) == 2)
@@ -2912,7 +2912,7 @@ async def test_startup_failure_stays_unresumable_guides_to_run():
     )
     await wait_until(lambda: current_runner(daemon) is None)
     task = task_by_thread(daemon.store, "om_root1")
-    assert not task.session_id  # startup 失败没建会话
+    assert not task.agent_session_id  # startup 失败没建会话
     # 话题回复 → 尝试恢复但无 session → 挡回 /run（不丢人，只是没得恢复）
     await daemon._handle_message(thread_msg("再试"))
     await wait_until(
@@ -3177,7 +3177,7 @@ async def test_get_task_returns_detail():
     store = TaskStore(None)
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/run demo do it"))
-    await wait_until(lambda: store.get("t1") and store.get("t1").session_id)
+    await wait_until(lambda: store.get("t1") and store.get("t1").agent_session_id)
     info = daemon._sched_get_task("t1")
     assert info["task_id"] == "t1"
     assert info["project"] == "demo"
@@ -3446,7 +3446,7 @@ async def test_model_choice_survives_suspend_resume():
     # 切到 glm-5 → 台账记成 glm-5
     await d1._handle_message(thread_msg("/model zhipuai/glm-5", mid="om_m"))
     assert store.get("t1").model == "zhipuai/glm-5"
-    saved_sid = task_by_thread(store, "om_root1").session_id
+    saved_sid = task_by_thread(store, "om_root1").agent_session_id
 
     # 挂起：任务标 suspended、记录保留，Task.model 应仍是 glm-5
     await d1._shutdown()
@@ -3550,7 +3550,7 @@ async def test_attach_creates_task_and_resumes_external_session():
 
     t = task_by_thread(store, root)
     assert t.origin == "attach"
-    assert t.session_id == "ext_sid_1"
+    assert t.agent_session_id == "ext_sid_1"
     assert t.agent_label == "opencode"
     assert t.project_name == "demo"
     assert t.conversation_ref == ConversationRef("feishu", "oc_1")
@@ -3606,7 +3606,7 @@ async def test_attach_duplicate_rejected_and_guides_to_existing():
         conversation=ConversationRef("feishu", "oc_1"),
         thread_root_id="om_old",
         workspace="C:/tmp/demo",
-        session_id="ext_sid_1",
+        agent_session_id="ext_sid_1",
         origin="attach",
     )
     daemon, bridge, created = make_daemon(store=store)
@@ -3654,7 +3654,7 @@ async def test_attach_launch_failure_reports_attach_error():
         conversation=ConversationRef("feishu", "oc_1"),
         thread_root_id="om_root1",
         workspace="C:/tmp/demo",
-        session_id="ext_sid_1",
+        agent_session_id="ext_sid_1",
         origin="attach",
     )
     daemon._launch(
@@ -3677,7 +3677,7 @@ async def test_attach_after_restart_recovers_via_load_session(tmp_path: Path):
     root = "om_newroot_1"
     await wait_until(lambda: task_by_thread(store1, root) is not None)
     await wait_until(lambda: len(c1) == 2)
-    saved_sid = task_by_thread(store1, root).session_id
+    saved_sid = task_by_thread(store1, root).agent_session_id
     assert saved_sid == "ext_sid_1"
     assert task_by_thread(store1, root).origin == "attach"
     await d1._shutdown()
@@ -3726,7 +3726,7 @@ async def test_sched_attach_session_creates_task_and_resumes_external_session():
     t = task_by_thread(store, root)
     assert t is not None
     assert t.origin == "attach"
-    assert t.session_id == "ext_sid_1"
+    assert t.agent_session_id == "ext_sid_1"
     assert t.agent_label == "opencode"
     assert t.project_name == "demo"
     assert t.conversation_ref == ConversationRef("feishu", "oc_1")
@@ -3826,7 +3826,7 @@ async def test_sched_attach_session_duplicate_rejected():
         conversation=ConversationRef("feishu", "oc_1"),
         thread_root_id="om_old",
         workspace="C:/tmp/demo",
-        session_id="ext_sid_1",
+        agent_session_id="ext_sid_1",
         origin="attach",
     )
     daemon, bridge, created = make_daemon(store=store)
