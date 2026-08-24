@@ -38,6 +38,9 @@ from feishu_dispatcher.http_channel import HttpChannel
 from feishu_dispatcher.livecard import LiveCard
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
 from feishu_dispatcher.session_event import (
+    AgentOutputDelta,
+    AgentOutputFinished,
+    AgentOutputStarted,
     SessionEvent,
     SessionInputAccepted,
 )
@@ -1447,6 +1450,221 @@ async def test_daemon_streams_structured_output_display_text():
     )
 
     assert not any(text == "thinkinganswer" for text in bridge.texts("om_root1"))
+    await daemon._shutdown()
+
+
+async def test_daemon_emits_agent_output_session_events_per_turn():
+    class StructuredOutputAgent(FakeAgent):
+        async def prompt(self, text: str) -> str:
+            self.prompts.append(text)
+            self.last_message = f"answer:{text}"
+            await self.on_output(
+                AgentOutputChunk(
+                    kind="thought",
+                    raw_text=f"think:{text}",
+                    display_text=f"💭 think:{text}",
+                )
+            )
+            await self.on_output(
+                AgentOutputChunk(
+                    kind="activity",
+                    raw_text=None,
+                    display_text="\n🔧 working\n",
+                )
+            )
+            await self.on_output(
+                AgentOutputChunk(
+                    kind="message",
+                    raw_text=f"answer:{text}",
+                    display_text=f"\nanswer:{text}",
+                )
+            )
+            return "end_turn"
+
+    events: list[SessionEvent] = []
+
+    async def collect(event: SessionEvent) -> None:
+        events.append(event)
+
+    daemon, bridge, created = make_daemon(agent_cls=StructuredOutputAgent)
+    daemon._session_event_handler = collect
+
+    await daemon._handle_message(root_msg("/run demo first"))
+    await wait_until(
+        lambda: (
+            len(
+                [
+                    event
+                    for event in events
+                    if isinstance(event.body, AgentOutputFinished)
+                ]
+            )
+            == 1
+        )
+    )
+    await daemon._handle_message(thread_msg("second"))
+    await wait_until(
+        lambda: (
+            len(
+                [
+                    event
+                    for event in events
+                    if isinstance(event.body, AgentOutputFinished)
+                ]
+            )
+            == 2
+        )
+    )
+
+    assert created[0].prompts == ["first", "second"]
+    assert [type(event.body) for event in events] == [
+        AgentOutputStarted,
+        AgentOutputDelta,
+        AgentOutputDelta,
+        AgentOutputFinished,
+        AgentOutputStarted,
+        AgentOutputDelta,
+        AgentOutputDelta,
+        AgentOutputFinished,
+    ]
+    task = task_by_thread(daemon.store, "om_root1")
+    assert task is not None
+    assert {event.session_id for event in events} == {task.session_id}
+    first_turn_id = events[0].turn_id
+    second_turn_id = events[4].turn_id
+    assert first_turn_id
+    assert second_turn_id
+    assert first_turn_id != second_turn_id
+    assert {event.turn_id for event in events[:4]} == {first_turn_id}
+    assert {event.turn_id for event in events[4:]} == {second_turn_id}
+    assert events[1].body == AgentOutputDelta(
+        stream="thought",
+        text="think:first",
+    )
+    assert events[2].body == AgentOutputDelta(
+        stream="message",
+        text="answer:first",
+    )
+    assert events[3].body == AgentOutputFinished(
+        message="answer:first",
+        thought="think:first",
+        outcome="completed",
+    )
+    assert events[7].body == AgentOutputFinished(
+        message="answer:second",
+        thought="think:second",
+        outcome="completed",
+    )
+    assert bridge.session_events == []
+    await daemon._shutdown()
+
+
+async def test_daemon_emits_cancelled_agent_output_session_event():
+    class PartialCancelableAgent(CancelableAgent):
+        async def prompt(self, text: str) -> str:
+            await self.on_output(
+                AgentOutputChunk(
+                    kind="message",
+                    raw_text="partial",
+                    display_text="partial",
+                )
+            )
+            return await super().prompt(text)
+
+    events: list[SessionEvent] = []
+
+    async def collect(event: SessionEvent) -> None:
+        events.append(event)
+
+    daemon, _, created = make_daemon(agent_cls=PartialCancelableAgent)
+    daemon._session_event_handler = collect
+
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(lambda: created and created[0].in_prompt.is_set())
+    await daemon._handle_message(thread_msg("/cancel"))
+    await wait_until(
+        lambda: any(
+            isinstance(event.body, AgentOutputFinished)
+            and event.body.outcome == "cancelled"
+            for event in events
+        )
+    )
+
+    assert [type(event.body) for event in events] == [
+        AgentOutputStarted,
+        AgentOutputDelta,
+        AgentOutputFinished,
+    ]
+    assert events[-1].body == AgentOutputFinished(
+        message="partial",
+        thought="",
+        outcome="cancelled",
+    )
+    await daemon._shutdown()
+
+
+async def test_daemon_emits_failed_agent_output_session_event():
+    class PartialFailingAgent(FakeAgent):
+        async def prompt(self, text: str) -> str:
+            await self.on_output(
+                AgentOutputChunk(
+                    kind="thought",
+                    raw_text="partial thought",
+                    display_text="💭 partial thought",
+                )
+            )
+            raise RuntimeError("boom")
+
+    events: list[SessionEvent] = []
+
+    async def collect(event: SessionEvent) -> None:
+        events.append(event)
+
+    daemon, _, _ = make_daemon(agent_cls=PartialFailingAgent)
+    daemon._session_event_handler = collect
+
+    await daemon._handle_message(root_msg("/run demo task"))
+    await wait_until(
+        lambda: any(
+            isinstance(event.body, AgentOutputFinished)
+            and event.body.outcome == "failed"
+            for event in events
+        )
+    )
+
+    assert [type(event.body) for event in events] == [
+        AgentOutputStarted,
+        AgentOutputDelta,
+        AgentOutputFinished,
+    ]
+    assert events[-1].body == AgentOutputFinished(
+        message="",
+        thought="partial thought",
+        outcome="failed",
+    )
+    await daemon._shutdown()
+
+
+async def test_session_event_handler_failure_does_not_abort_agent_turn(caplog):
+    async def broken_handler(_event: SessionEvent) -> None:
+        raise RuntimeError("sink boom")
+
+    daemon, bridge, created = make_daemon()
+    daemon._session_event_handler = broken_handler
+
+    with caplog.at_level("ERROR"):
+        await daemon._handle_message(root_msg("/run demo task"))
+        await wait_until(
+            lambda: (
+                created
+                and created[0].prompts == ["task"]
+                and any("本轮结束" in text for text in bridge.texts("om_root1"))
+            )
+        )
+
+    assert "echo:task" in "".join(bridge.texts("om_root1"))
+    assert "SessionEvent 运行时消费者失败" in caplog.text
+    assert task_by_thread(daemon.store, "om_root1").status == "idle"
     await daemon._shutdown()
 
 
