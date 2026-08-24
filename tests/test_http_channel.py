@@ -19,7 +19,14 @@ from feishu_dispatcher import __version__
 from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.http_channel import HttpChannel, ensure_token
-from feishu_dispatcher.session_event import SessionEvent, SessionInputAccepted
+from feishu_dispatcher.session_event import (
+    AgentOutputDelta,
+    AgentOutputFinished,
+    AgentOutputStarted,
+    SessionEvent,
+    SessionInputAccepted,
+    session_event_to_dict,
+)
 
 
 def _available_port() -> int:
@@ -760,8 +767,14 @@ async def test_session_input_event_projects_to_thread_message():
 
         channel.handle_session_event(thread_id, event)
 
-        events = await _wait_for_events(channel, "browser-a", minimum=2)
-        projected = events["events"][1]
+        events = await _wait_for_events(channel, "browser-a", minimum=3)
+        raw_event = events["events"][1]
+        assert raw_event == {
+            "cursor": 2,
+            "type": "session.event",
+            "event": session_event_to_dict(event),
+        }
+        projected = events["events"][2]
         assert projected["type"] == "message.created"
         assert projected["target_id"] == thread_id
         assert projected["text"] == "↪️ 同步自 feishu：检查状态"
@@ -792,8 +805,59 @@ async def test_empty_session_input_event_does_not_create_message():
         channel.handle_session_event(thread_id, event)
 
         events = channel._events_after("browser-a", 0)
-        assert len(events["events"]) == 1
+        assert len(events["events"]) == 2
         assert events["events"][0]["type"] == "thread.created"
+        assert events["events"][1] == {
+            "cursor": 2,
+            "type": "session.event",
+            "event": session_event_to_dict(event),
+        }
+    finally:
+        channel.stop()
+
+
+async def test_agent_output_events_project_as_session_events():
+    channel = HttpChannel(
+        "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
+    )
+
+    async def ignore(_message: ChannelMessage) -> None:
+        return None
+
+    channel.start(ignore)
+    try:
+        thread_id = channel.create_thread("browser-a", "start")
+        bodies = [
+            AgentOutputStarted(),
+            AgentOutputDelta(stream="thought", text="thinking"),
+            AgentOutputDelta(stream="message", text="answer"),
+            AgentOutputFinished(
+                message="answer",
+                thought="thinking",
+                outcome="completed",
+            ),
+        ]
+        expected = []
+        for index, body in enumerate(bodies, start=1):
+            event = SessionEvent(
+                event_id=f"event-{index}",
+                session_id="t1",
+                turn_id="turn-1",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=body,
+            )
+            expected.append(session_event_to_dict(event))
+            channel.handle_session_event(thread_id, event)
+
+        events = channel._events_after("browser-a", 0)["events"]
+        assert [event["type"] for event in events] == [
+            "thread.created",
+            "session.event",
+            "session.event",
+            "session.event",
+            "session.event",
+        ]
+        assert [event["event"] for event in events[1:]] == expected
     finally:
         channel.stop()
 

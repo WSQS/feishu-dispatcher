@@ -39,7 +39,13 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .channel import ChannelMessage, MessageHandler, StreamingOutput
-from .session_event import SessionEvent, SessionInputAccepted
+from .session_event import (
+    AgentOutputDelta,
+    AgentOutputFinished,
+    AgentOutputStarted,
+    SessionEvent,
+    SessionInputAccepted,
+)
 
 # 延迟 import：event 模型属于 im.v1 namespace（单 ns，安全），但顶部 import
 # 会触发 lark_oapi/__init__；shim 必须先装好。调用方 import 顺序：
@@ -651,6 +657,10 @@ class FeishuBridge:
         """把 Session 领域事件投影为飞书话题消息。"""
         body = event.body
         if not isinstance(body, SessionInputAccepted):
+            if isinstance(
+                body, (AgentOutputStarted, AgentOutputDelta, AgentOutputFinished)
+            ):
+                return
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
         if not body.text:
             return

@@ -110,6 +110,10 @@ class FakeBridge:
         self.session_events.append((conversation_id, event))
         body = event.body
         if not isinstance(body, SessionInputAccepted):
+            if isinstance(
+                body, (AgentOutputStarted, AgentOutputDelta, AgentOutputFinished)
+            ):
+                return
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
         source = body.source.channel_key if body.source is not None else "unknown"
         self.reply_text(
@@ -1515,6 +1519,7 @@ async def test_daemon_emits_agent_output_session_events_per_turn():
             == 2
         )
     )
+    await wait_until(lambda: len(bridge.session_events) == 8)
 
     assert created[0].prompts == ["first", "second"]
     assert [type(event.body) for event in events] == [
@@ -1555,7 +1560,16 @@ async def test_daemon_emits_agent_output_session_events_per_turn():
         thought="think:second",
         outcome="completed",
     )
-    assert bridge.session_events == []
+    assert [type(event.body) for _, event in bridge.session_events] == [
+        AgentOutputStarted,
+        AgentOutputDelta,
+        AgentOutputDelta,
+        AgentOutputFinished,
+        AgentOutputStarted,
+        AgentOutputDelta,
+        AgentOutputDelta,
+        AgentOutputFinished,
+    ]
     await daemon._shutdown()
 
 
@@ -2211,7 +2225,12 @@ async def test_runner_fans_out_turns_to_bound_conversations():
     runner = current_runner(daemon)
     main_conversation = ConversationRef("feishu", "om_root1")
     web_conversation = ConversationRef("web", "web-thread")
-    assert feishu.session_events == []
+    await wait_until(
+        lambda: any(
+            isinstance(event.body, AgentOutputFinished)
+            for _, event in feishu.session_events
+        )
+    )
     daemon._bind_conversation(web_conversation, task.session_id)
 
     runner.enqueue(TurnRequest("web turn", web_conversation))
@@ -2228,14 +2247,44 @@ async def test_runner_fans_out_turns_to_bound_conversations():
     assert runner.conversation == main_conversation
     assert "↪️ 同步自 web：web turn" in feishu.texts("om_root1")
     assert "↪️ 同步自 web：web turn" not in web.texts("web-thread")
-    projected_event = feishu.session_events[-1][1]
+    projected_event = next(
+        event
+        for _, event in feishu.session_events
+        if isinstance(event.body, SessionInputAccepted)
+        and event.body.text == "web turn"
+    )
     assert projected_event.session_id == task.session_id
     assert projected_event.turn_id
     assert projected_event.body == SessionInputAccepted(
         text="web turn",
         source=web_conversation,
     )
-    assert web.session_events == []
+    await wait_until(
+        lambda: any(
+            isinstance(event.body, AgentOutputFinished)
+            and event.turn_id == projected_event.turn_id
+            for _, event in web.session_events
+        )
+    )
+    assert [
+        type(event.body)
+        for _, event in web.session_events
+        if event.turn_id == projected_event.turn_id
+    ] == [
+        AgentOutputStarted,
+        AgentOutputDelta,
+        AgentOutputFinished,
+    ]
+    assert [
+        event.body
+        for _, event in web.session_events
+        if event.turn_id == projected_event.turn_id
+    ] == [
+        event.body
+        for _, event in feishu.session_events
+        if event.turn_id == projected_event.turn_id
+        and not isinstance(event.body, SessionInputAccepted)
+    ]
 
     await daemon._sched_send_to_task(task.session_id, "main turn")
     await wait_until(
@@ -2247,7 +2296,13 @@ async def test_runner_fans_out_turns_to_bound_conversations():
     )
     assert "↪️ 同步自 feishu：main turn" in web.texts("web-thread")
     assert "↪️ 同步自 feishu：main turn" not in feishu.texts("om_root1")
-    assert web.session_events[-1][1].turn_id != projected_event.turn_id
+    main_projected_event = next(
+        event
+        for _, event in web.session_events
+        if isinstance(event.body, SessionInputAccepted)
+        and event.body.text == "main turn"
+    )
+    assert main_projected_event.turn_id != projected_event.turn_id
     await daemon._shutdown()
 
 
@@ -2289,8 +2344,13 @@ async def test_session_input_event_projection_failure_does_not_abort_turn(caplog
             )
         )
 
-    assert healthy.session_events[-1][0] == "healthy-thread"
-    assert healthy.session_events[-1][1].body == SessionInputAccepted(
+    projected_conversation, projected_event = next(
+        (conversation_id, event)
+        for conversation_id, event in healthy.session_events
+        if isinstance(event.body, SessionInputAccepted)
+    )
+    assert projected_conversation == "healthy-thread"
+    assert projected_event.body == SessionInputAccepted(
         text="continue",
         source=source,
     )
