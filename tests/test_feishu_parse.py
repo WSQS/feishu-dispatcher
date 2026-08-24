@@ -17,6 +17,7 @@ from feishu_dispatcher.session_event import (
     AgentOutputStarted,
     SessionEvent,
     SessionInputAccepted,
+    ToolCallObserved,
 )
 from feishu_dispatcher.throttler import StreamThrottler
 
@@ -500,6 +501,13 @@ def test_channel_accepts_agent_output_events_without_rendering(monkeypatch):
         AgentOutputStarted(),
         AgentOutputDelta(stream="message", text="answer"),
         AgentOutputFinished(message="answer", thought="", outcome="completed"),
+        ToolCallObserved(
+            tool_call_id="tc1",
+            kind="execute",
+            title="pytest",
+            status="completed",
+            detail="pytest -q",
+        ),
     ]
 
     for index, body in enumerate(bodies, start=1):

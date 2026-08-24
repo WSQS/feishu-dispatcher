@@ -32,9 +32,11 @@ from . import forge
 from .acp_client import (
     AcpAgent,
     AgentOutputChunk,
+    AgentToolCallUpdate,
     AgentSpawn,
     OnAction,
     OnOutput,
+    OnToolCall,
     _resolve_executable,
 )
 from .channel import Channel, ChannelMessage, OutputStatus, StreamingOutput
@@ -57,6 +59,7 @@ from .session_event import (
     OutputOutcome,
     SessionEvent,
     SessionInputAccepted,
+    ToolCallObserved,
 )
 from .store import Job, JobStore, ModelStore, ProjectStore, Session, SessionStore
 from ._scan_executor import ScanExecutor
@@ -1629,12 +1632,14 @@ class _Daemon:
         on_output: OnOutput,
         on_action: "OnAction | None" = None,
         *,
+        on_tool_call: "OnToolCall | None" = None,
         resume_session_id: str | None = None,
     ) -> AcpAgent:
         """构造底层 agent（拆出来是测试注入点）。"""
         return AcpAgent(
             spawn,
             on_output,
+            on_tool_call=on_tool_call,
             on_action=on_action,
             resume_session_id=resume_session_id,
             start_timeout=self.cfg.agent_start_timeout,
@@ -1705,6 +1710,28 @@ class _Daemon:
             turn = (cur.turns if cur else 0) + 1
             self.store.add_action(sess.session_id, {"turn": turn, **action})
 
+        async def on_tool_call(update: AgentToolCallUpdate) -> None:
+            if (
+                not self._runners.is_current(sess.session_id, sess)
+                or sess.current_turn_id is None
+            ):
+                return
+            event = SessionEvent(
+                event_id=secrets.token_hex(16),
+                session_id=sess.session_id,
+                turn_id=sess.current_turn_id,
+                occurred_at=datetime.now(timezone.utc),
+                body=ToolCallObserved(
+                    tool_call_id=update.tool_call_id,
+                    kind=update.kind,
+                    title=update.title,
+                    status=update.status,
+                    detail=update.detail,
+                ),
+            )
+            await self._emit_session_event(event)
+            self._queue_session_event_projection(sess, event)
+
         # 配置里给该后端声明的追加 env（[agents.<名>].env，如 codex 的 CODEX_PATH）打底。
         env: dict[str, str] = dict(self.cfg.agent_env.get(session.agent_label, {}))
         # 身份注入（#68）：给 agent 子进程一份一次性 token + 控制面 URL（经 env 逐层
@@ -1724,6 +1751,7 @@ class _Daemon:
             AgentSpawn(command=list(agent_argv), cwd=session.workspace, env=env),
             on_output,
             on_action,
+            on_tool_call=on_tool_call,
             resume_session_id=resume_session_id,
         )
         if first_turn is not None:

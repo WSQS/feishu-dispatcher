@@ -321,6 +321,44 @@ async def test_client_tool_call_callback_ignores_non_tool_updates():
     assert updates == []
 
 
+async def test_client_tool_call_callback_failure_does_not_abort_update(caplog):
+    actions: list[dict] = []
+    outputs: list[AgentOutputChunk] = []
+
+    async def broken(_update: AgentToolCallUpdate) -> None:
+        raise RuntimeError("tool event sink boom")
+
+    async def collect_action(action: dict) -> None:
+        actions.append(action)
+
+    async def collect_output(output: AgentOutputChunk) -> None:
+        outputs.append(output)
+
+    impl = _ClientImpl(
+        _Callbacks(
+            on_output=collect_output,
+            on_tool_call=broken,
+            on_action=collect_action,
+        )
+    )
+
+    with caplog.at_level(logging.ERROR):
+        await impl.session_update(
+            "s",
+            start_tool_call("tc1", "Editing src/foo.py", kind="edit"),
+        )
+
+    assert actions == [{"kind": "edit", "title": "Editing src/foo.py"}]
+    assert outputs == [
+        AgentOutputChunk(
+            kind="activity",
+            raw_text=None,
+            display_text="\n🔧 Editing src/foo.py\n",
+        )
+    ]
+    assert "ACP on_tool_call 回调失败 tool_call_id=tc1" in caplog.text
+
+
 # --- 单条 update（无前置状态）------------------------------------------- #
 
 
