@@ -230,6 +230,31 @@ def test_webui_recovers_http_channel_instance_and_cursor():
     assert "renderedCursor = 0;" in reset
 
 
+def test_webui_consumes_session_events_without_duplicate_unknown_entries():
+    javascript = (
+        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "app.js"
+    ).read_text(encoding="utf-8")
+
+    def section(start: str, end: str) -> str:
+        return javascript.split(start, maxsplit=1)[1].split(end, maxsplit=1)[0]
+
+    task_routing = section("function taskForEvent", "function renderEvent")
+    event_rendering = section("function renderEvent", "async function apiRequest")
+
+    assert 'event.type === "session.event"' in task_routing
+    assert "event.event?.session_id" in task_routing
+    assert 'case "session.event":' in event_rendering
+    for event_type in (
+        "session.input.accepted",
+        "agent.output.started",
+        "agent.output.delta",
+        "agent.output.finished",
+    ):
+        assert f'sessionEvent.type === "{event_type}"' in event_rendering
+    assert "收到无法识别的 SessionEvent。" in event_rendering
+    assert "text: sessionEvent.type" in event_rendering
+
+
 async def test_webui_assets_are_same_origin_and_do_not_require_token():
     channel = HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
