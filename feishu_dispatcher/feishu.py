@@ -39,6 +39,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .channel import ChannelMessage, MessageHandler, StreamingOutput
+from .session_event import SessionEvent, SessionInputAccepted
 
 # 延迟 import：event 模型属于 im.v1 namespace（单 ns，安全），但顶部 import
 # 会触发 lark_oapi/__init__；shim 必须先装好。调用方 import 顺序：
@@ -641,6 +642,24 @@ class FeishuBridge:
         if threaded:
             return self.reply_in_thread(target_id, text)
         return self.reply(target_id, text)
+
+    def handle_session_event(
+        self,
+        conversation_id: str,
+        event: SessionEvent,
+    ) -> None:
+        """把 Session 领域事件投影为飞书话题消息。"""
+        body = event.body
+        if not isinstance(body, SessionInputAccepted):
+            raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
+        if not body.text:
+            return
+        source = body.source.channel_key if body.source is not None else "unknown"
+        self.reply_text(
+            conversation_id,
+            f"↪️ 同步自 {source}：{body.text}",
+            threaded=True,
+        )
 
     def reply_card(self, root_message_id: str, card: dict) -> str:
         """在话题内发一张 interactive 卡片，返回新消息 message_id。"""

@@ -1,4 +1,4 @@
-from feishu_dispatcher.channel import ConversationRef
+from feishu_dispatcher.conversation import ConversationRef
 
 
 def test_conversation_ref_scopes_conversation_id_by_channel() -> None:

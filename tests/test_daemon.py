@@ -23,7 +23,8 @@ from feishu_dispatcher.config import (
     LLMSettings,
     Project,
 )
-from feishu_dispatcher.channel import ChannelMessage, ConversationRef, StreamingOutput
+from feishu_dispatcher.channel import ChannelMessage, StreamingOutput
+from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.daemon import (
     TurnRequest,
     _AgentSessionRunner,
@@ -35,6 +36,10 @@ from feishu_dispatcher.daemon import (
 from feishu_dispatcher.http_channel import HttpChannel
 from feishu_dispatcher.livecard import LiveCard
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
+from feishu_dispatcher.session_event import (
+    SessionEvent,
+    SessionInputAccepted,
+)
 from feishu_dispatcher.store import ProjectStore, SessionStore
 from feishu_dispatcher.throttler import StreamThrottler
 
@@ -59,6 +64,7 @@ class FakeBridge:
         self.roots: list[tuple[str, str]] = []
         self.created_threads: list[tuple[str, str]] = []
         self.plain: list[tuple[str, str]] = []  # reply_in_thread=False（不建话题）
+        self.session_events: list[tuple[str, SessionEvent]] = []
 
     def start(self, on_message) -> None:
         self.start_count += 1
@@ -91,6 +97,22 @@ class FakeBridge:
         if threaded:
             return self.reply_in_thread(target_id, text)
         return self.reply(target_id, text)
+
+    def handle_session_event(
+        self,
+        conversation_id: str,
+        event: SessionEvent,
+    ) -> None:
+        self.session_events.append((conversation_id, event))
+        body = event.body
+        if not isinstance(body, SessionInputAccepted):
+            raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
+        source = body.source.channel_key if body.source is not None else "unknown"
+        self.reply_text(
+            conversation_id,
+            f"↪️ 同步自 {source}：{body.text}",
+            threaded=True,
+        )
 
     def open_output(
         self, target_id: str, title: str, *, footer: str = ""
@@ -181,6 +203,16 @@ class FakeAgent:
 class FailingAgent(FakeAgent):
     async def prompt(self, text: str) -> str:
         raise RuntimeError("boom")
+
+
+def test_turn_request_assigns_stable_unique_turn_id():
+    conversation = ConversationRef("feishu", "om_root")
+
+    first = TurnRequest("first", conversation)
+    second = TurnRequest("second", conversation)
+
+    assert first.turn_id
+    assert second.turn_id != first.turn_id
 
 
 class FailUnlessResumedAgent(FakeAgent):
@@ -1920,6 +1952,7 @@ async def test_runner_fans_out_turns_to_bound_conversations():
     runner = current_runner(daemon)
     main_conversation = ConversationRef("feishu", "om_root1")
     web_conversation = ConversationRef("web", "web-thread")
+    assert feishu.session_events == []
     daemon._bind_conversation(web_conversation, task.session_id)
 
     runner.enqueue(TurnRequest("web turn", web_conversation))
@@ -1936,6 +1969,14 @@ async def test_runner_fans_out_turns_to_bound_conversations():
     assert runner.conversation == main_conversation
     assert "↪️ 同步自 web：web turn" in feishu.texts("om_root1")
     assert "↪️ 同步自 web：web turn" not in web.texts("web-thread")
+    projected_event = feishu.session_events[-1][1]
+    assert projected_event.session_id == task.session_id
+    assert projected_event.turn_id
+    assert projected_event.body == SessionInputAccepted(
+        text="web turn",
+        source=web_conversation,
+    )
+    assert web.session_events == []
 
     await daemon._sched_send_to_task(task.session_id, "main turn")
     await wait_until(
@@ -1947,6 +1988,55 @@ async def test_runner_fans_out_turns_to_bound_conversations():
     )
     assert "↪️ 同步自 feishu：main turn" in web.texts("web-thread")
     assert "↪️ 同步自 feishu：main turn" not in feishu.texts("om_root1")
+    assert web.session_events[-1][1].turn_id != projected_event.turn_id
+    await daemon._shutdown()
+
+
+async def test_session_input_event_projection_failure_does_not_abort_turn(caplog):
+    class BrokenEventBridge(FakeBridge):
+        def handle_session_event(
+            self,
+            conversation_id: str,
+            event: SessionEvent,
+        ) -> None:
+            raise RuntimeError("session event boom")
+
+    daemon, feishu, created = make_daemon()
+    broken = BrokenEventBridge()
+    healthy = FakeBridge()
+    daemon._channels["broken"] = broken
+    daemon._channels["healthy"] = healthy
+    await daemon._handle_message(root_msg("/run demo first"))
+    await wait_until(lambda: created and created[0].prompts == ["first"])
+    task = task_by_thread(daemon.store, "om_root1")
+    runner = current_runner(daemon)
+    source = ConversationRef("feishu", "om_root1")
+    daemon._bind_conversation(
+        ConversationRef("broken", "broken-thread"),
+        task.session_id,
+    )
+    daemon._bind_conversation(
+        ConversationRef("healthy", "healthy-thread"),
+        task.session_id,
+    )
+
+    with caplog.at_level("ERROR"):
+        runner.enqueue(TurnRequest("continue", source))
+        await wait_until(
+            lambda: (
+                created[0].prompts == ["first", "continue"]
+                and healthy.session_events
+                and any("echo:continue" in text for text in feishu.texts("om_root1"))
+            )
+        )
+
+    assert healthy.session_events[-1][0] == "healthy-thread"
+    assert healthy.session_events[-1][1].body == SessionInputAccepted(
+        text="continue",
+        source=source,
+    )
+    assert "Channel SessionEvent 投影失败" in caplog.text
+    assert "channel=broken conversation=broken-thread" in caplog.text
     await daemon._shutdown()
 
 

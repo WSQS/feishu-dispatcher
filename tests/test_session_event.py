@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from feishu_dispatcher.channel import ConversationRef
+from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,

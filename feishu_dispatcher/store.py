@@ -25,8 +25,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from ._atomic import atomic_write
-from .channel import ConversationRef
 from .config import Project
+from .conversation import ConversationRef
 
 logger = logging.getLogger(__name__)
 

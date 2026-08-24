@@ -22,20 +22,16 @@ import secrets
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from functools import partial
 
 from pathlib import Path
 
 from . import forge
 from .acp_client import AcpAgent, AgentSpawn, OnAction, OnOutput, _resolve_executable
-from .channel import (
-    Channel,
-    ChannelMessage,
-    ConversationRef,
-    OutputStatus,
-    StreamingOutput,
-)
+from .channel import Channel, ChannelMessage, OutputStatus, StreamingOutput
 from .config import DEFAULT_CONFIG_PATH, Config, Project
+from .conversation import ConversationRef
 from .control import ControlServer
 from .feishu import FeishuBridge
 from .http_channel import HttpChannel, ensure_token as ensure_http_channel_token
@@ -46,6 +42,7 @@ from .scheduler import (
     build_scheduler_tools,
     run_tool_loop,
 )
+from .session_event import SessionEvent, SessionInputAccepted
 from .store import Job, JobStore, ModelStore, ProjectStore, Session, SessionStore
 from ._scan_executor import ScanExecutor
 from .workspace_api import (
@@ -372,6 +369,7 @@ class TurnRequest:
 
     text: str
     conversation: ConversationRef
+    turn_id: str = field(default_factory=lambda: secrets.token_hex(16))
 
 
 class _FanoutStreamingOutput:
@@ -704,22 +702,16 @@ class _Daemon:
             self._conversations_for_session(session_id, source=source), text
         )
 
-    async def _mirror_turn_input(
+    async def _publish_session_event(
         self,
-        request: TurnRequest,
+        event: SessionEvent,
         conversations: tuple[ConversationRef, ...],
     ) -> None:
-        targets = tuple(
-            conversation
-            for conversation in conversations
-            if conversation != request.conversation
-        )
-        if not request.text or not targets:
-            return
-        source = request.conversation.channel_key or "unknown"
-        await self._reply_to_conversations(
-            targets,
-            f"↪️ 同步自 {source}：{request.text}",
+        await asyncio.gather(
+            *(
+                self._safe_handle_session_event(event, conversation=conversation)
+                for conversation in conversations
+            )
         )
 
     def _open_session_output(
@@ -1800,7 +1792,24 @@ class _Daemon:
                         source=turn_conversation,
                     )
                     if mirror_input:
-                        await self._mirror_turn_input(request, turn_conversations)
+                        event = SessionEvent(
+                            event_id=secrets.token_hex(16),
+                            session_id=sess.session_id,
+                            turn_id=request.turn_id,
+                            occurred_at=datetime.now(timezone.utc),
+                            body=SessionInputAccepted(
+                                text=request.text,
+                                source=request.conversation,
+                            ),
+                        )
+                        await self._publish_session_event(
+                            event,
+                            tuple(
+                                conversation
+                                for conversation in turn_conversations
+                                if conversation != request.conversation
+                            ),
+                        )
                     title = f"{sess.project_name} · {sess.agent_label}"
                     model = getattr(sess.agent, "model", "") or ""
                     # footer 与模型同一行显示项目名（#44）：在任意输出单元都可辨归属
@@ -3083,6 +3092,28 @@ class _Daemon:
         except Exception:
             logger.exception(
                 "Channel 独立文本发送失败 channel=%s conversation=%s",
+                conversation.channel_key,
+                conversation.conversation_id,
+            )
+
+    async def _safe_handle_session_event(
+        self,
+        event: SessionEvent,
+        *,
+        conversation: ConversationRef,
+    ) -> None:
+        """向 Conversation 投影 SessionEvent，并隔离单个 Channel 失败。"""
+        try:
+            channel = self._channel_for(conversation)
+            await asyncio.to_thread(
+                channel.handle_session_event,
+                conversation.conversation_id,
+                event,
+            )
+        except Exception:
+            logger.exception(
+                "Channel SessionEvent 投影失败 event=%s channel=%s conversation=%s",
+                event.event_id,
                 conversation.channel_key,
                 conversation.conversation_id,
             )
