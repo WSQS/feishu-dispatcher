@@ -34,6 +34,7 @@ _PROTOCOL_VERSION = 1
 _DEFAULT_START_TIMEOUT = 120.0
 
 AgentOutputKind = Literal["message", "thought", "activity"]
+AgentToolCallStatus = Literal["started", "completed", "failed"]
 
 
 @dataclass(frozen=True)
@@ -45,7 +46,19 @@ class AgentOutputChunk:
     display_text: str
 
 
+@dataclass(frozen=True)
+class AgentToolCallUpdate:
+    """ACP 工具调用的一次结构化生命周期更新。"""
+
+    tool_call_id: str
+    kind: str
+    title: str
+    status: AgentToolCallStatus
+    detail: str | None = None
+
+
 OnOutput = Callable[[AgentOutputChunk], Awaitable[None]]
+OnToolCall = Callable[[AgentToolCallUpdate], Awaitable[None]]
 #: 审计动作回调：收到一个 tool_call 时推一条结构化动作（{"kind","title"}）
 OnAction = Callable[[dict], Awaitable[None]]
 
@@ -61,6 +74,7 @@ class _Callbacks:
     """
 
     on_output: OnOutput
+    on_tool_call: "OnToolCall | None" = None
     on_action: "OnAction | None" = None
 
 
@@ -75,6 +89,7 @@ class _ClientImpl:
     def __init__(self, cb: _Callbacks) -> None:
         self._cb = cb
         self._fmt = _StreamFormatter()
+        self._tool_calls = _ToolCallTracker()
         self._suppress = False
         #: 本轮 agent 的最终 message 文本（只攒 agent_message，不含思考/工具行），
         #: 供上层落 Session.last_output；每轮 reset_formatter 时清空
@@ -90,6 +105,7 @@ class _ClientImpl:
     def reset_formatter(self) -> None:
         """每个 prompt 回合开始时重置流式格式化状态（新卡片从头开始）。"""
         self._fmt.reset()
+        self._tool_calls.reset()
         self._message_buf.clear()
         self._usage_used = None
 
@@ -116,6 +132,9 @@ class _ClientImpl:
             used = getattr(update, "used", None)
             if isinstance(used, int) and used >= 0:
                 self._usage_used = used
+        tool_call = self._tool_calls.observe(update)
+        if tool_call is not None and self._cb.on_tool_call is not None:
+            await self._cb.on_tool_call(tool_call)
         # 审计（A）：tool_call 是离散的「做了什么」事件，旁路存一份进 task。
         # 放在 suppress 之后，load_session 重放的历史动作不会被重复记录。
         if self._cb.on_action is not None:
@@ -301,6 +320,69 @@ def _extract_tool_detail(update: Any) -> str:
         if isinstance(ri, dict) and ri.get("path"):
             return _one_line_detail(ri["path"])
     return ""
+
+
+class _ToolCallTracker:
+    """把 ACP 稀疏工具更新合成为稳定的结构化生命周期回调。"""
+
+    def __init__(self) -> None:
+        self._tools: dict[str, dict[str, object]] = {}
+        self._finished_ids: set[str] = set()
+
+    def reset(self) -> None:
+        self._tools.clear()
+        self._finished_ids.clear()
+
+    def observe(self, update: Any) -> AgentToolCallUpdate | None:
+        update_type = getattr(update, "session_update", None)
+        if update_type not in {"tool_call", "tool_call_update"}:
+            return None
+        tool_call_id = getattr(update, "tool_call_id", "") or ""
+        if not tool_call_id or tool_call_id in self._finished_ids:
+            return None
+
+        state = self._tools.setdefault(
+            tool_call_id,
+            {"kind": "", "title": "", "detail": "", "last": None},
+        )
+        kind = getattr(update, "kind", "") or ""
+        title = getattr(update, "title", "") or ""
+        detail = _extract_tool_detail(update)
+        if kind and not state["kind"]:
+            state["kind"] = kind
+        if title and not state["title"]:
+            state["title"] = title
+        if detail and not state["detail"]:
+            state["detail"] = detail
+
+        raw_status = getattr(update, "status", None)
+        status: AgentToolCallStatus
+        if raw_status == "completed":
+            status = "completed"
+        elif raw_status == "failed":
+            status = "failed"
+        else:
+            status = "started"
+
+        resolved_kind = str(state["kind"])
+        resolved_title = str(state["title"] or resolved_kind or "工具")
+        resolved_detail = str(state["detail"]) or None
+        signature = (resolved_kind, resolved_title, status, resolved_detail)
+        if state["last"] == signature:
+            return None
+        state["last"] = signature
+
+        result = AgentToolCallUpdate(
+            tool_call_id=tool_call_id,
+            kind=resolved_kind,
+            title=resolved_title,
+            status=status,
+            detail=resolved_detail,
+        )
+        if status in {"completed", "failed"}:
+            self._tools.pop(tool_call_id, None)
+            self._finished_ids.add(tool_call_id)
+        return result
 
 
 class _StreamFormatter:
@@ -571,12 +653,14 @@ class AcpAgent:
         spawn: AgentSpawn,
         on_output: OnOutput,
         *,
+        on_tool_call: OnToolCall | None = None,
         on_action: OnAction | None = None,
         resume_session_id: str | None = None,
         start_timeout: float | None = _DEFAULT_START_TIMEOUT,
     ) -> None:
         self._spawn = spawn
         self._on_output = on_output
+        self._on_tool_call = on_tool_call
         self._on_action = on_action
         #: 非 None 则恢复该 ACP 会话（load_session）而非新建（new_session）
         self._resume_session_id = resume_session_id
@@ -699,7 +783,11 @@ class AcpAgent:
             self._drain_stderr(proc), name="agent-stderr"
         )
 
-        cb = _Callbacks(on_output=self._on_output, on_action=self._on_action)
+        cb = _Callbacks(
+            on_output=self._on_output,
+            on_tool_call=self._on_tool_call,
+            on_action=self._on_action,
+        )
         self._client_impl = _ClientImpl(cb)
         self._conn = acp.connect_to_agent(
             self._client_impl, writer, reader, observers=[_MethodNotFoundTap()]
