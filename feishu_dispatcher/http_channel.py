@@ -19,7 +19,14 @@ from uuid import uuid4
 from . import __version__
 from ._atomic import atomic_write
 from .channel import ChannelMessage, MessageHandler, OutputStatus
-from .session_event import SessionEvent, SessionInputAccepted
+from .session_event import (
+    AgentOutputDelta,
+    AgentOutputFinished,
+    AgentOutputStarted,
+    SessionEvent,
+    SessionInputAccepted,
+    session_event_to_dict,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -254,8 +261,24 @@ class HttpChannel:
     ) -> None:
         """把 Session 领域事件投影为 HTTP Conversation 事件。"""
         body = event.body
-        if not isinstance(body, SessionInputAccepted):
+        if not isinstance(
+            body,
+            (
+                SessionInputAccepted,
+                AgentOutputStarted,
+                AgentOutputDelta,
+                AgentOutputFinished,
+            ),
+        ):
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
+        owner = self._conversation_for_target(conversation_id)
+        self._append_event(
+            owner,
+            "session.event",
+            event=session_event_to_dict(event),
+        )
+        if not isinstance(body, SessionInputAccepted):
+            return
         if not body.text:
             return
         source = body.source.channel_key if body.source is not None else "unknown"

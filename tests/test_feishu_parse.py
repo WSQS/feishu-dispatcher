@@ -11,7 +11,13 @@ from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.feishu import FeishuBridge, _RateLimiter
 from feishu_dispatcher.livecard import LiveCard
-from feishu_dispatcher.session_event import SessionEvent, SessionInputAccepted
+from feishu_dispatcher.session_event import (
+    AgentOutputDelta,
+    AgentOutputFinished,
+    AgentOutputStarted,
+    SessionEvent,
+    SessionInputAccepted,
+)
 from feishu_dispatcher.throttler import StreamThrottler
 
 
@@ -477,6 +483,36 @@ def test_channel_skips_empty_session_input_event(monkeypatch):
     )
 
     bridge.handle_session_event("om_root", event)
+
+    assert calls == []
+
+
+def test_channel_accepts_agent_output_events_without_rendering(monkeypatch):
+    bridge = make_bridge()
+    calls: list[tuple[str, str, bool]] = []
+
+    def reply_text(target_id: str, text: str, *, threaded: bool = False) -> str:
+        calls.append((target_id, text, threaded))
+        return "om_reply"
+
+    monkeypatch.setattr(bridge, "reply_text", reply_text)
+    bodies = [
+        AgentOutputStarted(),
+        AgentOutputDelta(stream="message", text="answer"),
+        AgentOutputFinished(message="answer", thought="", outcome="completed"),
+    ]
+
+    for index, body in enumerate(bodies, start=1):
+        bridge.handle_session_event(
+            "om_root",
+            SessionEvent(
+                event_id=f"event-{index}",
+                session_id="t1",
+                turn_id="turn-1",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=body,
+            ),
+        )
 
     assert calls == []
 

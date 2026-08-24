@@ -483,8 +483,10 @@ class _AgentSessionRunner:
     turn_in_flight: bool = False
     #: 当前 Turn 的运行事实聚合，供 SessionEvent sink 生成完整收尾事件。
     current_turn_id: str | None = None
+    current_conversations: tuple[ConversationRef, ...] = ()
     current_message_chunks: list[str] = field(default_factory=list)
     current_thought_chunks: list[str] = field(default_factory=list)
+    session_event_projection_tail: "asyncio.Task[None] | None" = None
     #: 后台任务身份 token（本次启动一次性下发，注入 agent env，映射到 task_id）；#68
     bg_token: str = ""
     #: 单消费者 worker，持有 agent 完整生命周期
@@ -749,6 +751,22 @@ class _Daemon:
                 event.event_id,
             )
 
+    def _queue_session_event_projection(
+        self,
+        sess: _AgentSessionRunner,
+        event: SessionEvent,
+    ) -> None:
+        """按 Turn 顺序异步投影事件，避免 Channel 延迟阻塞 ACP 输出。"""
+        previous = sess.session_event_projection_tail
+        conversations = sess.current_conversations
+
+        async def project() -> None:
+            if previous is not None:
+                await previous
+            await self._publish_session_event(event, conversations)
+
+        sess.session_event_projection_tail = asyncio.create_task(project())
+
     async def _finish_agent_output(
         self,
         sess: _AgentSessionRunner,
@@ -756,19 +774,19 @@ class _Daemon:
     ) -> None:
         if sess.current_turn_id is None:
             return
-        await self._emit_session_event(
-            SessionEvent(
-                event_id=secrets.token_hex(16),
-                session_id=sess.session_id,
-                turn_id=sess.current_turn_id,
-                occurred_at=datetime.now(timezone.utc),
-                body=AgentOutputFinished(
-                    message="".join(sess.current_message_chunks),
-                    thought="".join(sess.current_thought_chunks),
-                    outcome=outcome,
-                ),
-            )
+        event = SessionEvent(
+            event_id=secrets.token_hex(16),
+            session_id=sess.session_id,
+            turn_id=sess.current_turn_id,
+            occurred_at=datetime.now(timezone.utc),
+            body=AgentOutputFinished(
+                message="".join(sess.current_message_chunks),
+                thought="".join(sess.current_thought_chunks),
+                outcome=outcome,
+            ),
         )
+        await self._emit_session_event(event)
+        self._queue_session_event_projection(sess, event)
 
     def _open_session_output(
         self,
@@ -1668,15 +1686,15 @@ class _Daemon:
                 stream = "thought"
             else:
                 return
-            await self._emit_session_event(
-                SessionEvent(
-                    event_id=secrets.token_hex(16),
-                    session_id=sess.session_id,
-                    turn_id=sess.current_turn_id,
-                    occurred_at=datetime.now(timezone.utc),
-                    body=AgentOutputDelta(stream=stream, text=output.raw_text),
-                )
+            event = SessionEvent(
+                event_id=secrets.token_hex(16),
+                session_id=sess.session_id,
+                turn_id=sess.current_turn_id,
+                occurred_at=datetime.now(timezone.utc),
+                body=AgentOutputDelta(stream=stream, text=output.raw_text),
             )
+            await self._emit_session_event(event)
+            self._queue_session_event_projection(sess, event)
 
         async def on_action(action: dict) -> None:
             # 审计（A）：只有 current runner 能把 tool_call 记进 Task；旧代 runner
@@ -1902,6 +1920,7 @@ class _Daemon:
                     )
                     sess.current_output = output
                     sess.current_turn_id = request.turn_id
+                    sess.current_conversations = turn_conversations
                     sess.current_message_chunks.clear()
                     sess.current_thought_chunks.clear()
                     self.store.update(sess.session_id, status="running")
@@ -1912,15 +1931,15 @@ class _Daemon:
                         prompt,
                     )
                     sess.turn_in_flight = True
-                    await self._emit_session_event(
-                        SessionEvent(
-                            event_id=secrets.token_hex(16),
-                            session_id=sess.session_id,
-                            turn_id=request.turn_id,
-                            occurred_at=datetime.now(timezone.utc),
-                            body=AgentOutputStarted(),
-                        )
+                    event = SessionEvent(
+                        event_id=secrets.token_hex(16),
+                        session_id=sess.session_id,
+                        turn_id=request.turn_id,
+                        occurred_at=datetime.now(timezone.utc),
+                        body=AgentOutputStarted(),
                     )
+                    await self._emit_session_event(event)
+                    self._queue_session_event_projection(sess, event)
                     outcome: OutputOutcome | None = None
                     try:
                         stop_reason = await sess.agent.prompt(prompt)
@@ -2007,9 +2026,14 @@ class _Daemon:
                         sess.turn_in_flight = False
                         if outcome is not None:
                             await self._finish_agent_output(sess, outcome)
+                        projection_tail = sess.session_event_projection_tail
+                        if projection_tail is not None:
+                            await projection_tail
+                            sess.session_event_projection_tail = None
                         await output.aclose()
                         sess.current_output = None
                         sess.current_turn_id = None
+                        sess.current_conversations = ()
                         sess.current_message_chunks.clear()
                         sess.current_thought_chunks.clear()
         except asyncio.CancelledError:
