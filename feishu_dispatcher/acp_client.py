@@ -134,7 +134,13 @@ class _ClientImpl:
                 self._usage_used = used
         tool_call = self._tool_calls.observe(update)
         if tool_call is not None and self._cb.on_tool_call is not None:
-            await self._cb.on_tool_call(tool_call)
+            try:
+                await self._cb.on_tool_call(tool_call)
+            except Exception:
+                logger.exception(
+                    "ACP on_tool_call 回调失败 tool_call_id=%s",
+                    tool_call.tool_call_id,
+                )
         # 审计（A）：tool_call 是离散的「做了什么」事件，旁路存一份进 task。
         # 放在 suppress 之后，load_session 重放的历史动作不会被重复记录。
         if self._cb.on_action is not None:

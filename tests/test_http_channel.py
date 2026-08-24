@@ -25,6 +25,7 @@ from feishu_dispatcher.session_event import (
     AgentOutputStarted,
     SessionEvent,
     SessionInputAccepted,
+    ToolCallObserved,
     session_event_to_dict,
 )
 
@@ -861,6 +862,13 @@ async def test_agent_output_events_project_as_session_events():
                 thought="thinking",
                 outcome="completed",
             ),
+            ToolCallObserved(
+                tool_call_id="tc1",
+                kind="execute",
+                title="pytest",
+                status="completed",
+                detail="pytest -q",
+            ),
         ]
         expected = []
         for index, body in enumerate(bodies, start=1):
@@ -877,6 +885,7 @@ async def test_agent_output_events_project_as_session_events():
         events = channel._events_after("browser-a", 0)["events"]
         assert [event["type"] for event in events] == [
             "thread.created",
+            "session.event",
             "session.event",
             "session.event",
             "session.event",

@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 import feishu_dispatcher.daemon as daemon_module
-from feishu_dispatcher.acp_client import AgentOutputChunk
+from feishu_dispatcher.acp_client import AgentOutputChunk, AgentToolCallUpdate
 from feishu_dispatcher.config import (
     Config,
     HttpChannelConfig,
@@ -43,6 +43,7 @@ from feishu_dispatcher.session_event import (
     AgentOutputStarted,
     SessionEvent,
     SessionInputAccepted,
+    ToolCallObserved,
 )
 from feishu_dispatcher.store import ProjectStore, SessionStore
 from feishu_dispatcher.throttler import StreamThrottler
@@ -114,6 +115,8 @@ class FakeBridge:
                 body, (AgentOutputStarted, AgentOutputDelta, AgentOutputFinished)
             ):
                 return
+            if isinstance(body, ToolCallObserved):
+                return
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
         source = body.source.channel_key if body.source is not None else "unknown"
         self.reply_text(
@@ -169,11 +172,18 @@ class FakeBridge:
 
 class FakeAgent:
     def __init__(
-        self, spawn, on_output, on_action=None, *, resume_session_id=None
+        self,
+        spawn,
+        on_output,
+        on_action=None,
+        *,
+        on_tool_call=None,
+        resume_session_id=None,
     ) -> None:
         self.spawn = spawn
         self.on_output = on_output
         self.on_action = on_action
+        self.on_tool_call = on_tool_call
         self.resume_session_id = resume_session_id
         self.prompts: list[str] = []
         self.start_count = 0
@@ -372,9 +382,20 @@ def make_daemon(
     )
     created: list[FakeAgent] = []
 
-    def factory(spawn, on_output, on_action=None, *, resume_session_id=None):
+    def factory(
+        spawn,
+        on_output,
+        on_action=None,
+        *,
+        on_tool_call=None,
+        resume_session_id=None,
+    ):
         agent = agent_cls(
-            spawn, on_output, on_action, resume_session_id=resume_session_id
+            spawn,
+            on_output,
+            on_action,
+            on_tool_call=on_tool_call,
+            resume_session_id=resume_session_id,
         )
         created.append(agent)
         return agent
@@ -1573,6 +1594,265 @@ async def test_daemon_emits_agent_output_session_events_per_turn():
     await daemon._shutdown()
 
 
+async def test_daemon_emits_and_projects_tool_call_session_events():
+    class ToolCallAgent(FakeAgent):
+        async def prompt(self, text: str) -> str:
+            self.prompts.append(text)
+            assert self.on_tool_call is not None
+            await self.on_tool_call(
+                AgentToolCallUpdate(
+                    tool_call_id="tc1",
+                    kind="execute",
+                    title="pytest",
+                    status="started",
+                    detail="pytest -q",
+                )
+            )
+            await self.on_tool_call(
+                AgentToolCallUpdate(
+                    tool_call_id="tc1",
+                    kind="execute",
+                    title="pytest",
+                    status="completed",
+                    detail="pytest -q",
+                )
+            )
+            await self._emit_message(f"echo:{text}")
+            return "end_turn"
+
+    events: list[SessionEvent] = []
+
+    async def collect(event: SessionEvent) -> None:
+        events.append(event)
+
+    daemon, feishu, created = make_daemon(agent_cls=ToolCallAgent)
+    web = FakeBridge()
+    daemon._channels["web"] = web
+    daemon._session_event_handler = collect
+
+    await daemon._handle_message(root_msg("/run demo first"))
+    await wait_until(
+        lambda: (
+            created
+            and created[0].prompts == ["first"]
+            and any(isinstance(event.body, AgentOutputFinished) for event in events)
+        )
+    )
+    task = task_by_thread(daemon.store, "om_root1")
+    assert task is not None
+    daemon._bind_conversation(ConversationRef("web", "web-thread"), task.session_id)
+
+    await daemon._handle_message(thread_msg("second"))
+    await wait_until(
+        lambda: (
+            len([event for event in events if isinstance(event.body, ToolCallObserved)])
+            == 4
+        )
+    )
+
+    tool_events = [
+        event for event in events if isinstance(event.body, ToolCallObserved)
+    ]
+    assert [event.body.status for event in tool_events] == [
+        "started",
+        "completed",
+        "started",
+        "completed",
+    ]
+    assert {event.session_id for event in tool_events} == {task.session_id}
+    assert len({event.turn_id for event in tool_events}) == 2
+    assert all(event.turn_id for event in tool_events)
+    assert tool_events[0].body == ToolCallObserved(
+        tool_call_id="tc1",
+        kind="execute",
+        title="pytest",
+        status="started",
+        detail="pytest -q",
+    )
+    await wait_until(
+        lambda: (
+            len(
+                [
+                    event
+                    for _, event in feishu.session_events
+                    if isinstance(event.body, ToolCallObserved)
+                ]
+            )
+            == 4
+        )
+    )
+    assert [
+        event.body
+        for _, event in feishu.session_events
+        if isinstance(event.body, ToolCallObserved)
+    ] == [event.body for event in tool_events]
+    await wait_until(
+        lambda: (
+            [
+                event.body
+                for _, event in web.session_events
+                if isinstance(event.body, ToolCallObserved)
+            ]
+            == [event.body for event in tool_events[2:]]
+        )
+    )
+    assert created[0].prompts == ["first", "second"]
+    assert any("echo:second" in text for text in feishu.texts("om_root1"))
+    await daemon._shutdown()
+
+
+async def test_tool_call_without_current_turn_is_ignored():
+    class ToolCallAgent(FakeAgent):
+        async def prompt(self, text: str) -> str:
+            self.prompts.append(text)
+            await self._emit_message(f"echo:{text}")
+            return "end_turn"
+
+    events: list[SessionEvent] = []
+
+    async def collect(event: SessionEvent) -> None:
+        events.append(event)
+
+    daemon, _, created = make_daemon(agent_cls=ToolCallAgent)
+    daemon._session_event_handler = collect
+    await daemon._handle_message(root_msg("/run demo first"))
+    await wait_until(lambda: created and created[0].prompts == ["first"])
+    await wait_until(
+        lambda: (
+            (runner := current_runner(daemon)) is not None
+            and runner.current_turn_id is None
+        )
+    )
+
+    assert created[0].on_tool_call is not None
+    await created[0].on_tool_call(
+        AgentToolCallUpdate(
+            tool_call_id="late",
+            kind="execute",
+            title="late",
+            status="completed",
+        )
+    )
+
+    assert not any(isinstance(event.body, ToolCallObserved) for event in events)
+    await daemon._shutdown()
+
+
+async def test_tool_call_projection_failure_does_not_abort_turn(caplog):
+    class ToolCallAgent(FakeAgent):
+        async def prompt(self, text: str) -> str:
+            self.prompts.append(text)
+            assert self.on_tool_call is not None
+            await self.on_tool_call(
+                AgentToolCallUpdate(
+                    tool_call_id="tc1",
+                    kind="execute",
+                    title="pytest",
+                    status="completed",
+                )
+            )
+            await self._emit_message(f"echo:{text}")
+            return "end_turn"
+
+    class BrokenEventBridge(FakeBridge):
+        def handle_session_event(
+            self,
+            conversation_id: str,
+            event: SessionEvent,
+        ) -> None:
+            if isinstance(event.body, ToolCallObserved):
+                raise RuntimeError("tool event boom")
+            super().handle_session_event(conversation_id, event)
+
+    daemon, feishu, created = make_daemon(agent_cls=ToolCallAgent)
+    broken = BrokenEventBridge()
+    daemon._channels["broken"] = broken
+    await daemon._handle_message(root_msg("/run demo first"))
+    await wait_until(lambda: created and created[0].prompts == ["first"])
+    task = task_by_thread(daemon.store, "om_root1")
+    assert task is not None
+    daemon._bind_conversation(
+        ConversationRef("broken", "broken-thread"), task.session_id
+    )
+
+    with caplog.at_level("ERROR"):
+        await daemon._handle_message(thread_msg("second"))
+        await wait_until(
+            lambda: (
+                created[0].prompts == ["first", "second"]
+                and any("echo:second" in text for text in feishu.texts("om_root1"))
+            )
+        )
+        await wait_until(lambda: "Channel SessionEvent 投影失败" in caplog.text)
+
+    assert "Channel SessionEvent 投影失败" in caplog.text
+    assert "channel=broken conversation=broken-thread" in caplog.text
+    assert any(
+        isinstance(event.body, ToolCallObserved) for _, event in feishu.session_events
+    )
+    await daemon._shutdown()
+
+
+async def test_daemon_emits_failed_tool_call_session_event():
+    class FailedToolCallAgent(FakeAgent):
+        async def prompt(self, text: str) -> str:
+            self.prompts.append(text)
+            assert self.on_tool_call is not None
+            await self.on_tool_call(
+                AgentToolCallUpdate(
+                    tool_call_id="tc-failed",
+                    kind="execute",
+                    title="pytest",
+                    status="failed",
+                    detail="pytest -q",
+                )
+            )
+            await self._emit_message(f"echo:{text}")
+            return "end_turn"
+
+    events: list[SessionEvent] = []
+
+    async def collect(event: SessionEvent) -> None:
+        events.append(event)
+
+    daemon, bridge, created = make_daemon(agent_cls=FailedToolCallAgent)
+    daemon._session_event_handler = collect
+
+    await daemon._handle_message(root_msg("/run demo first"))
+    await wait_until(
+        lambda: (
+            created
+            and created[0].prompts == ["first"]
+            and any(
+                isinstance(event.body, ToolCallObserved)
+                and event.body.status == "failed"
+                for event in events
+            )
+        )
+    )
+
+    event = next(event for event in events if isinstance(event.body, ToolCallObserved))
+    task = task_by_thread(daemon.store, "om_root1")
+    assert task is not None
+    assert event.session_id == task.session_id
+    assert event.turn_id
+    assert event.body == ToolCallObserved(
+        tool_call_id="tc-failed",
+        kind="execute",
+        title="pytest",
+        status="failed",
+        detail="pytest -q",
+    )
+    await wait_until(
+        lambda: any(
+            isinstance(projected.body, ToolCallObserved)
+            and projected.body.status == "failed"
+            for _, projected in bridge.session_events
+        )
+    )
+    await daemon._shutdown()
+
+
 async def test_daemon_emits_cancelled_agent_output_session_event():
     class PartialCancelableAgent(CancelableAgent):
         async def prompt(self, text: str) -> str:
@@ -2597,9 +2877,20 @@ def make_daemon_with_limit(
     daemon._channels[daemon._primary_channel_key] = bridge
     created: list[FakeAgent] = []
 
-    def factory(spawn, on_output, on_action=None, *, resume_session_id=None):
+    def factory(
+        spawn,
+        on_output,
+        on_action=None,
+        *,
+        on_tool_call=None,
+        resume_session_id=None,
+    ):
         agent = agent_cls(
-            spawn, on_output, on_action, resume_session_id=resume_session_id
+            spawn,
+            on_output,
+            on_action,
+            on_tool_call=on_tool_call,
+            resume_session_id=resume_session_id,
         )
         created.append(agent)
         return agent
@@ -2642,10 +2933,19 @@ async def test_discover_mode_does_not_execute_commands():
     daemon._channels[daemon._primary_channel_key] = bridge
     created: list[FakeAgent] = []
     daemon._make_agent = (
-        lambda spawn, on_output, on_action=None, *, resume_session_id=None: (  # noqa: E731
+        lambda spawn,  # noqa: E731
+        on_output,
+        on_action=None,
+        *,
+        on_tool_call=None,
+        resume_session_id=None: (
             created.append(
                 FakeAgent(
-                    spawn, on_output, on_action, resume_session_id=resume_session_id
+                    spawn,
+                    on_output,
+                    on_action,
+                    on_tool_call=on_tool_call,
+                    resume_session_id=resume_session_id,
                 )
             )
             or created[-1]
@@ -5377,9 +5677,20 @@ async def test_launch_threads_agent_env_into_spawn():
     daemon._channels[daemon._primary_channel_key] = bridge
     created: list[FakeAgent] = []
 
-    def factory(spawn, on_output, on_action=None, *, resume_session_id=None):
+    def factory(
+        spawn,
+        on_output,
+        on_action=None,
+        *,
+        on_tool_call=None,
+        resume_session_id=None,
+    ):
         agent = FakeAgent(
-            spawn, on_output, on_action, resume_session_id=resume_session_id
+            spawn,
+            on_output,
+            on_action,
+            on_tool_call=on_tool_call,
+            resume_session_id=resume_session_id,
         )
         created.append(agent)
         return agent

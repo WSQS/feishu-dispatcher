@@ -25,6 +25,7 @@ from .session_event import (
     AgentOutputStarted,
     SessionEvent,
     SessionInputAccepted,
+    ToolCallObserved,
     session_event_to_dict,
 )
 
@@ -268,6 +269,7 @@ class HttpChannel:
                 AgentOutputStarted,
                 AgentOutputDelta,
                 AgentOutputFinished,
+                ToolCallObserved,
             ),
         ):
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")

@@ -45,6 +45,7 @@ from .session_event import (
     AgentOutputStarted,
     SessionEvent,
     SessionInputAccepted,
+    ToolCallObserved,
 )
 
 # 延迟 import：event 模型属于 im.v1 namespace（单 ns，安全），但顶部 import
@@ -660,6 +661,8 @@ class FeishuBridge:
             if isinstance(
                 body, (AgentOutputStarted, AgentOutputDelta, AgentOutputFinished)
             ):
+                return
+            if isinstance(body, ToolCallObserved):
                 return
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
         if not body.text:
