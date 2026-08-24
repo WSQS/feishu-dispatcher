@@ -16,7 +16,7 @@ import os
 import sys
 from pathlib import Path
 
-from feishu_dispatcher.acp_client import AcpAgent, AgentSpawn
+from feishu_dispatcher.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 CWD = str(Path(__file__).resolve().parent.parent)
@@ -36,8 +36,8 @@ class Collector:
     def __init__(self) -> None:
         self.buf: list[str] = []
 
-    async def __call__(self, text: str) -> None:
-        self.buf.append(text)
+    async def __call__(self, output: AgentOutputChunk) -> None:
+        self.buf.append(output.display_text)
 
     def take(self) -> str:
         out = "".join(self.buf)

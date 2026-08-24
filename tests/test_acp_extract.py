@@ -19,7 +19,10 @@ import pytest
 
 from feishu_dispatcher.acp_client import (
     AcpAgent,
+    AgentOutputChunk,
     AgentSpawn,
+    _Callbacks,
+    _ClientImpl,
     _MethodNotFoundTap,
     _StreamFormatter,
     _extract_action,
@@ -31,7 +34,7 @@ from feishu_dispatcher.acp_client import (
 )
 
 
-async def _noop_out(_t: str) -> None:
+async def _noop_out(_output: AgentOutputChunk) -> None:
     pass
 
 
@@ -152,9 +155,7 @@ def test_extract_usage_tokens_ignores_non_int_and_negative():
 
 
 async def test_client_captures_streamed_usage_update():
-    from feishu_dispatcher.acp_client import _Callbacks, _ClientImpl
-
-    async def noop(_t: str) -> None:
+    async def noop(_output: AgentOutputChunk) -> None:
         pass
 
     impl = _ClientImpl(_Callbacks(on_output=noop))
@@ -174,9 +175,7 @@ async def test_client_captures_streamed_usage_update():
 
 
 async def test_client_usage_update_suppressed_during_load():
-    from feishu_dispatcher.acp_client import _Callbacks, _ClientImpl
-
-    async def noop(_t: str) -> None:
+    async def noop(_output: AgentOutputChunk) -> None:
         pass
 
     impl = _ClientImpl(_Callbacks(on_output=noop))
@@ -191,9 +190,7 @@ async def test_client_usage_update_suppressed_during_load():
 
 
 async def test_client_accumulates_agent_message_not_thought():
-    from feishu_dispatcher.acp_client import _Callbacks, _ClientImpl
-
-    async def noop(_t: str) -> None:
+    async def noop(_output: AgentOutputChunk) -> None:
         pass
 
     impl = _ClientImpl(_Callbacks(on_output=noop))
@@ -204,6 +201,39 @@ async def test_client_accumulates_agent_message_not_thought():
     # 回合重置后清空
     impl.reset_formatter()
     assert impl.last_message() == ""
+
+
+async def test_client_emits_structured_message_thought_and_activity_output():
+    outputs: list[AgentOutputChunk] = []
+
+    async def collect(output: AgentOutputChunk) -> None:
+        outputs.append(output)
+
+    impl = _ClientImpl(_Callbacks(on_output=collect))
+    await impl.session_update("s", update_agent_thought_text("thinking"))
+    await impl.session_update("s", update_agent_message_text("answer"))
+    await impl.session_update(
+        "s",
+        start_tool_call("tc1", "Edit", kind="edit"),
+    )
+
+    assert outputs == [
+        AgentOutputChunk(
+            kind="thought",
+            raw_text="thinking",
+            display_text="💭 thinking",
+        ),
+        AgentOutputChunk(
+            kind="message",
+            raw_text="answer",
+            display_text="\nanswer",
+        ),
+        AgentOutputChunk(
+            kind="activity",
+            raw_text=None,
+            display_text="\n🔧 Edit\n",
+        ),
+    ]
 
 
 # --- 单条 update（无前置状态）------------------------------------------- #

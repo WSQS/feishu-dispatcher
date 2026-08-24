@@ -21,6 +21,7 @@ from acp import text_block
 from acp.transports import spawn_stdio_transport
 
 from feishu_dispatcher.acp_client import (
+    AgentOutputChunk,
     _PROTOCOL_VERSION,
     _Callbacks,
     _ClientImpl,
@@ -63,7 +64,7 @@ async def main() -> int:
     argv = _AGENTS[name]
     executable = _resolve_executable(argv[0])
 
-    async def _noop(_t: str) -> None:
+    async def _noop(_output: AgentOutputChunk) -> None:
         pass
 
     cap = _Capturing(_Callbacks(on_output=_noop))

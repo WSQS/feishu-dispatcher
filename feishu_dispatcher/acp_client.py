@@ -17,7 +17,7 @@ import signal
 import sys
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import acp
 from acp import text_block
@@ -33,7 +33,19 @@ _PROTOCOL_VERSION = 1
 #: load_session 时快速失败而非永久冻结；<=0/None = 不超时。可经 config 覆盖。
 _DEFAULT_START_TIMEOUT = 120.0
 
-OnOutput = Callable[[str], Awaitable[None]]
+AgentOutputKind = Literal["message", "thought", "activity"]
+
+
+@dataclass(frozen=True)
+class AgentOutputChunk:
+    """ACP 输出的语义分类与当前 Channel 展示文本。"""
+
+    kind: AgentOutputKind
+    raw_text: str | None
+    display_text: str
+
+
+OnOutput = Callable[[AgentOutputChunk], Awaitable[None]]
 #: 审计动作回调：收到一个 tool_call 时推一条结构化动作（{"kind","title"}）
 OnAction = Callable[[dict], Awaitable[None]]
 
@@ -113,9 +125,9 @@ class _ClientImpl:
         # 攒本轮最终回复（只认 agent_message，不含 💭 思考/🔧 工具噪音）
         if getattr(update, "session_update", None) == "agent_message_chunk":
             self._message_buf.append(_content_text(update))
-        text = self._fmt.format(update)
-        if text:
-            await self._cb.on_output(text)
+        output = self._fmt.format_output(update)
+        if output is not None:
+            await self._cb.on_output(output)
 
     async def request_permission(
         self,
@@ -312,25 +324,37 @@ class _StreamFormatter:
         self._tools.clear()
 
     def format(self, update: Any) -> str:
+        output = self.format_output(update)
+        return output.display_text if output is not None else ""
+
+    def format_output(self, update: Any) -> AgentOutputChunk | None:
         kind = getattr(update, "session_update", None)
         if kind == "agent_message_chunk":
             text = _content_text(update)
             if not text:
-                return ""
+                return None
             out = ("\n" if self._last == "thought" else "") + text
             self._last = "text"
-            return out
+            return AgentOutputChunk(
+                kind="message",
+                raw_text=text,
+                display_text=out,
+            )
         if kind == "agent_thought_chunk":
             text = _content_text(update)
             if not text:
-                return ""
+                return None
             out = ("💭 " if self._last != "thought" else "") + text
             self._last = "thought"
-            return out
+            return AgentOutputChunk(
+                kind="thought",
+                raw_text=text,
+                display_text=out,
+            )
         if kind == "tool_call":
-            return self._format_tool(update, is_start=True)
+            return self._activity(self._format_tool(update, is_start=True))
         if kind == "tool_call_update":
-            return self._format_tool(update, is_start=False)
+            return self._activity(self._format_tool(update, is_start=False))
         if kind == "plan":
             marks = {"pending": "⬜", "in_progress": "🔄", "completed": "☑️"}
             lines = [
@@ -338,12 +362,22 @@ class _StreamFormatter:
                 for e in (getattr(update, "entries", None) or [])
             ]
             if not lines:
-                return ""
+                return None
             self._last = None
-            return "\n📋 计划:\n" + "\n".join(lines) + "\n"
+            return self._activity("\n📋 计划:\n" + "\n".join(lines) + "\n")
         # 其余变体（plan_update/usage_update/current_mode_update/available_commands_update
         # 等）有意忽略：P0 只转发对用户可读的主输出与进度。
-        return ""
+        return None
+
+    @staticmethod
+    def _activity(text: str) -> AgentOutputChunk | None:
+        if not text:
+            return None
+        return AgentOutputChunk(
+            kind="activity",
+            raw_text=None,
+            display_text=text,
+        )
 
     def _format_tool(self, update: Any, *, is_start: bool) -> str:
         """跨 tool_call / tool_call_update 事件按 tool_call_id 跟踪一次工具调用。

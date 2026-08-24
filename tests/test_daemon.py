@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 import feishu_dispatcher.daemon as daemon_module
+from feishu_dispatcher.acp_client import AgentOutputChunk
 from feishu_dispatcher.config import (
     Config,
     HttpChannelConfig,
@@ -186,8 +187,17 @@ class FakeAgent:
     async def prompt(self, text: str) -> str:
         self.prompts.append(text)
         self.last_message = f"reply:{text}"
-        await self.on_output(f"echo:{text}")
+        await self._emit_message(f"echo:{text}")
         return "end_turn"
+
+    async def _emit_message(self, text: str) -> None:
+        await self.on_output(
+            AgentOutputChunk(
+                kind="message",
+                raw_text=text,
+                display_text=text,
+            )
+        )
 
     async def cancel(self) -> None:
         self.cancel_calls += 1
@@ -224,7 +234,7 @@ class FailUnlessResumedAgent(FakeAgent):
         if self.resume_session_id is None:
             raise RuntimeError("boom")
         self.last_message = f"reply:{text}"
-        await self.on_output(f"echo:{text}")
+        await self._emit_message(f"echo:{text}")
         return "end_turn"
 
 
@@ -317,7 +327,7 @@ class GatedAgent(FakeAgent):
             self._first = False
             await self.gate.wait()
         self.last_message = f"reply:{text}"
-        await self.on_output(f"echo:{text}")
+        await self._emit_message(f"echo:{text}")
         return "end_turn"
 
 
@@ -1407,6 +1417,37 @@ async def test_run_dispatches_and_streams_output():
     assert len(created) == 1
     assert created[0].prompts == ["do stuff"]
     assert created[0].start_count == 1
+
+
+async def test_daemon_streams_structured_output_display_text():
+    class StructuredOutputAgent(FakeAgent):
+        async def prompt(self, text: str) -> str:
+            self.prompts.append(text)
+            self.last_message = "answer"
+            await self.on_output(
+                AgentOutputChunk(
+                    kind="thought",
+                    raw_text="thinking",
+                    display_text="💭 thinking",
+                )
+            )
+            await self.on_output(
+                AgentOutputChunk(
+                    kind="message",
+                    raw_text="answer",
+                    display_text="\nanswer",
+                )
+            )
+            return "end_turn"
+
+    daemon, bridge, _ = make_daemon(agent_cls=StructuredOutputAgent)
+    await daemon._handle_message(root_msg("/run demo do stuff"))
+    await wait_until(
+        lambda: any("💭 thinking\nanswer" in text for text in bridge.texts("om_root1"))
+    )
+
+    assert not any(text == "thinkinganswer" for text in bridge.texts("om_root1"))
+    await daemon._shutdown()
 
 
 async def test_agent_turn_lock_serializes_only_the_same_session():
@@ -3341,7 +3382,7 @@ class ActionAgent(FakeAgent):
         if self.on_action is not None:
             await self.on_action({"kind": "edit", "title": f"Editing {text}.py"})
             await self.on_action({"kind": "execute", "title": "pytest"})
-        await self.on_output(f"echo:{text}")
+        await self._emit_message(f"echo:{text}")
 
 
 async def test_tool_call_actions_logged_to_task_with_turn():
@@ -3637,7 +3678,7 @@ async def test_load_session_replay_does_not_log_actions():
     async def on_action(a: dict) -> None:
         logged.append(a)
 
-    async def on_output(_t: str) -> None:
+    async def on_output(_output: AgentOutputChunk) -> None:
         pass
 
     impl = _ClientImpl(_Callbacks(on_output=on_output, on_action=on_action))

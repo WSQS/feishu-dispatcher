@@ -14,7 +14,7 @@ import asyncio
 import logging
 import sys
 
-from feishu_dispatcher.acp_client import AcpAgent, AgentSpawn
+from feishu_dispatcher.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
 
 WORKDIR = (
     r"C:\Users\wsqsy\AppData\Local\Temp\pty-smoke"  # 有现成 opencode.json（flash 模型）
@@ -37,9 +37,9 @@ PROMPT = (
 async def main() -> int:
     outputs: list[str] = []
 
-    async def on_output(text: str) -> None:
-        print(f"[OUT] {text!r}", flush=True)
-        outputs.append(text)
+    async def on_output(output: AgentOutputChunk) -> None:
+        print(f"[OUT] {output.display_text!r}", flush=True)
+        outputs.append(output.display_text)
 
     spawn = AgentSpawn(
         command=["opencode", "acp"],
