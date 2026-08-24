@@ -998,8 +998,9 @@ async def test_http_task_conversation_round_trip_routes_to_existing_runner():
                 "tok-http",
             )
             if output_status == 200 and any(
-                event["type"] == "output.delta"
-                and "echo:web follow up" in event["text"]
+                event["type"] == "session.event"
+                and event["event"]["type"] == "agent.output.delta"
+                and "echo:web follow up" in event["presentation"]["text"]
                 for event in output_events["events"]
             ):
                 break
@@ -1007,8 +1008,13 @@ async def test_http_task_conversation_round_trip_routes_to_existing_runner():
                 raise AssertionError((output_status, output_events))
             await asyncio.sleep(0.01)
         assert any(
-            event["type"] == "output.started" and event["target_id"] == thread_id
+            event["type"] == "session.event"
+            and event["event"]["type"] == "agent.output.started"
+            and event["presentation"]["target_id"] == thread_id
             for event in output_events["events"]
+        )
+        assert not any(
+            event["type"].startswith("output.") for event in output_events["events"]
         )
     finally:
         await daemon._shutdown()

@@ -347,12 +347,37 @@ function renderEvent(event) {
         });
         break;
       }
+      const presentation = event.presentation;
+      if (sessionEvent.type === "session.input.accepted") {
+        break;
+      }
+      if (sessionEvent.type === "agent.output.started") {
+        if (presentation?.output_id) {
+          rememberTarget(presentation.output_id, taskId);
+          ensureOutput(presentation, taskId);
+        }
+        break;
+      }
       if (
-        sessionEvent.type === "session.input.accepted" ||
-        sessionEvent.type === "agent.output.started" ||
         sessionEvent.type === "agent.output.delta" ||
-        sessionEvent.type === "agent.output.finished"
+        sessionEvent.type === "tool.call.observed"
       ) {
+        if (presentation?.output_id) {
+          const output = ensureOutput(presentation, taskId);
+          output.body.textContent += presentation.text || "";
+          scrollTimeline(output.taskId);
+        }
+        break;
+      }
+      if (sessionEvent.type === "agent.output.finished") {
+        if (presentation?.output_id) {
+          const output = ensureOutput(presentation, taskId);
+          output.body.textContent += presentation.text || "";
+          output.footer.textContent = presentation.footer || "";
+          output.status.textContent = presentation.status || "running";
+          output.article.dataset.status = presentation.status || "running";
+          scrollTimeline(output.taskId);
+        }
         break;
       }
       appendEvent({
