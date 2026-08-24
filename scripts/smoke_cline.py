@@ -16,7 +16,7 @@ import logging
 import sys
 from pathlib import Path
 
-from feishu_dispatcher.acp_client import AcpAgent, AgentSpawn
+from feishu_dispatcher.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
 
 REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 
@@ -28,9 +28,9 @@ logging.basicConfig(
 async def main() -> int:
     outputs: list[str] = []
 
-    async def on_output(text: str) -> None:
-        print(f"[OUT] {text!r}", flush=True)
-        outputs.append(text)
+    async def on_output(output: AgentOutputChunk) -> None:
+        print(f"[OUT] {output.display_text!r}", flush=True)
+        outputs.append(output.display_text)
 
     spawn = AgentSpawn(
         command=["cline", "--acp"],

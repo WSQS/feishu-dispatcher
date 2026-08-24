@@ -20,7 +20,7 @@ import logging
 import sys
 from pathlib import Path
 
-from feishu_dispatcher.acp_client import AcpAgent, AgentSpawn
+from feishu_dispatcher.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
 
 REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 
@@ -34,9 +34,9 @@ _SECRET = "4287"
 async def main() -> int:
     outputs: list[str] = []
 
-    async def on_output(text: str) -> None:
-        print(f"[OUT] {text!r}", flush=True)
-        outputs.append(text)
+    async def on_output(output: AgentOutputChunk) -> None:
+        print(f"[OUT] {output.display_text!r}", flush=True)
+        outputs.append(output.display_text)
 
     # 模型来自 ~/.codebuddy/models.json + settings.json（DeepSeek），codebuddy 自读、免云端登录。
     spawn = AgentSpawn(command=["codebuddy", "--acp"], cwd=REPO_ROOT)
@@ -81,8 +81,8 @@ async def main() -> int:
         return 0
     outputs2: list[str] = []
 
-    async def on_output2(text: str) -> None:
-        outputs2.append(text)
+    async def on_output2(output: AgentOutputChunk) -> None:
+        outputs2.append(output.display_text)
 
     a2 = AcpAgent(spawn, on_output2, resume_session_id=sid)
     try:

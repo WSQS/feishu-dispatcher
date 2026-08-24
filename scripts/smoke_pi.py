@@ -21,7 +21,7 @@ import re
 import sys
 from pathlib import Path
 
-from feishu_dispatcher.acp_client import AcpAgent
+from feishu_dispatcher.acp_client import AcpAgent, AgentOutputChunk
 from feishu_dispatcher.pi_backend import build_pi_agent_spawn
 
 REPO_ROOT = str(Path(__file__).resolve().parent.parent)
@@ -57,9 +57,9 @@ async def main() -> int:
     outputs: list[str] = []
     actions: list[dict] = []
 
-    async def on_output(text: str) -> None:
-        print(f"[OUT] {text!r}", flush=True)
-        outputs.append(text)
+    async def on_output(output: AgentOutputChunk) -> None:
+        print(f"[OUT] {output.display_text!r}", flush=True)
+        outputs.append(output.display_text)
 
     async def on_action(action: dict) -> None:
         print(f"[ACTION] {action!r}", flush=True)
@@ -107,9 +107,9 @@ async def main() -> int:
         )
         resumed: list[str] = []
 
-        async def on_resumed(text: str) -> None:
-            print(f"[RESUME] {text!r}", flush=True)
-            resumed.append(text)
+        async def on_resumed(output: AgentOutputChunk) -> None:
+            print(f"[RESUME] {output.display_text!r}", flush=True)
+            resumed.append(output.display_text)
 
         agent2 = AcpAgent(
             build_pi_agent_spawn(REPO_ROOT, api_key=key),

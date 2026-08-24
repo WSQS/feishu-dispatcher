@@ -28,7 +28,14 @@ from functools import partial
 from pathlib import Path
 
 from . import forge
-from .acp_client import AcpAgent, AgentSpawn, OnAction, OnOutput, _resolve_executable
+from .acp_client import (
+    AcpAgent,
+    AgentOutputChunk,
+    AgentSpawn,
+    OnAction,
+    OnOutput,
+    _resolve_executable,
+)
 from .channel import Channel, ChannelMessage, OutputStatus, StreamingOutput
 from .config import DEFAULT_CONFIG_PATH, Config, Project
 from .conversation import ConversationRef
@@ -1232,7 +1239,7 @@ class _Daemon:
             next((str(p.path) for p in projs.values()), "."),
         )
 
-        async def _noop_out(_t: str) -> None:
+        async def _noop_out(_output: AgentOutputChunk) -> None:
             pass
 
         async def _noop_act(_a: dict) -> None:
@@ -1519,7 +1526,7 @@ class _Daemon:
         尝试失败即报错，不做静态标志/动态探测。
         """
 
-        async def _noop_out(_t: str) -> None:
+        async def _noop_out(_output: AgentOutputChunk) -> None:
             pass
 
         async def _noop_act(_a: dict) -> None:
@@ -1597,12 +1604,12 @@ class _Daemon:
             issue_url=session.issue_url,
         )
 
-        async def on_output(text: str) -> None:
+        async def on_output(output: AgentOutputChunk) -> None:
             if (
                 self._runners.is_current(sess.session_id, sess)
                 and sess.current_output is not None
             ):
-                sess.current_output.feed(text)
+                sess.current_output.feed(output.display_text)
 
         async def on_action(action: dict) -> None:
             # 审计（A）：只有 current runner 能把 tool_call 记进 Task；旧代 runner

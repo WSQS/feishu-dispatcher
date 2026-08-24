@@ -20,7 +20,7 @@ import sys
 import time
 
 from feishu_dispatcher import acp_client
-from feishu_dispatcher.acp_client import AcpAgent, AgentSpawn
+from feishu_dispatcher.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
 
 WORKDIR = r"C:\Users\wsqsy\AppData\Local\Temp\pty-smoke"
 EXIT_MARKER = "DONE_MARKER_XYZ"
@@ -92,7 +92,7 @@ def _install_class_patch() -> None:
     acp_client._ClientImpl.session_update = logged
 
 
-async def on_output(text: str) -> None:
+async def on_output(_output: AgentOutputChunk) -> None:
     return None  # v2 只关心原始 update；格式化文本不再打印，免得刷屏
 
 
