@@ -26,6 +26,7 @@ from datetime import datetime, timezone
 from functools import partial
 
 from pathlib import Path
+from typing import Awaitable, Callable
 
 from . import forge
 from .acp_client import (
@@ -49,7 +50,14 @@ from .scheduler import (
     build_scheduler_tools,
     run_tool_loop,
 )
-from .session_event import SessionEvent, SessionInputAccepted
+from .session_event import (
+    AgentOutputDelta,
+    AgentOutputFinished,
+    AgentOutputStarted,
+    OutputOutcome,
+    SessionEvent,
+    SessionInputAccepted,
+)
 from .store import Job, JobStore, ModelStore, ProjectStore, Session, SessionStore
 from ._scan_executor import ScanExecutor
 from .workspace_api import (
@@ -60,6 +68,8 @@ from .workspace_api import (
 )
 
 logger = logging.getLogger(__name__)
+
+SessionEventHandler = Callable[[SessionEvent], Awaitable[None]]
 
 _DISPATCHER_SESSION_ID = "dispatcher"
 _DISPATCH_PREFIX = "/run "
@@ -471,6 +481,10 @@ class _AgentSessionRunner:
     terminate_status: str = "stopped"
     #: 本轮是否正在跑（worker 卡在 agent.prompt() 里）；/stop 据此决定要不要发 cancel
     turn_in_flight: bool = False
+    #: 当前 Turn 的运行事实聚合，供 SessionEvent sink 生成完整收尾事件。
+    current_turn_id: str | None = None
+    current_message_chunks: list[str] = field(default_factory=list)
+    current_thought_chunks: list[str] = field(default_factory=list)
     #: 后台任务身份 token（本次启动一次性下发，注入 agent env，映射到 task_id）；#68
     bg_token: str = ""
     #: 单消费者 worker，持有 agent 完整生命周期
@@ -557,6 +571,8 @@ class _Daemon:
     _conversation_session_ids: dict[ConversationRef, str] = field(default_factory=dict)
     #: 每个 Session 的单活 current runner；Thread 只经 Session 路由到这里。
     _runners: _CurrentRunnerRegistry = field(default_factory=_CurrentRunnerRegistry)
+    #: 可选的运行时事件消费者；不参与 Channel 投影或持久化。
+    _session_event_handler: SessionEventHandler | None = None
     _seen_message_keys: OrderedDict[tuple[ConversationRef, str], None] = field(
         default_factory=OrderedDict
     )
@@ -718,6 +734,39 @@ class _Daemon:
             *(
                 self._safe_handle_session_event(event, conversation=conversation)
                 for conversation in conversations
+            )
+        )
+
+    async def _emit_session_event(self, event: SessionEvent) -> None:
+        """把运行事实交给可选消费者，并隔离消费者失败。"""
+        if self._session_event_handler is None:
+            return
+        try:
+            await self._session_event_handler(event)
+        except Exception:
+            logger.exception(
+                "SessionEvent 运行时消费者失败 event=%s",
+                event.event_id,
+            )
+
+    async def _finish_agent_output(
+        self,
+        sess: _AgentSessionRunner,
+        outcome: OutputOutcome,
+    ) -> None:
+        if sess.current_turn_id is None:
+            return
+        await self._emit_session_event(
+            SessionEvent(
+                event_id=secrets.token_hex(16),
+                session_id=sess.session_id,
+                turn_id=sess.current_turn_id,
+                occurred_at=datetime.now(timezone.utc),
+                body=AgentOutputFinished(
+                    message="".join(sess.current_message_chunks),
+                    thought="".join(sess.current_thought_chunks),
+                    outcome=outcome,
+                ),
             )
         )
 
@@ -1605,11 +1654,29 @@ class _Daemon:
         )
 
         async def on_output(output: AgentOutputChunk) -> None:
-            if (
-                self._runners.is_current(sess.session_id, sess)
-                and sess.current_output is not None
-            ):
+            if not self._runners.is_current(sess.session_id, sess):
+                return
+            if sess.current_output is not None:
                 sess.current_output.feed(output.display_text)
+            if sess.current_turn_id is None or output.raw_text is None:
+                return
+            if output.kind == "message":
+                sess.current_message_chunks.append(output.raw_text)
+                stream = "message"
+            elif output.kind == "thought":
+                sess.current_thought_chunks.append(output.raw_text)
+                stream = "thought"
+            else:
+                return
+            await self._emit_session_event(
+                SessionEvent(
+                    event_id=secrets.token_hex(16),
+                    session_id=sess.session_id,
+                    turn_id=sess.current_turn_id,
+                    occurred_at=datetime.now(timezone.utc),
+                    body=AgentOutputDelta(stream=stream, text=output.raw_text),
+                )
+            )
 
         async def on_action(action: dict) -> None:
             # 审计（A）：只有 current runner 能把 tool_call 记进 Task；旧代 runner
@@ -1834,6 +1901,9 @@ class _Daemon:
                         footer=footer,
                     )
                     sess.current_output = output
+                    sess.current_turn_id = request.turn_id
+                    sess.current_message_chunks.clear()
+                    sess.current_thought_chunks.clear()
                     self.store.update(sess.session_id, status="running")
                     logger.info(
                         "任务 %s 开始一轮（%s）: %.80s",
@@ -1842,6 +1912,16 @@ class _Daemon:
                         prompt,
                     )
                     sess.turn_in_flight = True
+                    await self._emit_session_event(
+                        SessionEvent(
+                            event_id=secrets.token_hex(16),
+                            session_id=sess.session_id,
+                            turn_id=request.turn_id,
+                            occurred_at=datetime.now(timezone.utc),
+                            body=AgentOutputStarted(),
+                        )
+                    )
+                    outcome: OutputOutcome | None = None
                     try:
                         stop_reason = await sess.agent.prompt(prompt)
                         await output.flush()
@@ -1855,6 +1935,7 @@ class _Daemon:
                                 break
                             self.store.update(sess.session_id, status="idle")
                             logger.info("任务 %s 本轮被取消", sess.session_id)
+                            outcome = "cancelled"
                             continue
                         # footer 追加本轮 token 用量（#53）：取不到就不显示、不报错。
                         # 只标脏，紧随的 set_status("done") 会把新 footer 一起 emit。
@@ -1896,11 +1977,13 @@ class _Daemon:
                                 note += f"：{snippet}"
                             note += "，在其话题里查看/继续。"
                             await self._notify_main(note)
+                        outcome = "completed"
                     except asyncio.CancelledError:
                         raise
                     except Exception as exc:
                         logger.exception("agent 执行异常")
                         err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
+                        outcome = "failed"
                         try:
                             await output.set_status("error")
                         except Exception:
@@ -1922,8 +2005,13 @@ class _Daemon:
                         break
                     finally:
                         sess.turn_in_flight = False
+                        if outcome is not None:
+                            await self._finish_agent_output(sess, outcome)
                         await output.aclose()
                         sess.current_output = None
+                        sess.current_turn_id = None
+                        sess.current_message_chunks.clear()
+                        sess.current_thought_chunks.clear()
         except asyncio.CancelledError:
             logger.debug("agent worker 被取消 root=%s", root)
         finally:
