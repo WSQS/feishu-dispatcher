@@ -20,6 +20,7 @@ import pytest
 from feishu_dispatcher.acp_client import (
     AcpAgent,
     AgentOutputChunk,
+    AgentToolCallUpdate,
     AgentSpawn,
     _Callbacks,
     _ClientImpl,
@@ -234,6 +235,90 @@ async def test_client_emits_structured_message_thought_and_activity_output():
             display_text="\n🔧 Edit\n",
         ),
     ]
+
+
+async def test_client_emits_structured_tool_call_lifecycle_updates():
+    updates: list[AgentToolCallUpdate] = []
+
+    async def collect(update: AgentToolCallUpdate) -> None:
+        updates.append(update)
+
+    impl = _ClientImpl(_Callbacks(on_output=_noop_out, on_tool_call=collect))
+    await impl.session_update(
+        "s",
+        start_tool_call("tc1", "bash", kind="execute", raw_input={"cwd": "/tmp"}),
+    )
+    await impl.session_update(
+        "s",
+        update_tool_call(
+            "tc1",
+            title="git status",
+            status="in_progress",
+            raw_input={"command": "git status"},
+        ),
+    )
+    await impl.session_update(
+        "s",
+        update_tool_call("tc1", title="git status", status="completed"),
+    )
+
+    assert updates == [
+        AgentToolCallUpdate(
+            tool_call_id="tc1",
+            kind="execute",
+            title="bash",
+            status="started",
+        ),
+        AgentToolCallUpdate(
+            tool_call_id="tc1",
+            kind="execute",
+            title="bash",
+            status="started",
+            detail="git status",
+        ),
+        AgentToolCallUpdate(
+            tool_call_id="tc1",
+            kind="execute",
+            title="bash",
+            status="completed",
+            detail="git status",
+        ),
+    ]
+
+
+async def test_client_deduplicates_tool_call_updates_and_resets_per_turn():
+    updates: list[AgentToolCallUpdate] = []
+
+    async def collect(update: AgentToolCallUpdate) -> None:
+        updates.append(update)
+
+    impl = _ClientImpl(_Callbacks(on_output=_noop_out, on_tool_call=collect))
+    update = update_tool_call(
+        "tc1",
+        title="git status",
+        status="in_progress",
+        raw_input={"command": "git status"},
+    )
+    await impl.session_update("s", update)
+    await impl.session_update("s", update)
+    assert len(updates) == 1
+
+    impl.reset_formatter()
+    await impl.session_update("s", update)
+    assert len(updates) == 2
+
+
+async def test_client_tool_call_callback_ignores_non_tool_updates():
+    updates: list[AgentToolCallUpdate] = []
+
+    async def collect(update: AgentToolCallUpdate) -> None:
+        updates.append(update)
+
+    impl = _ClientImpl(_Callbacks(on_output=_noop_out, on_tool_call=collect))
+    await impl.session_update("s", update_agent_message_text("answer"))
+    await impl.session_update("s", update_agent_thought_text("thinking"))
+
+    assert updates == []
 
 
 # --- 单条 update（无前置状态）------------------------------------------- #
