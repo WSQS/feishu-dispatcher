@@ -280,6 +280,12 @@ function taskForEvent(event) {
   if (event.type === "output.delta" || event.type === "output.updated") {
     return outputs.get(event.output_id)?.taskId || DISPATCHER_TASK_ID;
   }
+  if (event.type === "session.event") {
+    const sessionId = event.event?.session_id;
+    if (typeof sessionId === "string" && sessionId) {
+      return sessionId;
+    }
+  }
   const targetIds = [event.target_id, event.thread_id, event.output_id, event.message_id];
   for (const targetId of targetIds) {
     const taskId = targetTasks.get(targetId);
@@ -327,6 +333,35 @@ function renderEvent(event) {
       output.footer.textContent = event.footer || "";
       output.status.textContent = event.status || "running";
       output.article.dataset.status = event.status || "running";
+      break;
+    }
+    case "session.event": {
+      const sessionEvent = event.event;
+      if (!sessionEvent || typeof sessionEvent.type !== "string") {
+        appendEvent({
+          taskId,
+          role: "system",
+          label: "Session event",
+          text: "收到无法识别的 SessionEvent。",
+          detail: `cursor ${event.cursor ?? "?"}`,
+        });
+        break;
+      }
+      if (
+        sessionEvent.type === "session.input.accepted" ||
+        sessionEvent.type === "agent.output.started" ||
+        sessionEvent.type === "agent.output.delta" ||
+        sessionEvent.type === "agent.output.finished"
+      ) {
+        break;
+      }
+      appendEvent({
+        taskId,
+        role: "system",
+        label: "Session event",
+        text: sessionEvent.type,
+        detail: `cursor ${event.cursor ?? "?"}`,
+      });
       break;
     }
     default:
