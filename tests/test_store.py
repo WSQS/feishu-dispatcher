@@ -7,8 +7,8 @@ from pathlib import Path
 import pytest
 
 from feishu_dispatcher import store as store_module
-from feishu_dispatcher.channel import ConversationRef
 from feishu_dispatcher.config import Project
+from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.store import (
     _MAX_ACTIONS,
     JobStore,

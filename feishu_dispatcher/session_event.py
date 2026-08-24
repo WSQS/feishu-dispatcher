@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal, TypeAlias, cast
 
-from .channel import ConversationRef
+from .conversation import ConversationRef
 
 SESSION_EVENT_SCHEMA_VERSION = 1
 

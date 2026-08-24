@@ -6,13 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-
-@dataclass(frozen=True)
-class ConversationRef:
-    """一个 Channel 内会话的稳定引用。"""
-
-    channel_key: str
-    conversation_id: str
+from .session_event import SessionEvent
 
 
 @dataclass(frozen=True)
@@ -68,6 +62,12 @@ class Channel(Protocol):
         *,
         threaded: bool = False,
     ) -> str: ...
+
+    def handle_session_event(
+        self,
+        conversation_id: str,
+        event: SessionEvent,
+    ) -> None: ...
 
     def open_output(
         self,

@@ -5,10 +5,13 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from datetime import datetime, timezone
 
 from feishu_dispatcher.channel import ChannelMessage
+from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.feishu import FeishuBridge, _RateLimiter
 from feishu_dispatcher.livecard import LiveCard
+from feishu_dispatcher.session_event import SessionEvent, SessionInputAccepted
 from feishu_dispatcher.throttler import StreamThrottler
 
 
@@ -429,6 +432,53 @@ def test_channel_reply_text_selects_plain_or_threaded_reply(monkeypatch):
         ("plain", "om_message", "plain"),
         ("threaded", "om_root", "threaded"),
     ]
+
+
+def test_channel_projects_session_input_event_to_thread(monkeypatch):
+    bridge = make_bridge()
+    calls: list[tuple[str, str, bool]] = []
+
+    def reply_text(target_id: str, text: str, *, threaded: bool = False) -> str:
+        calls.append((target_id, text, threaded))
+        return "om_reply"
+
+    monkeypatch.setattr(bridge, "reply_text", reply_text)
+    event = SessionEvent(
+        event_id="event-1",
+        session_id="t1",
+        turn_id="turn-1",
+        occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+        body=SessionInputAccepted(
+            text="检查状态",
+            source=ConversationRef("http", "http-thread"),
+        ),
+    )
+
+    bridge.handle_session_event("om_root", event)
+
+    assert calls == [("om_root", "↪️ 同步自 http：检查状态", True)]
+
+
+def test_channel_skips_empty_session_input_event(monkeypatch):
+    bridge = make_bridge()
+    calls: list[tuple[str, str, bool]] = []
+
+    def reply_text(target_id: str, text: str, *, threaded: bool = False) -> str:
+        calls.append((target_id, text, threaded))
+        return "om_reply"
+
+    monkeypatch.setattr(bridge, "reply_text", reply_text)
+    event = SessionEvent(
+        event_id="event-empty",
+        session_id="t1",
+        turn_id="turn-empty",
+        occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+        body=SessionInputAccepted(text=""),
+    )
+
+    bridge.handle_session_event("om_root", event)
+
+    assert calls == []
 
 
 def test_feishu_card_methods_delegate_to_feishu_card_methods(monkeypatch):
