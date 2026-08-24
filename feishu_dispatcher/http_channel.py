@@ -35,7 +35,6 @@ _MAX_BODY = 1_000_000
 _DEFAULT_MAX_CONVERSATIONS = 128
 _DEFAULT_MAX_EVENTS = 512
 _DEFAULT_MAX_TARGETS = 4096
-_DEFAULT_OUTPUT_CHUNK_CHARS = 4000
 _DISPATCH_TIMEOUT = 30.0
 
 RouteHandler = Callable[[dict, dict], Awaitable[tuple[int, dict]]]
@@ -129,7 +128,6 @@ class HttpChannel:
         self._port = port
         self._routes = dict(routes or {})
         self._route_context = dict(route_context or {})
-        self._throttle_window = max(0.0, throttle_window)
         self._max_conversations = max_conversations
         self._max_events = max_events
         self._max_targets = max_targets
@@ -138,6 +136,8 @@ class HttpChannel:
         self._lifecycle_lock = threading.Lock()
         self._conversations: dict[str, _ConversationState] = {}
         self._target_conversations: dict[str, str] = {}
+        self._pending_outputs: dict[str, deque[_HttpStreamingOutput]] = {}
+        self._active_outputs: dict[tuple[str, str, str], _HttpStreamingOutput] = {}
         self._on_message: MessageHandler | None = None
         self._webui_assets = _load_webui_assets()
         self._server: _HttpServer | None = self._build_server()
@@ -274,10 +274,30 @@ class HttpChannel:
         ):
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
         owner = self._conversation_for_target(conversation_id)
+        presentation: dict[str, object] | None = None
+        if isinstance(body, AgentOutputStarted):
+            output = self._start_session_output(owner, event)
+            if output is not None:
+                presentation = output.started_presentation()
+        elif isinstance(body, AgentOutputDelta):
+            output = self._active_output(owner, event)
+            if output is not None:
+                presentation = output.delta_presentation(body)
+        elif isinstance(body, AgentOutputFinished):
+            output = self._active_output(owner, event)
+            if output is not None:
+                presentation = output.finished_presentation(body)
+        elif isinstance(body, ToolCallObserved):
+            output = self._active_output(owner, event)
+            if output is not None:
+                presentation = output.tool_call_presentation(body)
+        payload: dict[str, object] = {"event": session_event_to_dict(event)}
+        if presentation is not None:
+            payload["presentation"] = presentation
         self._append_event(
             owner,
             "session.event",
-            event=session_event_to_dict(event),
+            **payload,
         )
         if not isinstance(body, SessionInputAccepted):
             return
@@ -304,8 +324,57 @@ class HttpChannel:
             target_id,
             title,
             footer=footer,
-            window=self._throttle_window,
         )
+
+    def _register_output(self, output: _HttpStreamingOutput) -> None:
+        with self._state_lock:
+            self._pending_outputs.setdefault(output.conversation_id, deque()).append(
+                output
+            )
+
+    def _unregister_output(self, output: _HttpStreamingOutput) -> None:
+        with self._state_lock:
+            pending = self._pending_outputs.get(output.conversation_id)
+            if pending is not None:
+                self._pending_outputs[output.conversation_id] = deque(
+                    item for item in pending if item is not output
+                )
+                if not self._pending_outputs[output.conversation_id]:
+                    del self._pending_outputs[output.conversation_id]
+            for key, active in list(self._active_outputs.items()):
+                if active is output:
+                    del self._active_outputs[key]
+
+    def _start_session_output(
+        self,
+        conversation_id: str,
+        event: SessionEvent,
+    ) -> _HttpStreamingOutput | None:
+        if event.turn_id is None:
+            return None
+        with self._state_lock:
+            pending = self._pending_outputs.get(conversation_id)
+            if not pending:
+                return None
+            output = pending.popleft()
+            if not pending:
+                del self._pending_outputs[conversation_id]
+            self._active_outputs[(conversation_id, event.session_id, event.turn_id)] = (
+                output
+            )
+            return output
+
+    def _active_output(
+        self,
+        conversation_id: str,
+        event: SessionEvent,
+    ) -> _HttpStreamingOutput | None:
+        if event.turn_id is None:
+            return None
+        with self._state_lock:
+            return self._active_outputs.get(
+                (conversation_id, event.session_id, event.turn_id)
+            )
 
     def _build_server(self) -> _HttpServer:
         return _HttpServer((self._host, self._port), _make_handler(self))
@@ -562,7 +631,7 @@ class HttpChannel:
 
 
 class _HttpStreamingOutput:
-    """把流式文本节流为 Conversation-scoped 事件。"""
+    """登记一个回合的 HTTP 展示元数据，由 SessionEvent 驱动实际事件。"""
 
     def __init__(
         self,
@@ -572,101 +641,101 @@ class _HttpStreamingOutput:
         title: str,
         *,
         footer: str,
-        window: float,
     ) -> None:
         self._channel = channel
-        self._conversation_id = conversation_id
         self._target_id = target_id
         self._output_id = channel._new_target(conversation_id, "output")
+        self.conversation_id = conversation_id
         self._footer = footer
-        self._status: OutputStatus = "running"
-        self._window = window
-        self._chunks: list[str] = []
-        self._meta_dirty = False
         self._closed = False
-        self._pending = asyncio.Event()
-        self._force = asyncio.Event()
-        self._flush_lock = asyncio.Lock()
-        self._task: asyncio.Task[None] | None = None
-        channel._append_event(
-            conversation_id,
-            "output.started",
-            output_id=self._output_id,
-            target_id=target_id,
-            title=title,
-            footer=footer,
-            status=self._status,
-        )
+        self._title = title
+        self._message_text = ""
+        self._last_stream: str | None = None
+        self._channel._register_output(self)
 
     def feed(self, text: str) -> None:
-        if self._closed or not text:
-            return
-        self._chunks.append(text)
-        self._pending.set()
-        if self._task is None:
-            self._task = asyncio.get_running_loop().create_task(self._run())
+        return None
 
     def set_footer(self, footer: str) -> None:
-        if self._closed or footer == self._footer:
-            return
-        self._footer = footer
-        self._meta_dirty = True
-
-    async def flush(self) -> None:
-        self._force.set()
-        await self._drain()
-
-    async def set_status(self, status: OutputStatus) -> None:
         if self._closed:
             return
-        self._status = status
-        self._meta_dirty = True
-        await self.flush()
+        self._footer = footer
+
+    async def flush(self) -> None:
+        return None
+
+    async def set_status(self, status: OutputStatus) -> None:
+        return None
 
     async def aclose(self) -> None:
         if self._closed:
             return
         self._closed = True
-        self._pending.set()
-        self._force.set()
-        if self._task is not None:
-            await self._task
-        await self._drain()
+        self._channel._unregister_output(self)
 
-    async def _run(self) -> None:
-        while not self._closed:
-            await self._pending.wait()
-            if self._closed:
-                break
-            try:
-                await asyncio.wait_for(self._force.wait(), timeout=self._window)
-            except asyncio.TimeoutError:
-                pass
-            self._force.clear()
-            self._pending.clear()
-            await self._drain()
+    def started_presentation(self) -> dict[str, object]:
+        return {
+            "output_id": self._output_id,
+            "target_id": self._target_id,
+            "title": self._title,
+            "footer": self._footer,
+            "status": "running",
+        }
 
-    async def _drain(self) -> None:
-        async with self._flush_lock:
-            if self._chunks:
-                text = "".join(self._chunks)
-                self._chunks.clear()
-                for start in range(0, len(text), _DEFAULT_OUTPUT_CHUNK_CHARS):
-                    self._channel._append_event(
-                        self._conversation_id,
-                        "output.delta",
-                        output_id=self._output_id,
-                        text=text[start : start + _DEFAULT_OUTPUT_CHUNK_CHARS],
-                    )
-            if self._meta_dirty:
-                self._meta_dirty = False
-                self._channel._append_event(
-                    self._conversation_id,
-                    "output.updated",
-                    output_id=self._output_id,
-                    footer=self._footer,
-                    status=self._status,
-                )
+    def delta_presentation(self, event: AgentOutputDelta) -> dict[str, object]:
+        display_text = event.text
+        if event.stream == "thought" and self._last_stream != "thought":
+            display_text = f"💭 {event.text}"
+        elif event.stream == "message" and self._last_stream == "thought":
+            display_text = f"\n{event.text}"
+        self._last_stream = event.stream
+        if event.stream == "message":
+            self._message_text += event.text
+        return {
+            "output_id": self._output_id,
+            "text": display_text,
+        }
+
+    def finished_presentation(self, event: AgentOutputFinished) -> dict[str, object]:
+        if event.message != self._message_text:
+            suffix = (
+                event.message[len(self._message_text) :]
+                if event.message.startswith(self._message_text)
+                else event.message
+            )
+            self._message_text = event.message
+        else:
+            suffix = ""
+        status: OutputStatus = {
+            "completed": "done",
+            "cancelled": "stopped",
+            "failed": "error",
+        }[event.outcome]
+        return {
+            "output_id": self._output_id,
+            "text": suffix,
+            "footer": self._footer,
+            "status": status,
+        }
+
+    def tool_call_presentation(self, event: ToolCallObserved) -> dict[str, object]:
+        if (
+            event.status == "started"
+            and event.kind in {"execute", "other"}
+            and not event.detail
+        ):
+            text = ""
+        else:
+            icon = {"started": "🔧", "completed": "✅", "failed": "❌"}[event.status]
+            text = f"{icon} {event.title}"
+            if event.detail and event.detail != event.title:
+                text += f": {event.detail}"
+            text = f"\n{text}\n"
+        self._last_stream = "activity"
+        return {
+            "output_id": self._output_id,
+            "text": text,
+        }
 
 
 def _match_route(

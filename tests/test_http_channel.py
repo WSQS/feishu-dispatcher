@@ -250,8 +250,11 @@ def test_webui_consumes_session_events_without_duplicate_unknown_entries():
         "agent.output.started",
         "agent.output.delta",
         "agent.output.finished",
+        "tool.call.observed",
     ):
         assert f'sessionEvent.type === "{event_type}"' in event_rendering
+    assert "event.presentation" in event_rendering
+    assert "ensureOutput(presentation, taskId)" in event_rendering
     assert "收到无法识别的 SessionEvent。" in event_rendering
     assert "text: sessionEvent.type" in event_rendering
 
@@ -705,7 +708,7 @@ async def test_cursor_expiry_invalid_cursor_and_conversation_capacity():
         channel.stop()
 
 
-async def test_thread_reply_streaming_output_and_restart():
+async def test_thread_reply_session_event_output_and_restart():
     port = _available_port()
     channel = HttpChannel(
         "tok-http",
@@ -723,24 +726,70 @@ async def test_thread_reply_streaming_output_and_restart():
         thread_id = channel.create_thread("browser-a", "start")
         channel.reply_text(thread_id, "reply", threaded=True)
         output = channel.open_output(thread_id, "demo", footer="model:a")
-        output.feed("hello")
-        output.feed(" world")
-        await asyncio.sleep(0.03)
+        channel.handle_session_event(
+            thread_id,
+            SessionEvent(
+                event_id="event-started",
+                session_id="t1",
+                turn_id="turn-1",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=AgentOutputStarted(),
+            ),
+        )
+        channel.handle_session_event(
+            thread_id,
+            SessionEvent(
+                event_id="event-delta",
+                session_id="t1",
+                turn_id="turn-1",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=AgentOutputDelta(stream="message", text="hello world"),
+            ),
+        )
         output.set_footer("model:b")
         await output.set_status("done")
+        channel.handle_session_event(
+            thread_id,
+            SessionEvent(
+                event_id="event-finished",
+                session_id="t1",
+                turn_id="turn-1",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=AgentOutputFinished(
+                    message="hello world",
+                    thought="",
+                    outcome="completed",
+                ),
+            ),
+        )
         await output.aclose()
         events = await _wait_for_events(channel, "browser-a", minimum=5)
         event_types = [event["type"] for event in events["events"]]
         assert event_types == [
             "thread.created",
             "message.created",
-            "output.started",
-            "output.delta",
-            "output.updated",
+            "session.event",
+            "session.event",
+            "session.event",
         ]
-        assert events["events"][3]["text"] == "hello world"
-        assert events["events"][4]["footer"] == "model:b"
-        assert events["events"][4]["status"] == "done"
+        output_id = events["events"][2]["presentation"]["output_id"]
+        assert events["events"][2]["presentation"] == {
+            "output_id": output_id,
+            "target_id": thread_id,
+            "title": "demo",
+            "footer": "model:a",
+            "status": "running",
+        }
+        assert events["events"][3]["presentation"] == {
+            "output_id": output_id,
+            "text": "hello world",
+        }
+        assert events["events"][4]["presentation"] == {
+            "output_id": output_id,
+            "text": "",
+            "footer": "model:b",
+            "status": "done",
+        }
 
         first_thread = channel._thread
         first_instance_id = channel._instance_id
@@ -892,6 +941,59 @@ async def test_agent_output_events_project_as_session_events():
             "session.event",
         ]
         assert [event["event"] for event in events[1:]] == expected
+    finally:
+        channel.stop()
+
+
+async def test_session_event_presentation_is_the_only_live_output_path():
+    channel = HttpChannel(
+        "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
+    )
+
+    async def ignore(_message: ChannelMessage) -> None:
+        return None
+
+    channel.start(ignore)
+    try:
+        thread_id = channel.create_thread("browser-a", "start")
+        output = channel.open_output(thread_id, "demo", footer="model:a")
+        output.feed("legacy text must not be emitted")
+        await output.flush()
+        channel.handle_session_event(
+            thread_id,
+            SessionEvent(
+                event_id="event-started",
+                session_id="t1",
+                turn_id="turn-1",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=AgentOutputStarted(),
+            ),
+        )
+        channel.handle_session_event(
+            thread_id,
+            SessionEvent(
+                event_id="event-tool",
+                session_id="t1",
+                turn_id="turn-1",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=ToolCallObserved(
+                    tool_call_id="tc1",
+                    kind="execute",
+                    title="pytest",
+                    status="completed",
+                    detail="pytest -q",
+                ),
+            ),
+        )
+
+        events = channel._events_after("browser-a", 0)["events"]
+        assert [event["type"] for event in events] == [
+            "thread.created",
+            "session.event",
+            "session.event",
+        ]
+        assert events[2]["presentation"]["text"] == "\n✅ pytest: pytest -q\n"
+        assert "legacy text must not be emitted" not in str(events)
     finally:
         channel.stop()
 
