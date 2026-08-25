@@ -116,6 +116,33 @@ class SessionTraceStore:
             ).fetchall()
         return tuple(self._record_from_row(row) for row in rows)
 
+    def read_before(
+        self,
+        session_id: str,
+        *,
+        before: int | None = None,
+        limit: int = 100,
+    ) -> tuple[SessionTraceRecord, ...]:
+        _validate_session_id(session_id)
+        if before is not None and before <= 0:
+            raise ValueError("before 必须大于 0")
+        if limit <= 0:
+            raise ValueError("limit 必须大于 0")
+        query = """
+            SELECT sequence, event_json
+            FROM session_trace_events
+            WHERE session_id = ?
+        """
+        parameters: tuple[object, ...] = (session_id,)
+        if before is not None:
+            query += " AND sequence < ?"
+            parameters += (before,)
+        query += " ORDER BY sequence DESC LIMIT ?"
+        parameters += (limit,)
+        with self._lock:
+            rows = self._connection.execute(query, parameters).fetchall()
+        return tuple(self._record_from_row(row) for row in reversed(rows))
+
     def _create_schema(self) -> None:
         with self._lock:
             self._connection.executescript(
