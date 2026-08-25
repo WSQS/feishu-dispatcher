@@ -204,6 +204,64 @@ async def test_client_accumulates_agent_message_not_thought():
     assert impl.last_message() == ""
 
 
+async def test_client_serializes_concurrent_session_updates():
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    outputs: list[str] = []
+
+    async def collect(output: AgentOutputChunk) -> None:
+        if output.raw_text == "first":
+            first_started.set()
+            await release_first.wait()
+        outputs.append(output.raw_text or "")
+
+    impl = _ClientImpl(_Callbacks(on_output=collect))
+    first = asyncio.create_task(
+        impl.session_update("s", update_agent_message_text("first"))
+    )
+    await first_started.wait()
+    second = asyncio.create_task(
+        impl.session_update("s", update_agent_message_text("second"))
+    )
+    await asyncio.sleep(0)
+
+    assert outputs == []
+    assert not second.done()
+
+    release_first.set()
+    await asyncio.gather(first, second)
+
+    assert outputs == ["first", "second"]
+    assert impl.last_message() == "firstsecond"
+
+
+async def test_client_serialization_does_not_block_another_client():
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    other_outputs: list[str] = []
+
+    async def block_first(output: AgentOutputChunk) -> None:
+        first_started.set()
+        await release_first.wait()
+
+    async def collect_other(output: AgentOutputChunk) -> None:
+        other_outputs.append(output.raw_text or "")
+
+    first_impl = _ClientImpl(_Callbacks(on_output=block_first))
+    other_impl = _ClientImpl(_Callbacks(on_output=collect_other))
+    blocked = asyncio.create_task(
+        first_impl.session_update("first", update_agent_message_text("blocked"))
+    )
+    await first_started.wait()
+
+    await other_impl.session_update("other", update_agent_message_text("parallel"))
+
+    assert other_outputs == ["parallel"]
+
+    release_first.set()
+    await blocked
+
+
 async def test_client_emits_structured_message_thought_and_activity_output():
     outputs: list[AgentOutputChunk] = []
 
