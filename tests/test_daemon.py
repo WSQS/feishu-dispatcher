@@ -41,6 +41,8 @@ from feishu_dispatcher.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
     AgentOutputStarted,
+    AgentPlanEntry,
+    AgentPlanUpdated,
     SessionEvent,
     SessionInputAccepted,
     ToolCallObserved,
@@ -112,7 +114,13 @@ class FakeBridge:
         body = event.body
         if not isinstance(body, SessionInputAccepted):
             if isinstance(
-                body, (AgentOutputStarted, AgentOutputDelta, AgentOutputFinished)
+                body,
+                (
+                    AgentOutputStarted,
+                    AgentOutputDelta,
+                    AgentPlanUpdated,
+                    AgentOutputFinished,
+                ),
             ):
                 return
             if isinstance(body, ToolCallObserved):
@@ -1500,7 +1508,10 @@ async def test_daemon_emits_agent_output_session_events_per_turn():
                 AgentOutputChunk(
                     kind="activity",
                     raw_text=None,
-                    display_text="\n🔧 working\n",
+                    display_text="\n📋 计划:\n🔄 working\n",
+                    plan_entries=(
+                        AgentPlanEntry(content="working", status="in_progress"),
+                    ),
                 )
             )
             await self.on_output(
@@ -1546,16 +1557,18 @@ async def test_daemon_emits_agent_output_session_events_per_turn():
             == 2
         )
     )
-    await wait_until(lambda: len(bridge.session_events) == 8)
+    await wait_until(lambda: len(bridge.session_events) == 10)
 
     assert created[0].prompts == ["first", "second"]
     assert [type(event.body) for event in events] == [
         AgentOutputStarted,
         AgentOutputDelta,
+        AgentPlanUpdated,
         AgentOutputDelta,
         AgentOutputFinished,
         AgentOutputStarted,
         AgentOutputDelta,
+        AgentPlanUpdated,
         AgentOutputDelta,
         AgentOutputFinished,
     ]
@@ -1563,26 +1576,29 @@ async def test_daemon_emits_agent_output_session_events_per_turn():
     assert task is not None
     assert {event.session_id for event in events} == {task.session_id}
     first_turn_id = events[0].turn_id
-    second_turn_id = events[4].turn_id
+    second_turn_id = events[5].turn_id
     assert first_turn_id
     assert second_turn_id
     assert first_turn_id != second_turn_id
-    assert {event.turn_id for event in events[:4]} == {first_turn_id}
-    assert {event.turn_id for event in events[4:]} == {second_turn_id}
+    assert {event.turn_id for event in events[:5]} == {first_turn_id}
+    assert {event.turn_id for event in events[5:]} == {second_turn_id}
     assert events[1].body == AgentOutputDelta(
         stream="thought",
         text="think:first",
     )
-    assert events[2].body == AgentOutputDelta(
+    assert events[2].body == AgentPlanUpdated(
+        entries=(AgentPlanEntry(content="working", status="in_progress"),)
+    )
+    assert events[3].body == AgentOutputDelta(
         stream="message",
         text="answer:first",
     )
-    assert events[3].body == AgentOutputFinished(
+    assert events[4].body == AgentOutputFinished(
         message="answer:first",
         thought="think:first",
         outcome="completed",
     )
-    assert events[7].body == AgentOutputFinished(
+    assert events[9].body == AgentOutputFinished(
         message="answer:second",
         thought="think:second",
         outcome="completed",
@@ -1590,10 +1606,12 @@ async def test_daemon_emits_agent_output_session_events_per_turn():
     assert [type(event.body) for _, event in bridge.session_events] == [
         AgentOutputStarted,
         AgentOutputDelta,
+        AgentPlanUpdated,
         AgentOutputDelta,
         AgentOutputFinished,
         AgentOutputStarted,
         AgentOutputDelta,
+        AgentPlanUpdated,
         AgentOutputDelta,
         AgentOutputFinished,
     ]
@@ -3122,6 +3140,7 @@ async def test_recovery_turn_fans_out_start_and_output():
             and any("已恢复会话" in text for text in web.texts("web-thread"))
             and any("echo:continue" in text for text in web.texts("web-thread"))
             and any("本轮结束" in text for text in web.texts("web-thread"))
+            and any("本轮结束" in text for text in feishu.texts("om_main"))
         )
     )
 

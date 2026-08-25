@@ -22,6 +22,7 @@ from .channel import ChannelMessage, MessageHandler, OutputStatus
 from .session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
+    AgentPlanUpdated,
     AgentOutputStarted,
     SessionEvent,
     SessionInputAccepted,
@@ -268,6 +269,7 @@ class HttpChannel:
                 SessionInputAccepted,
                 AgentOutputStarted,
                 AgentOutputDelta,
+                AgentPlanUpdated,
                 AgentOutputFinished,
                 ToolCallObserved,
             ),
@@ -283,6 +285,10 @@ class HttpChannel:
             output = self._active_output(owner, event)
             if output is not None:
                 presentation = output.delta_presentation(body)
+        elif isinstance(body, AgentPlanUpdated):
+            output = self._active_output(owner, event)
+            if output is not None:
+                presentation = output.plan_presentation(body)
         elif isinstance(body, AgentOutputFinished):
             output = self._active_output(owner, event)
             if output is not None:
@@ -694,6 +700,18 @@ class _HttpStreamingOutput:
         return {
             "output_id": self._output_id,
             "text": display_text,
+        }
+
+    def plan_presentation(self, event: AgentPlanUpdated) -> dict[str, object]:
+        marks = {"pending": "⬜", "in_progress": "🔄", "completed": "☑️"}
+        self._last_stream = "activity"
+        return {
+            "output_id": self._output_id,
+            "text": "\n📋 计划:\n"
+            + "\n".join(
+                f"{marks[entry.status]} {entry.content}" for entry in event.entries
+            )
+            + "\n",
         }
 
     def finished_presentation(self, event: AgentOutputFinished) -> dict[str, object]:

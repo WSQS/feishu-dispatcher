@@ -55,6 +55,8 @@ from .scheduler import (
 from .session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
+    AgentPlanEntry,
+    AgentPlanUpdated,
     AgentOutputStarted,
     OutputOutcome,
     SessionEvent,
@@ -1681,7 +1683,28 @@ class _Daemon:
                 return
             if sess.current_output is not None:
                 sess.current_output.feed(output.display_text)
-            if sess.current_turn_id is None or output.raw_text is None:
+            if sess.current_turn_id is None:
+                return
+            if output.raw_text is None:
+                if not output.plan_entries:
+                    return
+                event = SessionEvent(
+                    event_id=secrets.token_hex(16),
+                    session_id=sess.session_id,
+                    turn_id=sess.current_turn_id,
+                    occurred_at=datetime.now(timezone.utc),
+                    body=AgentPlanUpdated(
+                        entries=tuple(
+                            AgentPlanEntry(
+                                content=entry.content,
+                                status=entry.status,
+                            )
+                            for entry in output.plan_entries
+                        )
+                    ),
+                )
+                await self._emit_session_event(event)
+                self._queue_session_event_projection(sess, event)
                 return
             if output.kind == "message":
                 sess.current_message_chunks.append(output.raw_text)

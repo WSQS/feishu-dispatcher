@@ -360,6 +360,7 @@ function renderEvent(event) {
       }
       if (
         sessionEvent.type === "agent.output.delta" ||
+        sessionEvent.type === "agent.plan.updated" ||
         sessionEvent.type === "tool.call.observed"
       ) {
         if (presentation?.output_id) {

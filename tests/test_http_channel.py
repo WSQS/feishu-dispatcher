@@ -23,6 +23,8 @@ from feishu_dispatcher.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
     AgentOutputStarted,
+    AgentPlanEntry,
+    AgentPlanUpdated,
     SessionEvent,
     SessionInputAccepted,
     ToolCallObserved,
@@ -249,6 +251,7 @@ def test_webui_consumes_session_events_without_duplicate_unknown_entries():
         "session.input.accepted",
         "agent.output.started",
         "agent.output.delta",
+        "agent.plan.updated",
         "agent.output.finished",
         "tool.call.observed",
     ):
@@ -905,6 +908,12 @@ async def test_agent_output_events_project_as_session_events():
         bodies = [
             AgentOutputStarted(),
             AgentOutputDelta(stream="thought", text="thinking"),
+            AgentPlanUpdated(
+                entries=(
+                    AgentPlanEntry(content="read files", status="completed"),
+                    AgentPlanEntry(content="write code", status="in_progress"),
+                )
+            ),
             AgentOutputDelta(stream="message", text="answer"),
             AgentOutputFinished(
                 message="answer",
@@ -934,6 +943,7 @@ async def test_agent_output_events_project_as_session_events():
         events = channel._events_after("browser-a", 0)["events"]
         assert [event["type"] for event in events] == [
             "thread.created",
+            "session.event",
             "session.event",
             "session.event",
             "session.event",
@@ -985,14 +995,28 @@ async def test_session_event_presentation_is_the_only_live_output_path():
                 ),
             ),
         )
+        channel.handle_session_event(
+            thread_id,
+            SessionEvent(
+                event_id="event-plan",
+                session_id="t1",
+                turn_id="turn-1",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=AgentPlanUpdated(
+                    entries=(AgentPlanEntry(content="run tests", status="in_progress"),)
+                ),
+            ),
+        )
 
         events = channel._events_after("browser-a", 0)["events"]
         assert [event["type"] for event in events] == [
             "thread.created",
             "session.event",
             "session.event",
+            "session.event",
         ]
         assert events[2]["presentation"]["text"] == "\n✅ pytest: pytest -q\n"
+        assert events[3]["presentation"]["text"] == "\n📋 计划:\n🔄 run tests\n"
         assert "legacy text must not be emitted" not in str(events)
     finally:
         channel.stop()

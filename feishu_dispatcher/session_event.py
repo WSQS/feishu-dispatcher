@@ -12,6 +12,7 @@ SESSION_EVENT_SCHEMA_VERSION = 1
 
 OutputStream = Literal["message", "thought"]
 OutputOutcome = Literal["completed", "cancelled", "failed"]
+PlanEntryStatus = Literal["pending", "in_progress", "completed"]
 ToolCallStatus = Literal["started", "completed", "failed"]
 SessionState = Literal[
     "starting",
@@ -25,6 +26,7 @@ SessionState = Literal[
 
 _OUTPUT_STREAMS = frozenset({"message", "thought"})
 _OUTPUT_OUTCOMES = frozenset({"completed", "cancelled", "failed"})
+_PLAN_ENTRY_STATUSES = frozenset({"pending", "in_progress", "completed"})
 _TOOL_CALL_STATUSES = frozenset({"started", "completed", "failed"})
 _SESSION_STATES = frozenset(
     {"starting", "running", "idle", "suspended", "done", "stopped", "failed"}
@@ -50,6 +52,21 @@ class AgentOutputDelta:
 
     stream: OutputStream
     text: str
+
+
+@dataclass(frozen=True)
+class AgentPlanEntry:
+    """Agent 计划中的一个步骤快照。"""
+
+    content: str
+    status: PlanEntryStatus
+
+
+@dataclass(frozen=True)
+class AgentPlanUpdated:
+    """Agent 更新了当前 Turn 的计划。"""
+
+    entries: tuple[AgentPlanEntry, ...]
 
 
 @dataclass(frozen=True)
@@ -92,6 +109,7 @@ SessionEventBody: TypeAlias = (
     SessionInputAccepted
     | AgentOutputStarted
     | AgentOutputDelta
+    | AgentPlanUpdated
     | AgentOutputFinished
     | ToolCallObserved
     | SessionStateChanged
@@ -102,6 +120,7 @@ _TURN_SCOPED_EVENT_BODIES = (
     SessionInputAccepted,
     AgentOutputStarted,
     AgentOutputDelta,
+    AgentPlanUpdated,
     AgentOutputFinished,
     ToolCallObserved,
 )
@@ -110,6 +129,7 @@ _EVENT_TYPES = {
     SessionInputAccepted: "session.input.accepted",
     AgentOutputStarted: "agent.output.started",
     AgentOutputDelta: "agent.output.delta",
+    AgentPlanUpdated: "agent.plan.updated",
     AgentOutputFinished: "agent.output.finished",
     ToolCallObserved: "tool.call.observed",
     SessionStateChanged: "session.state.changed",
@@ -165,6 +185,13 @@ def session_event_to_dict(event: SessionEvent) -> dict[str, object]:
     elif isinstance(body, AgentOutputDelta):
         _require_enum("stream", body.stream, _OUTPUT_STREAMS)
         payload = {"stream": body.stream, "text": body.text}
+    elif isinstance(body, AgentPlanUpdated):
+        payload = {
+            "entries": [
+                {"content": entry.content, "status": entry.status}
+                for entry in body.entries
+            ]
+        }
     elif isinstance(body, AgentOutputFinished):
         _require_enum("outcome", body.outcome, _OUTPUT_OUTCOMES)
         payload = {
@@ -260,6 +287,26 @@ def _decode_body(event_type: str, payload: dict[str, object]) -> SessionEventBod
             stream=cast(OutputStream, stream),
             text=_require_string(payload, "text"),
         )
+    if event_type == "agent.plan.updated":
+        entries_value = payload.get("entries")
+        if not isinstance(entries_value, list):
+            raise ValueError("entries 必须是数组")
+        entries = []
+        for entry_value in entries_value:
+            if not isinstance(entry_value, dict):
+                raise ValueError("entries 元素必须是对象")
+            status = _require_enum(
+                "status",
+                _require_string(entry_value, "status"),
+                _PLAN_ENTRY_STATUSES,
+            )
+            entries.append(
+                AgentPlanEntry(
+                    content=_require_string(entry_value, "content"),
+                    status=cast(PlanEntryStatus, status),
+                )
+            )
+        return AgentPlanUpdated(entries=tuple(entries))
     if event_type == "agent.output.finished":
         outcome = _require_enum(
             "outcome", _require_string(payload, "outcome"), _OUTPUT_OUTCOMES
@@ -309,6 +356,9 @@ def _decode_body(event_type: str, payload: dict[str, object]) -> SessionEventBod
 def _validate_body(body: SessionEventBody) -> None:
     if isinstance(body, AgentOutputDelta):
         _require_enum("stream", body.stream, _OUTPUT_STREAMS)
+    elif isinstance(body, AgentPlanUpdated):
+        for entry in body.entries:
+            _require_enum("status", entry.status, _PLAN_ENTRY_STATUSES)
     elif isinstance(body, AgentOutputFinished):
         _require_enum("outcome", body.outcome, _OUTPUT_OUTCOMES)
     elif isinstance(body, ToolCallObserved):

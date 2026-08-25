@@ -22,6 +22,7 @@ import logging
 import re
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Collection
 from urllib.parse import parse_qs, urlparse
 
@@ -38,10 +39,11 @@ from lark_oapi.ws.const import (
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .channel import ChannelMessage, MessageHandler, StreamingOutput
+from .channel import ChannelMessage, MessageHandler, OutputStatus, StreamingOutput
 from .session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
+    AgentPlanUpdated,
     AgentOutputStarted,
     SessionEvent,
     SessionInputAccepted,
@@ -158,6 +160,105 @@ class _RateLimiter:
                 self._tokens -= 1.0
 
 
+class _FeishuSessionEventOutput:
+    """把 SessionEvent 转换为现有 Feishu 流式呈现。"""
+
+    def __init__(
+        self,
+        bridge: FeishuBridge,
+        conversation_id: str,
+        output: StreamingOutput,
+        *,
+        footer: str,
+    ) -> None:
+        self._bridge = bridge
+        self.conversation_id = conversation_id
+        self._output = output
+        self._footer = footer
+        self._closed = False
+        self._message_text = ""
+        self._last_stream: str | None = None
+
+    def feed(self, _text: str) -> None:
+        return None
+
+    def set_footer(self, footer: str) -> None:
+        if not self._closed:
+            self._footer = footer
+
+    async def flush(self) -> None:
+        return None
+
+    async def set_status(self, _status: OutputStatus) -> None:
+        return None
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._bridge._unregister_output(self)
+        await self._output.aclose()
+
+    async def handle_event(self, event: SessionEvent) -> None:
+        body = event.body
+        if isinstance(body, AgentOutputDelta):
+            display_text = body.text
+            if body.stream == "thought" and self._last_stream != "thought":
+                display_text = f"💭 {body.text}"
+            elif body.stream == "message" and self._last_stream == "thought":
+                display_text = f"\n{body.text}"
+            self._last_stream = body.stream
+            if body.stream == "message":
+                self._message_text += body.text
+            self._output.feed(display_text)
+            return
+        if isinstance(body, AgentPlanUpdated):
+            marks = {"pending": "⬜", "in_progress": "🔄", "completed": "☑️"}
+            self._last_stream = "activity"
+            self._output.feed(
+                "\n📋 计划:\n"
+                + "\n".join(
+                    f"{marks[entry.status]} {entry.content}" for entry in body.entries
+                )
+                + "\n"
+            )
+            return
+        if isinstance(body, ToolCallObserved):
+            if (
+                body.status == "started"
+                and body.kind in {"execute", "other"}
+                and not body.detail
+            ):
+                return
+            icon = {"started": "🔧", "completed": "✅", "failed": "❌"}[body.status]
+            prefix = "\n" if body.status == "started" else ""
+            text = f"{prefix}{icon} {body.title}"
+            if body.detail and body.detail != body.title:
+                text += f": {body.detail}"
+            self._last_stream = "activity"
+            self._output.feed(text + "\n")
+            return
+        if not isinstance(body, AgentOutputFinished):
+            return
+        if body.message != self._message_text:
+            suffix = (
+                body.message[len(self._message_text) :]
+                if body.message.startswith(self._message_text)
+                else body.message
+            )
+            if suffix:
+                self._output.feed(suffix)
+            self._message_text = body.message
+        self._output.set_footer(self._footer)
+        status = {
+            "completed": "done",
+            "cancelled": "stopped",
+            "failed": "error",
+        }[body.outcome]
+        await self._output.set_status(status)
+        await self._output.flush()
+
+
 class FeishuBridge:
     """飞书双向通信封装。
 
@@ -199,6 +300,9 @@ class FeishuBridge:
         self._ws_loop: asyncio.AbstractEventLoop | None = None
         self._ws_task: asyncio.Task[None] | None = None
         self._stopping = threading.Event()
+        self._output_lock = threading.Lock()
+        self._pending_outputs: dict[str, deque[_FeishuSessionEventOutput]] = {}
+        self._active_outputs: dict[tuple[str, str, str], _FeishuSessionEventOutput] = {}
         #: ping 间隔（秒），服务端可通过 endpoint 发现响应 / pong payload 下发
         self._ping_interval: float = 120.0
         #: 分片合包缓存：message_id -> (首片到达时刻 monotonic, 分片列表)。
@@ -589,18 +693,132 @@ class FeishuBridge:
         *,
         footer: str = "",
     ) -> StreamingOutput:
-        """为一个 agent 回合创建对应的流式输出呈现。"""
+        """登记一个 agent 回合的输出呈现，由 SessionEvent 驱动实际发送。"""
         if self._stream_mode == "card":
             from .livecard import LiveCard
 
-            return LiveCard(self, target_id, title, footer=footer)
+            output: StreamingOutput = LiveCard(
+                self,
+                target_id,
+                title,
+                footer=footer,
+                window=self._throttle_window,
+            )
+        else:
+            from .throttler import StreamThrottler
 
-        from .throttler import StreamThrottler
+            async def send_piece(piece: str) -> None:
+                await asyncio.to_thread(
+                    self.reply_text, target_id, piece, threaded=True
+                )
 
-        async def send_piece(piece: str) -> None:
-            await asyncio.to_thread(self.reply_text, target_id, piece, threaded=True)
+            output = StreamThrottler(send_piece, window=self._throttle_window)
+        session_output = _FeishuSessionEventOutput(
+            self,
+            target_id,
+            output,
+            footer=footer,
+        )
+        with self._output_lock:
+            self._pending_outputs.setdefault(target_id, deque()).append(session_output)
+        return session_output
 
-        return StreamThrottler(send_piece, window=self._throttle_window)
+    def handle_session_event(
+        self,
+        conversation_id: str,
+        event: SessionEvent,
+    ) -> None:
+        """把 Session 领域事件投影为飞书话题消息。"""
+        body = event.body
+        if isinstance(body, SessionInputAccepted):
+            if not body.text:
+                return
+            source = body.source.channel_key if body.source is not None else "unknown"
+            self.reply_text(
+                conversation_id,
+                f"↪️ 同步自 {source}：{body.text}",
+                threaded=True,
+            )
+            return
+        if not isinstance(
+            body,
+            (
+                AgentOutputStarted,
+                AgentOutputDelta,
+                AgentPlanUpdated,
+                AgentOutputFinished,
+                ToolCallObserved,
+            ),
+        ):
+            raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
+        self._run_on_main_loop(self._project_session_event(conversation_id, event))
+
+    def _run_on_main_loop(self, coroutine) -> None:
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
+        if current_loop is self._main_loop:
+            self._main_loop.create_task(coroutine)
+            return
+        if current_loop is not None and (
+            self._main_loop.is_closed() or not self._main_loop.is_running()
+        ):
+            current_loop.create_task(coroutine)
+            return
+        if self._main_loop.is_running():
+            future = asyncio.run_coroutine_threadsafe(coroutine, self._main_loop)
+            future.result()
+            return
+        if self._main_loop.is_closed():
+            asyncio.run(coroutine)
+            return
+        self._main_loop.run_until_complete(coroutine)
+
+    async def _project_session_event(
+        self,
+        conversation_id: str,
+        event: SessionEvent,
+    ) -> None:
+        output = self._output_for_event(conversation_id, event)
+        if output is not None:
+            await output.handle_event(event)
+
+    def _output_for_event(
+        self,
+        conversation_id: str,
+        event: SessionEvent,
+    ) -> _FeishuSessionEventOutput | None:
+        with self._output_lock:
+            if isinstance(event.body, AgentOutputStarted):
+                pending = self._pending_outputs.get(conversation_id)
+                if not pending or event.turn_id is None:
+                    return None
+                output = pending.popleft()
+                if not pending:
+                    del self._pending_outputs[conversation_id]
+                self._active_outputs[
+                    (conversation_id, event.session_id, event.turn_id)
+                ] = output
+                return output
+            if event.turn_id is None:
+                return None
+            return self._active_outputs.get(
+                (conversation_id, event.session_id, event.turn_id)
+            )
+
+    def _unregister_output(self, output: _FeishuSessionEventOutput) -> None:
+        with self._output_lock:
+            pending = self._pending_outputs.get(output.conversation_id)
+            if pending is not None:
+                self._pending_outputs[output.conversation_id] = deque(
+                    item for item in pending if item is not output
+                )
+                if not self._pending_outputs[output.conversation_id]:
+                    del self._pending_outputs[output.conversation_id]
+            for key, active in list(self._active_outputs.items()):
+                if active is output:
+                    del self._active_outputs[key]
 
     def create_thread(self, conversation_id: str, initial_text: str) -> str:
         """在会话中发送根消息创建话题，返回根 message_id。"""
@@ -649,30 +867,6 @@ class FeishuBridge:
         if threaded:
             return self.reply_in_thread(target_id, text)
         return self.reply(target_id, text)
-
-    def handle_session_event(
-        self,
-        conversation_id: str,
-        event: SessionEvent,
-    ) -> None:
-        """把 Session 领域事件投影为飞书话题消息。"""
-        body = event.body
-        if not isinstance(body, SessionInputAccepted):
-            if isinstance(
-                body, (AgentOutputStarted, AgentOutputDelta, AgentOutputFinished)
-            ):
-                return
-            if isinstance(body, ToolCallObserved):
-                return
-            raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
-        if not body.text:
-            return
-        source = body.source.channel_key if body.source is not None else "unknown"
-        self.reply_text(
-            conversation_id,
-            f"↪️ 同步自 {source}：{body.text}",
-            threaded=True,
-        )
 
     def reply_card(self, root_message_id: str, card: dict) -> str:
         """在话题内发一张 interactive 卡片，返回新消息 message_id。"""
