@@ -262,6 +262,52 @@ def test_webui_consumes_session_events_without_duplicate_unknown_entries():
     assert "text: sessionEvent.type" in event_rendering
 
 
+def test_webui_loads_and_paginates_persisted_task_history():
+    javascript = (
+        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "app.js"
+    ).read_text(encoding="utf-8")
+
+    def section(start: str, end: str) -> str:
+        return javascript.split(start, maxsplit=1)[1].split(end, maxsplit=1)[0]
+
+    timeline = section("function ensureTimeline", "function renderSelectedTask")
+    live_events = section("function renderEvent", "function traceState")
+    history = section("function traceState", "async function apiRequest")
+    task_selection = section("async function selectTask", "function persistCursor")
+
+    assert "const TASK_HISTORY_LIMIT = 100;" in javascript
+    assert "const taskTraceStates = new Map();" in javascript
+    assert "let taskHistoryGeneration = 0;" in javascript
+    assert "timeline.scrollTop > 24" in timeline
+    assert "loadEarlierTaskHistory(taskId, generation)" in timeline
+    assert 'historyLoad.className = "history-load";' in timeline
+    assert "event.trace_sequence" in live_events
+    assert "!claimTraceSequence(taskId, event.trace_sequence)" in live_events
+    assert "state.seenSequences.has(sequence)" in history
+    assert 'timeline.querySelector(".history-load")?.after(fragment);' in history
+    assert "preserveScroll: before !== null" in history
+    assert "state.finishedTurns.add(turnId);" in history
+    assert 'query.set("before", String(before));' in history
+    assert "`/api/tasks/${encodeURIComponent(taskId)}/events?${query}`" in history
+    assert (
+        "generation !== taskHistoryGeneration || selectedTaskId !== taskId" in history
+    )
+    for event_type in (
+        "session.input.accepted",
+        "agent.output.finished",
+        "agent.plan.updated",
+        "tool.call.observed",
+        "session.state.changed",
+        "session.error.occurred",
+    ):
+        assert f'case "{event_type}"' in history
+    assert "!taskIsTerminal(task)" in task_selection
+    assert "await loadTaskHistory(taskId" in task_selection
+    assert "historyGeneration !== taskHistoryGeneration" in task_selection
+    assert "button.disabled = taskSelectionBusy;" in javascript
+    assert "taskSelectionBusy || terminal" not in javascript
+
+
 async def test_webui_assets_are_same_origin_and_do_not_require_token():
     channel = HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
@@ -334,6 +380,7 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert "/api/channel/messages" in javascript
         assert "/api/channel/events" in javascript
         assert 'apiRequest("/api/tasks")' in javascript
+        assert "/events?${query}`" in javascript
         assert "elements.connectionSettings.open = false;" in javascript
         assert (
             'task.task_id !== DISPATCHER_TASK_ID && task.status === "stopped"'

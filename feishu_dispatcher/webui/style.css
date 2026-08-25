@@ -568,6 +568,27 @@ body.dragging {
   display: none;
 }
 
+.history-load {
+  justify-self: center;
+  padding: 7px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--muted);
+  background: transparent;
+  cursor: pointer;
+}
+
+.history-load:hover:not(:disabled),
+.history-load:focus-visible {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.history-load:disabled {
+  cursor: wait;
+  opacity: 0.7;
+}
+
 .empty-state {
   display: grid;
   place-content: center;

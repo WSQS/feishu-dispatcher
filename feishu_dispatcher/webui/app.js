@@ -1,5 +1,6 @@
 const DISPATCHER_TASK_ID = "dispatcher";
 const MAX_POLL_RECOVERY_ATTEMPTS = 2;
+const TASK_HISTORY_LIMIT = 100;
 const TASK_POLL_INTERVAL_MS = 2000;
 const TERMINAL_TASK_STATUSES = new Set(["done", "stopped"]);
 
@@ -38,6 +39,7 @@ const outputs = new Map();
 const tasks = new Map();
 const taskThreads = new Map();
 const targetTasks = new Map();
+const taskTraceStates = new Map();
 const taskTimelines = new Map();
 let conversationId = storedConversationId();
 let cursor = storedCursor(conversationId);
@@ -49,6 +51,7 @@ let pollGeneration = 0;
 let selectedTaskId = DISPATCHER_TASK_ID;
 let statusRevision = 0;
 let statusSource = null;
+let taskHistoryGeneration = 0;
 let taskPollGeneration = 0;
 let taskRequestTail = Promise.resolve();
 let taskSelectionBusy = false;
@@ -175,7 +178,35 @@ function ensureTimeline(taskId) {
   timeline.className = "task-timeline";
   timeline.dataset.taskId = taskId;
   timeline.hidden = taskId !== selectedTaskId;
-  timeline.append(createEmptyState(taskId));
+  const historyLoad = document.createElement("button");
+  historyLoad.type = "button";
+  historyLoad.className = "history-load";
+  historyLoad.hidden = true;
+  historyLoad.textContent = "加载更早历史";
+  historyLoad.addEventListener("click", () => {
+    const generation = taskHistoryGeneration;
+    void loadEarlierTaskHistory(taskId, generation).catch((error) => {
+      if (generation === taskHistoryGeneration && selectedTaskId === taskId) {
+        showError(error);
+      }
+    });
+  });
+  timeline.append(historyLoad, createEmptyState(taskId));
+  timeline.addEventListener("scroll", () => {
+    if (
+      timeline.hidden ||
+      timeline.scrollTop > 24 ||
+      taskId === DISPATCHER_TASK_ID
+    ) {
+      return;
+    }
+    const generation = taskHistoryGeneration;
+    void loadEarlierTaskHistory(taskId, generation).catch((error) => {
+      if (generation === taskHistoryGeneration && selectedTaskId === taskId) {
+        showError(error);
+      }
+    });
+  });
   elements.timelines.append(timeline);
   taskTimelines.set(taskId, timeline);
   return timeline;
@@ -183,13 +214,18 @@ function ensureTimeline(taskId) {
 
 function renderSelectedTask() {
   const task = tasks.get(selectedTaskId);
+  const readOnly = taskIsTerminal(task);
   const threadId =
     selectedTaskId === DISPATCHER_TASK_ID
       ? null
       : taskThreads.get(selectedTaskId) || null;
   elements.currentTask.textContent = taskName(task);
   elements.currentThread.textContent = threadId || "root";
-  elements.composerTarget.textContent = `发送给 ${taskName(task)}`;
+  elements.composerTarget.textContent = readOnly
+    ? `${taskName(task)} · 历史只读`
+    : `发送给 ${taskName(task)}`;
+  elements.message.disabled = readOnly;
+  elements.send.disabled = readOnly;
   for (const [taskId, timeline] of taskTimelines) {
     timeline.hidden = taskId !== selectedTaskId;
   }
@@ -201,6 +237,18 @@ function revealTimeline(taskId) {
   ensureTimeline(taskId).querySelector(".empty-state")?.remove();
 }
 
+function updateHistoryLoad(taskId) {
+  const timeline = ensureTimeline(taskId);
+  const button = timeline.querySelector(".history-load");
+  const state = traceState(taskId);
+  if (!button) {
+    return;
+  }
+  button.hidden = state.exhausted || state.oldestLoaded === null;
+  button.disabled = state.loadingCount > 0;
+  button.textContent = state.loadingCount > 0 ? "加载中…" : "加载更早历史";
+}
+
 function scrollTimeline(taskId) {
   const timeline = taskTimelines.get(taskId);
   if (timeline && !timeline.hidden) {
@@ -208,14 +256,12 @@ function scrollTimeline(taskId) {
   }
 }
 
-function appendEvent({
-  taskId = selectedTaskId,
+function createEventArticle({
   role = "assistant",
   label,
   text,
   detail = "",
 }) {
-  revealTimeline(taskId);
   const article = document.createElement("article");
   article.className = "event";
   article.dataset.role = role;
@@ -232,6 +278,18 @@ function appendEvent({
   content.className = "event-text";
   content.textContent = text;
   article.append(meta, content);
+  return article;
+}
+
+function appendEvent({
+  taskId = selectedTaskId,
+  role = "assistant",
+  label,
+  text,
+  detail = "",
+}) {
+  revealTimeline(taskId);
+  const article = createEventArticle({ role, label, text, detail });
   ensureTimeline(taskId).append(article);
   scrollTimeline(taskId);
 }
@@ -298,6 +356,13 @@ function taskForEvent(event) {
 
 function renderEvent(event) {
   const taskId = taskForEvent(event);
+  if (
+    event.type === "session.event" &&
+    Number.isSafeInteger(event.trace_sequence) &&
+    !claimTraceSequence(taskId, event.trace_sequence)
+  ) {
+    return;
+  }
   switch (event.type) {
     case "message.created":
       rememberTarget(event.message_id, taskId);
@@ -401,6 +466,219 @@ function renderEvent(event) {
   }
 }
 
+function traceState(taskId) {
+  let state = taskTraceStates.get(taskId);
+  if (!state) {
+    state = {
+      exhausted: false,
+      loadingCount: 0,
+      oldestLoaded: null,
+      finishedTurns: new Set(),
+      seenSequences: new Set(),
+    };
+    taskTraceStates.set(taskId, state);
+  }
+  return state;
+}
+
+function claimTraceSequence(taskId, sequence) {
+  const state = traceState(taskId);
+  if (state.seenSequences.has(sequence)) {
+    return false;
+  }
+  state.seenSequences.add(sequence);
+  state.oldestLoaded =
+    state.oldestLoaded === null ? sequence : Math.min(state.oldestLoaded, sequence);
+  return true;
+}
+
+function traceRecordArticle(record, state) {
+  const event = record?.event;
+  const payload = event?.payload;
+  if (
+    !Number.isSafeInteger(record?.sequence) ||
+    !event ||
+    typeof event.type !== "string" ||
+    !payload ||
+    typeof payload !== "object"
+  ) {
+    return null;
+  }
+  const detail = `seq ${record.sequence}`;
+  switch (event.type) {
+    case "session.input.accepted": {
+      const source = payload.source?.channel_key;
+      return createEventArticle({
+        role: "user",
+        label: typeof source === "string" && source ? source : "User",
+        text: typeof payload.text === "string" ? payload.text : "",
+        detail,
+      });
+    }
+    case "agent.output.finished":
+      if (typeof event.turn_id === "string" && event.turn_id) {
+        state.finishedTurns.add(event.turn_id);
+      }
+      return createEventArticle({
+        label: "Agent",
+        text: typeof payload.message === "string" ? payload.message : "",
+        detail: `${payload.outcome || "completed"} · ${detail}`,
+      });
+    case "agent.output.delta":
+      if (
+        payload.stream !== "message" ||
+        (typeof event.turn_id === "string" && state.finishedTurns.has(event.turn_id))
+      ) {
+        return null;
+      }
+      return createEventArticle({
+        label: "Agent",
+        text: typeof payload.text === "string" ? payload.text : "",
+        detail: detail,
+      });
+    case "agent.plan.updated": {
+      const marks = {
+        completed: "☑️",
+        in_progress: "🔄",
+        pending: "⬜",
+      };
+      const entries = Array.isArray(payload.entries) ? payload.entries : [];
+      return createEventArticle({
+        role: "system",
+        label: "Plan",
+        text: entries
+          .map((entry) => `${marks[entry?.status] || "•"} ${entry?.content || ""}`)
+          .join("\n"),
+        detail,
+      });
+    }
+    case "tool.call.observed": {
+      const icons = { completed: "✅", failed: "❌", started: "🔧" };
+      const title = typeof payload.title === "string" ? payload.title : "Tool call";
+      const toolDetail =
+        typeof payload.detail === "string" && payload.detail !== title
+          ? `：${payload.detail}`
+          : "";
+      return createEventArticle({
+        role: "system",
+        label: "Tool",
+        text: `${icons[payload.status] || "🔧"} ${title}${toolDetail}`,
+        detail: `${payload.status || "unknown"} · ${detail}`,
+      });
+    }
+    case "session.state.changed":
+      return createEventArticle({
+        role: "system",
+        label: "Session",
+        text: `${payload.previous_state || "unknown"} → ${
+          payload.current_state || "unknown"
+        }`,
+        detail,
+      });
+    case "session.error.occurred":
+      return createEventArticle({
+        role: "system",
+        label: "Error",
+        text: typeof payload.message === "string" ? payload.message : "",
+        detail: `${payload.phase || "unknown"} · ${detail}`,
+      });
+    default:
+      return null;
+  }
+}
+
+function renderTraceRecords(taskId, records, { preserveScroll = false } = {}) {
+  const timeline = ensureTimeline(taskId);
+  const state = traceState(taskId);
+  for (const record of records) {
+    if (record?.event?.type === "agent.output.finished") {
+      const turnId = record.event.turn_id;
+      if (typeof turnId === "string" && turnId) {
+        state.finishedTurns.add(turnId);
+      }
+    }
+  }
+  const fragment = document.createDocumentFragment();
+  for (const record of records) {
+    if (
+      !Number.isSafeInteger(record?.sequence) ||
+      !claimTraceSequence(taskId, record.sequence)
+    ) {
+      continue;
+    }
+    const article = traceRecordArticle(record, state);
+    if (article) {
+      fragment.append(article);
+    }
+  }
+  if (!fragment.childNodes.length) {
+    return;
+  }
+  revealTimeline(taskId);
+  const previousHeight = timeline.scrollHeight;
+  timeline.querySelector(".history-load")?.after(fragment);
+  if (preserveScroll) {
+    timeline.scrollTop += timeline.scrollHeight - previousHeight;
+  } else {
+    scrollTimeline(taskId);
+  }
+  updateHistoryLoad(taskId);
+}
+
+async function loadTaskHistory(
+  taskId,
+  { before = null, generation = taskHistoryGeneration } = {},
+) {
+  if (taskId === DISPATCHER_TASK_ID) {
+    return;
+  }
+  const state = traceState(taskId);
+  if (
+    before !== null &&
+    (state.loadingCount > 0 || state.exhausted)
+  ) {
+    return;
+  }
+  state.loadingCount += 1;
+  updateHistoryLoad(taskId);
+  try {
+    const query = new URLSearchParams({ limit: String(TASK_HISTORY_LIMIT) });
+    if (before !== null) {
+      query.set("before", String(before));
+    }
+    const payload = await apiRequest(
+      `/api/tasks/${encodeURIComponent(taskId)}/events?${query}`,
+    );
+    if (generation !== taskHistoryGeneration || selectedTaskId !== taskId) {
+      return;
+    }
+    const records = Array.isArray(payload.events) ? payload.events : [];
+    renderTraceRecords(taskId, records, { preserveScroll: before !== null });
+    const pageSequences = records
+      .map((record) => record?.sequence)
+      .filter((sequence) => Number.isSafeInteger(sequence));
+    const firstSequence = pageSequences.length ? Math.min(...pageSequences) : null;
+    state.exhausted =
+      firstSequence === null ||
+      payload.oldest_sequence === null ||
+      firstSequence <= payload.oldest_sequence;
+  } finally {
+    state.loadingCount -= 1;
+    updateHistoryLoad(taskId);
+  }
+}
+
+async function loadEarlierTaskHistory(taskId, generation) {
+  const state = traceState(taskId);
+  if (state.exhausted || state.oldestLoaded === null) {
+    return;
+  }
+  await loadTaskHistory(taskId, {
+    before: state.oldestLoaded,
+    generation,
+  });
+}
+
 async function apiRequest(path, options = {}) {
   const token = elements.token.value.trim();
   if (!token) {
@@ -442,7 +720,7 @@ function renderTaskList() {
     button.className = "task-item";
     button.dataset.selected = String(task.task_id === selectedTaskId);
     button.dataset.terminal = String(terminal);
-    button.disabled = taskSelectionBusy || terminal;
+    button.disabled = taskSelectionBusy;
     button.setAttribute("aria-pressed", String(task.task_id === selectedTaskId));
 
     const header = document.createElement("span");
@@ -471,7 +749,7 @@ function renderTaskList() {
     if (task.task_id === DISPATCHER_TASK_ID) {
       binding.textContent = "根会话";
     } else if (terminal) {
-      binding.textContent = "已终止";
+      binding.textContent = "查看历史";
     } else if (taskThreads.has(task.task_id)) {
       binding.textContent = "已打开";
     } else {
@@ -522,7 +800,7 @@ function applyTasks(nextTasks) {
   }
   taskSnapshot = nextSnapshot;
   const selected = tasks.get(selectedTaskId);
-  if (!selected || taskIsTerminal(selected)) {
+  if (!selected) {
     selectedTaskId = DISPATCHER_TASK_ID;
   }
   renderTaskList();
@@ -544,6 +822,7 @@ async function loadTasks() {
 
 function clearChannelRuntimeState() {
   pollGeneration += 1;
+  taskHistoryGeneration += 1;
   storageRemove(storageKeys.cursor(conversationId));
   storageRemove(storageKeys.started(conversationId));
   cursor = 0;
@@ -873,16 +1152,17 @@ async function selectTask(taskId) {
   if (!task || taskSelectionBusy) {
     return;
   }
-  if (taskIsTerminal(task)) {
-    setStatus(`${taskName(task)} 已终止，不能打开`, "error");
-    return;
-  }
 
+  const historyGeneration = ++taskHistoryGeneration;
   taskSelectionBusy = true;
   renderTaskList();
   let pollingPaused = false;
   try {
-    if (taskId !== DISPATCHER_TASK_ID && !taskThreads.has(taskId)) {
+    if (
+      taskId !== DISPATCHER_TASK_ID &&
+      !taskIsTerminal(task) &&
+      !taskThreads.has(taskId)
+    ) {
       pollGeneration += 1;
       pollingPaused = true;
       setStatus(`正在打开 ${taskName(task)}…`, "busy");
@@ -891,7 +1171,7 @@ async function selectTask(taskId) {
     selectedTaskId = taskId;
     ensureTimeline(taskId);
     renderSelectedTask();
-    setStatus(`已选择 ${taskName(task)}`, "ok");
+    setStatus(`正在加载 ${taskName(task)} 的历史…`, "busy");
   } finally {
     taskSelectionBusy = false;
     renderTaskList();
@@ -899,6 +1179,29 @@ async function selectTask(taskId) {
       startPolling();
     }
   }
+  try {
+    await loadTaskHistory(taskId, { generation: historyGeneration });
+  } catch (error) {
+    if (
+      historyGeneration === taskHistoryGeneration &&
+      selectedTaskId === taskId
+    ) {
+      throw error;
+    }
+    return;
+  }
+  if (
+    historyGeneration !== taskHistoryGeneration ||
+    selectedTaskId !== taskId
+  ) {
+    return;
+  }
+  setStatus(
+    taskIsTerminal(task)
+      ? `已打开 ${taskName(task)} 的历史`
+      : `已选择 ${taskName(task)}`,
+    "ok",
+  );
 }
 
 function persistCursor() {
@@ -1168,6 +1471,7 @@ function resetConversation() {
     return;
   }
   pollGeneration += 1;
+  taskHistoryGeneration += 1;
   storageRemove(storageKeys.cursor(conversationId));
   storageRemove(storageKeys.started(conversationId));
   conversationId = newId("webui-conversation");
@@ -1178,6 +1482,7 @@ function resetConversation() {
   storageSet(storageKeys.conversation, conversationId);
   outputs.clear();
   taskThreads.clear();
+  taskTraceStates.clear();
   targetTasks.clear();
   taskTimelines.clear();
   elements.timelines.replaceChildren();
