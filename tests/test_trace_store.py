@@ -55,6 +55,24 @@ def test_trace_store_read_after_applies_cursor_and_limit(tmp_path):
         assert store.read_after("session-1", after=4) == ()
 
 
+def test_trace_store_read_before_returns_newest_page_in_sequence_order(
+    tmp_path,
+):
+    with SessionTraceStore(tmp_path / "trace.sqlite") as store:
+        records = [store.append(_event(f"event-{index}")) for index in range(1, 5)]
+
+        assert store.read_before("session-1", limit=2) == tuple(records[2:4])
+        assert store.read_before("session-1", before=4, limit=2) == tuple(records[1:3])
+        assert store.read_before("session-1", before=2) == (records[0],)
+        assert store.read_before("session-1", before=1) == ()
+
+
+def test_trace_store_read_before_paginates_to_empty_session(tmp_path):
+    with SessionTraceStore(tmp_path / "trace.sqlite") as store:
+        assert store.read_before("session-1") == ()
+        assert store.read_before("session-1", before=100) == ()
+
+
 def test_trace_store_duplicate_event_is_idempotent(tmp_path):
     with SessionTraceStore(tmp_path / "trace.sqlite") as store:
         event = _event("event-1")
@@ -89,6 +107,7 @@ def test_trace_store_recovers_after_reopen(tmp_path):
 
     with SessionTraceStore(path) as store:
         assert store.read_after("session-1") == (expected,)
+        assert store.read_before("session-1") == (expected,)
 
 
 @pytest.mark.parametrize(
@@ -105,3 +124,19 @@ def test_trace_store_rejects_invalid_read_arguments(
     with SessionTraceStore(tmp_path / "trace.sqlite") as store:
         with pytest.raises(ValueError, match=message):
             store.read_after(session_id, after=after, limit=limit)
+
+
+@pytest.mark.parametrize(
+    ("before", "limit", "message"),
+    [
+        (0, 100, "before"),
+        (-1, 100, "before"),
+        (None, 0, "limit"),
+    ],
+)
+def test_trace_store_rejects_invalid_read_before_arguments(
+    tmp_path, before, limit, message
+):
+    with SessionTraceStore(tmp_path / "trace.sqlite") as store:
+        with pytest.raises(ValueError, match=message):
+            store.read_before("session-1", before=before, limit=limit)
