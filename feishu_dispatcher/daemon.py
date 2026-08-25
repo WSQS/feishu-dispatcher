@@ -64,7 +64,7 @@ from .session_event import (
     ToolCallObserved,
 )
 from .store import Job, JobStore, ModelStore, ProjectStore, Session, SessionStore
-from .trace_store import SessionTraceStore
+from .trace_store import SessionTraceRecord, SessionTraceStore
 from ._scan_executor import ScanExecutor
 from .workspace_api import (
     file as workspace_file,
@@ -744,26 +744,35 @@ class _Daemon:
         self,
         event: SessionEvent,
         conversations: tuple[ConversationRef, ...],
+        *,
+        trace_sequence: int | None = None,
     ) -> None:
         await asyncio.gather(
             *(
-                self._safe_handle_session_event(event, conversation=conversation)
+                self._safe_handle_session_event(
+                    event,
+                    conversation=conversation,
+                    trace_sequence=trace_sequence,
+                )
                 for conversation in conversations
             )
         )
 
-    async def _emit_session_event(self, event: SessionEvent) -> None:
+    async def _emit_session_event(
+        self, event: SessionEvent
+    ) -> SessionTraceRecord | None:
         """持久化运行事实并交给其它消费者，分别隔离消费者失败。"""
+        record = None
         if self.trace_store is not None:
             try:
-                await asyncio.to_thread(self.trace_store.append, event)
+                record = await asyncio.to_thread(self.trace_store.append, event)
             except Exception:
                 logger.exception(
                     "SessionEvent 持久化失败 event=%s",
                     event.event_id,
                 )
         if self._session_event_handler is None:
-            return
+            return record
         try:
             await self._session_event_handler(event)
         except Exception:
@@ -771,6 +780,7 @@ class _Daemon:
                 "SessionEvent 运行时消费者失败 event=%s",
                 event.event_id,
             )
+        return record
 
     async def _close_trace_store(self) -> None:
         """幂等关闭 daemon 持有的 Session Trace Store。"""
@@ -787,6 +797,7 @@ class _Daemon:
         self,
         sess: _AgentSessionRunner,
         event: SessionEvent,
+        trace_sequence: int | None,
     ) -> None:
         """按 Turn 顺序异步投影事件，避免 Channel 延迟阻塞 ACP 输出。"""
         previous = sess.session_event_projection_tail
@@ -795,7 +806,11 @@ class _Daemon:
         async def project() -> None:
             if previous is not None:
                 await previous
-            await self._publish_session_event(event, conversations)
+            await self._publish_session_event(
+                event,
+                conversations,
+                trace_sequence=trace_sequence,
+            )
 
         sess.session_event_projection_tail = asyncio.create_task(project())
 
@@ -817,8 +832,12 @@ class _Daemon:
                 outcome=outcome,
             ),
         )
-        await self._emit_session_event(event)
-        self._queue_session_event_projection(sess, event)
+        record = await self._emit_session_event(event)
+        self._queue_session_event_projection(
+            sess,
+            event,
+            record.sequence if record is not None else None,
+        )
 
     def _open_session_output(
         self,
@@ -1730,8 +1749,12 @@ class _Daemon:
                         )
                     ),
                 )
-                await self._emit_session_event(event)
-                self._queue_session_event_projection(sess, event)
+                record = await self._emit_session_event(event)
+                self._queue_session_event_projection(
+                    sess,
+                    event,
+                    record.sequence if record is not None else None,
+                )
                 return
             if output.kind == "message":
                 sess.current_message_chunks.append(output.raw_text)
@@ -1748,8 +1771,12 @@ class _Daemon:
                 occurred_at=datetime.now(timezone.utc),
                 body=AgentOutputDelta(stream=stream, text=output.raw_text),
             )
-            await self._emit_session_event(event)
-            self._queue_session_event_projection(sess, event)
+            record = await self._emit_session_event(event)
+            self._queue_session_event_projection(
+                sess,
+                event,
+                record.sequence if record is not None else None,
+            )
 
         async def on_action(action: dict) -> None:
             # 审计（A）：只有 current runner 能把 tool_call 记进 Task；旧代 runner
@@ -1779,8 +1806,12 @@ class _Daemon:
                     detail=update.detail,
                 ),
             )
-            await self._emit_session_event(event)
-            self._queue_session_event_projection(sess, event)
+            record = await self._emit_session_event(event)
+            self._queue_session_event_projection(
+                sess,
+                event,
+                record.sequence if record is not None else None,
+            )
 
         # 配置里给该后端声明的追加 env（[agents.<名>].env，如 codex 的 CODEX_PATH）打底。
         env: dict[str, str] = dict(self.cfg.agent_env.get(session.agent_label, {}))
@@ -1972,13 +2003,16 @@ class _Daemon:
                                 source=request.conversation,
                             ),
                         )
-                        await self._emit_session_event(event)
+                        record = await self._emit_session_event(event)
                         await self._publish_session_event(
                             event,
                             tuple(
                                 conversation
                                 for conversation in turn_conversations
                                 if conversation != request.conversation
+                            ),
+                            trace_sequence=(
+                                record.sequence if record is not None else None
                             ),
                         )
                     title = f"{sess.project_name} · {sess.agent_label}"
@@ -2017,8 +2051,12 @@ class _Daemon:
                         occurred_at=datetime.now(timezone.utc),
                         body=AgentOutputStarted(),
                     )
-                    await self._emit_session_event(event)
-                    self._queue_session_event_projection(sess, event)
+                    record = await self._emit_session_event(event)
+                    self._queue_session_event_projection(
+                        sess,
+                        event,
+                        record.sequence if record is not None else None,
+                    )
                     outcome: OutputOutcome | None = None
                     try:
                         stop_reason = await sess.agent.prompt(prompt)
@@ -3299,6 +3337,7 @@ class _Daemon:
         event: SessionEvent,
         *,
         conversation: ConversationRef,
+        trace_sequence: int | None,
     ) -> None:
         """向 Conversation 投影 SessionEvent，并隔离单个 Channel 失败。"""
         try:
@@ -3307,6 +3346,7 @@ class _Daemon:
                 channel.handle_session_event,
                 conversation.conversation_id,
                 event,
+                trace_sequence=trace_sequence,
             )
         except Exception:
             logger.exception(

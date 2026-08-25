@@ -73,6 +73,7 @@ class FakeBridge:
         self.created_threads: list[tuple[str, str]] = []
         self.plain: list[tuple[str, str]] = []  # reply_in_thread=False（不建话题）
         self.session_events: list[tuple[str, SessionEvent]] = []
+        self.session_event_trace_sequences: list[int | None] = []
 
     def start(self, on_message) -> None:
         self.start_count += 1
@@ -110,8 +111,11 @@ class FakeBridge:
         self,
         conversation_id: str,
         event: SessionEvent,
+        *,
+        trace_sequence: int | None = None,
     ) -> None:
         self.session_events.append((conversation_id, event))
+        self.session_event_trace_sequences.append(trace_sequence)
         body = event.body
         if not isinstance(body, SessionInputAccepted):
             if isinstance(
@@ -1625,6 +1629,7 @@ async def test_daemon_emits_agent_output_session_events_per_turn():
         AgentOutputDelta,
         AgentOutputFinished,
     ]
+    assert bridge.session_event_trace_sequences == [None] * 10
     await daemon._shutdown()
 
 
@@ -1687,6 +1692,8 @@ async def test_daemon_persists_session_events_once_across_conversation_fanout(
     assert len({record.event.event_id for record in records}) == len(records)
     assert len(feishu.session_events) == 7
     assert len(web.session_events) == 3
+    assert feishu.session_event_trace_sequences == [2, 3, 4, 5, 6, 7, 8]
+    assert web.session_event_trace_sequences == [6, 7, 8]
 
 
 async def test_daemon_emits_and_projects_tool_call_session_events():
@@ -1854,10 +1861,16 @@ async def test_tool_call_projection_failure_does_not_abort_turn(caplog):
             self,
             conversation_id: str,
             event: SessionEvent,
+            *,
+            trace_sequence: int | None = None,
         ) -> None:
             if isinstance(event.body, ToolCallObserved):
                 raise RuntimeError("tool event boom")
-            super().handle_session_event(conversation_id, event)
+            super().handle_session_event(
+                conversation_id,
+                event,
+                trace_sequence=trace_sequence,
+            )
 
     daemon, feishu, created = make_daemon(agent_cls=ToolCallAgent)
     broken = BrokenEventBridge()
@@ -2079,6 +2092,8 @@ async def test_trace_store_failure_does_not_abort_agent_turn(tmp_path, caplog):
 
     assert "echo:task" in "".join(bridge.texts("om_root1"))
     assert "SessionEvent 持久化失败" in caplog.text
+    assert bridge.session_event_trace_sequences
+    assert set(bridge.session_event_trace_sequences) == {None}
     assert task_by_thread(daemon.store, "om_root1").status == "idle"
     await daemon._shutdown()
 
@@ -2713,6 +2728,8 @@ async def test_session_input_event_projection_failure_does_not_abort_turn(caplog
             self,
             conversation_id: str,
             event: SessionEvent,
+            *,
+            trace_sequence: int | None = None,
         ) -> None:
             raise RuntimeError("session event boom")
 

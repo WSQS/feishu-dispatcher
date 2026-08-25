@@ -727,6 +727,8 @@ class FeishuBridge:
         self,
         conversation_id: str,
         event: SessionEvent,
+        *,
+        trace_sequence: int | None = None,
     ) -> None:
         """把 Session 领域事件投影为飞书话题消息。"""
         body = event.body

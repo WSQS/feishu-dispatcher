@@ -260,6 +260,8 @@ class HttpChannel:
         self,
         conversation_id: str,
         event: SessionEvent,
+        *,
+        trace_sequence: int | None = None,
     ) -> None:
         """把 Session 领域事件投影为 HTTP Conversation 事件。"""
         body = event.body
@@ -298,6 +300,8 @@ class HttpChannel:
             if output is not None:
                 presentation = output.tool_call_presentation(body)
         payload: dict[str, object] = {"event": session_event_to_dict(event)}
+        if trace_sequence is not None:
+            payload["trace_sequence"] = trace_sequence
         if presentation is not None:
             payload["presentation"] = presentation
         self._append_event(
