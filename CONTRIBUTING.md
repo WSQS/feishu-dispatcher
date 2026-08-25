@@ -41,6 +41,20 @@
 - 标题或 body 带 `(closes #N)` / `(refs #N)`（或 PR body 里的 `Closes #N` / `Refs #N`）。
 - 写代码遵循 **[on-write](https://github.com/WSQS/agent-skills/tree/master/skills/on-write)**（单一结果、最小 diff）；提交 / 合入前按 **[on-submit](https://github.com/WSQS/agent-skills/tree/master/skills/on-submit)** 自检（一致性、必要性、无 drive-by）。技能集仓库：[WSQS/agent-skills](https://github.com/WSQS/agent-skills)。
 
+### WebUI 浏览器测试
+
+首次运行先安装 Playwright Chromium：
+
+```powershell
+uv run playwright install chromium
+```
+
+运行真实浏览器 E2E：
+
+```powershell
+uv run pytest -q -m webui_e2e
+```
+
 ## 注释规范
 
 注释的职责是说明「**是什么 / 为什么这样写**」，让代码自包含可读。
