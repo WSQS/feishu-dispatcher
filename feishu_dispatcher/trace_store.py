@@ -19,12 +19,26 @@ class SessionTraceRecord:
     event: SessionEvent
 
 
+@dataclass(frozen=True)
+class SessionTracePage:
+    """一次一致快照中的 Session Trace 记录与序号边界。"""
+
+    records: tuple[SessionTraceRecord, ...]
+    oldest_sequence: int | None
+    latest_sequence: int | None
+
+
+class SessionTraceStoreClosed(RuntimeError):
+    """Session Trace Store 已关闭。"""
+
+
 class SessionTraceStore:
     """按 Session 持久化、顺序读取并幂等追加 SessionEvent。"""
 
     def __init__(self, path: Path) -> None:
         self._path = path
         self._lock = threading.RLock()
+        self._closed = False
         self._connection = sqlite3.connect(
             path,
             timeout=30.0,
@@ -36,7 +50,10 @@ class SessionTraceStore:
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
             self._connection.close()
+            self._closed = True
 
     def __enter__(self) -> SessionTraceStore:
         return self
@@ -155,6 +172,41 @@ class SessionTraceStore:
                 (session_id,),
             ).fetchone()
         return oldest, latest
+
+    def read_page(
+        self,
+        session_id: str,
+        *,
+        before: int | None = None,
+        after: int | None = None,
+        limit: int = 100,
+    ) -> SessionTracePage:
+        _validate_session_id(session_id)
+        if before is not None and after is not None:
+            raise ValueError("before 和 after 不能同时指定")
+        with self._lock:
+            if self._closed:
+                raise SessionTraceStoreClosed("Session Trace Store 已关闭")
+            if before is not None:
+                records = self.read_before(
+                    session_id,
+                    before=before,
+                    limit=limit,
+                )
+            elif after is not None:
+                records = self.read_after(
+                    session_id,
+                    after=after,
+                    limit=limit,
+                )
+            else:
+                records = self.read_before(session_id, limit=limit)
+            oldest, latest = self.sequence_bounds(session_id)
+        return SessionTracePage(
+            records=records,
+            oldest_sequence=oldest,
+            latest_sequence=latest,
+        )
 
     def _create_schema(self) -> None:
         with self._lock:

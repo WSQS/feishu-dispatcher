@@ -934,6 +934,109 @@ async def test_http_task_events_route_reads_trace_with_before_after_and_auth(tmp
 
 
 @pytest.mark.asyncio
+async def test_http_task_events_route_returns_unavailable_when_shutdown_wins_read_race(
+    tmp_path,
+):
+    class PausingTraceStore(SessionTraceStore):
+        def __init__(self, path):
+            super().__init__(path)
+            self.read_started = threading.Event()
+            self.resume_read = threading.Event()
+
+        def read_page(self, *args, **kwargs):
+            self.read_started.set()
+            assert self.resume_read.wait(timeout=1)
+            return super().read_page(*args, **kwargs)
+
+    store = SessionStore(None)
+    task = store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="trace task",
+        conversation=ConversationRef("feishu", "oc_trace"),
+        thread_root_id="om_trace",
+        workspace="C:/tmp/demo",
+    )
+    trace_store = PausingTraceStore(tmp_path / "trace.sqlite")
+    daemon, _, _ = make_daemon(store=store, trace_store=trace_store)
+
+    request_task = asyncio.create_task(
+        daemon._http_task_events(
+            {},
+            {
+                "segments": {"task_id": task.session_id},
+                "query": {},
+            },
+        )
+    )
+    assert await asyncio.to_thread(trace_store.read_started.wait, 1)
+
+    await daemon._close_trace_store()
+    trace_store.resume_read.set()
+
+    status, payload = await request_task
+    assert status == 503
+    assert payload == {"error": "trace_unavailable"}
+
+
+@pytest.mark.asyncio
+async def test_http_task_events_route_completes_when_read_wins_shutdown_race(tmp_path):
+    class PausingTraceStore(SessionTraceStore):
+        def __init__(self, path):
+            super().__init__(path)
+            self.read_started = threading.Event()
+            self.resume_read = threading.Event()
+
+        def read_before(self, *args, **kwargs):
+            self.read_started.set()
+            assert self.resume_read.wait(timeout=1)
+            return super().read_before(*args, **kwargs)
+
+    store = SessionStore(None)
+    task = store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="trace task",
+        conversation=ConversationRef("feishu", "oc_trace"),
+        thread_root_id="om_trace",
+        workspace="C:/tmp/demo",
+    )
+    trace_store = PausingTraceStore(tmp_path / "trace.sqlite")
+    trace_store.append(
+        SessionEvent(
+            event_id="event-1",
+            session_id=task.session_id,
+            turn_id="turn-1",
+            occurred_at=datetime(2026, 8, 25, tzinfo=timezone.utc),
+            body=AgentOutputDelta(stream="message", text="event-1"),
+        )
+    )
+    daemon, _, _ = make_daemon(store=store, trace_store=trace_store)
+
+    request_task = asyncio.create_task(
+        daemon._http_task_events(
+            {},
+            {
+                "segments": {"task_id": task.session_id},
+                "query": {},
+            },
+        )
+    )
+    assert await asyncio.to_thread(trace_store.read_started.wait, 1)
+
+    close_task = asyncio.create_task(daemon._close_trace_store())
+    await asyncio.sleep(0)
+    trace_store.resume_read.set()
+
+    status, payload = await request_task
+    await close_task
+    assert status == 200
+    assert [item["sequence"] for item in payload["events"]] == [1]
+    assert payload["oldest_sequence"] == 1
+    assert payload["latest_sequence"] == 1
+
+
+@pytest.mark.asyncio
 async def test_http_create_task_conversation_validates_request_and_task_state():
     store = SessionStore(None)
     active = store.create(

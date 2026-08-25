@@ -11,7 +11,10 @@ from feishu_dispatcher.session_event import (
     SessionEvent,
     SessionInputAccepted,
 )
-from feishu_dispatcher.trace_store import SessionTraceStore
+from feishu_dispatcher.trace_store import (
+    SessionTraceStore,
+    SessionTraceStoreClosed,
+)
 
 _OCCURRED_AT = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
 
@@ -72,6 +75,7 @@ def test_trace_store_read_before_paginates_to_empty_session(tmp_path):
         assert store.read_before("session-1") == ()
         assert store.read_before("session-1", before=100) == ()
         assert store.sequence_bounds("session-1") == (None, None)
+        assert store.read_page("session-1").records == ()
 
 
 def test_trace_store_duplicate_event_is_idempotent(tmp_path):
@@ -110,6 +114,25 @@ def test_trace_store_recovers_after_reopen(tmp_path):
         assert store.read_after("session-1") == (expected,)
         assert store.read_before("session-1") == (expected,)
         assert store.sequence_bounds("session-1") == (1, 1)
+
+
+def test_trace_store_read_page_returns_records_and_bounds_from_one_snapshot(tmp_path):
+    with SessionTraceStore(tmp_path / "trace.sqlite") as store:
+        records = [store.append(_event(f"event-{index}")) for index in range(1, 5)]
+
+        page = store.read_page("session-1", before=4, limit=2)
+
+        assert page.records == tuple(records[1:3])
+        assert page.oldest_sequence == 1
+        assert page.latest_sequence == 4
+
+
+def test_trace_store_read_page_rejects_closed_store(tmp_path):
+    store = SessionTraceStore(tmp_path / "trace.sqlite")
+    store.close()
+
+    with pytest.raises(SessionTraceStoreClosed, match="已关闭"):
+        store.read_page("session-1")
 
 
 @pytest.mark.parametrize(
