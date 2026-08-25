@@ -12,6 +12,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -46,6 +47,7 @@ from feishu_dispatcher.session_event import (
     SessionEvent,
     SessionInputAccepted,
     ToolCallObserved,
+    session_event_to_dict,
 )
 from feishu_dispatcher.store import ProjectStore, SessionStore
 from feishu_dispatcher.throttler import StreamThrottler
@@ -587,6 +589,7 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
         ("GET", "/api/health"),
         ("GET", "/api/tasks"),
         ("POST", "/api/tasks/{task_id}/conversations"),
+        ("GET", "/api/tasks/{task_id}/events"),
         ("GET", "/api/projects"),
         ("GET", "/api/projects/{name}/tree/children"),
         ("GET", "/api/projects/{name}/file"),
@@ -775,6 +778,159 @@ async def test_http_tasks_route_requires_token_and_runs_on_main_loop():
         assert store.read_threads == [main_thread_id]
     finally:
         http.stop()
+
+
+@pytest.mark.asyncio
+async def test_http_task_events_route_reads_trace_with_before_after_and_auth(tmp_path):
+    store = SessionStore(None)
+    task = store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="trace task",
+        conversation=ConversationRef("feishu", "oc_trace"),
+        thread_root_id="om_trace",
+        workspace="C:/tmp/demo",
+        status="done",
+    )
+    trace_store = SessionTraceStore(tmp_path / "trace.sqlite")
+    events = [
+        SessionEvent(
+            event_id=f"event-{index}",
+            session_id=task.session_id,
+            turn_id="turn-1",
+            occurred_at=datetime(2026, 8, 25, tzinfo=timezone.utc),
+            body=AgentOutputDelta(stream="message", text=f"event-{index}"),
+        )
+        for index in range(1, 4)
+    ]
+    for event in events:
+        trace_store.append(event)
+
+    daemon, _, _ = make_daemon(
+        store=store,
+        trace_store=trace_store,
+        channel_key="http",
+    )
+    http = HttpChannel(
+        "tok-http",
+        asyncio.get_running_loop(),
+        host="127.0.0.1",
+        port=0,
+        routes={("GET", "/api/tasks/{task_id}/events"): daemon._http_task_events},
+    )
+
+    async def ignore(_message: ChannelMessage) -> None:
+        return None
+
+    http.start(ignore)
+    try:
+        for token in (None, "wrong-token"):
+            status, payload = await asyncio.to_thread(
+                http_channel_request,
+                "GET",
+                http.base_url + f"/api/tasks/{task.session_id}/events",
+                token,
+            )
+            assert status == 401
+            assert payload == {"error": "invalid_token"}
+
+        status, payload = await asyncio.to_thread(
+            http_channel_request,
+            "GET",
+            http.base_url + f"/api/tasks/{task.session_id}/events?limit=2",
+            "tok-http",
+        )
+        assert status == 200
+        assert [item["sequence"] for item in payload["events"]] == [2, 3]
+        assert payload["oldest_sequence"] == 1
+        assert payload["latest_sequence"] == 3
+
+        status, payload = await asyncio.to_thread(
+            http_channel_request,
+            "GET",
+            http.base_url + f"/api/tasks/{task.session_id}/events?before=3&limit=2",
+            "tok-http",
+        )
+        assert status == 200
+        assert [item["sequence"] for item in payload["events"]] == [1, 2]
+
+        status, payload = await asyncio.to_thread(
+            http_channel_request,
+            "GET",
+            http.base_url + f"/api/tasks/{task.session_id}/events?after=1&limit=2",
+            "tok-http",
+        )
+        assert status == 200
+        assert [item["sequence"] for item in payload["events"]] == [2, 3]
+        assert payload["events"][0]["event"] == session_event_to_dict(events[1])
+
+        status, payload = await asyncio.to_thread(
+            http_channel_request,
+            "GET",
+            http.base_url + f"/api/tasks/{task.session_id}/events?before=2&after=1",
+            "tok-http",
+        )
+        assert status == 400
+        assert payload["error"] == "invalid_request"
+
+        status, payload = await asyncio.to_thread(
+            http_channel_request,
+            "GET",
+            http.base_url + f"/api/tasks/{task.session_id}/events?limit=501",
+            "tok-http",
+        )
+        assert status == 400
+        assert payload["error"] == "invalid_limit"
+
+        for query in (
+            "before=0",
+            "before=abc",
+            "after=-1",
+            "after=abc",
+            "limit=0",
+            "limit=abc",
+        ):
+            status, payload = await asyncio.to_thread(
+                http_channel_request,
+                "GET",
+                http.base_url + f"/api/tasks/{task.session_id}/events?{query}",
+                "tok-http",
+            )
+            assert status == 400
+            assert payload["error"] in {"invalid_cursor", "invalid_limit"}
+
+        status, payload = await asyncio.to_thread(
+            http_channel_request,
+            "GET",
+            http.base_url + f"/api/tasks/{task.session_id}/events?after=3",
+            "tok-http",
+        )
+        assert status == 200
+        assert payload["events"] == []
+        assert payload["oldest_sequence"] == 1
+        assert payload["latest_sequence"] == 3
+
+        daemon.trace_store = None
+        status, payload = await asyncio.to_thread(
+            http_channel_request,
+            "GET",
+            http.base_url + f"/api/tasks/{task.session_id}/events",
+            "tok-http",
+        )
+        assert status == 503
+        assert payload == {"error": "trace_unavailable"}
+
+        status, payload = await asyncio.to_thread(
+            http_channel_request,
+            "GET",
+            http.base_url + "/api/tasks/missing/events",
+            "tok-http",
+        )
+        assert status == 404
+        assert payload == {"error": "task_not_found", "task_id": "missing"}
+    finally:
+        http.stop()
+        trace_store.close()
 
 
 @pytest.mark.asyncio
