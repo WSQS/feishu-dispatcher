@@ -64,6 +64,7 @@ from .session_event import (
     ToolCallObserved,
 )
 from .store import Job, JobStore, ModelStore, ProjectStore, Session, SessionStore
+from .trace_store import SessionTraceStore
 from ._scan_executor import ScanExecutor
 from .workspace_api import (
     file as workspace_file,
@@ -310,6 +311,7 @@ async def run(
         cfg,
         discover=discover,
         store=SessionStore(store_path.parent / "tasks.json"),
+        trace_store=SessionTraceStore(store_path.parent / "session-trace.sqlite"),
         project_store=ProjectStore(store_path.parent / "projects.json"),
         model_store=ModelStore(store_path.parent / "models.json"),
         job_store=JobStore(store_path.parent / "jobs.json"),
@@ -355,11 +357,15 @@ async def run(
             )
         except BaseException:
             await scan_executor.aclose()
+            await daemon._close_trace_store()
             raise
         daemon._scan_executor = scan_executor
         daemon._channels["http"] = http_channel
         logger.info("HTTP Channel token 已存: %s", http_token_path)
-    await daemon.run()
+    try:
+        await daemon.run()
+    finally:
+        await daemon._close_trace_store()
     return daemon._reboot_requested
 
 
@@ -553,6 +559,8 @@ class _Daemon:
     discover: bool = False
     #: 任务台账（默认纯内存，不写盘）；run() 注入文件版（tasks.json）
     store: SessionStore = field(default_factory=lambda: SessionStore(None))
+    #: Host-owned Session Trace（默认不启用）；run() 注入 SQLite 版。
+    trace_store: SessionTraceStore | None = None
     #: 运行时注册的项目台账（默认纯内存）；run() 注入文件版（projects.json）。
     #: 有效项目 = config.toml 种子（cfg.projects）+ 这里注册的，见 _all_projects
     project_store: ProjectStore = field(default_factory=lambda: ProjectStore(None))
@@ -745,7 +753,15 @@ class _Daemon:
         )
 
     async def _emit_session_event(self, event: SessionEvent) -> None:
-        """把运行事实交给可选消费者，并隔离消费者失败。"""
+        """持久化运行事实并交给其它消费者，分别隔离消费者失败。"""
+        if self.trace_store is not None:
+            try:
+                await asyncio.to_thread(self.trace_store.append, event)
+            except Exception:
+                logger.exception(
+                    "SessionEvent 持久化失败 event=%s",
+                    event.event_id,
+                )
         if self._session_event_handler is None:
             return
         try:
@@ -755,6 +771,17 @@ class _Daemon:
                 "SessionEvent 运行时消费者失败 event=%s",
                 event.event_id,
             )
+
+    async def _close_trace_store(self) -> None:
+        """幂等关闭 daemon 持有的 Session Trace Store。"""
+        trace_store = self.trace_store
+        self.trace_store = None
+        if trace_store is None:
+            return
+        try:
+            await asyncio.to_thread(trace_store.close)
+        except Exception:
+            logger.warning("Session Trace 存储关闭失败，忽略", exc_info=True)
 
     def _queue_session_event_projection(
         self,
@@ -1945,6 +1972,7 @@ class _Daemon:
                                 source=request.conversation,
                             ),
                         )
+                        await self._emit_session_event(event)
                         await self._publish_session_event(
                             event,
                             tuple(
@@ -3399,3 +3427,4 @@ class _Daemon:
             except Exception:
                 logger.warning("扫描执行服务关闭失败，忽略", exc_info=True)
             self._scan_executor = None
+        await self._close_trace_store()

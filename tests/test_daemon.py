@@ -49,6 +49,7 @@ from feishu_dispatcher.session_event import (
 )
 from feishu_dispatcher.store import ProjectStore, SessionStore
 from feishu_dispatcher.throttler import StreamThrottler
+from feishu_dispatcher.trace_store import SessionTraceStore
 
 
 class FakeBridge:
@@ -361,6 +362,7 @@ def make_daemon(
     *,
     stream_mode: str = "text",
     store: SessionStore | None = None,
+    trace_store: SessionTraceStore | None = None,
     project_store: ProjectStore | None = None,
     idle_timeout: float = 1800.0,
     channel_key: str = "feishu",
@@ -384,6 +386,7 @@ def make_daemon(
     daemon = _Daemon(
         cfg,
         store=store or SessionStore(None),
+        trace_store=trace_store,
         project_store=project_store or ProjectStore(None),
         _channels={channel_key: bridge},
         _primary_channel_key=channel_key,
@@ -504,6 +507,7 @@ async def test_run_builds_default_feishu_channel_and_injects_it(
     assert set(channels) == {"feishu"}
     assert isinstance(channels["feishu"], FakeFeishuChannel)
     assert constructed["primary_channel_key"] == "feishu"
+    assert (tmp_path / "session-trace.sqlite").exists()
 
 
 @pytest.mark.asyncio
@@ -1561,11 +1565,13 @@ async def test_daemon_emits_agent_output_session_events_per_turn():
 
     assert created[0].prompts == ["first", "second"]
     assert [type(event.body) for event in events] == [
+        SessionInputAccepted,
         AgentOutputStarted,
         AgentOutputDelta,
         AgentPlanUpdated,
         AgentOutputDelta,
         AgentOutputFinished,
+        SessionInputAccepted,
         AgentOutputStarted,
         AgentOutputDelta,
         AgentPlanUpdated,
@@ -1576,29 +1582,33 @@ async def test_daemon_emits_agent_output_session_events_per_turn():
     assert task is not None
     assert {event.session_id for event in events} == {task.session_id}
     first_turn_id = events[0].turn_id
-    second_turn_id = events[5].turn_id
+    second_turn_id = events[6].turn_id
     assert first_turn_id
     assert second_turn_id
     assert first_turn_id != second_turn_id
-    assert {event.turn_id for event in events[:5]} == {first_turn_id}
-    assert {event.turn_id for event in events[5:]} == {second_turn_id}
-    assert events[1].body == AgentOutputDelta(
+    assert {event.turn_id for event in events[:6]} == {first_turn_id}
+    assert {event.turn_id for event in events[6:]} == {second_turn_id}
+    assert events[0].body == SessionInputAccepted(
+        text="first",
+        source=ConversationRef("feishu", "om_root1"),
+    )
+    assert events[2].body == AgentOutputDelta(
         stream="thought",
         text="think:first",
     )
-    assert events[2].body == AgentPlanUpdated(
+    assert events[3].body == AgentPlanUpdated(
         entries=(AgentPlanEntry(content="working", status="in_progress"),)
     )
-    assert events[3].body == AgentOutputDelta(
+    assert events[4].body == AgentOutputDelta(
         stream="message",
         text="answer:first",
     )
-    assert events[4].body == AgentOutputFinished(
+    assert events[5].body == AgentOutputFinished(
         message="answer:first",
         thought="think:first",
         outcome="completed",
     )
-    assert events[9].body == AgentOutputFinished(
+    assert events[11].body == AgentOutputFinished(
         message="answer:second",
         thought="think:second",
         outcome="completed",
@@ -1616,6 +1626,67 @@ async def test_daemon_emits_agent_output_session_events_per_turn():
         AgentOutputFinished,
     ]
     await daemon._shutdown()
+
+
+async def test_daemon_persists_session_events_once_across_conversation_fanout(
+    tmp_path,
+):
+    trace_path = tmp_path / "session-trace.sqlite"
+    trace_store = SessionTraceStore(trace_path)
+    daemon, feishu, created = make_daemon(trace_store=trace_store)
+    web = FakeBridge()
+    daemon._channels["web"] = web
+
+    await daemon._handle_message(root_msg("/run demo first"))
+    await wait_until(lambda: created and created[0].prompts == ["first"])
+    task = task_by_thread(daemon.store, "om_root1")
+    assert task is not None
+
+    web_conversation = ConversationRef("web", "web-thread")
+    daemon._bind_conversation(web_conversation, task.session_id)
+    current_runner(daemon).enqueue(TurnRequest("second", web_conversation))
+    await wait_until(
+        lambda: (
+            created[0].prompts == ["first", "second"]
+            and len(
+                [
+                    record
+                    for record in trace_store.read_after(task.session_id)
+                    if isinstance(record.event.body, AgentOutputFinished)
+                ]
+            )
+            == 2
+        )
+    )
+    await wait_until(
+        lambda: len(feishu.session_events) == 7 and len(web.session_events) == 3
+    )
+
+    await daemon._shutdown()
+
+    assert daemon.trace_store is None
+    with SessionTraceStore(trace_path) as reopened:
+        records = reopened.read_after(task.session_id)
+
+    assert [record.sequence for record in records] == list(range(1, 9))
+    assert [type(record.event.body) for record in records] == [
+        SessionInputAccepted,
+        AgentOutputStarted,
+        AgentOutputDelta,
+        AgentOutputFinished,
+        SessionInputAccepted,
+        AgentOutputStarted,
+        AgentOutputDelta,
+        AgentOutputFinished,
+    ]
+    assert [
+        record.event.body.text
+        for record in records
+        if isinstance(record.event.body, SessionInputAccepted)
+    ] == ["first", "second"]
+    assert len({record.event.event_id for record in records}) == len(records)
+    assert len(feishu.session_events) == 7
+    assert len(web.session_events) == 3
 
 
 async def test_daemon_emits_and_projects_tool_call_session_events():
@@ -1909,6 +1980,7 @@ async def test_daemon_emits_cancelled_agent_output_session_event():
     )
 
     assert [type(event.body) for event in events] == [
+        SessionInputAccepted,
         AgentOutputStarted,
         AgentOutputDelta,
         AgentOutputFinished,
@@ -1951,6 +2023,7 @@ async def test_daemon_emits_failed_agent_output_session_event():
     )
 
     assert [type(event.body) for event in events] == [
+        SessionInputAccepted,
         AgentOutputStarted,
         AgentOutputDelta,
         AgentOutputFinished,
@@ -1982,6 +2055,30 @@ async def test_session_event_handler_failure_does_not_abort_agent_turn(caplog):
 
     assert "echo:task" in "".join(bridge.texts("om_root1"))
     assert "SessionEvent 运行时消费者失败" in caplog.text
+    assert task_by_thread(daemon.store, "om_root1").status == "idle"
+    await daemon._shutdown()
+
+
+async def test_trace_store_failure_does_not_abort_agent_turn(tmp_path, caplog):
+    class BrokenTraceStore(SessionTraceStore):
+        def append(self, event: SessionEvent):
+            raise RuntimeError("trace boom")
+
+    trace_store = BrokenTraceStore(tmp_path / "session-trace.sqlite")
+    daemon, bridge, created = make_daemon(trace_store=trace_store)
+
+    with caplog.at_level("ERROR"):
+        await daemon._handle_message(root_msg("/run demo task"))
+        await wait_until(
+            lambda: (
+                created
+                and created[0].prompts == ["task"]
+                and any("本轮结束" in text for text in bridge.texts("om_root1"))
+            )
+        )
+
+    assert "echo:task" in "".join(bridge.texts("om_root1"))
+    assert "SessionEvent 持久化失败" in caplog.text
     assert task_by_thread(daemon.store, "om_root1").status == "idle"
     await daemon._shutdown()
 
