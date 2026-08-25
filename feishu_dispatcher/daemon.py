@@ -65,7 +65,11 @@ from .session_event import (
     session_event_to_dict,
 )
 from .store import Job, JobStore, ModelStore, ProjectStore, Session, SessionStore
-from .trace_store import SessionTraceRecord, SessionTraceStore
+from .trace_store import (
+    SessionTraceRecord,
+    SessionTraceStore,
+    SessionTraceStoreClosed,
+)
 from ._scan_executor import ScanExecutor
 from .workspace_api import (
     file as workspace_file,
@@ -2809,7 +2813,8 @@ class _Daemon:
         task_id = request["segments"]["task_id"]
         if self.store.get(task_id) is None:
             return 404, {"error": "task_not_found", "task_id": task_id}
-        if self.trace_store is None:
+        trace_store = self.trace_store
+        if trace_store is None:
             return 503, {"error": "trace_unavailable"}
 
         query = request.get("query") or {}
@@ -2865,30 +2870,16 @@ class _Daemon:
                 "message": f"limit 必须是 1-{_TRACE_EVENTS_LIMIT_MAX} 的整数",
             }
 
-        if before is not None:
-            records = await asyncio.to_thread(
-                self.trace_store.read_before,
+        try:
+            page = await asyncio.to_thread(
+                trace_store.read_page,
                 task_id,
                 before=before,
-                limit=limit,
-            )
-        elif after is not None:
-            records = await asyncio.to_thread(
-                self.trace_store.read_after,
-                task_id,
                 after=after,
                 limit=limit,
             )
-        else:
-            records = await asyncio.to_thread(
-                self.trace_store.read_before,
-                task_id,
-                limit=limit,
-            )
-        oldest, latest = await asyncio.to_thread(
-            self.trace_store.sequence_bounds,
-            task_id,
-        )
+        except SessionTraceStoreClosed:
+            return 503, {"error": "trace_unavailable"}
         return 200, {
             "task_id": task_id,
             "events": [
@@ -2896,10 +2887,10 @@ class _Daemon:
                     "sequence": record.sequence,
                     "event": session_event_to_dict(record.event),
                 }
-                for record in records
+                for record in page.records
             ],
-            "oldest_sequence": oldest,
-            "latest_sequence": latest,
+            "oldest_sequence": page.oldest_sequence,
+            "latest_sequence": page.latest_sequence,
         }
 
     def _sched_list_tasks(self) -> list[dict]:
