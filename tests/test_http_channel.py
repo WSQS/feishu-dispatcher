@@ -843,7 +843,7 @@ async def test_session_input_event_projects_to_thread_message():
             ),
         )
 
-        channel.handle_session_event(thread_id, event)
+        channel.handle_session_event(thread_id, event, trace_sequence=42)
 
         events = await _wait_for_events(channel, "browser-a", minimum=3)
         raw_event = events["events"][1]
@@ -851,6 +851,7 @@ async def test_session_input_event_projects_to_thread_message():
             "cursor": 2,
             "type": "session.event",
             "event": session_event_to_dict(event),
+            "trace_sequence": 42,
         }
         projected = events["events"][2]
         assert projected["type"] == "message.created"

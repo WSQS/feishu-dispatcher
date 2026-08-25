@@ -67,6 +67,8 @@ class Channel(Protocol):
         self,
         conversation_id: str,
         event: SessionEvent,
+        *,
+        trace_sequence: int | None = None,
     ) -> None: ...
 
     def open_output(
