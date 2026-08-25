@@ -143,6 +143,19 @@ class SessionTraceStore:
             rows = self._connection.execute(query, parameters).fetchall()
         return tuple(self._record_from_row(row) for row in reversed(rows))
 
+    def sequence_bounds(self, session_id: str) -> tuple[int | None, int | None]:
+        _validate_session_id(session_id)
+        with self._lock:
+            oldest, latest = self._connection.execute(
+                """
+                SELECT MIN(sequence), MAX(sequence)
+                FROM session_trace_events
+                WHERE session_id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+        return oldest, latest
+
     def _create_schema(self) -> None:
         with self._lock:
             self._connection.executescript(

@@ -62,6 +62,7 @@ from .session_event import (
     SessionEvent,
     SessionInputAccepted,
     ToolCallObserved,
+    session_event_to_dict,
 )
 from .store import Job, JobStore, ModelStore, ProjectStore, Session, SessionStore
 from .trace_store import SessionTraceRecord, SessionTraceStore
@@ -103,6 +104,7 @@ _DEDUP_CAPACITY = 512
 
 #: 关闭时等控制面停下的上限（秒）；超时即放弃继续关（serve_forever 是 daemon 线程）。#81
 _CONTROL_STOP_TIMEOUT = 5.0
+_TRACE_EVENTS_LIMIT_MAX = 500
 
 _USAGE = (
     "用法：\n"
@@ -341,6 +343,7 @@ async def run(
                         "POST",
                         "/api/tasks/{task_id}/conversations",
                     ): daemon._http_create_task_conversation,
+                    ("GET", "/api/tasks/{task_id}/events"): daemon._http_task_events,
                     ("GET", "/api/projects"): workspace_list_projects,
                     (
                         "GET",
@@ -2798,6 +2801,105 @@ class _Daemon:
             "task_id": task.session_id,
             "conversation_id": parent_conversation_id,
             "thread_id": thread_id,
+        }
+
+    async def _http_task_events(
+        self, _context: dict, request: dict
+    ) -> tuple[int, dict]:
+        task_id = request["segments"]["task_id"]
+        if self.store.get(task_id) is None:
+            return 404, {"error": "task_not_found", "task_id": task_id}
+        if self.trace_store is None:
+            return 503, {"error": "trace_unavailable"}
+
+        query = request.get("query") or {}
+        raw_before = query.get("before")
+        raw_after = query.get("after")
+        if raw_before is not None and raw_after is not None:
+            return 400, {
+                "error": "invalid_request",
+                "message": "before 和 after 不能同时指定",
+            }
+
+        before = None
+        if raw_before is not None:
+            try:
+                before = int(raw_before)
+            except (TypeError, ValueError):
+                return 400, {
+                    "error": "invalid_cursor",
+                    "message": "before 必须是正整数",
+                }
+            if before <= 0:
+                return 400, {
+                    "error": "invalid_cursor",
+                    "message": "before 必须是正整数",
+                }
+
+        after = None
+        if raw_after is not None:
+            try:
+                after = int(raw_after)
+            except (TypeError, ValueError):
+                return 400, {
+                    "error": "invalid_cursor",
+                    "message": "after 必须是非负整数",
+                }
+            if after < 0:
+                return 400, {
+                    "error": "invalid_cursor",
+                    "message": "after 必须是非负整数",
+                }
+
+        raw_limit = query.get("limit", "100")
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return 400, {
+                "error": "invalid_limit",
+                "message": f"limit 必须是 1-{_TRACE_EVENTS_LIMIT_MAX} 的整数",
+            }
+        if not 1 <= limit <= _TRACE_EVENTS_LIMIT_MAX:
+            return 400, {
+                "error": "invalid_limit",
+                "message": f"limit 必须是 1-{_TRACE_EVENTS_LIMIT_MAX} 的整数",
+            }
+
+        if before is not None:
+            records = await asyncio.to_thread(
+                self.trace_store.read_before,
+                task_id,
+                before=before,
+                limit=limit,
+            )
+        elif after is not None:
+            records = await asyncio.to_thread(
+                self.trace_store.read_after,
+                task_id,
+                after=after,
+                limit=limit,
+            )
+        else:
+            records = await asyncio.to_thread(
+                self.trace_store.read_before,
+                task_id,
+                limit=limit,
+            )
+        oldest, latest = await asyncio.to_thread(
+            self.trace_store.sequence_bounds,
+            task_id,
+        )
+        return 200, {
+            "task_id": task_id,
+            "events": [
+                {
+                    "sequence": record.sequence,
+                    "event": session_event_to_dict(record.event),
+                }
+                for record in records
+            ],
+            "oldest_sequence": oldest,
+            "latest_sequence": latest,
         }
 
     def _sched_list_tasks(self) -> list[dict]:

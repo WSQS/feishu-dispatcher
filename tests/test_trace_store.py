@@ -71,6 +71,7 @@ def test_trace_store_read_before_paginates_to_empty_session(tmp_path):
     with SessionTraceStore(tmp_path / "trace.sqlite") as store:
         assert store.read_before("session-1") == ()
         assert store.read_before("session-1", before=100) == ()
+        assert store.sequence_bounds("session-1") == (None, None)
 
 
 def test_trace_store_duplicate_event_is_idempotent(tmp_path):
@@ -108,6 +109,7 @@ def test_trace_store_recovers_after_reopen(tmp_path):
     with SessionTraceStore(path) as store:
         assert store.read_after("session-1") == (expected,)
         assert store.read_before("session-1") == (expected,)
+        assert store.sequence_bounds("session-1") == (1, 1)
 
 
 @pytest.mark.parametrize(
