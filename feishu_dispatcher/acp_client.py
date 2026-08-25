@@ -34,7 +34,16 @@ _PROTOCOL_VERSION = 1
 _DEFAULT_START_TIMEOUT = 120.0
 
 AgentOutputKind = Literal["message", "thought", "activity"]
+AgentPlanEntryStatus = Literal["pending", "in_progress", "completed"]
 AgentToolCallStatus = Literal["started", "completed", "failed"]
+
+
+@dataclass(frozen=True)
+class AgentPlanEntryUpdate:
+    """ACP plan 中的一个步骤快照。"""
+
+    content: str
+    status: AgentPlanEntryStatus
 
 
 @dataclass(frozen=True)
@@ -44,6 +53,7 @@ class AgentOutputChunk:
     kind: AgentOutputKind
     raw_text: str | None
     display_text: str
+    plan_entries: tuple[AgentPlanEntryUpdate, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -445,26 +455,40 @@ class _StreamFormatter:
             return self._activity(self._format_tool(update, is_start=False))
         if kind == "plan":
             marks = {"pending": "⬜", "in_progress": "🔄", "completed": "☑️"}
-            lines = [
-                f"{marks.get(getattr(e, 'status', ''), '⬜')} {getattr(e, 'content', '')}"
-                for e in (getattr(update, "entries", None) or [])
-            ]
+            entries = tuple(
+                AgentPlanEntryUpdate(
+                    content=getattr(entry, "content", ""),
+                    status=(
+                        getattr(entry, "status", "")
+                        if getattr(entry, "status", "") in marks
+                        else "pending"
+                    ),
+                )
+                for entry in (getattr(update, "entries", None) or [])
+            )
+            lines = [f"{marks[entry.status]} {entry.content}" for entry in entries]
             if not lines:
                 return None
             self._last = None
-            return self._activity("\n📋 计划:\n" + "\n".join(lines) + "\n")
+            return self._activity(
+                "\n📋 计划:\n" + "\n".join(lines) + "\n",
+                plan_entries=entries,
+            )
         # 其余变体（plan_update/usage_update/current_mode_update/available_commands_update
         # 等）有意忽略：P0 只转发对用户可读的主输出与进度。
         return None
 
     @staticmethod
-    def _activity(text: str) -> AgentOutputChunk | None:
+    def _activity(
+        text: str, *, plan_entries: tuple[AgentPlanEntryUpdate, ...] = ()
+    ) -> AgentOutputChunk | None:
         if not text:
             return None
         return AgentOutputChunk(
             kind="activity",
             raw_text=None,
             display_text=text,
+            plan_entries=plan_entries,
         )
 
     def _format_tool(self, update: Any, *, is_start: bool) -> str:

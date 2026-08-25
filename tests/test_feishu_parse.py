@@ -7,6 +7,8 @@ import json
 import time
 from datetime import datetime, timezone
 
+import pytest
+
 from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.feishu import FeishuBridge, _RateLimiter
@@ -15,6 +17,8 @@ from feishu_dispatcher.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
     AgentOutputStarted,
+    AgentPlanEntry,
+    AgentPlanUpdated,
     SessionEvent,
     SessionInputAccepted,
     ToolCallObserved,
@@ -553,7 +557,7 @@ def test_channel_open_output_uses_card_mode():
 
     output = bridge.open_output("om_root", "demo", footer="project")
 
-    assert isinstance(output, LiveCard)
+    assert isinstance(output._output, LiveCard)
 
 
 async def test_channel_open_output_uses_text_mode(monkeypatch):
@@ -567,12 +571,233 @@ async def test_channel_open_output_uses_text_mode(monkeypatch):
     monkeypatch.setattr(bridge, "reply_text", reply_text)
     output = bridge.open_output("om_root", "demo")
 
-    assert isinstance(output, StreamThrottler)
-    output.feed("hello")
+    assert isinstance(output._output, StreamThrottler)
+    output.feed("legacy")
     await output.flush()
+    await output.handle_event(
+        SessionEvent(
+            event_id="event-started",
+            session_id="t1",
+            turn_id="turn-1",
+            occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+            body=AgentOutputStarted(),
+        )
+    )
+    await output.handle_event(
+        SessionEvent(
+            event_id="event-delta",
+            session_id="t1",
+            turn_id="turn-1",
+            occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+            body=AgentOutputDelta(stream="message", text="hello"),
+        )
+    )
+    await output.handle_event(
+        SessionEvent(
+            event_id="event-finished",
+            session_id="t1",
+            turn_id="turn-1",
+            occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+            body=AgentOutputFinished(message="hello", thought="", outcome="completed"),
+        )
+    )
     await output.aclose()
 
     assert calls == [("om_root", "hello", True)]
+
+
+async def test_text_output_is_driven_by_session_events(monkeypatch):
+    bridge = FeishuBridge(
+        app_id="a",
+        app_secret="b",
+        main_loop=asyncio.get_running_loop(),
+        stream_mode="text",
+        throttle_window=60.0,
+    )
+    calls: list[tuple[str, str, bool]] = []
+
+    def reply_text(target_id: str, text: str, *, threaded: bool = False) -> str:
+        calls.append((target_id, text, threaded))
+        return "om_text"
+
+    monkeypatch.setattr(bridge, "reply_text", reply_text)
+    output = bridge.open_output("om_root", "demo")
+    output.feed("legacy")
+
+    events = [
+        AgentOutputStarted(),
+        AgentOutputDelta(stream="thought", text="thinking"),
+        AgentOutputDelta(stream="message", text="answer"),
+        AgentPlanUpdated(
+            entries=(AgentPlanEntry(content="run tests", status="in_progress"),)
+        ),
+        ToolCallObserved(
+            tool_call_id="tc1",
+            kind="edit",
+            title="Edit",
+            status="started",
+        ),
+        ToolCallObserved(
+            tool_call_id="tc1",
+            kind="edit",
+            title="Edit",
+            status="completed",
+        ),
+        AgentOutputFinished(
+            message="answer",
+            thought="thinking",
+            outcome="completed",
+        ),
+    ]
+    for index, body in enumerate(events, start=1):
+        await asyncio.to_thread(
+            bridge.handle_session_event,
+            "om_root",
+            SessionEvent(
+                event_id=f"event-{index}",
+                session_id="t1",
+                turn_id="turn-1",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=body,
+            ),
+        )
+
+    await output.aclose()
+
+    assert calls == [
+        (
+            "om_root",
+            "💭 thinking\nanswer\n📋 计划:\n🔄 run tests\n\n🔧 Edit\n✅ Edit\n",
+            True,
+        )
+    ]
+
+
+async def test_card_output_is_driven_by_session_events(monkeypatch):
+    bridge = FeishuBridge(
+        app_id="a",
+        app_secret="b",
+        main_loop=asyncio.get_running_loop(),
+        stream_mode="card",
+    )
+    replies: list[tuple[str, dict]] = []
+    patches: list[tuple[str, dict]] = []
+
+    def reply_card(root_message_id: str, card: dict) -> str:
+        replies.append((root_message_id, card))
+        return "om_card"
+
+    def patch_card(message_id: str, card: dict) -> None:
+        patches.append((message_id, card))
+
+    monkeypatch.setattr(bridge, "reply_card", reply_card)
+    monkeypatch.setattr(bridge, "patch_card", patch_card)
+    output = bridge.open_output("om_root", "demo")
+    output.feed("legacy")
+
+    await asyncio.to_thread(
+        bridge.handle_session_event,
+        "om_root",
+        SessionEvent(
+            event_id="event-started",
+            session_id="t1",
+            turn_id="turn-1",
+            occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+            body=AgentOutputStarted(),
+        ),
+    )
+    await asyncio.to_thread(
+        bridge.handle_session_event,
+        "om_root",
+        SessionEvent(
+            event_id="event-delta",
+            session_id="t1",
+            turn_id="turn-1",
+            occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+            body=AgentOutputDelta(stream="message", text="answer"),
+        ),
+    )
+    await asyncio.to_thread(
+        bridge.handle_session_event,
+        "om_root",
+        SessionEvent(
+            event_id="event-plan",
+            session_id="t1",
+            turn_id="turn-1",
+            occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+            body=AgentPlanUpdated(
+                entries=(AgentPlanEntry(content="run tests", status="in_progress"),)
+            ),
+        ),
+    )
+    await asyncio.to_thread(
+        bridge.handle_session_event,
+        "om_root",
+        SessionEvent(
+            event_id="event-finished",
+            session_id="t1",
+            turn_id="turn-1",
+            occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+            body=AgentOutputFinished(
+                message="answer",
+                thought="",
+                outcome="completed",
+            ),
+        ),
+    )
+    await output.aclose()
+
+    assert len(replies) == 1
+    assert "answer" in replies[0][1]["body"]["elements"][0]["content"]
+    assert "📋 计划:\n🔄 run tests" in replies[0][1]["body"]["elements"][0]["content"]
+    assert "legacy" not in str(replies + patches)
+    assert replies[0][1]["header"]["template"] == "green"
+
+
+@pytest.mark.parametrize(
+    ("outcome", "template"),
+    [
+        ("completed", "green"),
+        ("cancelled", "grey"),
+        ("failed", "red"),
+    ],
+)
+async def test_card_output_maps_session_outcome(monkeypatch, outcome, template):
+    bridge = FeishuBridge(
+        app_id="a",
+        app_secret="b",
+        main_loop=asyncio.get_running_loop(),
+        stream_mode="card",
+    )
+    cards: list[dict] = []
+
+    def reply_card(_root_message_id: str, card: dict) -> str:
+        cards.append(card)
+        return "om_card"
+
+    monkeypatch.setattr(bridge, "reply_card", reply_card)
+    output = bridge.open_output("om_root", "demo")
+    for index, body in enumerate(
+        [
+            AgentOutputStarted(),
+            AgentOutputFinished(message="answer", thought="", outcome=outcome),
+        ],
+        start=1,
+    ):
+        await asyncio.to_thread(
+            bridge.handle_session_event,
+            "om_root",
+            SessionEvent(
+                event_id=f"event-{index}",
+                session_id="t1",
+                turn_id="turn-1",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=body,
+            ),
+        )
+    await output.aclose()
+
+    assert cards[-1]["header"]["template"] == template
 
 
 # ---------------------------------------------------------------------- #

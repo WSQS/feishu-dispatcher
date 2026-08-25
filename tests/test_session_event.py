@@ -8,6 +8,8 @@ from feishu_dispatcher.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
     AgentOutputStarted,
+    AgentPlanEntry,
+    AgentPlanUpdated,
     SessionErrorOccurred,
     SessionEvent,
     SessionInputAccepted,
@@ -34,6 +36,12 @@ _OCCURRED_AT = datetime(2026, 8, 23, 14, 30, tzinfo=timezone.utc)
         (AgentOutputStarted(), "turn-1"),
         (AgentOutputDelta(stream="message", text="正在检查"), "turn-1"),
         (AgentOutputDelta(stream="thought", text="需要读取日志"), "turn-1"),
+        (
+            AgentPlanUpdated(
+                entries=(AgentPlanEntry(content="读取日志", status="in_progress"),)
+            ),
+            "turn-1",
+        ),
         (
             AgentOutputFinished(
                 message="检查完成",
@@ -138,6 +146,18 @@ def test_session_event_round_trip(body, turn_id):
             "turn-1",
             "agent.output.delta",
             {"stream": "thought", "text": "需要读取日志"},
+        ),
+        (
+            AgentPlanUpdated(
+                entries=(AgentPlanEntry(content="读取日志", status="in_progress"),)
+            ),
+            "turn-1",
+            "agent.plan.updated",
+            {
+                "entries": [
+                    {"content": "读取日志", "status": "in_progress"},
+                ]
+            },
         ),
         (
             AgentOutputFinished(

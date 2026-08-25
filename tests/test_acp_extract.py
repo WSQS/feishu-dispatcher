@@ -533,6 +533,13 @@ def test_plan_update_renders_entries_with_status_marks():
     assert "☑️ read files" in out
     assert "🔄 write code" in out
     assert "⬜ run tests" in out
+    formatted = _StreamFormatter().format_output(update)
+    assert formatted is not None
+    assert [(entry.content, entry.status) for entry in formatted.plan_entries] == [
+        ("read files", "completed"),
+        ("write code", "in_progress"),
+        ("run tests", "pending"),
+    ]
 
 
 def test_plan_update_with_no_entries_emits_nothing():
