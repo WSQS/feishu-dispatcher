@@ -85,6 +85,13 @@ export interface TaskEventQuery {
   limit?: number;
 }
 
+export interface ChannelHealth {
+  ok: true;
+  channel: "http";
+  version: string;
+  instance_id: string;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -192,6 +199,16 @@ function isTaskEventPage(value: unknown): value is TaskEventPage {
   );
 }
 
+function isChannelHealth(value: unknown): value is ChannelHealth {
+  return (
+    isRecord(value) &&
+    value.ok === true &&
+    value.channel === "http" &&
+    isNonEmptyString(value.version) &&
+    isNonEmptyString(value.instance_id)
+  );
+}
+
 function invalidResponse(name: string): Error {
   return new Error(`${name}响应格式无效`);
 }
@@ -239,6 +256,14 @@ export function createApiClient(getToken: () => string) {
       return isRecord(payload) && Array.isArray(payload.tasks)
         ? payload.tasks.filter(isTaskSummary)
         : [];
+    },
+
+    async getChannelHealth(): Promise<ChannelHealth> {
+      const payload = await request<unknown>("/api/channel/health");
+      if (!isChannelHealth(payload)) {
+        throw invalidResponse("HTTP Channel 健康");
+      }
+      return payload;
     },
 
     async loadTaskEvents(
