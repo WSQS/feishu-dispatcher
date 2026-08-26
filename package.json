@@ -3,9 +3,11 @@
   "private": true,
   "scripts": {
     "build:webui": "tsc -p tsconfig.webui.json",
-    "check:webui": "tsc -p tsconfig.webui.json --noEmit"
+    "check:webui": "tsc -p tsconfig.webui.json --noEmit && tsc -p tsconfig.webui.test.json --noEmit",
+    "test:webui": "vitest run"
   },
   "devDependencies": {
-    "typescript": "7.0.2"
+    "typescript": "7.0.2",
+    "vitest": "4.1.11"
   }
 }
