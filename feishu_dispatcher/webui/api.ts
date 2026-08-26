@@ -35,8 +35,34 @@ export interface FilePreview {
   content: string;
 }
 
+export interface DispatcherTaskSummary {
+  task_id: string;
+  kind: "dispatcher";
+  description: string;
+  status: string;
+  active: boolean;
+}
+
+export interface AgentTaskSummary {
+  task_id: string;
+  project: string;
+  agent: string;
+  description: string;
+  status: string;
+  turns: number;
+  issue_url: string | null;
+  kind: "agent";
+  active: boolean;
+}
+
+export type TaskSummary = DispatcherTaskSummary | AgentTaskSummary;
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
+}
+
+function isNonEmptyString(value: unknown): value is string {
+  return typeof value === "string" && value.trim().length > 0;
 }
 
 function isProjectSummary(value: unknown): value is ProjectSummary {
@@ -65,6 +91,38 @@ function isFilePreview(value: unknown): value is FilePreview {
     typeof value.binary === "boolean" &&
     typeof value.content === "string"
   );
+}
+
+function isDispatcherTaskSummary(value: unknown): value is DispatcherTaskSummary {
+  return (
+    isRecord(value) &&
+    isNonEmptyString(value.task_id) &&
+    value.kind === "dispatcher" &&
+    typeof value.description === "string" &&
+    typeof value.status === "string" &&
+    typeof value.active === "boolean"
+  );
+}
+
+function isAgentTaskSummary(value: unknown): value is AgentTaskSummary {
+  return (
+    isRecord(value) &&
+    isNonEmptyString(value.task_id) &&
+    typeof value.project === "string" &&
+    typeof value.agent === "string" &&
+    typeof value.description === "string" &&
+    typeof value.status === "string" &&
+    typeof value.turns === "number" &&
+    Number.isInteger(value.turns) &&
+    value.turns >= 0 &&
+    (typeof value.issue_url === "string" || value.issue_url === null) &&
+    value.kind === "agent" &&
+    typeof value.active === "boolean"
+  );
+}
+
+function isTaskSummary(value: unknown): value is TaskSummary {
+  return isDispatcherTaskSummary(value) || isAgentTaskSummary(value);
 }
 
 function invalidResponse(name: string): Error {
@@ -106,6 +164,13 @@ export function createApiClient(getToken: () => string) {
       const payload = await request<unknown>("/api/projects");
       return isRecord(payload) && Array.isArray(payload.items)
         ? payload.items.filter(isProjectSummary)
+        : [];
+    },
+
+    async listTasks(): Promise<TaskSummary[]> {
+      const payload = await request<unknown>("/api/tasks");
+      return isRecord(payload) && Array.isArray(payload.tasks)
+        ? payload.tasks.filter(isTaskSummary)
         : [];
     },
 

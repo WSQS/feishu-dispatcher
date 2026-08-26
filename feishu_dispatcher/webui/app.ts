@@ -742,10 +742,9 @@ function applyTasks(nextTasks) {
 }
 
 async function fetchTasks() {
-  const request = taskRequestTail.then(() => apiRequest("/api/tasks"));
+  const request = taskRequestTail.then(() => api.listTasks());
   taskRequestTail = request.catch(() => {});
-  const payload = await request;
-  return normalizeTasks(Array.isArray(payload.tasks) ? payload.tasks : []);
+  return normalizeTasks(await request);
 }
 
 async function loadTasks() {

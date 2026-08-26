@@ -223,6 +223,8 @@ async def test_webui_browser_task_history_pagination_dedup_and_switch_isolation(
                     "description": "History task A",
                     "status": "done",
                     "turns": 2,
+                    "issue_url": None,
+                    "kind": "agent",
                     "active": False,
                 },
                 {
@@ -232,6 +234,8 @@ async def test_webui_browser_task_history_pagination_dedup_and_switch_isolation(
                     "description": "History task B",
                     "status": "done",
                     "turns": 1,
+                    "issue_url": None,
+                    "kind": "agent",
                     "active": False,
                 },
             ]

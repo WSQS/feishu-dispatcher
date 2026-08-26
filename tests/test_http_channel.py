@@ -438,7 +438,10 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
             assert f'id="{element_id}"' in html
         assert "/api/channel/messages" in javascript
         assert "/api/channel/events" in javascript
-        assert 'apiRequest("/api/tasks")' in javascript
+        assert "api.listTasks()" in javascript
+        assert 'apiRequest("/api/tasks")' not in javascript
+        assert "async listTasks()" in api_javascript
+        assert 'request("/api/tasks")' in api_javascript
         assert "/events?${query}`" in javascript
         assert "elements.connectionSettings.open = false;" in javascript
         assert (
