@@ -12,8 +12,9 @@
 
 ## 前置环境
 
-本机装好 [`uv`](https://docs.astral.sh/uv/)、Node.js/npm，以及至少一个
-coding agent CLI（npm 全局）——都经 ACP 协议控制、本地实测握手/流式/会话恢复通过。
+本机装好 [`uv`](https://docs.astral.sh/uv/)、Node.js 与 npm（运行 TypeScript
+单元测试需要 Node.js 20+），以及至少一个 coding agent CLI（npm 全局）——都经
+ACP 协议控制、本地实测握手/流式/会话恢复通过。
 Node.js/npm 用于从源码同步依赖和构建 WebUI；已经安装构建好的 wheel 时不需要它。
 
 - **Copilot CLI**：`copilot` 已登录过 GitHub 账号。冒烟 `uv run python scripts/smoke_acp.py`。

@@ -1,0 +1,12 @@
+{
+  "extends": "./tsconfig.webui.json",
+  "compilerOptions": {
+    "noEmit": true
+  },
+  "include": [
+    "feishu_dispatcher/webui/api.ts",
+    "feishu_dispatcher/webui/storage.ts",
+    "tests/webui/**/*.test.ts",
+    "vitest.config.mts"
+  ]
+}
