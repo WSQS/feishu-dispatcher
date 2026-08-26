@@ -1,0 +1,11 @@
+{
+  "name": "feishu-dispatcher-webui",
+  "private": true,
+  "scripts": {
+    "build:webui": "tsc -p tsconfig.webui.json",
+    "check:webui": "tsc -p tsconfig.webui.json --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2"
+  }
+}
