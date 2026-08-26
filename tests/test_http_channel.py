@@ -331,6 +331,13 @@ def test_webui_api_logic_isolated_from_app_source():
     assert "new ApiError" not in app_source
     assert "fetch(" in api_source
     assert "new ApiError" in api_source
+    for endpoint in (
+        "/api/projects",
+        "/tree/children",
+        "/file?",
+    ):
+        assert endpoint not in app_source
+        assert endpoint in api_source
 
 
 def test_webui_storage_logic_isolated_from_app_source():
@@ -417,10 +424,11 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
             assert declaration in desktop_layout["rules"]
         assert 'id="task-list"' in html
         assert 'id="timelines"' in html
-        assert 'import { ApiError, createApiRequest } from "./api.js";' in javascript
+        assert 'import { ApiError, createApiClient } from "./api.js";' in javascript
         assert 'from "./storage.js";' in javascript
         assert "export class ApiError" in api_javascript
         assert "export function createApiRequest" in api_javascript
+        assert "export function createApiClient" in api_javascript
         assert "export const storageKeys" in storage_javascript
         assert "export function storageGet" in storage_javascript
         for element_id in re.findall(

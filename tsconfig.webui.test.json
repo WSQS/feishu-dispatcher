@@ -1,6 +1,7 @@
 {
   "extends": "./tsconfig.webui.json",
   "compilerOptions": {
+    "allowImportingTsExtensions": true,
     "noEmit": true
   },
   "include": [
