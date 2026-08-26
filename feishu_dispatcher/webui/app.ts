@@ -786,7 +786,7 @@ function acceptChannelInstance(payload, required = true) {
 }
 
 async function refreshChannelInstance() {
-  return acceptChannelInstance(await apiRequest("/api/channel/health"));
+  return acceptChannelInstance(await api.getChannelHealth());
 }
 
 async function loadProjects() {

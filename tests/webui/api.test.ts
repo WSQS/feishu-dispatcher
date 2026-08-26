@@ -7,6 +7,7 @@ import {
 } from "../../feishu_dispatcher/webui/api.ts";
 import type {
   AgentTaskSummary,
+  ChannelHealth,
   DispatcherTaskSummary,
   FilePreview,
   ProjectSummary,
@@ -110,6 +111,9 @@ describe("createApiClient 类型化方法", () => {
     >();
     expectTypeOf(api.readFile).returns.resolves.toEqualTypeOf<FilePreview>();
     expectTypeOf(api.listTasks).returns.resolves.toEqualTypeOf<TaskSummary[]>();
+    expectTypeOf(api.getChannelHealth).returns.resolves.toEqualTypeOf<
+      ChannelHealth
+    >();
     expectTypeOf(api.loadTaskEvents).returns.resolves.toEqualTypeOf<
       TaskEventPage
     >();
@@ -280,6 +284,49 @@ describe("createApiClient 类型化方法", () => {
     const api = createApiClient(() => "token-a");
 
     await expect(api.listTasks()).resolves.toEqual([]);
+  });
+
+  it("读取并校验 HTTP Channel 健康响应", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            ok: true,
+            channel: "http",
+            version: "0.0.1",
+            instance_id: "instance-a",
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            ok: false,
+            channel: "http",
+            version: "0.0.1",
+            instance_id: "instance-a",
+          }),
+          { status: 200 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetch);
+    const api = createApiClient(() => "token-a");
+
+    await expect(api.getChannelHealth()).resolves.toEqual({
+      ok: true,
+      channel: "http",
+      version: "0.0.1",
+      instance_id: "instance-a",
+    } satisfies ChannelHealth);
+    await expect(api.getChannelHealth()).rejects.toThrow(
+      "HTTP Channel 健康响应格式无效",
+    );
+    expect(fetch.mock.calls.map(([path]) => path)).toEqual([
+      "/api/channel/health",
+      "/api/channel/health",
+    ]);
   });
 
   it("读取 Task 历史并编码分页参数", async () => {

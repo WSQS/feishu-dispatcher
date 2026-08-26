@@ -441,6 +441,10 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert "/api/channel/events" in javascript
         assert "api.listTasks()" in javascript
         assert 'apiRequest("/api/tasks")' not in javascript
+        assert "api.getChannelHealth()" in javascript
+        assert 'apiRequest("/api/channel/health")' not in javascript
+        assert "async getChannelHealth()" in api_javascript
+        assert 'request("/api/channel/health")' in api_javascript
         assert "api.loadTaskEvents(taskId" in javascript
         assert "/api/tasks/${encodeURIComponent(taskId)}/events" not in javascript
         assert "async loadTaskEvents(" in api_javascript
