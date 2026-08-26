@@ -106,6 +106,16 @@ export interface ChannelEventPage {
   oldest_cursor: number;
 }
 
+export interface CreateTaskConversationRequest {
+  conversation_id: string;
+}
+
+export interface TaskConversationCreated {
+  task_id: string;
+  conversation_id: string;
+  thread_id: string;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -250,6 +260,17 @@ function isChannelEventPage(value: unknown): value is ChannelEventPage {
   );
 }
 
+function isTaskConversationCreated(
+  value: unknown,
+): value is TaskConversationCreated {
+  return (
+    isRecord(value) &&
+    isNonEmptyString(value.task_id) &&
+    isNonEmptyString(value.conversation_id) &&
+    isNonEmptyString(value.thread_id)
+  );
+}
+
 function invalidResponse(name: string): Error {
   return new Error(`${name}响应格式无效`);
 }
@@ -321,6 +342,31 @@ export function createApiClient(getToken: () => string) {
         payload.conversation_id !== conversationId
       ) {
         throw invalidResponse("Channel 事件");
+      }
+      return payload;
+    },
+
+    async createTaskConversation(
+      taskId: string,
+      conversationId: string,
+    ): Promise<TaskConversationCreated> {
+      const body: CreateTaskConversationRequest = {
+        conversation_id: conversationId,
+      };
+      const payload = await request<unknown>(
+        `/api/tasks/${encodeURIComponent(taskId)}/conversations`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        },
+      );
+      if (
+        !isTaskConversationCreated(payload) ||
+        payload.task_id !== taskId ||
+        payload.conversation_id !== conversationId
+      ) {
+        throw invalidResponse("Task Conversation");
       }
       return payload;
     },

@@ -9,10 +9,12 @@ import type {
   AgentTaskSummary,
   ChannelEventPage,
   ChannelHealth,
+  CreateTaskConversationRequest,
   DispatcherTaskSummary,
   FilePreview,
   ProjectSummary,
   TaskEventPage,
+  TaskConversationCreated,
   TaskSummary,
   TreeEntry,
 } from "../../feishu_dispatcher/webui/api.ts";
@@ -118,6 +120,15 @@ describe("createApiClient 类型化方法", () => {
     expectTypeOf(api.loadChannelEvents).returns.resolves.toEqualTypeOf<
       ChannelEventPage
     >();
+    expectTypeOf(api.createTaskConversation).parameters.toEqualTypeOf<
+      [string, string]
+    >();
+    expectTypeOf(api.createTaskConversation).returns.resolves.toEqualTypeOf<
+      TaskConversationCreated
+    >();
+    expectTypeOf<CreateTaskConversationRequest>().toEqualTypeOf<{
+      conversation_id: string;
+    }>();
     expectTypeOf(api.loadTaskEvents).returns.resolves.toEqualTypeOf<
       TaskEventPage
     >();
@@ -407,6 +418,57 @@ describe("createApiClient 类型化方法", () => {
       "/api/channel/events?conversation_id=conversation+A&after=2",
       "/api/channel/events?conversation_id=conversation+A&after=2",
     ]);
+  });
+
+  it("创建 Task Conversation 并校验响应身份", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            task_id: "task A",
+            conversation_id: "conversation-a",
+            thread_id: "thread-a",
+          }),
+          { status: 201 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            task_id: "other-task",
+            conversation_id: "conversation-a",
+            thread_id: "thread-b",
+          }),
+          { status: 201 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetch);
+    const api = createApiClient(() => "token-a");
+
+    await expect(
+      api.createTaskConversation("task A", "conversation-a"),
+    ).resolves.toEqual({
+      task_id: "task A",
+      conversation_id: "conversation-a",
+      thread_id: "thread-a",
+    } satisfies TaskConversationCreated);
+    await expect(
+      api.createTaskConversation("task A", "conversation-a"),
+    ).rejects.toThrow("Task Conversation响应格式无效");
+
+    expect(fetch.mock.calls.map(([path]) => path)).toEqual([
+      "/api/tasks/task%20A/conversations",
+      "/api/tasks/task%20A/conversations",
+    ]);
+    for (const [, options] of fetch.mock.calls) {
+      expect(options).toMatchObject({
+        method: "POST",
+        body: JSON.stringify({ conversation_id: "conversation-a" }),
+      });
+      expect(options.headers).toBeInstanceOf(Headers);
+      expect(options.headers.get("Content-Type")).toBe("application/json");
+    }
   });
 
   it("读取 Task 历史并编码分页参数", async () => {

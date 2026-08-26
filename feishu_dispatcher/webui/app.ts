@@ -1048,17 +1048,10 @@ async function connect() {
 
 async function createTaskConversation(task) {
   await refreshChannelInstance();
-  const payload = await apiRequest(
-    `/api/tasks/${encodeURIComponent(task.task_id)}/conversations`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ conversation_id: conversationId }),
-    },
+  const payload = await api.createTaskConversation(
+    task.task_id,
+    conversationId,
   );
-  if (typeof payload.thread_id !== "string" || !payload.thread_id.trim()) {
-    throw new Error("创建 Task Conversation 未返回 thread_id");
-  }
   const threadId = payload.thread_id.trim();
   taskThreads.set(task.task_id, threadId);
   rememberTarget(threadId, task.task_id);
