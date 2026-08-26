@@ -12,7 +12,9 @@
 
 ## 前置环境
 
-本机装好 [`uv`](https://docs.astral.sh/uv/)，以及至少一个 coding agent CLI（npm 全局）——都经 ACP 协议控制、本地实测握手/流式/会话恢复通过：
+本机装好 [`uv`](https://docs.astral.sh/uv/)、Node.js/npm，以及至少一个
+coding agent CLI（npm 全局）——都经 ACP 协议控制、本地实测握手/流式/会话恢复通过。
+Node.js/npm 用于从源码同步依赖和构建 WebUI；已经安装构建好的 wheel 时不需要它。
 
 - **Copilot CLI**：`copilot` 已登录过 GitHub 账号。冒烟 `uv run python scripts/smoke_acp.py`。
 - **OpenCode**：`opencode` 已配好 provider/凭据（`opencode providers`）。冒烟 `uv run python scripts/smoke_opencode.py`。
@@ -50,6 +52,12 @@ git clone https://github.com/WSQS/feishu-dispatcher.git
 cd feishu-dispatcher
 uv sync                                  # 装依赖
 ```
+
+`uv sync` 或后续从源码构建 Python wheel/sdist 时，Hatchling 会自动执行
+`npm run build:webui`。首次构建如果没有本地前端依赖，会按
+`package-lock.json` 自动执行 `npm ci --ignore-scripts`；因此构建机需要能运行
+Node.js/npm，并能访问 npm registry。若只安装已经构建好的 wheel，则不需要
+Node.js/npm。
 
 后续步骤都默认你在仓库根目录下操作。
 

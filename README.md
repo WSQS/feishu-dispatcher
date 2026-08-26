@@ -59,6 +59,9 @@ agent 边干边把输出流式发回飞书 —— 每个任务一个独立「话
 ## 快速开始
 
 前置：本机装好 [`uv`](https://docs.astral.sh/uv/)，以及至少一个上面的 agent CLI。
+如果从源码构建或执行 `uv sync` 触发本地构建，还需要安装 Node.js/npm；
+构建阶段会自动生成 WebUI 的 JavaScript 产物。安装已经构建好的 wheel
+则不需要 Node.js/npm。
 
 ```powershell
 git clone https://github.com/WSQS/feishu-dispatcher.git
