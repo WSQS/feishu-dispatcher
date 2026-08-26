@@ -50,6 +50,12 @@ def _webui_javascript() -> str:
     ).read_text(encoding="utf-8")
 
 
+def _webui_storage_javascript() -> str:
+    return (
+        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "storage.js"
+    ).read_text(encoding="utf-8")
+
+
 def _request(
     method: str,
     url: str,
@@ -168,6 +174,7 @@ def test_webui_polls_task_snapshots_independently():
 
 def test_webui_recovers_http_channel_instance_and_cursor():
     javascript = _webui_javascript()
+    storage_javascript = _webui_storage_javascript()
 
     def section(start: str, end: str) -> str:
         return javascript.split(start, maxsplit=1)[1].split(end, maxsplit=1)[0]
@@ -189,7 +196,10 @@ def test_webui_recovers_http_channel_instance_and_cursor():
     send = section("async function sendMessage", "function resetConversation")
     reset = section("function resetConversation", "const COLUMN_DEFAULTS")
 
-    assert 'channelInstance: "feishu-dispatcher.http-channel.instance"' in javascript
+    assert (
+        'channelInstance: "feishu-dispatcher.http-channel.instance"'
+        in storage_javascript
+    )
     assert "const MAX_POLL_RECOVERY_ATTEMPTS = 2;" in javascript
     for expected in (
         "pollGeneration += 1;",
@@ -323,6 +333,22 @@ def test_webui_api_logic_isolated_from_app_source():
     assert "new ApiError" in api_source
 
 
+def test_webui_storage_logic_isolated_from_app_source():
+    app_source = (
+        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "app.ts"
+    ).read_text(encoding="utf-8")
+    storage_source = (
+        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "storage.ts"
+    ).read_text(encoding="utf-8")
+
+    assert "localStorage." not in app_source
+    assert "feishu-dispatcher.http-channel.conversation" not in app_source
+    assert "localStorage.getItem" in storage_source
+    assert "localStorage.setItem" in storage_source
+    assert "localStorage.removeItem" in storage_source
+    assert "feishu-dispatcher.http-channel.conversation" in storage_source
+
+
 async def test_webui_assets_are_same_origin_and_do_not_require_token():
     channel = HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
@@ -337,6 +363,7 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
             "/": "text/html; charset=utf-8",
             "/webui/app.js": "text/javascript; charset=utf-8",
             "/webui/api.js": "text/javascript; charset=utf-8",
+            "/webui/storage.js": "text/javascript; charset=utf-8",
             "/webui/style.css": "text/css; charset=utf-8",
         }
         assets: dict[str, bytes] = {}
@@ -354,6 +381,7 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         html = assets["/"].decode("utf-8")
         javascript = assets["/webui/app.js"].decode("utf-8")
         api_javascript = assets["/webui/api.js"].decode("utf-8")
+        storage_javascript = assets["/webui/storage.js"].decode("utf-8")
         stylesheet = assets["/webui/style.css"].decode("utf-8")
         assert 'src="/webui/app.js"' in html
         assert 'href="/webui/style.css"' in html
@@ -390,8 +418,11 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert 'id="task-list"' in html
         assert 'id="timelines"' in html
         assert 'import { ApiError, createApiRequest } from "./api.js";' in javascript
+        assert 'from "./storage.js";' in javascript
         assert "export class ApiError" in api_javascript
         assert "export function createApiRequest" in api_javascript
+        assert "export const storageKeys" in storage_javascript
+        assert "export function storageGet" in storage_javascript
         for element_id in re.findall(
             r'document\.querySelector\("#([^"]+)"\)',
             javascript,
@@ -409,9 +440,9 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert "/conversations`" in javascript
         assert "thread_id: threadId" in javascript
         assert "const taskThreads = new Map();" in javascript
-        assert "feishu-dispatcher.http-channel.conversation" in javascript
-        assert "feishu-dispatcher.http-channel.cursor" in javascript
-        assert "feishu-dispatcher.http-channel.thread" not in javascript
+        assert "feishu-dispatcher.http-channel.conversation" in storage_javascript
+        assert "feishu-dispatcher.http-channel.cursor" in storage_javascript
+        assert "feishu-dispatcher.http-channel.thread" not in storage_javascript
     finally:
         channel.stop()
 

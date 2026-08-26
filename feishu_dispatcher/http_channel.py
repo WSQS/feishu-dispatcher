@@ -84,6 +84,9 @@ def _load_webui_assets() -> dict[str, _WebAsset]:
         "/webui/api.js": _WebAsset(
             root.joinpath("api.js").read_bytes(), "text/javascript; charset=utf-8"
         ),
+        "/webui/storage.js": _WebAsset(
+            root.joinpath("storage.js").read_bytes(), "text/javascript; charset=utf-8"
+        ),
         "/webui/style.css": _WebAsset(
             root.joinpath("style.css").read_bytes(), "text/css; charset=utf-8"
         ),

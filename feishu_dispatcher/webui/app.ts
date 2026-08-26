@@ -2,22 +2,21 @@
 // Compile with `npm run build:webui`; app.js is the deployed artifact.
 
 import { ApiError, createApiRequest } from "./api.js";
+import {
+  storageGet,
+  storageKeys,
+  storageRemove,
+  storageSet,
+  storedChannelInstanceId,
+  storedConversationId,
+  storedCursor,
+} from "./storage.js";
 
 const DISPATCHER_TASK_ID = "dispatcher";
 const MAX_POLL_RECOVERY_ATTEMPTS = 2;
 const TASK_HISTORY_LIMIT = 100;
 const TASK_POLL_INTERVAL_MS = 2000;
 const TERMINAL_TASK_STATUSES = new Set(["done", "stopped"]);
-
-const storageKeys = Object.freeze({
-  channelInstance: "feishu-dispatcher.http-channel.instance",
-  columnWidths: "feishu-dispatcher.webui.column-widths",
-  conversation: "feishu-dispatcher.http-channel.conversation",
-  cursor: (conversationId) =>
-    `feishu-dispatcher.http-channel.cursor.${conversationId}`,
-  started: (conversationId) =>
-    `feishu-dispatcher.http-channel.started.${conversationId}`,
-});
 
 const elements = Object.freeze({
   composer: document.querySelector("#composer"),
@@ -48,7 +47,7 @@ const taskThreads = new Map();
 const targetTasks = new Map();
 const taskTraceStates = new Map();
 const taskTimelines = new Map();
-let conversationId = storedConversationId();
+let conversationId = storedConversationId(() => newId("webui-conversation"));
 let cursor = storedCursor(conversationId);
 let renderedCursor = 0;
 let conversationStarted = storageGet(storageKeys.started(conversationId)) === "1";
@@ -69,30 +68,6 @@ const treeChildrenCache = new Map();
 const expandedDirs = new Set();
 let selectedFilePath = null;
 
-function storageGet(key) {
-  try {
-    return localStorage.getItem(key);
-  } catch (_error) {
-    return null;
-  }
-}
-
-function storageSet(key, value) {
-  try {
-    localStorage.setItem(key, value);
-  } catch (_error) {
-    return;
-  }
-}
-
-function storageRemove(key) {
-  try {
-    localStorage.removeItem(key);
-  } catch (_error) {
-    return;
-  }
-}
-
 function newId(prefix) {
   if (globalThis.crypto?.randomUUID) {
     return `${prefix}-${globalThis.crypto.randomUUID()}`;
@@ -103,26 +78,6 @@ function newId(prefix) {
     "",
   );
   return `${prefix}-${suffix}`;
-}
-
-function storedConversationId() {
-  const existing = storageGet(storageKeys.conversation)?.trim();
-  if (existing) {
-    return existing;
-  }
-  const created = newId("webui-conversation");
-  storageSet(storageKeys.conversation, created);
-  return created;
-}
-
-function storedCursor(id) {
-  const value = Number.parseInt(storageGet(storageKeys.cursor(id)) || "0", 10);
-  return Number.isSafeInteger(value) && value >= 0 ? value : 0;
-}
-
-function storedChannelInstanceId() {
-  const value = storageGet(storageKeys.channelInstance)?.trim();
-  return value || null;
 }
 
 function setStatus(text, tone = "idle", source = null) {
