@@ -1344,11 +1344,7 @@ async function sendMessage(text) {
     text,
   };
   try {
-    await apiRequest("/api/channel/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(payload),
-    });
+    await api.sendChannelMessage(payload);
   } catch (error) {
     if (targetTasks.get(messageId) === taskId) {
       targetTasks.delete(messageId);

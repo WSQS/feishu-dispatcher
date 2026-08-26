@@ -116,6 +116,18 @@ export interface TaskConversationCreated {
   thread_id: string;
 }
 
+export interface SendChannelMessageRequest {
+  conversation_id: string;
+  message_id: string;
+  thread_id: string | null;
+  sender_id: string;
+  text: string;
+}
+
+export interface ChannelMessageAccepted {
+  accepted: true;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -271,6 +283,10 @@ function isTaskConversationCreated(
   );
 }
 
+function isChannelMessageAccepted(value: unknown): value is ChannelMessageAccepted {
+  return isRecord(value) && value.accepted === true;
+}
+
 function invalidResponse(name: string): Error {
   return new Error(`${name}响应格式无效`);
 }
@@ -367,6 +383,20 @@ export function createApiClient(getToken: () => string) {
         payload.conversation_id !== conversationId
       ) {
         throw invalidResponse("Task Conversation");
+      }
+      return payload;
+    },
+
+    async sendChannelMessage(
+      message: SendChannelMessageRequest,
+    ): Promise<ChannelMessageAccepted> {
+      const payload = await request<unknown>("/api/channel/messages", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(message),
+      });
+      if (!isChannelMessageAccepted(payload)) {
+        throw invalidResponse("Channel 消息发送");
       }
       return payload;
     },

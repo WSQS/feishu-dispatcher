@@ -9,10 +9,12 @@ import type {
   AgentTaskSummary,
   ChannelEventPage,
   ChannelHealth,
+  ChannelMessageAccepted,
   CreateTaskConversationRequest,
   DispatcherTaskSummary,
   FilePreview,
   ProjectSummary,
+  SendChannelMessageRequest,
   TaskEventPage,
   TaskConversationCreated,
   TaskSummary,
@@ -129,6 +131,12 @@ describe("createApiClient 类型化方法", () => {
     expectTypeOf<CreateTaskConversationRequest>().toEqualTypeOf<{
       conversation_id: string;
     }>();
+    expectTypeOf(api.sendChannelMessage).parameters.toEqualTypeOf<
+      [SendChannelMessageRequest]
+    >();
+    expectTypeOf(api.sendChannelMessage).returns.resolves.toEqualTypeOf<
+      ChannelMessageAccepted
+    >();
     expectTypeOf(api.loadTaskEvents).returns.resolves.toEqualTypeOf<
       TaskEventPage
     >();
@@ -465,6 +473,46 @@ describe("createApiClient 类型化方法", () => {
       expect(options).toMatchObject({
         method: "POST",
         body: JSON.stringify({ conversation_id: "conversation-a" }),
+      });
+      expect(options.headers).toBeInstanceOf(Headers);
+      expect(options.headers.get("Content-Type")).toBe("application/json");
+    }
+  });
+
+  it("发送 Channel 消息并校验 accepted 响应", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ accepted: true }), { status: 202 }),
+      )
+      .mockResolvedValueOnce(
+        new Response(JSON.stringify({ accepted: false }), { status: 202 }),
+      );
+    vi.stubGlobal("fetch", fetch);
+    const api = createApiClient(() => "token-a");
+    const message: SendChannelMessageRequest = {
+      conversation_id: "conversation-a",
+      message_id: "message-a",
+      thread_id: "thread-a",
+      sender_id: "webui:conversation-a",
+      text: "hello",
+    };
+
+    await expect(api.sendChannelMessage(message)).resolves.toEqual({
+      accepted: true,
+    } satisfies ChannelMessageAccepted);
+    await expect(api.sendChannelMessage(message)).rejects.toThrow(
+      "Channel 消息发送响应格式无效",
+    );
+
+    expect(fetch.mock.calls.map(([path]) => path)).toEqual([
+      "/api/channel/messages",
+      "/api/channel/messages",
+    ]);
+    for (const [, options] of fetch.mock.calls) {
+      expect(options).toMatchObject({
+        method: "POST",
+        body: JSON.stringify(message),
       });
       expect(options.headers).toBeInstanceOf(Headers);
       expect(options.headers.get("Content-Type")).toBe("application/json");
