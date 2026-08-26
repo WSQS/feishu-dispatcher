@@ -57,6 +57,12 @@ npm run build:webui
 npm run check:webui
 ```
 
+构建 Python wheel 或源码包时，Hatchling 会在打包前自动执行
+`npm run build:webui`。如果构建环境没有本地 TypeScript 依赖，构建 hook
+会先执行 `npm ci --ignore-scripts`；因此源码构建需要安装 Node.js/npm，
+并且在没有本地依赖时需要访问 npm registry。安装已经构建好的 wheel
+不需要 Node.js/npm。
+
 首次运行先安装 Playwright Chromium：
 
 ```powershell
