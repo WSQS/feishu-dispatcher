@@ -438,20 +438,24 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         ):
             assert f'id="{element_id}"' in html
         assert "/api/channel/messages" in javascript
-        assert "/api/channel/events" in javascript
+        assert "/api/channel/events" in api_javascript
         assert "api.listTasks()" in javascript
         assert 'apiRequest("/api/tasks")' not in javascript
         assert "api.getChannelHealth()" in javascript
         assert 'apiRequest("/api/channel/health")' not in javascript
         assert "async getChannelHealth()" in api_javascript
         assert 'request("/api/channel/health")' in api_javascript
+        assert "api.loadChannelEvents(targetConversationId, cursor)" in javascript
+        assert "apiRequest(`/api/channel/events?${query}`)" not in javascript
+        assert "async loadChannelEvents(" in api_javascript
+        assert "api/channel/events?${query}" in api_javascript
         assert "api.loadTaskEvents(taskId" in javascript
         assert "/api/tasks/${encodeURIComponent(taskId)}/events" not in javascript
         assert "async loadTaskEvents(" in api_javascript
         assert "/api/tasks/${encodeURIComponent(taskId)}/events" in api_javascript
         assert "async listTasks()" in api_javascript
         assert 'request("/api/tasks")' in api_javascript
-        assert "/events?${query}`" in javascript
+        assert "/events?${query}`" in api_javascript
         assert "elements.connectionSettings.open = false;" in javascript
         assert (
             'task.task_id !== DISPATCHER_TASK_ID && task.status === "stopped"'

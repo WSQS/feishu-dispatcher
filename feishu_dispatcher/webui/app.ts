@@ -1131,11 +1131,7 @@ function persistCursor() {
 
 async function pollOnce(generation) {
   const targetConversationId = conversationId;
-  const query = new URLSearchParams({
-    conversation_id: targetConversationId,
-    after: String(cursor),
-  });
-  const payload = await apiRequest(`/api/channel/events?${query}`);
+  const payload = await api.loadChannelEvents(targetConversationId, cursor);
   if (generation !== pollGeneration || targetConversationId !== conversationId) {
     return false;
   }
