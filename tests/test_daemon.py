@@ -5181,6 +5181,41 @@ def test_classify_path_error_caps_sibling_listing(tmp_path):
     assert "d11" not in msg  # 第 11 个被截断（d00..d09 + 省略提示）
 
 
+def test_classify_path_error_permission_denied_is_dir(monkeypatch, tmp_path):
+    # 中间目录无权限时 is_dir/exists 会抛 OSError → 友好「路径不可访问」，不冒泡
+    target = tmp_path / "locked" / "typo"
+
+    def boom(_self):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Path, "is_dir", boom)
+    msg = _Daemon._classify_path_error(str(target))
+    assert msg is not None
+    assert "路径不可访问" in msg
+    assert str(target) in msg
+
+
+def test_classify_path_error_permission_denied_ancestor_exists(monkeypatch, tmp_path):
+    # 向上找祖先时 exists() 抛 OSError → 同样降级为「路径不可访问」
+    parent = tmp_path / "locked"
+    parent.mkdir()
+    target = parent / "typo" / "deeper"
+    real_exists = Path.exists
+
+    def fake_exists(self):
+        if self == target or self == target.parent:
+            return False
+        if self == parent:
+            raise PermissionError(13, "Permission denied")
+        return real_exists(self)
+
+    monkeypatch.setattr(Path, "is_dir", lambda _self: False)
+    monkeypatch.setattr(Path, "exists", fake_exists)
+    msg = _Daemon._classify_path_error(str(target))
+    assert msg is not None
+    assert "路径不可访问" in msg
+
+
 async def test_project_remove(tmp_path):
     daemon, bridge, _ = make_daemon()
     daemon.project_store.add(
