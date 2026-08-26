@@ -430,6 +430,8 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert "export class ApiError" in api_javascript
         assert "export function createApiRequest" in api_javascript
         assert "export function createApiClient" in api_javascript
+        assert "api.request" not in javascript
+        assert "request," not in api_javascript
         assert "export const storageKeys" in storage_javascript
         assert "export function storageGet" in storage_javascript
         for element_id in re.findall(

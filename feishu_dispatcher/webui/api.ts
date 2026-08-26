@@ -320,8 +320,6 @@ export function createApiClient(getToken: () => string) {
   const request = createApiRequest(getToken);
 
   return {
-    request,
-
     async listProjects(): Promise<ProjectSummary[]> {
       const payload = await request<unknown>("/api/projects");
       return isRecord(payload) && Array.isArray(payload.items)
