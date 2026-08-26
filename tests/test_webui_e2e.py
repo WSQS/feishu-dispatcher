@@ -256,24 +256,28 @@ async def test_webui_browser_task_history_pagination_dedup_and_switch_isolation(
                 await release_slow_history.wait()
                 slow_history_finished.set()
                 return 200, {
+                    "task_id": task_id,
                     "events": [late_task_a_record],
                     "oldest_sequence": 1,
                     "latest_sequence": 106,
                 }
             records = task_a_records[5:]
             return 200, {
+                "task_id": task_id,
                 "events": records,
                 "oldest_sequence": 1,
                 "latest_sequence": 105,
             }
         if task_id == "task-a" and before == "6":
             return 200, {
+                "task_id": task_id,
                 "events": task_a_records[:5],
                 "oldest_sequence": 1,
                 "latest_sequence": 105,
             }
         if task_id == "task-b" and before is None:
             return 200, {
+                "task_id": task_id,
                 "events": task_b_records,
                 "oldest_sequence": 1,
                 "latest_sequence": 1,

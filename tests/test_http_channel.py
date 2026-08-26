@@ -298,8 +298,9 @@ def test_webui_loads_and_paginates_persisted_task_history():
     assert 'timeline.querySelector(".history-load")?.after(fragment);' in history
     assert "preserveScroll: before !== null" in history
     assert "state.finishedTurns.add(turnId);" in history
-    assert 'query.set("before", String(before));' in history
-    assert "`/api/tasks/${encodeURIComponent(taskId)}/events?${query}`" in history
+    assert "api.loadTaskEvents(taskId, {" in history
+    assert "before: before ?? undefined" in history
+    assert "limit: TASK_HISTORY_LIMIT" in history
     assert (
         "generation !== taskHistoryGeneration || selectedTaskId !== taskId" in history
     )
@@ -440,6 +441,10 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert "/api/channel/events" in javascript
         assert "api.listTasks()" in javascript
         assert 'apiRequest("/api/tasks")' not in javascript
+        assert "api.loadTaskEvents(taskId" in javascript
+        assert "/api/tasks/${encodeURIComponent(taskId)}/events" not in javascript
+        assert "async loadTaskEvents(" in api_javascript
+        assert "/api/tasks/${encodeURIComponent(taskId)}/events" in api_javascript
         assert "async listTasks()" in api_javascript
         assert 'request("/api/tasks")' in api_javascript
         assert "/events?${query}`" in javascript

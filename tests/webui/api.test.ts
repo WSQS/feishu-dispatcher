@@ -10,6 +10,7 @@ import type {
   DispatcherTaskSummary,
   FilePreview,
   ProjectSummary,
+  TaskEventPage,
   TaskSummary,
   TreeEntry,
 } from "../../feishu_dispatcher/webui/api.ts";
@@ -109,6 +110,9 @@ describe("createApiClient 类型化方法", () => {
     >();
     expectTypeOf(api.readFile).returns.resolves.toEqualTypeOf<FilePreview>();
     expectTypeOf(api.listTasks).returns.resolves.toEqualTypeOf<TaskSummary[]>();
+    expectTypeOf(api.loadTaskEvents).returns.resolves.toEqualTypeOf<
+      TaskEventPage
+    >();
   });
 
   it("列出项目并归一化非法 items", async () => {
@@ -276,6 +280,118 @@ describe("createApiClient 类型化方法", () => {
     const api = createApiClient(() => "token-a");
 
     await expect(api.listTasks()).resolves.toEqual([]);
+  });
+
+  it("读取 Task 历史并编码分页参数", async () => {
+    const response = {
+      task_id: "项目 A/task",
+      events: [
+        {
+          sequence: 2,
+          event: {
+            schema_version: 1,
+            type: "session.input.accepted",
+            event_id: "event-2",
+            session_id: "项目 A/task",
+            turn_id: "turn-2",
+            occurred_at: "2026-08-25T00:00:00Z",
+            payload: { text: "hello" },
+          },
+        },
+        { sequence: 0, event: {} },
+        {
+          sequence: 3,
+          event: {
+            schema_version: 1,
+            type: "session.input.accepted",
+            event_id: "event-other",
+            session_id: "other-task",
+            turn_id: "turn-3",
+            occurred_at: "2026-08-25T00:00:00Z",
+            payload: { text: "other" },
+          },
+        },
+      ],
+      oldest_sequence: 1,
+      latest_sequence: 2,
+    };
+    const fetch = vi.fn().mockImplementation(() =>
+      Promise.resolve(
+        new Response(JSON.stringify(response), {
+          status: 200,
+        }),
+      ),
+    );
+    vi.stubGlobal("fetch", fetch);
+    const api = createApiClient(() => "token-a");
+
+    await expect(
+      api.loadTaskEvents("项目 A/task", { before: 6, limit: 2 }),
+    ).resolves.toEqual({
+      task_id: "项目 A/task",
+      events: [
+        {
+          sequence: 2,
+          event: {
+            schema_version: 1,
+            type: "session.input.accepted",
+            event_id: "event-2",
+            session_id: "项目 A/task",
+            turn_id: "turn-2",
+            occurred_at: "2026-08-25T00:00:00Z",
+            payload: { text: "hello" },
+          },
+        },
+      ],
+      oldest_sequence: 1,
+      latest_sequence: 2,
+    } satisfies TaskEventPage);
+    await expect(
+      api.loadTaskEvents("项目 A/task", { after: 2, limit: 3 }),
+    ).resolves.toMatchObject({ task_id: "项目 A/task" });
+    expect(fetch.mock.calls.map(([path]) => path)).toEqual([
+      "/api/tasks/%E9%A1%B9%E7%9B%AE%20A%2Ftask/events?limit=2&before=6",
+      "/api/tasks/%E9%A1%B9%E7%9B%AE%20A%2Ftask/events?limit=3&after=2",
+    ]);
+  });
+
+  it("Task 历史分页响应结构无效时抛出格式错误", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            task_id: "task-a",
+            events: [],
+            oldest_sequence: 0,
+            latest_sequence: null,
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            task_id: "other-task",
+            events: [],
+            oldest_sequence: null,
+            latest_sequence: null,
+          }),
+          { status: 200 },
+        ),
+      );
+    vi.stubGlobal(
+      "fetch",
+      fetch,
+    );
+    const api = createApiClient(() => "token-a");
+
+    await expect(api.loadTaskEvents("task-a")).rejects.toThrow(
+      "Task 历史响应格式无效",
+    );
+    await expect(api.loadTaskEvents("task-a")).rejects.toThrow(
+      "Task 历史响应格式无效",
+    );
   });
 
   it("文件响应字段不完整时抛出格式错误", async () => {
