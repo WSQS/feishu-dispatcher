@@ -57,6 +57,34 @@ export interface AgentTaskSummary {
 
 export type TaskSummary = DispatcherTaskSummary | AgentTaskSummary;
 
+export interface SessionEventRecord {
+  schema_version: 1;
+  type: string;
+  event_id: string;
+  session_id: string;
+  turn_id: string | null;
+  occurred_at: string;
+  payload: Record<string, unknown>;
+}
+
+export interface TaskEventRecord {
+  sequence: number;
+  event: SessionEventRecord;
+}
+
+export interface TaskEventPage {
+  task_id: string;
+  events: TaskEventRecord[];
+  oldest_sequence: number | null;
+  latest_sequence: number | null;
+}
+
+export interface TaskEventQuery {
+  before?: number;
+  after?: number;
+  limit?: number;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -125,6 +153,45 @@ function isTaskSummary(value: unknown): value is TaskSummary {
   return isDispatcherTaskSummary(value) || isAgentTaskSummary(value);
 }
 
+function isSequence(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 1;
+}
+
+function isSessionEventRecord(value: unknown): value is SessionEventRecord {
+  return (
+    isRecord(value) &&
+    value.schema_version === 1 &&
+    isNonEmptyString(value.type) &&
+    isNonEmptyString(value.event_id) &&
+    isNonEmptyString(value.session_id) &&
+    (value.turn_id === null || isNonEmptyString(value.turn_id)) &&
+    isNonEmptyString(value.occurred_at) &&
+    isRecord(value.payload)
+  );
+}
+
+function isTaskEventRecord(value: unknown): value is TaskEventRecord {
+  return (
+    isRecord(value) &&
+    isSequence(value.sequence) &&
+    isSessionEventRecord(value.event)
+  );
+}
+
+function isSequenceBoundary(value: unknown): value is number | null {
+  return value === null || isSequence(value);
+}
+
+function isTaskEventPage(value: unknown): value is TaskEventPage {
+  return (
+    isRecord(value) &&
+    isNonEmptyString(value.task_id) &&
+    Array.isArray(value.events) &&
+    isSequenceBoundary(value.oldest_sequence) &&
+    isSequenceBoundary(value.latest_sequence)
+  );
+}
+
 function invalidResponse(name: string): Error {
   return new Error(`${name}响应格式无效`);
 }
@@ -172,6 +239,38 @@ export function createApiClient(getToken: () => string) {
       return isRecord(payload) && Array.isArray(payload.tasks)
         ? payload.tasks.filter(isTaskSummary)
         : [];
+    },
+
+    async loadTaskEvents(
+      taskId: string,
+      {
+        before,
+        after,
+        limit = 100,
+      }: TaskEventQuery = {},
+    ): Promise<TaskEventPage> {
+      const query = new URLSearchParams({ limit: String(limit) });
+      if (before !== undefined) {
+        query.set("before", String(before));
+      }
+      if (after !== undefined) {
+        query.set("after", String(after));
+      }
+      const payload = await request<unknown>(
+        `/api/tasks/${encodeURIComponent(taskId)}/events?${query}`,
+      );
+      if (!isTaskEventPage(payload) || payload.task_id !== taskId) {
+        throw invalidResponse("Task 历史");
+      }
+      return {
+        task_id: payload.task_id,
+        events: payload.events.filter(
+          (record) =>
+            isTaskEventRecord(record) && record.event.session_id === taskId,
+        ),
+        oldest_sequence: payload.oldest_sequence,
+        latest_sequence: payload.latest_sequence,
+      };
     },
 
     async loadTreeChildren(project: string, path: string): Promise<TreeEntry[]> {

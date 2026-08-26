@@ -594,17 +594,14 @@ async function loadTaskHistory(
   state.loadingCount += 1;
   updateHistoryLoad(taskId);
   try {
-    const query = new URLSearchParams({ limit: String(TASK_HISTORY_LIMIT) });
-    if (before !== null) {
-      query.set("before", String(before));
-    }
-    const payload = await apiRequest(
-      `/api/tasks/${encodeURIComponent(taskId)}/events?${query}`,
-    );
+    const payload = await api.loadTaskEvents(taskId, {
+      before: before ?? undefined,
+      limit: TASK_HISTORY_LIMIT,
+    });
     if (generation !== taskHistoryGeneration || selectedTaskId !== taskId) {
       return;
     }
-    const records = Array.isArray(payload.events) ? payload.events : [];
+    const records = payload.events;
     renderTraceRecords(taskId, records, { preserveScroll: before !== null });
     const pageSequences = records
       .map((record) => record?.sequence)
