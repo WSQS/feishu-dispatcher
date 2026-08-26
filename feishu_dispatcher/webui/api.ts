@@ -92,6 +92,20 @@ export interface ChannelHealth {
   instance_id: string;
 }
 
+export interface ChannelEvent {
+  cursor: number;
+  type: string;
+  [key: string]: unknown;
+}
+
+export interface ChannelEventPage {
+  instance_id: string;
+  conversation_id: string;
+  events: ChannelEvent[];
+  next_cursor: number;
+  oldest_cursor: number;
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
@@ -209,6 +223,33 @@ function isChannelHealth(value: unknown): value is ChannelHealth {
   );
 }
 
+function isCursor(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function isChannelEvent(value: unknown): value is ChannelEvent {
+  return (
+    isRecord(value) &&
+    typeof value.type === "string" &&
+    value.type.trim().length > 0 &&
+    typeof value.cursor === "number" &&
+    Number.isSafeInteger(value.cursor) &&
+    value.cursor >= 1
+  );
+}
+
+function isChannelEventPage(value: unknown): value is ChannelEventPage {
+  return (
+    isRecord(value) &&
+    isNonEmptyString(value.instance_id) &&
+    isNonEmptyString(value.conversation_id) &&
+    Array.isArray(value.events) &&
+    value.events.every(isChannelEvent) &&
+    isCursor(value.next_cursor) &&
+    isCursor(value.oldest_cursor)
+  );
+}
+
 function invalidResponse(name: string): Error {
   return new Error(`${name}响应格式无效`);
 }
@@ -262,6 +303,24 @@ export function createApiClient(getToken: () => string) {
       const payload = await request<unknown>("/api/channel/health");
       if (!isChannelHealth(payload)) {
         throw invalidResponse("HTTP Channel 健康");
+      }
+      return payload;
+    },
+
+    async loadChannelEvents(
+      conversationId: string,
+      after: number,
+    ): Promise<ChannelEventPage> {
+      const query = new URLSearchParams({
+        conversation_id: conversationId,
+        after: String(after),
+      });
+      const payload = await request<unknown>(`/api/channel/events?${query}`);
+      if (
+        !isChannelEventPage(payload) ||
+        payload.conversation_id !== conversationId
+      ) {
+        throw invalidResponse("Channel 事件");
       }
       return payload;
     },

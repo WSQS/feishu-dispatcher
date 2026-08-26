@@ -7,6 +7,7 @@ import {
 } from "../../feishu_dispatcher/webui/api.ts";
 import type {
   AgentTaskSummary,
+  ChannelEventPage,
   ChannelHealth,
   DispatcherTaskSummary,
   FilePreview,
@@ -113,6 +114,9 @@ describe("createApiClient 类型化方法", () => {
     expectTypeOf(api.listTasks).returns.resolves.toEqualTypeOf<TaskSummary[]>();
     expectTypeOf(api.getChannelHealth).returns.resolves.toEqualTypeOf<
       ChannelHealth
+    >();
+    expectTypeOf(api.loadChannelEvents).returns.resolves.toEqualTypeOf<
+      ChannelEventPage
     >();
     expectTypeOf(api.loadTaskEvents).returns.resolves.toEqualTypeOf<
       TaskEventPage
@@ -326,6 +330,82 @@ describe("createApiClient 类型化方法", () => {
     expect(fetch.mock.calls.map(([path]) => path)).toEqual([
       "/api/channel/health",
       "/api/channel/health",
+    ]);
+  });
+
+  it("读取并校验 Channel 事件页并编码 cursor", async () => {
+    const fetch = vi
+      .fn()
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            instance_id: "instance-a",
+            conversation_id: "conversation A",
+            events: [
+              {
+                cursor: 2,
+                type: "message.created",
+                message_id: "message-a",
+                text: "hello",
+              },
+            ],
+            next_cursor: 2,
+            oldest_cursor: 1,
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            instance_id: "instance-a",
+            conversation_id: "other-conversation",
+            events: [],
+            next_cursor: 2,
+            oldest_cursor: 1,
+          }),
+          { status: 200 },
+        ),
+      )
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            instance_id: "instance-a",
+            conversation_id: "conversation A",
+            events: [{ cursor: 0, type: "message.created" }],
+            next_cursor: 2,
+            oldest_cursor: 1,
+          }),
+          { status: 200 },
+        ),
+      );
+    vi.stubGlobal("fetch", fetch);
+    const api = createApiClient(() => "token-a");
+
+    await expect(api.loadChannelEvents("conversation A", 1)).resolves.toEqual({
+      instance_id: "instance-a",
+      conversation_id: "conversation A",
+      events: [
+        {
+          cursor: 2,
+          type: "message.created",
+          message_id: "message-a",
+          text: "hello",
+        },
+      ],
+      next_cursor: 2,
+      oldest_cursor: 1,
+    } satisfies ChannelEventPage);
+    await expect(api.loadChannelEvents("conversation A", 2)).rejects.toThrow(
+      "Channel 事件响应格式无效",
+    );
+    await expect(api.loadChannelEvents("conversation A", 2)).rejects.toThrow(
+      "Channel 事件响应格式无效",
+    );
+    expect(fetch.mock.calls.map(([path]) => path)).toEqual([
+      "/api/channel/events?conversation_id=conversation+A&after=1",
+      "/api/channel/events?conversation_id=conversation+A&after=2",
+      "/api/channel/events?conversation_id=conversation+A&after=2",
     ]);
   });
 
