@@ -456,12 +456,15 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert "async listTasks()" in api_javascript
         assert 'request("/api/tasks")' in api_javascript
         assert "/events?${query}`" in api_javascript
+        assert "api.createTaskConversation(" in javascript
+        assert "/conversations`" not in javascript
+        assert "async createTaskConversation(" in api_javascript
         assert "elements.connectionSettings.open = false;" in javascript
         assert (
             'task.task_id !== DISPATCHER_TASK_ID && task.status === "stopped"'
             in javascript
         )
-        assert "/conversations`" in javascript
+        assert "/conversations`" in api_javascript
         assert "thread_id: threadId" in javascript
         assert "const taskThreads = new Map();" in javascript
         assert "feishu-dispatcher.http-channel.conversation" in storage_javascript
