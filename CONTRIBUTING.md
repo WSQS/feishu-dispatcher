@@ -43,6 +43,20 @@
 
 ### WebUI 浏览器测试
 
+WebUI 客户端源码位于 `feishu_dispatcher/webui/app.ts`。安装依赖并生成
+HTTP Channel 提供的 `app.js`：
+
+```powershell
+npm ci
+npm run build:webui
+```
+
+仅检查 TypeScript 源码：
+
+```powershell
+npm run check:webui
+```
+
 首次运行先安装 Playwright Chromium：
 
 ```powershell

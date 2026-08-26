@@ -44,6 +44,12 @@ def _raw_request(url: str) -> tuple[int, dict[str, str], bytes]:
         return response.status, dict(response.headers.items()), response.read()
 
 
+def _webui_javascript() -> str:
+    return (
+        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "app.js"
+    ).read_text(encoding="utf-8")
+
+
 def _request(
     method: str,
     url: str,
@@ -138,9 +144,7 @@ def test_webui_task_description_truncates_only_on_desktop():
 
 
 def test_webui_polls_task_snapshots_independently():
-    javascript = (
-        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "app.js"
-    ).read_text(encoding="utf-8")
+    javascript = _webui_javascript()
 
     assert "const TASK_POLL_INTERVAL_MS = 2000;" in javascript
     assert "let taskPollGeneration = 0;" in javascript
@@ -148,7 +152,10 @@ def test_webui_polls_task_snapshots_independently():
     assert "let taskSnapshot = null;" in javascript
     assert "let statusRevision = 0;" in javascript
     assert "nextSnapshot === taskSnapshot" in javascript
-    assert "taskRequestTail = request.catch(() => {});" in javascript
+    assert re.search(
+        r"taskRequestTail = request\.catch\(\(\) => \{\s*\}\);",
+        javascript,
+    )
     assert "statusRevision === statusRevisionAtStart" in javascript
     assert 'statusSource === "task-poll"' in javascript
     assert 'showError(error, "task-poll");' in javascript
@@ -160,9 +167,7 @@ def test_webui_polls_task_snapshots_independently():
 
 
 def test_webui_recovers_http_channel_instance_and_cursor():
-    javascript = (
-        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "app.js"
-    ).read_text(encoding="utf-8")
+    javascript = _webui_javascript()
 
     def section(start: str, end: str) -> str:
         return javascript.split(start, maxsplit=1)[1].split(end, maxsplit=1)[0]
@@ -234,9 +239,7 @@ def test_webui_recovers_http_channel_instance_and_cursor():
 
 
 def test_webui_consumes_session_events_without_duplicate_unknown_entries():
-    javascript = (
-        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "app.js"
-    ).read_text(encoding="utf-8")
+    javascript = _webui_javascript()
 
     def section(start: str, end: str) -> str:
         return javascript.split(start, maxsplit=1)[1].split(end, maxsplit=1)[0]
@@ -263,9 +266,7 @@ def test_webui_consumes_session_events_without_duplicate_unknown_entries():
 
 
 def test_webui_loads_and_paginates_persisted_task_history():
-    javascript = (
-        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "app.js"
-    ).read_text(encoding="utf-8")
+    javascript = _webui_javascript()
 
     def section(start: str, end: str) -> str:
         return javascript.split(start, maxsplit=1)[1].split(end, maxsplit=1)[0]
