@@ -1,5 +1,6 @@
-"use strict";
+// @ts-nocheck
 // Compile with `npm run build:webui`; app.js is the deployed artifact.
+import { ApiError, createApiRequest } from "./api.js";
 const DISPATCHER_TASK_ID = "dispatcher";
 const MAX_POLL_RECOVERY_ATTEMPTS = 2;
 const TASK_HISTORY_LIMIT = 100;
@@ -32,6 +33,7 @@ const elements = Object.freeze({
     timelines: document.querySelector("#timelines"),
     token: document.querySelector("#token"),
 });
+const apiRequest = createApiRequest(() => elements.token.value);
 const outputs = new Map();
 const tasks = new Map();
 const taskThreads = new Map();
@@ -57,16 +59,6 @@ let selectedProject = null;
 const treeChildrenCache = new Map();
 const expandedDirs = new Set();
 let selectedFilePath = null;
-class ApiError extends Error {
-    constructor(status, payload) {
-        const code = payload?.error || `http_${status}`;
-        const detail = payload?.message ? `：${payload.message}` : "";
-        super(`${code}${detail}`);
-        this.name = "ApiError";
-        this.status = status;
-        this.payload = payload;
-    }
-}
 function storageGet(key) {
     try {
         return localStorage.getItem(key);
@@ -607,26 +599,6 @@ async function loadEarlierTaskHistory(taskId, generation) {
         before: state.oldestLoaded,
         generation,
     });
-}
-async function apiRequest(path, options = {}) {
-    const token = elements.token.value.trim();
-    if (!token) {
-        throw new Error("请输入 http-channel.token");
-    }
-    const headers = new Headers(options.headers || {});
-    headers.set("Authorization", `Bearer ${token}`);
-    const response = await fetch(path, { ...options, headers });
-    let payload = {};
-    try {
-        payload = await response.json();
-    }
-    catch (_error) {
-        payload = {};
-    }
-    if (!response.ok) {
-        throw new ApiError(response.status, payload);
-    }
-    return payload;
 }
 function renderTaskList() {
     elements.taskList.replaceChildren();

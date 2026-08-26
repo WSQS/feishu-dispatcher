@@ -245,7 +245,7 @@ def test_webui_consumes_session_events_without_duplicate_unknown_entries():
         return javascript.split(start, maxsplit=1)[1].split(end, maxsplit=1)[0]
 
     task_routing = section("function taskForEvent", "function renderEvent")
-    event_rendering = section("function renderEvent", "async function apiRequest")
+    event_rendering = section("function renderEvent", "function renderTaskList")
 
     assert 'event.type === "session.event"' in task_routing
     assert "event.event?.session_id" in task_routing
@@ -273,7 +273,7 @@ def test_webui_loads_and_paginates_persisted_task_history():
 
     timeline = section("function ensureTimeline", "function renderSelectedTask")
     live_events = section("function renderEvent", "function traceState")
-    history = section("function traceState", "async function apiRequest")
+    history = section("function traceState", "function renderTaskList")
     task_selection = section("async function selectTask", "function persistCursor")
 
     assert "const TASK_HISTORY_LIMIT = 100;" in javascript
@@ -309,6 +309,20 @@ def test_webui_loads_and_paginates_persisted_task_history():
     assert "taskSelectionBusy || terminal" not in javascript
 
 
+def test_webui_api_logic_isolated_from_app_source():
+    app_source = (
+        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "app.ts"
+    ).read_text(encoding="utf-8")
+    api_source = (
+        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "api.ts"
+    ).read_text(encoding="utf-8")
+
+    assert "fetch(" not in app_source
+    assert "new ApiError" not in app_source
+    assert "fetch(" in api_source
+    assert "new ApiError" in api_source
+
+
 async def test_webui_assets_are_same_origin_and_do_not_require_token():
     channel = HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
@@ -322,6 +336,7 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         expected = {
             "/": "text/html; charset=utf-8",
             "/webui/app.js": "text/javascript; charset=utf-8",
+            "/webui/api.js": "text/javascript; charset=utf-8",
             "/webui/style.css": "text/css; charset=utf-8",
         }
         assets: dict[str, bytes] = {}
@@ -338,6 +353,7 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
 
         html = assets["/"].decode("utf-8")
         javascript = assets["/webui/app.js"].decode("utf-8")
+        api_javascript = assets["/webui/api.js"].decode("utf-8")
         stylesheet = assets["/webui/style.css"].decode("utf-8")
         assert 'src="/webui/app.js"' in html
         assert 'href="/webui/style.css"' in html
@@ -373,6 +389,9 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
             assert declaration in desktop_layout["rules"]
         assert 'id="task-list"' in html
         assert 'id="timelines"' in html
+        assert 'import { ApiError, createApiRequest } from "./api.js";' in javascript
+        assert "export class ApiError" in api_javascript
+        assert "export function createApiRequest" in api_javascript
         for element_id in re.findall(
             r'document\.querySelector\("#([^"]+)"\)',
             javascript,
