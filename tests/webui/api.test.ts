@@ -6,8 +6,11 @@ import {
   createApiRequest,
 } from "../../feishu_dispatcher/webui/api.ts";
 import type {
+  AgentTaskSummary,
+  DispatcherTaskSummary,
   FilePreview,
   ProjectSummary,
+  TaskSummary,
   TreeEntry,
 } from "../../feishu_dispatcher/webui/api.ts";
 
@@ -94,7 +97,7 @@ describe("createApiRequest", () => {
   });
 });
 
-describe("createApiClient Workspace 方法", () => {
+describe("createApiClient 类型化方法", () => {
   it("暴露精确的 Workspace 返回类型", () => {
     const api = createApiClient(() => "token-a");
 
@@ -105,6 +108,7 @@ describe("createApiClient Workspace 方法", () => {
       TreeEntry[]
     >();
     expectTypeOf(api.readFile).returns.resolves.toEqualTypeOf<FilePreview>();
+    expectTypeOf(api.listTasks).returns.resolves.toEqualTypeOf<TaskSummary[]>();
   });
 
   it("列出项目并归一化非法 items", async () => {
@@ -193,6 +197,85 @@ describe("createApiClient Workspace 方法", () => {
     expect(fetch.mock.calls[0][0]).toBe(
       "/api/projects/%E9%A1%B9%E7%9B%AE%20A/file?path=src%2F%E4%B8%AD%E6%96%87.ts&rev=work",
     );
+  });
+
+  it("列出并过滤 Dispatcher 与 Agent Task", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            tasks: [
+              {
+                task_id: "dispatcher",
+                kind: "dispatcher",
+                description: "Dispatcher",
+                status: "active",
+                active: true,
+              },
+              {
+                task_id: "task-a",
+                project: "demo",
+                agent: "codex",
+                description: "task",
+                status: "running",
+                turns: 2,
+                issue_url: null,
+                kind: "agent",
+                active: true,
+              },
+              {
+                task_id: "invalid",
+                kind: "agent",
+                turns: 2,
+              },
+              {
+                task_id: "   ",
+                kind: "dispatcher",
+                description: "invalid",
+                status: "active",
+                active: true,
+              },
+            ],
+          }),
+          { status: 200 },
+        ),
+      ),
+    );
+    const api = createApiClient(() => "token-a");
+
+    await expect(api.listTasks()).resolves.toEqual([
+      {
+        task_id: "dispatcher",
+        kind: "dispatcher",
+        description: "Dispatcher",
+        status: "active",
+        active: true,
+      } satisfies DispatcherTaskSummary,
+      {
+        task_id: "task-a",
+        project: "demo",
+        agent: "codex",
+        description: "task",
+        status: "running",
+        turns: 2,
+        issue_url: null,
+        kind: "agent",
+        active: true,
+      } satisfies AgentTaskSummary,
+    ]);
+  });
+
+  it("Task 顶层响应不是数组时返回空列表", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ tasks: "invalid" }), { status: 200 }),
+      ),
+    );
+    const api = createApiClient(() => "token-a");
+
+    await expect(api.listTasks()).resolves.toEqual([]);
   });
 
   it("文件响应字段不完整时抛出格式错误", async () => {
