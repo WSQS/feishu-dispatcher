@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 node_modules/
+feishu_dispatcher/webui/*.js
 .godot/
 *.egg-info/
 dist/

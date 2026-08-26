@@ -27,6 +27,9 @@ fdx = "feishu_dispatcher.agent_cli:main"
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
+[tool.hatch.build]
+artifacts = ["feishu_dispatcher/webui/*.js"]
+
 [tool.hatch.build.hooks.custom]
 path = "hatch_build.py"
 
