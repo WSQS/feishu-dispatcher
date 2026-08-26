@@ -1,9 +1,14 @@
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 
 import {
   ApiError,
   createApiClient,
   createApiRequest,
+} from "../../feishu_dispatcher/webui/api.ts";
+import type {
+  FilePreview,
+  ProjectSummary,
+  TreeEntry,
 } from "../../feishu_dispatcher/webui/api.ts";
 
 afterEach(() => {
@@ -90,13 +95,31 @@ describe("createApiRequest", () => {
 });
 
 describe("createApiClient Workspace 方法", () => {
+  it("暴露精确的 Workspace 返回类型", () => {
+    const api = createApiClient(() => "token-a");
+
+    expectTypeOf(api.listProjects).returns.resolves.toEqualTypeOf<
+      ProjectSummary[]
+    >();
+    expectTypeOf(api.loadTreeChildren).returns.resolves.toEqualTypeOf<
+      TreeEntry[]
+    >();
+    expectTypeOf(api.readFile).returns.resolves.toEqualTypeOf<FilePreview>();
+  });
+
   it("列出项目并归一化非法 items", async () => {
     const fetch = vi
       .fn()
       .mockResolvedValueOnce(
-        new Response(JSON.stringify({ items: [{ name: "项目 A" }] }), {
-          status: 200,
-        }),
+        new Response(
+          JSON.stringify({
+            items: [
+              { name: "项目 A", path: "C:/project-a", default_agent: "codex" },
+              { name: "invalid" },
+            ],
+          }),
+          { status: 200 },
+        ),
       )
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ items: null }), { status: 200 }),
@@ -104,7 +127,9 @@ describe("createApiClient Workspace 方法", () => {
     vi.stubGlobal("fetch", fetch);
     const api = createApiClient(() => "token-a");
 
-    await expect(api.listProjects()).resolves.toEqual([{ name: "项目 A" }]);
+    await expect(api.listProjects()).resolves.toEqual([
+      { name: "项目 A", path: "C:/project-a", default_agent: "codex" },
+    ]);
     await expect(api.listProjects()).resolves.toEqual([]);
     expect(fetch.mock.calls.map(([path]) => path)).toEqual([
       "/api/projects",
@@ -116,9 +141,15 @@ describe("createApiClient Workspace 方法", () => {
     const fetch = vi
       .fn()
       .mockResolvedValueOnce(
-        new Response(JSON.stringify({ entries: [{ name: "文件.ts" }] }), {
-          status: 200,
-        }),
+        new Response(
+          JSON.stringify({
+            entries: [
+              { name: "文件.ts", path: "src/文件.ts", type: "file" },
+              { name: "invalid", path: "src/invalid", type: "other" },
+            ],
+          }),
+          { status: 200 },
+        ),
       )
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ entries: "invalid" }), { status: 200 }),
@@ -128,7 +159,9 @@ describe("createApiClient Workspace 方法", () => {
 
     await expect(
       api.loadTreeChildren("项目 A", "src/中文"),
-    ).resolves.toEqual([{ name: "文件.ts" }]);
+    ).resolves.toEqual([
+      { name: "文件.ts", path: "src/文件.ts", type: "file" },
+    ]);
     await expect(api.loadTreeChildren("项目 A", "")).resolves.toEqual([]);
     expect(fetch.mock.calls.map(([path]) => path)).toEqual([
       "/api/projects/%E9%A1%B9%E7%9B%AE%20A/tree/children?path=src%2F%E4%B8%AD%E6%96%87",
@@ -138,19 +171,43 @@ describe("createApiClient Workspace 方法", () => {
 
   it("读取文件时默认使用 work revision", async () => {
     const fetch = vi.fn().mockResolvedValue(
-      new Response(JSON.stringify({ path: "src/中文.ts", content: "ok" }), {
-        status: 200,
-      }),
+      new Response(
+        JSON.stringify({
+          path: "src/中文.ts",
+          rev: "work",
+          binary: false,
+          content: "ok",
+        }),
+        { status: 200 },
+      ),
     );
     vi.stubGlobal("fetch", fetch);
     const api = createApiClient(() => "token-a");
 
     await expect(api.readFile("项目 A", "src/中文.ts")).resolves.toEqual({
       path: "src/中文.ts",
+      rev: "work",
+      binary: false,
       content: "ok",
     });
     expect(fetch.mock.calls[0][0]).toBe(
       "/api/projects/%E9%A1%B9%E7%9B%AE%20A/file?path=src%2F%E4%B8%AD%E6%96%87.ts&rev=work",
+    );
+  });
+
+  it("文件响应字段不完整时抛出格式错误", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(JSON.stringify({ path: "src/中文.ts", content: "ok" }), {
+          status: 200,
+        }),
+      ),
+    );
+    const api = createApiClient(() => "token-a");
+
+    await expect(api.readFile("项目 A", "src/中文.ts")).rejects.toThrow(
+      "文件响应格式无效",
     );
   });
 });
