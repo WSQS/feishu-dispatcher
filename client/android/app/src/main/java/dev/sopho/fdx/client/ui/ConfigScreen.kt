@@ -180,13 +180,14 @@ fun ConfigScreen(
                     scope.launch {
                         // 一个 ViewerClient 贯穿 health() 与后续项目列表：runTest 只调 health，
                         // 不再 .use{} 自闭；成功后把这同一个 client 交给 onConnected 复用，
-                        // 失败时由 runTest 负责关闭（避免泄漏）。
+                        // 失败/取消时 finally 关闭（CancellationException 也会走 finally）。
                         val client = ViewerClient.fromConnection(connection)
-                        testState = runTest(connection, storagePath, client)
-                        isTesting = false
-                        when (testState) {
-                            is TestState.Success -> onConnected?.invoke(client)
-                            else -> client.close()
+                        try {
+                            testState = runTest(connection, storagePath, client)
+                            isTesting = false
+                            if (testState is TestState.Success) onConnected?.invoke(client)
+                        } finally {
+                            if (testState !is TestState.Success) client.close()
                         }
                     }
                 },
