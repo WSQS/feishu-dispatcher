@@ -40,7 +40,6 @@ const elements = Object.freeze({
 });
 
 const api = createApiClient(() => elements.token.value);
-const apiRequest = api.request;
 
 const outputs = new Map();
 const tasks = new Map();

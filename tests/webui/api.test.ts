@@ -108,6 +108,7 @@ describe("createApiClient 类型化方法", () => {
   it("暴露精确的 Workspace 返回类型", () => {
     const api = createApiClient(() => "token-a");
 
+    expect(api).not.toHaveProperty("request");
     expectTypeOf(api.listProjects).returns.resolves.toEqualTypeOf<
       ProjectSummary[]
     >();
