@@ -43,8 +43,9 @@
 
 ### WebUI 浏览器测试
 
-WebUI 客户端源码位于 `feishu_dispatcher/webui/app.ts`。安装依赖并生成
-HTTP Channel 提供的 `app.js`：
+WebUI 客户端源码位于 `feishu_dispatcher/webui/app.ts`。`app.js` 和
+`api.js` 是编译生成的部署产物，已加入 `.gitignore`，不要手工修改或提交。
+安装依赖并生成 HTTP Channel 提供的 JavaScript：
 
 ```powershell
 npm ci
