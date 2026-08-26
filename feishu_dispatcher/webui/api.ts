@@ -36,3 +36,31 @@ export function createApiRequest(getToken: () => string) {
     return payload as T;
   };
 }
+
+export function createApiClient(getToken: () => string) {
+  const request = createApiRequest(getToken);
+
+  return {
+    request,
+
+    async listProjects(): Promise<any[]> {
+      const payload = await request("/api/projects");
+      return Array.isArray(payload.items) ? payload.items : [];
+    },
+
+    async loadTreeChildren(project: string, path: string): Promise<any[]> {
+      const query = new URLSearchParams({ path });
+      const payload = await request(
+        `/api/projects/${encodeURIComponent(project)}/tree/children?${query}`,
+      );
+      return Array.isArray(payload.entries) ? payload.entries : [];
+    },
+
+    async readFile(project: string, path: string, rev = "work"): Promise<any> {
+      const query = new URLSearchParams({ path, rev });
+      return request(
+        `/api/projects/${encodeURIComponent(project)}/file?${query}`,
+      );
+    },
+  };
+}

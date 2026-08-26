@@ -1,7 +1,7 @@
 // @ts-nocheck
 // Compile with `npm run build:webui`; app.js is the deployed artifact.
 
-import { ApiError, createApiRequest } from "./api.js";
+import { ApiError, createApiClient } from "./api.js";
 import {
   storageGet,
   storageKeys,
@@ -39,7 +39,8 @@ const elements = Object.freeze({
   token: document.querySelector("#token"),
 });
 
-const apiRequest = createApiRequest(() => elements.token.value);
+const api = createApiClient(() => elements.token.value);
+const apiRequest = api.request;
 
 const outputs = new Map();
 const tasks = new Map();
@@ -793,8 +794,7 @@ async function refreshChannelInstance() {
 }
 
 async function loadProjects() {
-  const payload = await apiRequest("/api/projects");
-  const items = Array.isArray(payload.items) ? payload.items : [];
+  const items = await api.listProjects();
   const previous = elements.projectSelect.value;
   elements.projectSelect.replaceChildren();
   const none = document.createElement("option");
@@ -833,13 +833,9 @@ async function loadChildren(dirPath) {
   if (!selectedProject) {
     return;
   }
-  const query = new URLSearchParams({ path: dirPath });
-  const payload = await apiRequest(
-    `/api/projects/${encodeURIComponent(selectedProject)}/tree/children?${query}`,
-  );
   treeChildrenCache.set(
     treeChildrenKey(dirPath),
-    Array.isArray(payload.entries) ? payload.entries : [],
+    await api.loadTreeChildren(selectedProject, dirPath),
   );
 }
 
@@ -1026,10 +1022,7 @@ async function openFile(path) {
   renderTree();
   renderFilePreview({ loading: true, path });
   try {
-    const query = new URLSearchParams({ path, rev: "work" });
-    const payload = await apiRequest(
-      `/api/projects/${encodeURIComponent(selectedProject)}/file?${query}`,
-    );
+    const payload = await api.readFile(selectedProject, path);
     renderFilePreview(payload);
   } catch (error) {
     renderFilePreview({ error: error.message || "加载文件失败" });
