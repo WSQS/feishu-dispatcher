@@ -437,7 +437,7 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
             javascript,
         ):
             assert f'id="{element_id}"' in html
-        assert "/api/channel/messages" in javascript
+        assert "/api/channel/messages" in api_javascript
         assert "/api/channel/events" in api_javascript
         assert "api.listTasks()" in javascript
         assert 'apiRequest("/api/tasks")' not in javascript
@@ -459,6 +459,10 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert "api.createTaskConversation(" in javascript
         assert "/conversations`" not in javascript
         assert "async createTaskConversation(" in api_javascript
+        assert "api.sendChannelMessage(payload)" in javascript
+        assert 'apiRequest("/api/channel/messages"' not in javascript
+        assert "async sendChannelMessage(" in api_javascript
+        assert 'request("/api/channel/messages"' in api_javascript
         assert "elements.connectionSettings.open = false;" in javascript
         assert (
             'task.task_id !== DISPATCHER_TASK_ID && task.status === "stopped"'
