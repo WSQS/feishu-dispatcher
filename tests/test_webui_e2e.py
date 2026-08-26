@@ -321,7 +321,9 @@ async def test_webui_browser_task_history_pagination_dedup_and_switch_isolation(
                 ).wait_for()
                 assert await task_a_timeline.locator(".event").count() == 100
 
-                await task_a_timeline.get_by_role("button", name="加载更早历史").click()
+                await task_a_timeline.evaluate(
+                    "(timeline) => { timeline.scrollTop = 0; }"
+                )
                 await task_a_timeline.get_by_text(
                     "task-a-history-1", exact=True
                 ).wait_for()
