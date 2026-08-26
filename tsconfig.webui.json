@@ -4,9 +4,11 @@
     "module": "ES2022",
     "lib": ["ES2022", "DOM"],
     "newLine": "lf",
-    "noCheck": true,
     "noEmitOnError": true,
     "skipLibCheck": true
   },
-  "include": ["feishu_dispatcher/webui/app.ts"]
+  "include": [
+    "feishu_dispatcher/webui/app.ts",
+    "feishu_dispatcher/webui/api.ts"
+  ]
 }
