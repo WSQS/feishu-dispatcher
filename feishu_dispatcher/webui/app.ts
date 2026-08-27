@@ -693,24 +693,8 @@ function renderTaskList() {
   }
 }
 
-function normalizeTasks(items) {
-  const normalized = new Map();
-  for (const task of items) {
-    if (task && typeof task.task_id === "string" && task.task_id) {
-      normalized.set(task.task_id, {
-        task_id: task.task_id,
-        project: task.project ?? null,
-        agent: task.agent ?? null,
-        description: task.description ?? null,
-        status: task.status ?? null,
-        turns: task.turns ?? null,
-        issue_url: task.issue_url ?? null,
-        kind: task.kind ?? null,
-        active: task.active ?? null,
-      });
-    }
-  }
-  return normalized;
+function indexTasks(items) {
+  return new Map(items.map((task) => [task.task_id, task]));
 }
 
 function applyTasks(nextTasks) {
@@ -740,7 +724,7 @@ function applyTasks(nextTasks) {
 async function fetchTasks() {
   const request = taskRequestTail.then(() => api.listTasks());
   taskRequestTail = request.catch(() => {});
-  return normalizeTasks(await request);
+  return indexTasks(await request);
 }
 
 async function loadTasks() {
