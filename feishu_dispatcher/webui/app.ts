@@ -238,10 +238,21 @@ function appendEvent({
   scrollTimeline(taskId);
 }
 
-function ensureOutput(event, taskId) {
+function ensureOutput(event, taskId, turnId = null) {
   const existing = outputs.get(event.output_id);
   if (existing) {
+    if (turnId) {
+      traceState(taskId).turnOutputs.set(turnId, existing);
+    }
     return existing;
+  }
+
+  const existingTurnOutput = turnId
+    ? traceState(taskId).turnOutputs.get(turnId)
+    : null;
+  if (existingTurnOutput) {
+    outputs.set(event.output_id, existingTurnOutput);
+    return existingTurnOutput;
   }
 
   revealTimeline(taskId);
@@ -266,8 +277,21 @@ function ensureOutput(event, taskId) {
   article.append(header, body, footer);
   ensureTimeline(taskId).append(article);
 
-  const output = { article, body, footer, status, taskId };
+  const output = {
+    article,
+    body,
+    chunks: new Map(),
+    content: body,
+    footer,
+    status,
+    taskId,
+    turnId,
+    unsequenced: "",
+  };
   outputs.set(event.output_id, output);
+  if (turnId) {
+    traceState(taskId).turnOutputs.set(turnId, output);
+  }
   scrollTimeline(taskId);
   return output;
 }
@@ -339,8 +363,12 @@ function renderEvent(event) {
     }
     case "output.updated": {
       const output = ensureOutput(event, taskId);
-      output.footer.textContent = event.footer || "";
-      output.status.textContent = event.status || "running";
+      if (output.footer) {
+        output.footer.textContent = event.footer || "";
+      }
+      if (output.status) {
+        output.status.textContent = event.status || "running";
+      }
       output.article.dataset.status = event.status || "running";
       break;
     }
@@ -363,7 +391,7 @@ function renderEvent(event) {
       if (sessionEvent.type === "agent.output.started") {
         if (presentation?.output_id) {
           rememberTarget(presentation.output_id, taskId);
-          ensureOutput(presentation, taskId);
+          ensureOutput(presentation, taskId, sessionEvent.turn_id);
         }
         break;
       }
@@ -372,17 +400,70 @@ function renderEvent(event) {
         sessionEvent.type === "agent.plan.updated" ||
         sessionEvent.type === "tool.call.observed"
       ) {
+        const turnOutput = traceState(taskId).turnOutputs.get(
+          sessionEvent.turn_id,
+        );
+        if (
+          sessionEvent.type === "agent.output.delta" &&
+          sessionEvent.payload?.stream === "message" &&
+          turnOutput
+        ) {
+          appendOutputChunk(
+            turnOutput,
+            event.trace_sequence,
+            presentation?.text || sessionEvent.payload.text || "",
+          );
+          scrollTimeline(taskId);
+          break;
+        }
         if (presentation?.output_id) {
-          const output = ensureOutput(presentation, taskId);
-          output.body.textContent += presentation.text || "";
+          const output = ensureOutput(
+            presentation,
+            taskId,
+            sessionEvent.turn_id,
+          );
+          appendOutputChunk(
+            output,
+            event.trace_sequence,
+            presentation.text || "",
+          );
           scrollTimeline(output.taskId);
         }
         break;
       }
       if (sessionEvent.type === "agent.output.finished") {
+        const state = traceState(taskId);
+        if (typeof sessionEvent.turn_id === "string" && sessionEvent.turn_id) {
+          state.finishedTurns.add(sessionEvent.turn_id);
+        }
+        const turnOutput = state.turnOutputs.get(sessionEvent.turn_id);
+        if (turnOutput) {
+          turnOutput.content.textContent =
+            typeof sessionEvent.payload?.message === "string"
+              ? sessionEvent.payload.message
+              : turnOutput.content.textContent;
+          turnOutput.chunks.clear();
+          turnOutput.unsequenced = "";
+          if (presentation?.footer && turnOutput.footer) {
+            turnOutput.footer.textContent = presentation.footer;
+          }
+          if (presentation?.status && turnOutput.status) {
+            turnOutput.status.textContent = presentation.status;
+            turnOutput.article.dataset.status = presentation.status;
+          }
+          scrollTimeline(taskId);
+          break;
+        }
         if (presentation?.output_id) {
-          const output = ensureOutput(presentation, taskId);
-          output.body.textContent += presentation.text || "";
+          const output = ensureOutput(
+            presentation,
+            taskId,
+            sessionEvent.turn_id,
+          );
+          output.content.textContent =
+            typeof sessionEvent.payload?.message === "string"
+              ? sessionEvent.payload.message
+              : presentation.text || "";
           output.footer.textContent = presentation.footer || "";
           output.status.textContent = presentation.status || "running";
           output.article.dataset.status = presentation.status || "running";
@@ -418,6 +499,7 @@ function traceState(taskId) {
       loadingCount: 0,
       oldestLoaded: null,
       finishedTurns: new Set(),
+      turnOutputs: new Map(),
       seenSequences: new Set(),
     };
     taskTraceStates.set(taskId, state);
@@ -436,7 +518,58 @@ function claimTraceSequence(taskId, sequence) {
   return true;
 }
 
-function traceRecordArticle(record, state) {
+function appendOutputChunk(output, sequence, text) {
+  if (Number.isSafeInteger(sequence)) {
+    output.chunks.set(sequence, text);
+  } else {
+    output.unsequenced += text;
+  }
+  output.content.textContent =
+    [...output.chunks]
+      .sort(([left], [right]) => left - right)
+      .map(([, chunk]) => chunk)
+      .join("") + output.unsequenced;
+}
+
+function mergeHistoryOutput(record, state, taskId) {
+  const event = record?.event;
+  const turnId = event?.turn_id;
+  const text = event?.payload?.text;
+  if (typeof turnId !== "string" || !turnId || typeof text !== "string") {
+    return createEventArticle({
+      label: "Agent",
+      text: typeof text === "string" ? text : "",
+      detail: `seq ${record.sequence}`,
+    });
+  }
+
+  const existing = state.turnOutputs.get(turnId);
+  if (existing) {
+    appendOutputChunk(existing, record.sequence, text);
+    return null;
+  }
+
+  const article = createEventArticle({
+    label: "Agent",
+    text,
+    detail: `seq ${record.sequence}`,
+  });
+  const content = article.querySelector(".event-text");
+  state.turnOutputs.set(turnId, {
+    article,
+    body: content,
+    chunks: new Map([[record.sequence, text]]),
+    content,
+    footer: null,
+    status: null,
+    taskId,
+    turnId,
+    unsequenced: "",
+  });
+  return article;
+}
+
+function traceRecordArticle(record, state, taskId) {
   const event = record?.event;
   const payload = event?.payload;
   if (
@@ -462,6 +595,16 @@ function traceRecordArticle(record, state) {
     case "agent.output.finished":
       if (typeof event.turn_id === "string" && event.turn_id) {
         state.finishedTurns.add(event.turn_id);
+        const turnOutput = state.turnOutputs.get(event.turn_id);
+        if (turnOutput) {
+          turnOutput.content.textContent =
+            typeof payload.message === "string"
+              ? payload.message
+              : turnOutput.content.textContent;
+          turnOutput.chunks.clear();
+          turnOutput.unsequenced = "";
+          return null;
+        }
       }
       return createEventArticle({
         label: "Agent",
@@ -475,11 +618,7 @@ function traceRecordArticle(record, state) {
       ) {
         return null;
       }
-      return createEventArticle({
-        label: "Agent",
-        text: typeof payload.text === "string" ? payload.text : "",
-        detail: detail,
-      });
+      return mergeHistoryOutput(record, state, taskId);
     case "agent.plan.updated": {
       const marks = {
         completed: "☑️",
@@ -534,6 +673,7 @@ function traceRecordArticle(record, state) {
 function renderTraceRecords(taskId, records, { preserveScroll = false } = {}) {
   const timeline = ensureTimeline(taskId);
   const state = traceState(taskId);
+  const previousHeight = timeline.scrollHeight;
   for (const record of records) {
     if (record?.event?.type === "agent.output.finished") {
       const turnId = record.event.turn_id;
@@ -550,16 +690,18 @@ function renderTraceRecords(taskId, records, { preserveScroll = false } = {}) {
     ) {
       continue;
     }
-    const article = traceRecordArticle(record, state);
+    const article = traceRecordArticle(record, state, taskId);
     if (article) {
       fragment.append(article);
     }
   }
   if (!fragment.childNodes.length) {
+    if (preserveScroll) {
+      timeline.scrollTop += timeline.scrollHeight - previousHeight;
+    }
     return;
   }
   revealTimeline(taskId);
-  const previousHeight = timeline.scrollHeight;
   timeline.querySelector(".history-load")?.after(fragment);
   if (preserveScroll) {
     timeline.scrollTop += timeline.scrollHeight - previousHeight;

@@ -13,6 +13,9 @@ from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.http_channel import HttpChannel
 from feishu_dispatcher.session_event import (
+    AgentOutputDelta,
+    AgentOutputFinished,
+    AgentOutputStarted,
     SessionErrorOccurred,
     SessionEvent,
     SessionInputAccepted,
@@ -66,6 +69,22 @@ def _trace_record(
                 source=ConversationRef("feishu", f"thread-{session_id}"),
             )
         ),
+    )
+    return {"sequence": sequence, "event": session_event_to_dict(event)}
+
+
+def _session_trace_record(
+    sequence: int,
+    session_id: str,
+    turn_id: str,
+    body,
+) -> dict:
+    event = SessionEvent(
+        event_id=f"event-{session_id}-{sequence}",
+        session_id=session_id,
+        turn_id=turn_id,
+        occurred_at=datetime(2026, 8, 25, tzinfo=timezone.utc),
+        body=body,
     )
     return {"sequence": sequence, "event": session_event_to_dict(event)}
 
@@ -178,6 +197,205 @@ async def test_webui_browser_help_refresh_cursor_and_token_storage():
             finally:
                 await browser.close()
     finally:
+        await asyncio.to_thread(channel.stop)
+
+
+@pytest.mark.parametrize("history_first", [True, False], ids=["history-first", "live-first"])
+@pytest.mark.asyncio
+async def test_webui_browser_running_task_history_merges_output_deltas(history_first):
+    loop = asyncio.get_running_loop()
+    token = "tok-browser-running-history"
+    turn_id = "turn-running-1"
+    thread_ids: list[str] = []
+    recent_history_started = asyncio.Event()
+    release_recent_history = asyncio.Event()
+    records = [
+        _session_trace_record(1, "task-running", turn_id, AgentOutputStarted()),
+        _session_trace_record(
+            2,
+            "task-running",
+            turn_id,
+            AgentOutputDelta(stream="message", text="The "),
+        ),
+        _session_trace_record(
+            3,
+            "task-running",
+            turn_id,
+            AgentOutputDelta(stream="message", text="quick brown fox"),
+        ),
+    ]
+    records.extend(
+        _session_trace_record(
+            sequence,
+            "task-running",
+            f"turn-filler-{sequence}",
+            AgentOutputDelta(stream="thought", text=f"thought-{sequence}"),
+        )
+        for sequence in range(4, 103)
+    )
+
+    async def list_tasks(_context: dict, _request: dict) -> tuple[int, dict]:
+        return 200, {
+            "tasks": [
+                {
+                    "task_id": "dispatcher",
+                    "kind": "dispatcher",
+                    "description": "Dispatcher",
+                    "status": "active",
+                    "active": True,
+                },
+                {
+                    "task_id": "task-running",
+                    "project": "project-running",
+                    "agent": "codex",
+                    "description": "Running history task",
+                    "status": "running",
+                    "turns": 1,
+                    "issue_url": None,
+                    "kind": "agent",
+                    "active": True,
+                },
+            ]
+        }
+
+    async def create_task_conversation(
+        _context: dict, request: dict
+    ) -> tuple[int, dict]:
+        conversation_id = request["body"]["conversation_id"]
+        thread_id = channel.create_thread(conversation_id, "task-running")
+        channel.open_output(thread_id, "Agent")
+        thread_ids.append(thread_id)
+        return 200, {
+            "task_id": request["segments"]["task_id"],
+            "conversation_id": conversation_id,
+            "thread_id": thread_id,
+        }
+
+    async def list_task_events(_context: dict, request: dict) -> tuple[int, dict]:
+        assert request["segments"]["task_id"] == "task-running"
+        before = request["query"].get("before")
+        if before is None:
+            recent_history_started.set()
+            await release_recent_history.wait()
+            page_records = records[2:]
+        elif before == "3":
+            page_records = records[:2]
+        else:
+            raise AssertionError(f"unexpected before cursor: {before}")
+        return 200, {
+            "task_id": "task-running",
+            "events": page_records,
+            "oldest_sequence": 1,
+            "latest_sequence": 102,
+        }
+
+    async def list_projects(_context: dict, _request: dict) -> tuple[int, dict]:
+        return 200, {"items": []}
+
+    channel = HttpChannel(
+        token,
+        loop,
+        host="127.0.0.1",
+        port=0,
+        routes={
+            ("GET", "/api/tasks"): list_tasks,
+            ("POST", "/api/tasks/{task_id}/conversations"): create_task_conversation,
+            ("GET", "/api/tasks/{task_id}/events"): list_task_events,
+            ("GET", "/api/projects"): list_projects,
+        },
+    )
+    channel.start(lambda _message: asyncio.sleep(0))
+    try:
+        async with async_playwright() as playwright:
+            browser = await _launch_browser(playwright)
+            try:
+                page = await browser.new_page()
+                page_errors: list[str] = []
+                page.on("pageerror", lambda error: page_errors.append(str(error)))
+                await page.goto(channel.base_url)
+                await page.locator("#connection-settings > summary").click()
+                await page.locator("#token").fill(token)
+                await page.locator("#connect").click()
+                await _wait_for_status(page, "已连接")
+
+                await page.locator(
+                    ".task-item", has_text="task-running · project-running"
+                ).click()
+
+                timeline = page.locator(
+                    '.task-timeline[data-task-id="task-running"]'
+                )
+                await asyncio.wait_for(recent_history_started.wait(), timeout=3)
+                if history_first:
+                    release_recent_history.set()
+                    await timeline.get_by_text(
+                        "quick brown fox", exact=True
+                    ).wait_for()
+
+                thread_id = thread_ids[0]
+                channel.handle_session_event(
+                    thread_id,
+                    SessionEvent(
+                        event_id="event-live-started",
+                        session_id="task-running",
+                        turn_id=turn_id,
+                        occurred_at=datetime(2026, 8, 25, tzinfo=timezone.utc),
+                        body=AgentOutputStarted(),
+                    ),
+                    trace_sequence=103,
+                )
+                channel.handle_session_event(
+                    thread_id,
+                    SessionEvent(
+                        event_id="event-live-delta",
+                        session_id="task-running",
+                        turn_id=turn_id,
+                        occurred_at=datetime(2026, 8, 25, tzinfo=timezone.utc),
+                        body=AgentOutputDelta(stream="message", text=" jumps"),
+                    ),
+                    trace_sequence=104,
+                )
+                if not history_first:
+                    await timeline.get_by_text(" jumps", exact=True).wait_for()
+                    release_recent_history.set()
+                await timeline.get_by_text(
+                    "quick brown fox jumps", exact=True
+                ).wait_for()
+                assert (
+                    await timeline.locator('.event[data-role="assistant"]').count() == 1
+                )
+
+                channel.handle_session_event(
+                    thread_id,
+                    SessionEvent(
+                        event_id="event-live-finished",
+                        session_id="task-running",
+                        turn_id=turn_id,
+                        occurred_at=datetime(2026, 8, 25, tzinfo=timezone.utc),
+                        body=AgentOutputFinished(
+                            message="The quick brown fox jumps.",
+                            thought="",
+                            outcome="completed",
+                        ),
+                    ),
+                    trace_sequence=105,
+                )
+                await timeline.get_by_text(
+                    "The quick brown fox jumps.", exact=True
+                ).wait_for()
+
+                await timeline.locator(".history-load").click()
+                await timeline.locator(".history-load").wait_for(state="hidden")
+                assert (
+                    await timeline.locator('.event[data-role="assistant"]').count() == 1
+                )
+                assert await timeline.get_by_text("The ", exact=True).count() == 0
+                assert page_errors == []
+            finally:
+                release_recent_history.set()
+                await browser.close()
+    finally:
+        release_recent_history.set()
         await asyncio.to_thread(channel.stop)
 
 
