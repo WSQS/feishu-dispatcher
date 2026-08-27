@@ -270,7 +270,7 @@ def test_webui_consumes_session_events_without_duplicate_unknown_entries():
     ):
         assert f'sessionEvent.type === "{event_type}"' in event_rendering
     assert "event.presentation" in event_rendering
-    assert "ensureOutput(presentation, taskId)" in event_rendering
+    assert "ensureOutput(presentation, taskId, sessionEvent.turn_id)" in event_rendering
     assert "收到无法识别的 SessionEvent。" in event_rendering
     assert "text: sessionEvent.type" in event_rendering
 
