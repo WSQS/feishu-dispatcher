@@ -11,12 +11,16 @@ import {
   storedConversationId,
   storedCursor,
 } from "./storage.js";
+import {
+  DISPATCHER_TASK_ID,
+  indexTasks,
+  taskIsTerminal,
+  taskName,
+} from "./tasks.js";
 
-const DISPATCHER_TASK_ID = "dispatcher";
 const MAX_POLL_RECOVERY_ATTEMPTS = 2;
 const TASK_HISTORY_LIMIT = 100;
 const TASK_POLL_INTERVAL_MS = 2000;
-const TERMINAL_TASK_STATUSES = new Set(["done", "stopped"]);
 
 const elements = Object.freeze({
   composer: document.querySelector("#composer"),
@@ -86,17 +90,6 @@ function setStatus(text, tone = "idle", source = null) {
   elements.status.textContent = text;
   elements.status.title = text;
   elements.status.dataset.tone = tone;
-}
-
-function taskName(task) {
-  if (!task || task.task_id === DISPATCHER_TASK_ID) {
-    return "Dispatcher";
-  }
-  return `${task.task_id} · ${task.project || "未命名项目"}`;
-}
-
-function taskIsTerminal(task) {
-  return TERMINAL_TASK_STATUSES.has(task?.status);
 }
 
 function renderMetadata() {
@@ -691,10 +684,6 @@ function renderTaskList() {
     });
     elements.taskList.append(button);
   }
-}
-
-function indexTasks(items) {
-  return new Map(items.map((task) => [task.task_id, task]));
 }
 
 function applyTasks(nextTasks) {
