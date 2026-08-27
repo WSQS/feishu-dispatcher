@@ -747,7 +747,9 @@ async function loadTaskHistory(
       firstSequence <= payload.oldest_sequence;
   } finally {
     state.loadingCount -= 1;
-    updateHistoryLoad(taskId);
+    if (generation === taskHistoryGeneration && selectedTaskId === taskId) {
+      updateHistoryLoad(taskId);
+    }
   }
 }
 
@@ -873,7 +875,10 @@ function clearChannelRuntimeState() {
   selectedTaskId = DISPATCHER_TASK_ID;
   outputs.clear();
   taskThreads.clear();
+  taskTraceStates.clear();
   targetTasks.clear();
+  taskTimelines.clear();
+  elements.timelines.replaceChildren();
   ensureTimeline(selectedTaskId);
   renderTaskList();
   renderSelectedTask();

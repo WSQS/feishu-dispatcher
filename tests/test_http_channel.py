@@ -195,6 +195,7 @@ def test_webui_recovers_http_channel_instance_and_cursor():
     polling = section("function startPolling", "async function pollTasksOnce")
     send = section("async function sendMessage", "function resetConversation")
     reset = section("function resetConversation", "const COLUMN_DEFAULTS")
+    history = section("async function loadTaskHistory", "async function loadEarlierTaskHistory")
 
     assert (
         'channelInstance: "feishu-dispatcher.http-channel.instance"'
@@ -206,8 +207,11 @@ def test_webui_recovers_http_channel_instance_and_cursor():
         "storageRemove(storageKeys.cursor(conversationId));",
         "storageRemove(storageKeys.started(conversationId));",
         "taskThreads.clear();",
+        "taskTraceStates.clear();",
         "targetTasks.clear();",
         "outputs.clear();",
+        "taskTimelines.clear();",
+        "elements.timelines.replaceChildren();",
     ):
         assert expected in clear_state
     assert (
@@ -246,6 +250,10 @@ def test_webui_recovers_http_channel_instance_and_cursor():
         "const taskId = requestedTaskId;"
     )
     assert "renderedCursor = 0;" in reset
+    assert (
+        "generation === taskHistoryGeneration && selectedTaskId === taskId"
+        in history
+    )
 
 
 def test_webui_consumes_session_events_without_duplicate_unknown_entries():
