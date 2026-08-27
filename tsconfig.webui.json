@@ -10,6 +10,7 @@
   "include": [
     "feishu_dispatcher/webui/app.ts",
     "feishu_dispatcher/webui/api.ts",
-    "feishu_dispatcher/webui/storage.ts"
+    "feishu_dispatcher/webui/storage.ts",
+    "feishu_dispatcher/webui/tasks.ts"
   ]
 }

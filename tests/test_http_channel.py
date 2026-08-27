@@ -372,6 +372,7 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
             "/webui/app.js": "text/javascript; charset=utf-8",
             "/webui/api.js": "text/javascript; charset=utf-8",
             "/webui/storage.js": "text/javascript; charset=utf-8",
+            "/webui/tasks.js": "text/javascript; charset=utf-8",
             "/webui/style.css": "text/css; charset=utf-8",
         }
         assets: dict[str, bytes] = {}
@@ -390,6 +391,7 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         javascript = assets["/webui/app.js"].decode("utf-8")
         api_javascript = assets["/webui/api.js"].decode("utf-8")
         storage_javascript = assets["/webui/storage.js"].decode("utf-8")
+        tasks_javascript = assets["/webui/tasks.js"].decode("utf-8")
         stylesheet = assets["/webui/style.css"].decode("utf-8")
         assert 'src="/webui/app.js"' in html
         assert 'href="/webui/style.css"' in html
@@ -427,6 +429,7 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert 'id="timelines"' in html
         assert 'import { ApiError, createApiClient } from "./api.js";' in javascript
         assert 'from "./storage.js";' in javascript
+        assert 'from "./tasks.js";' in javascript
         assert "export class ApiError" in api_javascript
         assert "export function createApiRequest" in api_javascript
         assert "export function createApiClient" in api_javascript
@@ -434,6 +437,8 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert "request," not in api_javascript
         assert "export const storageKeys" in storage_javascript
         assert "export function storageGet" in storage_javascript
+        assert "export const DISPATCHER_TASK_ID" in tasks_javascript
+        assert "export function indexTasks" in tasks_javascript
         for element_id in re.findall(
             r'document\.querySelector\("#([^"]+)"\)',
             javascript,
@@ -443,8 +448,11 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert "/api/channel/events" in api_javascript
         assert "api.listTasks()" in javascript
         assert 'apiRequest("/api/tasks")' not in javascript
-        assert "function indexTasks(items)" in javascript
-        assert "new Map(items.map((task) => [task.task_id, task]))" in javascript
+        assert "function indexTasks(items)" in tasks_javascript
+        assert (
+            "new Map(items.map((task) => [task.task_id, task]))"
+            in tasks_javascript
+        )
         assert "function normalizeTasks(items)" not in javascript
         assert "project: task.project ?? null" not in javascript
         assert "api.getChannelHealth()" in javascript
