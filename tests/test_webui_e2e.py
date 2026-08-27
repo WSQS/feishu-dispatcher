@@ -200,6 +200,131 @@ async def test_webui_browser_help_refresh_cursor_and_token_storage():
         await asyncio.to_thread(channel.stop)
 
 
+@pytest.mark.asyncio
+async def test_webui_browser_channel_restart_reloads_task_history_from_clean_state():
+    loop = asyncio.get_running_loop()
+    token = "tok-browser-restart-history"
+    history_requests = 0
+    reload_history_started = asyncio.Event()
+    release_reload_history = asyncio.Event()
+
+    async def list_tasks(_context: dict, _request: dict) -> tuple[int, dict]:
+        return 200, {
+            "tasks": [
+                {
+                    "task_id": "dispatcher",
+                    "kind": "dispatcher",
+                    "description": "Dispatcher",
+                    "status": "active",
+                    "active": True,
+                },
+                {
+                    "task_id": "task-restart",
+                    "project": "project-restart",
+                    "agent": "codex",
+                    "description": "Restart history task",
+                    "status": "done",
+                    "turns": 1,
+                    "issue_url": None,
+                    "kind": "agent",
+                    "active": False,
+                },
+            ]
+        }
+
+    async def list_projects(_context: dict, _request: dict) -> tuple[int, dict]:
+        return 200, {"items": []}
+
+    async def list_task_events(_context: dict, request: dict) -> tuple[int, dict]:
+        nonlocal history_requests
+        assert request["segments"]["task_id"] == "task-restart"
+        assert request["query"].get("before") is None
+        history_requests += 1
+        if history_requests == 2:
+            reload_history_started.set()
+            await release_reload_history.wait()
+        return 200, {
+            "task_id": "task-restart",
+            "events": [_trace_record(1, "task-restart", "history after restart")],
+            "oldest_sequence": 1,
+            "latest_sequence": 1,
+        }
+
+    channel = HttpChannel(
+        token,
+        loop,
+        host="127.0.0.1",
+        port=0,
+        routes={
+            ("GET", "/api/tasks"): list_tasks,
+            ("GET", "/api/tasks/{task_id}/events"): list_task_events,
+            ("GET", "/api/projects"): list_projects,
+        },
+    )
+    channel.start(lambda _message: asyncio.sleep(0))
+    try:
+        async with async_playwright() as playwright:
+            browser = await _launch_browser(playwright)
+            try:
+                page = await browser.new_page()
+                page_errors: list[str] = []
+                page.on("pageerror", lambda error: page_errors.append(str(error)))
+                await page.goto(channel.base_url)
+                await page.locator("#connection-settings > summary").click()
+                await page.locator("#token").fill(token)
+                await page.locator("#connect").click()
+                await _wait_for_status(page, "已连接")
+
+                task_button = page.locator(
+                    ".task-item", has_text="task-restart · project-restart"
+                )
+                await task_button.click()
+                await _wait_for_status(page, "已打开 task-restart · project-restart 的历史")
+                timeline = page.locator(
+                    '.task-timeline[data-task-id="task-restart"]'
+                )
+                await timeline.get_by_text("history after restart", exact=True).wait_for()
+                assert history_requests == 1
+                assert await timeline.locator(".event").count() == 1
+
+                await task_button.click()
+                await asyncio.wait_for(reload_history_started.wait(), timeout=3)
+                channel._instance_id = "restarted-instance"
+                await page.locator("#connection-settings > summary").click()
+                await page.locator("#connect").click()
+                await _wait_for_status(page, "服务已重启，请重新打开 Task")
+                assert (
+                    await page.locator(
+                        '.task-timeline[data-task-id="task-restart"]'
+                    ).count()
+                    == 0
+                )
+
+                release_reload_history.set()
+                await page.wait_for_timeout(200)
+                assert (
+                    await page.locator(
+                        '.task-timeline[data-task-id="task-restart"]'
+                    ).count()
+                    == 0
+                )
+
+                await task_button.click()
+                await _wait_for_status(page, "已打开 task-restart · project-restart 的历史")
+                timeline = page.locator(
+                    '.task-timeline[data-task-id="task-restart"]'
+                )
+                await timeline.get_by_text("history after restart", exact=True).wait_for()
+                assert history_requests == 3
+                assert await timeline.locator(".event").count() == 1
+                assert page_errors == []
+            finally:
+                release_reload_history.set()
+                await browser.close()
+    finally:
+        await asyncio.to_thread(channel.stop)
+
+
 @pytest.mark.parametrize("history_first", [True, False], ids=["history-first", "live-first"])
 @pytest.mark.asyncio
 async def test_webui_browser_running_task_history_merges_output_deltas(history_first):
