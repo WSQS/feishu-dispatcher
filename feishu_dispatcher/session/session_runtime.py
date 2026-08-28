@@ -6,8 +6,8 @@ import secrets
 from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
-from .conversation import ConversationRef
-from .session_event import SessionState
+from ..conversation import ConversationRef
+from ..session_event import SessionState
 
 
 @dataclass(frozen=True)

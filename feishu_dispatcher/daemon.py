@@ -52,7 +52,7 @@ from .scheduler import (
     build_scheduler_tools,
     run_tool_loop,
 )
-from .session_runtime import TurnRequest
+from .session import TurnRequest
 from .session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
