@@ -52,6 +52,7 @@ from .scheduler import (
     build_scheduler_tools,
     run_tool_loop,
 )
+from .session_runtime import TurnRequest
 from .session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
@@ -396,15 +397,6 @@ class _BgBatch:
 
     def render(self) -> str:
         return "\n\n".join(self.blocks) + "\n\n" + _BG_GUIDANCE
-
-
-@dataclass(frozen=True)
-class TurnRequest:
-    """一轮 agent 输入及其完整会话引用。"""
-
-    text: str
-    conversation: ConversationRef
-    turn_id: str = field(default_factory=lambda: secrets.token_hex(16))
 
 
 class _FanoutStreamingOutput:
