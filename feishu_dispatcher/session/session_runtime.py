@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Literal, Protocol
+from typing import Literal, Protocol, runtime_checkable
 
 from ..conversation import ConversationRef
-from ..session_event import SessionState
+from ..session_event import SessionEvent, SessionState
 
 
 @dataclass(frozen=True)
@@ -38,6 +39,10 @@ class TurnReceipt:
     placement: TurnPlacement
 
 
+SessionEventListener = Callable[[SessionEvent], None]
+
+
+@runtime_checkable
 class SessionRuntime(Protocol):
     """统一的 Session 输入与运行时生命周期接口。"""
 
@@ -46,6 +51,10 @@ class SessionRuntime(Protocol):
 
     @property
     def state(self) -> SessionState: ...
+
+    def subscribe(self, listener: SessionEventListener) -> Callable[[], None]:
+        """订阅 Session 事件并返回取消订阅函数。"""
+        ...
 
     def submit(self, request: TurnRequest) -> TurnReceipt:
         """接受并排队一轮输入，不等待执行完成。"""
