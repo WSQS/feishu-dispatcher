@@ -576,6 +576,8 @@ class _Daemon:
     )
     #: Dispatcher 的统一 Session Runtime；首次自然语言输入时惰性构造。
     _dispatcher_runtime: DispatcherSessionRuntime | None = None
+    #: Dispatcher Runtime 事件消费者尾任务；按产生顺序串行处理，关闭前等待收尾。
+    _dispatcher_event_tail: asyncio.Task[None] | None = None
     #: 同一 Session 的 Turn 共用一把锁；跨 Channel / runner 串行，不同 Session 可并行。
     _session_turn_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     #: 由启动装配层注入；稳定 key → Channel 实例。
@@ -781,6 +783,28 @@ class _Daemon:
                 event.event_id,
             )
         return record
+
+    def _queue_dispatcher_event(self, event: SessionEvent) -> None:
+        """串行桥接 Dispatcher Runtime 事件到 Daemon 事件管线。"""
+        previous = self._dispatcher_event_tail
+        task: asyncio.Task[None]
+
+        async def consume() -> None:
+            try:
+                if previous is not None:
+                    await previous
+                await self._emit_session_event(event)
+            finally:
+                if self._dispatcher_event_tail is task:
+                    self._dispatcher_event_tail = None
+
+        task = asyncio.create_task(consume())
+        self._dispatcher_event_tail = task
+
+    async def _wait_dispatcher_events(self) -> None:
+        """等待已接收的 Dispatcher Runtime 事件完成持久化与消费。"""
+        while (tail := self._dispatcher_event_tail) is not None:
+            await tail
 
     async def _close_trace_store(self) -> None:
         """幂等关闭 daemon 持有的 Session Trace Store。"""
@@ -2627,6 +2651,7 @@ class _Daemon:
                 memory=self._sched_memory,
                 tools_provider=self._dispatcher_tools_for,
             )
+            runtime.subscribe(self._queue_dispatcher_event)
             self._dispatcher_runtime = runtime
         return runtime
 
@@ -3511,6 +3536,7 @@ class _Daemon:
         """退出清理：停 WS 线程，取消并等待全部 agent worker 收尾。"""
         if self._dispatcher_runtime is not None:
             await self._dispatcher_runtime.close()
+            await self._wait_dispatcher_events()
         if self._control is not None:
             # control.stop() 会阻塞（等 serve_forever 确认），且可能与正 run_
             # coroutine_threadsafe 回等主 loop 的 handler 线程死锁。挪到 worker
