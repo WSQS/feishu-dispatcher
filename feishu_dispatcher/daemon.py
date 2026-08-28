@@ -785,15 +785,39 @@ class _Daemon:
         return record
 
     def _queue_dispatcher_event(self, event: SessionEvent) -> None:
-        """串行桥接 Dispatcher Runtime 事件到 Daemon 事件管线。"""
+        """串行桥接 Dispatcher Runtime 事件到 Daemon 与 Channel 事件管线。"""
         previous = self._dispatcher_event_tail
+        conversations = self._conversations_for_session(event.session_id)
+        if isinstance(event.body, SessionInputAccepted):
+            conversations = tuple(
+                conversation
+                for conversation in conversations
+                if conversation != event.body.source
+            )
         task: asyncio.Task[None]
 
         async def consume() -> None:
             try:
                 if previous is not None:
                     await previous
-                await self._emit_session_event(event)
+                record = await self._emit_session_event(event)
+                if not isinstance(
+                    event.body,
+                    (
+                        SessionInputAccepted,
+                        AgentOutputStarted,
+                        AgentOutputDelta,
+                        AgentPlanUpdated,
+                        AgentOutputFinished,
+                        ToolCallObserved,
+                    ),
+                ):
+                    return
+                await self._publish_session_event(
+                    event,
+                    conversations,
+                    trace_sequence=record.sequence if record is not None else None,
+                )
             finally:
                 if self._dispatcher_event_tail is task:
                     self._dispatcher_event_tail = None
@@ -2616,20 +2640,10 @@ class _Daemon:
             targets = tuple(
                 target for target in conversations if target != conversation
             )
-            if targets:
-                mirrored_input = (
-                    f"↪️ 同步自 {conversation.channel_key or 'unknown'}：{text}"
-                )
-                await asyncio.gather(
-                    *(
-                        self._safe_send_text(mirrored_input, conversation=target)
-                        for target in targets
-                    )
-                )
-
             runtime = self._get_dispatcher_runtime()
             receipt = runtime.submit(TurnRequest(text, conversation))
             reply = await runtime.wait_turn(receipt.turn)
+            await self._wait_dispatcher_events()
             await asyncio.gather(
                 self._reply_user(
                     msg.message_id,

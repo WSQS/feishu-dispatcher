@@ -470,6 +470,40 @@ def test_channel_projects_session_input_event_to_thread(monkeypatch):
     assert calls == [("om_root", "↪️ 同步自 http：检查状态", True)]
 
 
+def test_channel_projects_session_input_event_to_root_chat(monkeypatch):
+    loop = asyncio.new_event_loop()
+    try:
+        bridge = FeishuBridge(
+            app_id="a",
+            app_secret="b",
+            main_loop=loop,
+            chat_whitelist="oc_main",
+        )
+        calls: list[tuple[str, str]] = []
+
+        def send_text(conversation_id: str, text: str) -> str:
+            calls.append((conversation_id, text))
+            return "om_root"
+
+        monkeypatch.setattr(bridge, "send_text", send_text)
+        event = SessionEvent(
+            event_id="event-root",
+            session_id="dispatcher",
+            turn_id="turn-root",
+            occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+            body=SessionInputAccepted(
+                text="检查状态",
+                source=ConversationRef("http", "http-thread"),
+            ),
+        )
+
+        bridge.handle_session_event("oc_main", event)
+
+        assert calls == [("oc_main", "↪️ 同步自 http：检查状态")]
+    finally:
+        loop.close()
+
+
 def test_channel_skips_empty_session_input_event(monkeypatch):
     bridge = make_bridge()
     calls: list[tuple[str, str, bool]] = []
