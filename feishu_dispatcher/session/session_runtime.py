@@ -27,7 +27,7 @@ class TurnRef:
     turn_id: str
 
 
-TurnDisposition = Literal["running", "pending"]
+TurnPlacement = Literal["current", "pending"]
 
 
 @dataclass(frozen=True)
@@ -35,18 +35,7 @@ class TurnReceipt:
     """Runtime 接受 Turn 后返回的排队结果。"""
 
     turn: TurnRef
-    disposition: TurnDisposition
-    queue_position: int | None = None
-
-
-class AgentLoop(Protocol):
-    """由 Runtime 驱动的一种具体 Agent 执行策略。"""
-
-    async def run_turn(self, request: TurnRequest) -> None: ...
-
-    async def cancel(self) -> None: ...
-
-    async def close(self) -> None: ...
+    placement: TurnPlacement
 
 
 class SessionRuntime(Protocol):
@@ -62,7 +51,7 @@ class SessionRuntime(Protocol):
         """接受并排队一轮输入，不等待执行完成。"""
         ...
 
-    async def cancel(self, turn_id: str | None = None) -> None: ...
+    async def cancel(self) -> None: ...
 
     async def wait_idle(self) -> None: ...
 
