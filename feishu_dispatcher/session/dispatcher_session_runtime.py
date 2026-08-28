@@ -10,7 +10,13 @@ from collections.abc import Callable
 from ..conversation import ConversationRef
 from ..scheduler import LLMClient, SchedulerMemory, ToolSpec, run_tool_loop
 from ..session_event import SessionState
-from .session_runtime import SessionRuntime, TurnReceipt, TurnRef, TurnRequest
+from .session_runtime import (
+    SessionEventListener,
+    SessionRuntime,
+    TurnReceipt,
+    TurnRef,
+    TurnRequest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +42,7 @@ class DispatcherSessionRuntime(SessionRuntime):
         self._memory = memory
         self._tools_provider = tools_provider
         self._state: SessionState = "idle"
+        self._listeners: list[SessionEventListener] = []
         self._pending: deque[TurnRequest] = deque()
         self._results: dict[str, asyncio.Future[str]] = {}
         self._worker: asyncio.Task[None] | None = None
@@ -51,6 +58,18 @@ class DispatcherSessionRuntime(SessionRuntime):
     @property
     def state(self) -> SessionState:
         return self._state
+
+    def subscribe(self, listener: SessionEventListener) -> Callable[[], None]:
+        """订阅 Session 事件并返回取消订阅函数。"""
+        self._listeners.append(listener)
+
+        def unsubscribe() -> None:
+            try:
+                self._listeners.remove(listener)
+            except ValueError:
+                pass
+
+        return unsubscribe
 
     def submit(self, request: TurnRequest) -> TurnReceipt:
         """接受一轮 Dispatcher 输入，并由单消费者顺序执行。"""

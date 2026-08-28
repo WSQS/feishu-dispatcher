@@ -10,6 +10,7 @@ from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.scheduler import LLMResponse, SchedulerMemory
 from feishu_dispatcher.session import (
     DispatcherSessionRuntime,
+    SessionRuntime,
     TurnRequest,
 )
 
@@ -26,6 +27,17 @@ class FakeLLM:
 
 def request(text: str) -> TurnRequest:
     return TurnRequest(text, ConversationRef("test", "conversation"))
+
+
+def test_dispatcher_runtime_implements_session_runtime() -> None:
+    runtime = DispatcherSessionRuntime(
+        session_id="dispatcher",
+        llm_provider=lambda: None,
+        memory=SchedulerMemory(None),
+        tools_provider=lambda _conversation: [],
+    )
+
+    assert isinstance(runtime, SessionRuntime)
 
 
 @pytest.mark.asyncio
@@ -51,6 +63,25 @@ async def test_runtime_executes_turn_and_updates_memory() -> None:
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "reply"},
     ]
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_subscription_can_be_removed() -> None:
+    runtime = DispatcherSessionRuntime(
+        session_id="dispatcher",
+        llm_provider=lambda: None,
+        memory=SchedulerMemory(None),
+        tools_provider=lambda _conversation: [],
+    )
+
+    def listener(_event) -> None:
+        pass
+
+    unsubscribe = runtime.subscribe(listener)
+    unsubscribe()
+    unsubscribe()
+
     await runtime.close()
 
 
