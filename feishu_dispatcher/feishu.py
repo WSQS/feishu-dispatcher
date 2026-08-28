@@ -736,11 +736,11 @@ class FeishuBridge:
             if not body.text:
                 return
             source = body.source.channel_key if body.source is not None else "unknown"
-            self.reply_text(
-                conversation_id,
-                f"↪️ 同步自 {source}：{body.text}",
-                threaded=True,
-            )
+            text = f"↪️ 同步自 {source}：{body.text}"
+            if conversation_id == self._chat_whitelist:
+                self.send_text(conversation_id, text)
+            else:
+                self.reply_text(conversation_id, text, threaded=True)
             return
         if not isinstance(
             body,

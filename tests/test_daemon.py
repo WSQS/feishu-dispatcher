@@ -3807,8 +3807,10 @@ async def test_nl_channel_tools_receive_source_conversation():
     }
     assert feishu.plain == []
     assert feishu.roots == [
-        ("oc_1", "↪️ 同步自 web：dispatch through web"),
         ("oc_1", "web tools done"),
+    ]
+    assert feishu.replies == [
+        ("oc_1", "↪️ 同步自 web：dispatch through web"),
     ]
     assert web.plain == [("om_web_nl", "web tools done")]
 
@@ -3844,8 +3846,19 @@ async def test_dispatcher_root_turns_sync_between_channels():
     assert web.plain == [("web-message", "web reply")]
     assert web.roots == []
     assert feishu.roots == [
-        ("oc_1", "↪️ 同步自 web：web turn"),
         ("oc_1", "web reply"),
+    ]
+    assert feishu.replies == [
+        ("oc_1", "↪️ 同步自 web：web turn"),
+    ]
+    assert [type(event.body) for _, event in feishu.session_events] == [
+        SessionInputAccepted,
+        AgentOutputStarted,
+        AgentOutputFinished,
+    ]
+    assert [type(event.body) for _, event in web.session_events] == [
+        AgentOutputStarted,
+        AgentOutputFinished,
     ]
 
     await daemon._handle_channel_message(
@@ -3855,8 +3868,25 @@ async def test_dispatcher_root_turns_sync_between_channels():
 
     assert feishu.plain == [("feishu-message", "feishu reply")]
     assert web.roots == [
-        ("web-room", "↪️ 同步自 feishu：feishu turn"),
         ("web-room", "feishu reply"),
+    ]
+    assert web.replies == [
+        ("web-message", "web reply"),
+        ("web-room", "↪️ 同步自 feishu：feishu turn"),
+    ]
+    assert [type(event.body) for _, event in feishu.session_events] == [
+        SessionInputAccepted,
+        AgentOutputStarted,
+        AgentOutputFinished,
+        AgentOutputStarted,
+        AgentOutputFinished,
+    ]
+    assert [type(event.body) for _, event in web.session_events] == [
+        AgentOutputStarted,
+        AgentOutputFinished,
+        SessionInputAccepted,
+        AgentOutputStarted,
+        AgentOutputFinished,
     ]
     assert daemon._sched_memory.history() == [
         {"role": "user", "content": "web turn"},
@@ -3959,8 +3989,10 @@ async def test_dispatcher_target_send_failure_does_not_abort_turn(caplog):
         {"role": "assistant", "content": "still works"},
     ]
     assert healthy.roots == [
-        ("healthy-room", "↪️ 同步自 feishu：continue"),
         ("healthy-room", "still works"),
+    ]
+    assert healthy.replies == [
+        ("healthy-room", "↪️ 同步自 feishu：continue"),
     ]
     assert (
         "Channel 独立文本发送失败 channel=broken conversation=broken-room"
@@ -4025,7 +4057,11 @@ async def test_dispatcher_events_are_persisted_in_order(tmp_path):
         thought="",
         outcome="completed",
     )
-    assert bridge.session_events == []
+    assert [type(event.body) for _, event in bridge.session_events] == [
+        AgentOutputStarted,
+        AgentOutputFinished,
+    ]
+    assert bridge.session_event_trace_sequences == [3, 4]
     await daemon._shutdown()
 
 
