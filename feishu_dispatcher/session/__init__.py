@@ -1,5 +1,6 @@
 """Session 运行时公共接口。"""
 
+from .dispatcher_session_runtime import DispatcherSessionRuntime
 from .session_runtime import (
     SessionRuntime,
     TurnPlacement,
@@ -9,6 +10,7 @@ from .session_runtime import (
 )
 
 __all__ = [
+    "DispatcherSessionRuntime",
     "SessionRuntime",
     "TurnPlacement",
     "TurnReceipt",
