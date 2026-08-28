@@ -4,12 +4,24 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import secrets
 from collections import deque
 from collections.abc import Callable
+from datetime import datetime, timezone
 
 from ..conversation import ConversationRef
 from ..scheduler import LLMClient, SchedulerMemory, ToolSpec, run_tool_loop
-from ..session_event import SessionState
+from ..session_event import (
+    AgentOutputFinished,
+    AgentOutputStarted,
+    OutputOutcome,
+    SessionErrorOccurred,
+    SessionEvent,
+    SessionEventBody,
+    SessionInputAccepted,
+    SessionState,
+    SessionStateChanged,
+)
 from .session_runtime import (
     SessionEventListener,
     SessionRuntime,
@@ -80,6 +92,10 @@ class DispatcherSessionRuntime(SessionRuntime):
         if request.turn_id in self._results:
             raise ValueError(f"turn_id 已存在: {request.turn_id}")
 
+        self._emit_event(
+            request.turn_id,
+            SessionInputAccepted(text=request.text, source=request.conversation),
+        )
         placement = (
             "current"
             if self._current_task is None and not self._pending
@@ -130,7 +146,7 @@ class DispatcherSessionRuntime(SessionRuntime):
         await self.cancel()
         if self._worker is not None:
             await self._worker
-        self._state = "stopped"
+        self._set_state("stopped")
         self._idle.set()
 
     def _ensure_worker(self) -> None:
@@ -142,11 +158,20 @@ class DispatcherSessionRuntime(SessionRuntime):
             while self._pending and not self._closed:
                 request = self._pending.popleft()
                 future = self._results[request.turn_id]
-                self._state = "running"
+                self._set_state("running")
+                self._emit_event(request.turn_id, AgentOutputStarted())
                 self._current_task = asyncio.create_task(self._execute_turn(request))
                 try:
                     result = await self._current_task
                 except asyncio.CancelledError:
+                    self._emit_event(
+                        request.turn_id,
+                        AgentOutputFinished(
+                            message="",
+                            thought="",
+                            outcome="cancelled",
+                        ),
+                    )
                     if not future.done():
                         future.cancel()
                 else:
@@ -155,11 +180,12 @@ class DispatcherSessionRuntime(SessionRuntime):
                 finally:
                     self._current_task = None
         finally:
-            self._state = "stopped" if self._closed else "idle"
+            self._set_state("stopped" if self._closed else "idle")
             self._idle.set()
 
     async def _execute_turn(self, request: TurnRequest) -> str:
         turn: list[dict] | None = None
+        outcome: OutputOutcome = "completed"
         try:
             llm = self._llm_provider()
             if llm is None:
@@ -171,11 +197,50 @@ class DispatcherSessionRuntime(SessionRuntime):
                 history=self._memory.history(),
             )
         except Exception as exc:
+            outcome = "failed"
             logger.exception("调度器 LLM 失败")
+            self._emit_event(
+                request.turn_id,
+                SessionErrorOccurred(phase="execute_turn", message=str(exc)),
+            )
             reply = f"调度器出错：{str(exc)[:200]}。可用 `/run <项目> <任务>` 直接派发。"
         reply = reply or "（调度器无输出）"
         if turn:
             self._memory.add_turn(turn)
         else:
             self._memory.add_exchange(request.text, reply)
+        self._emit_event(
+            request.turn_id,
+            AgentOutputFinished(message=reply, thought="", outcome=outcome),
+        )
         return reply
+
+    def _set_state(self, state: SessionState) -> None:
+        previous_state = self._state
+        if previous_state == state:
+            return
+        self._state = state
+        self._emit_event(
+            None,
+            SessionStateChanged(
+                previous_state=previous_state,
+                current_state=state,
+            ),
+        )
+
+    def _emit_event(self, turn_id: str | None, body: SessionEventBody) -> None:
+        event = SessionEvent(
+            event_id=secrets.token_hex(16),
+            session_id=self.session_id,
+            turn_id=turn_id,
+            occurred_at=datetime.now(timezone.utc),
+            body=body,
+        )
+        for listener in tuple(self._listeners):
+            try:
+                listener(event)
+            except Exception:
+                logger.exception(
+                    "SessionEvent 订阅者处理失败 event=%s",
+                    event.event_id,
+                )

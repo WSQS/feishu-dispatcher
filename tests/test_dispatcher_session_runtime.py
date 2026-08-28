@@ -13,6 +13,13 @@ from feishu_dispatcher.session import (
     SessionRuntime,
     TurnRequest,
 )
+from feishu_dispatcher.session_event import (
+    AgentOutputFinished,
+    AgentOutputStarted,
+    SessionErrorOccurred,
+    SessionInputAccepted,
+    SessionStateChanged,
+)
 
 
 class FakeLLM:
@@ -86,6 +93,119 @@ async def test_runtime_subscription_can_be_removed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_runtime_notifies_multiple_subscribers_independently() -> None:
+    runtime = DispatcherSessionRuntime(
+        session_id="dispatcher",
+        llm_provider=lambda: FakeLLM(["reply"]),
+        memory=SchedulerMemory(None),
+        tools_provider=lambda _conversation: [],
+    )
+    first_events = []
+    second_events = []
+    runtime.subscribe(first_events.append)
+    runtime.subscribe(second_events.append)
+
+    receipt = runtime.submit(request("hello"))
+    assert await runtime.wait_turn(receipt.turn) == "reply"
+
+    assert first_events == second_events
+    assert len({event.event_id for event in first_events}) == len(first_events)
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_isolates_subscriber_failure() -> None:
+    runtime = DispatcherSessionRuntime(
+        session_id="dispatcher",
+        llm_provider=lambda: FakeLLM(["reply"]),
+        memory=SchedulerMemory(None),
+        tools_provider=lambda _conversation: [],
+    )
+    received = []
+
+    def broken_listener(_event) -> None:
+        raise RuntimeError("listener boom")
+
+    runtime.subscribe(broken_listener)
+    runtime.subscribe(received.append)
+
+    receipt = runtime.submit(request("hello"))
+
+    assert await runtime.wait_turn(receipt.turn) == "reply"
+    assert received
+    assert all(event.session_id == "dispatcher" for event in received)
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_publishes_turn_lifecycle_events() -> None:
+    runtime = DispatcherSessionRuntime(
+        session_id="dispatcher",
+        llm_provider=lambda: FakeLLM(["reply"]),
+        memory=SchedulerMemory(None),
+        tools_provider=lambda _conversation: [],
+    )
+    events = []
+    runtime.subscribe(events.append)
+
+    receipt = runtime.submit(request("hello"))
+    assert await runtime.wait_turn(receipt.turn) == "reply"
+
+    assert [type(event.body) for event in events] == [
+        SessionInputAccepted,
+        SessionStateChanged,
+        AgentOutputStarted,
+        AgentOutputFinished,
+        SessionStateChanged,
+    ]
+    assert events[0].turn_id == receipt.turn.turn_id
+    assert events[1].body == SessionStateChanged(
+        previous_state="idle",
+        current_state="running",
+    )
+    assert events[2].turn_id == receipt.turn.turn_id
+    assert events[3].body == AgentOutputFinished(
+        message="reply",
+        thought="",
+        outcome="completed",
+    )
+    assert events[4].body == SessionStateChanged(
+        previous_state="running",
+        current_state="idle",
+    )
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_publishes_execution_failure_event() -> None:
+    runtime = DispatcherSessionRuntime(
+        session_id="dispatcher",
+        llm_provider=lambda: None,
+        memory=SchedulerMemory(None),
+        tools_provider=lambda _conversation: [],
+    )
+    events = []
+    runtime.subscribe(events.append)
+
+    receipt = runtime.submit(request("hello"))
+    reply = await runtime.wait_turn(receipt.turn)
+
+    assert reply.startswith("调度器出错：调度器 LLM 未配置")
+    error = next(event for event in events if isinstance(event.body, SessionErrorOccurred))
+    assert error.turn_id == receipt.turn.turn_id
+    assert error.body == SessionErrorOccurred(
+        phase="execute_turn",
+        message="调度器 LLM 未配置",
+    )
+    finished = next(
+        event for event in events if isinstance(event.body, AgentOutputFinished)
+    )
+    assert finished.turn_id == receipt.turn.turn_id
+    assert finished.body.outcome == "failed"
+    await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_runtime_processes_pending_turns_in_order() -> None:
     first_started = asyncio.Event()
     release_first = asyncio.Event()
@@ -116,6 +236,43 @@ async def test_runtime_processes_pending_turns_in_order() -> None:
     assert await runtime.wait_turn(first.turn) == "reply 1"
     assert await runtime.wait_turn(second.turn) == "reply 2"
     await runtime.wait_idle()
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_publishes_cancellation_event() -> None:
+    started = asyncio.Event()
+
+    class BlockingLLM(FakeLLM):
+        async def chat(self, messages, tools) -> LLMResponse:
+            self.calls.append(list(messages))
+            started.set()
+            await asyncio.Future()
+
+    runtime = DispatcherSessionRuntime(
+        session_id="dispatcher",
+        llm_provider=lambda: BlockingLLM([]),
+        memory=SchedulerMemory(None),
+        tools_provider=lambda _conversation: [],
+    )
+    events = []
+    runtime.subscribe(events.append)
+
+    receipt = runtime.submit(request("hello"))
+    await started.wait()
+    await runtime.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await runtime.wait_turn(receipt.turn)
+    finished = next(
+        event for event in events if isinstance(event.body, AgentOutputFinished)
+    )
+    assert finished.turn_id == receipt.turn.turn_id
+    assert finished.body == AgentOutputFinished(
+        message="",
+        thought="",
+        outcome="cancelled",
+    )
     await runtime.close()
 
 
