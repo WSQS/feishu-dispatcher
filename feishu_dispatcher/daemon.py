@@ -50,9 +50,8 @@ from .scheduler import (
     LLMClient,
     SchedulerMemory,
     build_scheduler_tools,
-    run_tool_loop,
 )
-from .session import TurnRequest
+from .session import DispatcherSessionRuntime, TurnRequest
 from .session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
@@ -575,6 +574,8 @@ class _Daemon:
     _sched_memory: SchedulerMemory = field(
         default_factory=lambda: SchedulerMemory(None)
     )
+    #: Dispatcher 的统一 Session Runtime；首次自然语言输入时惰性构造。
+    _dispatcher_runtime: DispatcherSessionRuntime | None = None
     #: 同一 Session 的 Turn 共用一把锁；跨 Channel / runner 串行，不同 Session 可并行。
     _session_turn_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     #: 由启动装配层注入；稳定 key → Channel 实例。
@@ -2602,37 +2603,9 @@ class _Daemon:
                     )
                 )
 
-            tools = build_scheduler_tools(
-                list_projects=self._sched_list_projects,
-                spawn_agent=partial(self._sched_spawn_agent, conversation=conversation),
-                list_tasks=self._sched_list_tasks,
-                get_task=self._sched_get_task,
-                send_to_task=self._sched_send_to_task,
-                resume_task=self._sched_resume_task,
-                mark_done=self._sched_mark_done,
-                register_project=self._sched_register_project,
-                unregister_project=self._sched_unregister_project,
-                attach_session=partial(
-                    self._sched_attach_session, conversation=conversation
-                ),
-                list_forge=self._sched_list_forge,
-                get_forge=self._sched_get_forge,
-                list_models=self._sched_list_models,
-            )
-            turn: list[dict] | None = None
-            try:
-                reply, turn = await run_tool_loop(
-                    self._llm, text, tools, history=self._sched_memory.history()
-                )
-            except Exception as exc:
-                logger.exception("调度器 LLM 失败")
-                reply = f"调度器出错：{str(exc)[:200]}。可用 `/run <项目> <任务>` 直接派发。"
-            reply = reply or "（调度器无输出）"
-            # 无损记忆：存整轮（含真实 tool_calls/结果），避免只存文本训练出「说了不做」的幻觉
-            if turn:
-                self._sched_memory.add_turn(turn)
-            else:
-                self._sched_memory.add_exchange(text, reply)  # 出错兜底：至少存问答对
+            runtime = self._get_dispatcher_runtime()
+            receipt = runtime.submit(TurnRequest(text, conversation))
+            reply = await runtime.wait_turn(receipt.turn)
             await asyncio.gather(
                 self._reply_user(
                     msg.message_id,
@@ -2644,6 +2617,38 @@ class _Daemon:
                     for target in targets
                 ),
             )
+
+    def _get_dispatcher_runtime(self) -> DispatcherSessionRuntime:
+        runtime = self._dispatcher_runtime
+        if runtime is None:
+            runtime = DispatcherSessionRuntime(
+                session_id=_DISPATCHER_SESSION_ID,
+                llm_provider=lambda: self._llm,
+                memory=self._sched_memory,
+                tools_provider=self._dispatcher_tools_for,
+            )
+            self._dispatcher_runtime = runtime
+        return runtime
+
+    def _dispatcher_tools_for(self, conversation: ConversationRef) -> list:
+        """按来源 Conversation 构建 Dispatcher 本轮可用工具。"""
+        return build_scheduler_tools(
+            list_projects=self._sched_list_projects,
+            spawn_agent=partial(self._sched_spawn_agent, conversation=conversation),
+            list_tasks=self._sched_list_tasks,
+            get_task=self._sched_get_task,
+            send_to_task=self._sched_send_to_task,
+            resume_task=self._sched_resume_task,
+            mark_done=self._sched_mark_done,
+            register_project=self._sched_register_project,
+            unregister_project=self._sched_unregister_project,
+            attach_session=partial(
+                self._sched_attach_session, conversation=conversation
+            ),
+            list_forge=self._sched_list_forge,
+            get_forge=self._sched_get_forge,
+            list_models=self._sched_list_models,
+        )
 
     def _sched_list_projects(self) -> list[dict]:
         return [
@@ -3504,6 +3509,8 @@ class _Daemon:
 
     async def _shutdown(self) -> None:
         """退出清理：停 WS 线程，取消并等待全部 agent worker 收尾。"""
+        if self._dispatcher_runtime is not None:
+            await self._dispatcher_runtime.close()
         if self._control is not None:
             # control.stop() 会阻塞（等 serve_forever 确认），且可能与正 run_
             # coroutine_threadsafe 回等主 loop 的 handler 线程死锁。挪到 worker
