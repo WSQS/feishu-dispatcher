@@ -46,6 +46,7 @@ from feishu_dispatcher.session_event import (
     AgentPlanUpdated,
     SessionEvent,
     SessionInputAccepted,
+    SessionStateChanged,
     ToolCallObserved,
     session_event_to_dict,
 )
@@ -3990,6 +3991,42 @@ async def test_scheduler_records_exchange_in_memory():
         {"role": "user", "content": "记住我叫小明"},
         {"role": "assistant", "content": "收到"},
     ]
+
+
+async def test_dispatcher_events_are_persisted_in_order(tmp_path):
+    trace_store = SessionTraceStore(tmp_path / "session-trace.sqlite")
+    daemon, bridge, _ = make_daemon(trace_store=trace_store)
+    daemon._llm = ScriptedLLM([LLMResponse(content="收到")])
+    consumed_events = []
+
+    async def consume(event: SessionEvent) -> None:
+        consumed_events.append(event)
+
+    daemon._session_event_handler = consume
+
+    await daemon._handle_message(root_msg("你好", mid="om_dispatcher_trace"))
+    await daemon._wait_dispatcher_events()
+
+    records = trace_store.read_after(_DISPATCHER_SESSION_ID)
+    assert consumed_events == [record.event for record in records]
+    assert [type(record.event.body) for record in records] == [
+        SessionInputAccepted,
+        SessionStateChanged,
+        AgentOutputStarted,
+        AgentOutputFinished,
+        SessionStateChanged,
+    ]
+    assert records[0].event.turn_id == records[2].event.turn_id
+    assert records[2].event.turn_id == records[3].event.turn_id
+    assert records[1].event.turn_id is None
+    assert records[4].event.turn_id is None
+    assert records[3].event.body == AgentOutputFinished(
+        message="收到",
+        thought="",
+        outcome="completed",
+    )
+    assert bridge.session_events == []
+    await daemon._shutdown()
 
 
 async def test_scheduler_feeds_history_on_next_message():
