@@ -1423,6 +1423,24 @@ def test_channel_lookup_requires_registered_nonempty_key():
         daemon._channel_for(ConversationRef("web", "oc_1"))
 
 
+def test_conversation_binding_does_not_inspect_ref_fields():
+    daemon, _, created = make_daemon()
+    task = daemon.store.create(
+        project_name="demo",
+        agent_label="test",
+        description="binding",
+        conversation=_TEST_CONVERSATION,
+        thread_root_id="oc_1",
+        workspace=".",
+    )
+
+    conversation = ConversationRef("", "")
+    daemon._bind_conversation(conversation, task.session_id)
+
+    assert daemon._session_id_for_conversation(conversation) == task.session_id
+    assert created == []
+
+
 async def test_invalid_output_channel_never_falls_back_to_primary():
     daemon, feishu, _ = make_daemon()
 
