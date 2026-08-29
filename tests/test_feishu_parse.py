@@ -589,7 +589,9 @@ def test_feishu_card_methods_delegate_to_feishu_card_methods(monkeypatch):
 def test_channel_open_output_uses_card_mode():
     bridge = make_bridge(stream_mode="card")
 
-    output = bridge.open_output("om_root", "demo", footer="project")
+    output = bridge.open_output(
+        ConversationRef("feishu", "om_root"), "demo", footer="project"
+    )
 
     assert isinstance(output._output, LiveCard)
 
@@ -603,7 +605,7 @@ async def test_channel_open_output_uses_text_mode(monkeypatch):
         return "om_text"
 
     monkeypatch.setattr(bridge, "reply_text", reply_text)
-    output = bridge.open_output("om_root", "demo")
+    output = bridge.open_output(ConversationRef("feishu", "om_root"), "demo")
 
     assert isinstance(output._output, StreamThrottler)
     output.feed("legacy")
@@ -655,7 +657,7 @@ async def test_text_output_is_driven_by_session_events(monkeypatch):
         return "om_text"
 
     monkeypatch.setattr(bridge, "reply_text", reply_text)
-    output = bridge.open_output("om_root", "demo")
+    output = bridge.open_output(ConversationRef("feishu", "om_root"), "demo")
     output.feed("legacy")
 
     events = [
@@ -726,7 +728,7 @@ async def test_card_output_is_driven_by_session_events(monkeypatch):
 
     monkeypatch.setattr(bridge, "reply_card", reply_card)
     monkeypatch.setattr(bridge, "patch_card", patch_card)
-    output = bridge.open_output("om_root", "demo")
+    output = bridge.open_output(ConversationRef("feishu", "om_root"), "demo")
     output.feed("legacy")
 
     await asyncio.to_thread(
@@ -810,7 +812,7 @@ async def test_card_output_maps_session_outcome(monkeypatch, outcome, template):
         return "om_card"
 
     monkeypatch.setattr(bridge, "reply_card", reply_card)
-    output = bridge.open_output("om_root", "demo")
+    output = bridge.open_output(ConversationRef("feishu", "om_root"), "demo")
     for index, body in enumerate(
         [
             AgentOutputStarted(),

@@ -40,6 +40,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 from .channel import ChannelMessage, MessageHandler, OutputStatus, StreamingOutput
+from .conversation import ConversationRef
 from .session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
@@ -688,12 +689,13 @@ class FeishuBridge:
 
     def open_output(
         self,
-        target_id: str,
+        conversation: ConversationRef,
         title: str,
         *,
         footer: str = "",
     ) -> StreamingOutput:
         """登记一个 agent 回合的输出呈现，由 SessionEvent 驱动实际发送。"""
+        target_id = conversation.conversation_id
         if self._stream_mode == "card":
             from .livecard import LiveCard
 

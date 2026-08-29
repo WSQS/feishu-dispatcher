@@ -6,6 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
+from .conversation import ConversationRef
 from .session_event import SessionEvent
 
 
@@ -73,7 +74,7 @@ class Channel(Protocol):
 
     def open_output(
         self,
-        target_id: str,
+        conversation: ConversationRef,
         title: str,
         *,
         footer: str = "",

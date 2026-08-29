@@ -879,7 +879,9 @@ async def test_thread_reply_session_event_output_and_restart():
     try:
         thread_id = channel.create_thread("browser-a", "start")
         channel.reply_text(thread_id, "reply", threaded=True)
-        output = channel.open_output(thread_id, "demo", footer="model:a")
+        output = channel.open_output(
+            ConversationRef("http", thread_id), "demo", footer="model:a"
+        )
         channel.handle_session_event(
             thread_id,
             SessionEvent(
@@ -1118,7 +1120,9 @@ async def test_session_event_presentation_is_the_only_live_output_path():
     channel.start(ignore)
     try:
         thread_id = channel.create_thread("browser-a", "start")
-        output = channel.open_output(thread_id, "demo", footer="model:a")
+        output = channel.open_output(
+            ConversationRef("http", thread_id), "demo", footer="model:a"
+        )
         output.feed("legacy text must not be emitted")
         await output.flush()
         channel.handle_session_event(
