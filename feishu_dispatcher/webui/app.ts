@@ -47,7 +47,7 @@ const api = createApiClient(() => elements.token.value);
 
 const outputs = new Map();
 const tasks = new Map();
-const taskThreads = new Map();
+const taskConversations = new Map();
 const targetTasks = new Map();
 const taskTraceStates = new Map();
 const taskTimelines = new Map();
@@ -84,6 +84,21 @@ function newId(prefix) {
   return `${prefix}-${suffix}`;
 }
 
+function activeConversationId() {
+  if (selectedTaskId === DISPATCHER_TASK_ID) {
+    return conversationId;
+  }
+  return taskConversations.get(selectedTaskId) || conversationId;
+}
+
+function loadActiveConversationState() {
+  const activeId = activeConversationId();
+  cursor = storedCursor(activeId);
+  renderedCursor = cursor;
+  conversationStarted = storageGet(storageKeys.started(activeId)) === "1";
+  renderMetadata();
+}
+
 function setStatus(text, tone = "idle", source = null) {
   statusRevision += 1;
   statusSource = source;
@@ -93,7 +108,7 @@ function setStatus(text, tone = "idle", source = null) {
 }
 
 function renderMetadata() {
-  elements.conversationId.textContent = conversationId;
+  elements.conversationId.textContent = activeConversationId();
   elements.cursor.textContent = String(cursor);
 }
 
@@ -159,12 +174,12 @@ function ensureTimeline(taskId) {
 function renderSelectedTask() {
   const task = tasks.get(selectedTaskId);
   const readOnly = taskIsTerminal(task);
-  const threadId =
+  const taskConversationId =
     selectedTaskId === DISPATCHER_TASK_ID
       ? null
-      : taskThreads.get(selectedTaskId) || null;
+      : taskConversations.get(selectedTaskId) || null;
   elements.currentTask.textContent = taskName(task);
-  elements.currentThread.textContent = threadId || "root";
+  elements.currentThread.textContent = taskConversationId || "root";
   elements.composerTarget.textContent = readOnly
     ? `${taskName(task)} · 历史只读`
     : `发送给 ${taskName(task)}`;
@@ -815,7 +830,7 @@ function renderTaskList() {
       binding.textContent = "根会话";
     } else if (terminal) {
       binding.textContent = "查看历史";
-    } else if (taskThreads.has(task.task_id)) {
+    } else if (taskConversations.has(task.task_id)) {
       binding.textContent = "已打开";
     } else {
       binding.textContent = "点击打开";
@@ -847,6 +862,7 @@ function applyTasks(nextTasks) {
   const selected = tasks.get(selectedTaskId);
   if (!selected) {
     selectedTaskId = DISPATCHER_TASK_ID;
+    loadActiveConversationState();
   }
   renderTaskList();
   ensureTimeline(selectedTaskId);
@@ -869,12 +885,16 @@ function clearChannelRuntimeState() {
   taskHistoryGeneration += 1;
   storageRemove(storageKeys.cursor(conversationId));
   storageRemove(storageKeys.started(conversationId));
+  for (const taskConversationId of taskConversations.values()) {
+    storageRemove(storageKeys.cursor(taskConversationId));
+    storageRemove(storageKeys.started(taskConversationId));
+  }
   cursor = 0;
   renderedCursor = 0;
   conversationStarted = false;
   selectedTaskId = DISPATCHER_TASK_ID;
   outputs.clear();
-  taskThreads.clear();
+  taskConversations.clear();
   taskTraceStates.clear();
   targetTasks.clear();
   taskTimelines.clear();
@@ -1167,16 +1187,12 @@ async function connect() {
 
 async function createTaskConversation(task) {
   await refreshChannelInstance();
-  const payload = await api.createTaskConversation(
-    task.task_id,
-    conversationId,
-  );
-  const threadId = payload.thread_id.trim();
-  taskThreads.set(task.task_id, threadId);
-  rememberTarget(threadId, task.task_id);
-  conversationStarted = true;
-  storageSet(storageKeys.started(conversationId), "1");
-  return threadId;
+  const payload = await api.createTaskConversation(task.task_id);
+  const taskConversationId = payload.conversation_id.trim();
+  taskConversations.set(task.task_id, taskConversationId);
+  rememberTarget(taskConversationId, task.task_id);
+  storageSet(storageKeys.started(taskConversationId), "1");
+  return taskConversationId;
 }
 
 async function selectTask(taskId) {
@@ -1188,19 +1204,21 @@ async function selectTask(taskId) {
   const historyGeneration = ++taskHistoryGeneration;
   taskSelectionBusy = true;
   renderTaskList();
-  let pollingPaused = false;
+  const pollingPaused = taskId !== selectedTaskId;
+  if (pollingPaused) {
+    pollGeneration += 1;
+  }
   try {
     if (
       taskId !== DISPATCHER_TASK_ID &&
       !taskIsTerminal(task) &&
-      !taskThreads.has(taskId)
+      !taskConversations.has(taskId)
     ) {
-      pollGeneration += 1;
-      pollingPaused = true;
       setStatus(`正在打开 ${taskName(task)}…`, "busy");
       await createTaskConversation(task);
     }
     selectedTaskId = taskId;
+    loadActiveConversationState();
     ensureTimeline(taskId);
     renderSelectedTask();
     setStatus(`正在加载 ${taskName(task)} 的历史…`, "busy");
@@ -1237,14 +1255,17 @@ async function selectTask(taskId) {
 }
 
 function persistCursor() {
-  storageSet(storageKeys.cursor(conversationId), String(cursor));
+  storageSet(storageKeys.cursor(activeConversationId()), String(cursor));
   renderMetadata();
 }
 
 async function pollOnce(generation) {
-  const targetConversationId = conversationId;
+  const targetConversationId = activeConversationId();
   const payload = await api.loadChannelEvents(targetConversationId, cursor);
-  if (generation !== pollGeneration || targetConversationId !== conversationId) {
+  if (
+    generation !== pollGeneration ||
+    targetConversationId !== activeConversationId()
+  ) {
     return false;
   }
   const instanceState = acceptChannelInstance(payload);
@@ -1444,21 +1465,19 @@ async function sendMessage(text) {
   if (taskIsTerminal(task)) {
     throw new Error("当前 Task 已终止，不能发送");
   }
-  let threadId = null;
+  let targetConversationId = conversationId;
   if (taskId !== DISPATCHER_TASK_ID) {
-    threadId = taskThreads.get(taskId) || null;
-    if (!threadId) {
+    targetConversationId = taskConversations.get(taskId) || "";
+    if (!targetConversationId) {
       throw new Error("当前 Task Conversation 尚未打开");
     }
   }
 
-  const targetConversationId = conversationId;
   const messageId = newId("webui-message");
   rememberTarget(messageId, taskId);
   const payload = {
     conversation_id: targetConversationId,
     message_id: messageId,
-    thread_id: threadId,
     sender_id: `webui:${targetConversationId}`,
     text,
   };
@@ -1468,12 +1487,12 @@ async function sendMessage(text) {
     if (targetTasks.get(messageId) === taskId) {
       targetTasks.delete(messageId);
     }
-    if (targetConversationId === conversationId) {
+    if (targetConversationId === activeConversationId()) {
       throw error;
     }
     return;
   }
-  if (targetConversationId !== conversationId) {
+  if (targetConversationId !== activeConversationId()) {
     return;
   }
   appendEvent({
@@ -1484,7 +1503,7 @@ async function sendMessage(text) {
     detail: "accepted",
   });
   conversationStarted = true;
-  storageSet(storageKeys.started(conversationId), "1");
+  storageSet(storageKeys.started(targetConversationId), "1");
   setStatus("消息已接收，等待事件…", "busy");
   startPolling();
 }
@@ -1498,6 +1517,10 @@ function resetConversation() {
   taskHistoryGeneration += 1;
   storageRemove(storageKeys.cursor(conversationId));
   storageRemove(storageKeys.started(conversationId));
+  for (const taskConversationId of taskConversations.values()) {
+    storageRemove(storageKeys.cursor(taskConversationId));
+    storageRemove(storageKeys.started(taskConversationId));
+  }
   conversationId = newId("webui-conversation");
   cursor = 0;
   renderedCursor = 0;
@@ -1505,7 +1528,7 @@ function resetConversation() {
   selectedTaskId = DISPATCHER_TASK_ID;
   storageSet(storageKeys.conversation, conversationId);
   outputs.clear();
-  taskThreads.clear();
+  taskConversations.clear();
   taskTraceStates.clear();
   targetTasks.clear();
   taskTimelines.clear();

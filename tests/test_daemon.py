@@ -101,9 +101,9 @@ class FakeBridge:
             return self.reply_in_thread(conversation_id, text)
         return self.send_root_message(conversation_id, text)
 
-    def create_thread(self, conversation_id: str, initial_text: str) -> str:
-        self.created_threads.append((conversation_id, initial_text))
-        return self.send_root_message(conversation_id, initial_text)
+    def create_thread(self, initial_text: str) -> str:
+        self.created_threads.append(("oc_1", initial_text))
+        return self.send_root_message("oc_1", initial_text)
 
     def handle_session_event(
         self,
@@ -1061,28 +1061,9 @@ async def test_http_create_task_conversation_validates_request_and_task_state():
 
     cases = [
         (
-            {"segments": {"task_id": active.session_id}, "body": None},
-            400,
-            {
-                "error": "invalid_request",
-                "message": "请求体必须是 JSON object",
-            },
-        ),
-        (
-            {
-                "segments": {"task_id": active.session_id},
-                "body": {"conversation_id": " "},
-            },
-            400,
-            {
-                "error": "invalid_request",
-                "message": "conversation_id 必须是非空字符串",
-            },
-        ),
-        (
             {
                 "segments": {"task_id": "missing"},
-                "body": {"conversation_id": "browser-a"},
+                "body": None,
             },
             404,
             {"error": "task_not_found", "task_id": "missing"},
@@ -1090,7 +1071,7 @@ async def test_http_create_task_conversation_validates_request_and_task_state():
         (
             {
                 "segments": {"task_id": _DISPATCHER_SESSION_ID},
-                "body": {"conversation_id": "browser-a"},
+                "body": None,
             },
             404,
             {"error": "task_not_found", "task_id": _DISPATCHER_SESSION_ID},
@@ -1098,7 +1079,7 @@ async def test_http_create_task_conversation_validates_request_and_task_state():
         (
             {
                 "segments": {"task_id": terminal.session_id},
-                "body": {"conversation_id": "browser-a"},
+                "body": None,
             },
             409,
             {
@@ -1120,7 +1101,7 @@ async def test_http_create_task_conversation_validates_request_and_task_state():
         {},
         {
             "segments": {"task_id": active.session_id},
-            "body": {"conversation_id": "browser-a"},
+            "body": None,
         },
     )
     assert unavailable_status == 503
@@ -1147,17 +1128,16 @@ async def test_http_create_task_conversation_creates_thread_and_binds_task():
         {"channel_key": "http"},
         {
             "segments": {"task_id": task.session_id},
-            "body": {"conversation_id": " browser-a "},
+            "body": None,
         },
     )
 
     assert status == 201
     assert payload == {
         "task_id": task.session_id,
-        "conversation_id": "browser-a",
-        "thread_id": "om_newroot_1",
+        "conversation_id": "om_newroot_1",
     }
-    assert http.created_threads == [("browser-a", "[t1] review changes")]
+    assert http.created_threads == [("oc_1", "[t1] review changes")]
     task_conversation = ConversationRef("http", "om_newroot_1")
     assert daemon._session_for_conversation(task_conversation) is task
     assert task.conversation_ref == ConversationRef("feishu", "oc_1")
@@ -1167,11 +1147,11 @@ async def test_http_create_task_conversation_creates_thread_and_binds_task():
         {"channel_key": "http"},
         {
             "segments": {"task_id": task.session_id},
-            "body": {"conversation_id": "browser-a"},
+            "body": None,
         },
     )
     assert second_status == 201
-    assert second_payload["thread_id"] == "om_newroot_2"
+    assert second_payload["conversation_id"] == "om_newroot_2"
     assert (
         daemon._session_for_conversation(ConversationRef("http", "om_newroot_2"))
         is task
@@ -1216,29 +1196,31 @@ async def test_http_task_conversation_round_trip_routes_to_existing_runner():
             "POST",
             http.base_url + f"/api/tasks/{task.session_id}/conversations",
             "tok-http",
-            {"conversation_id": "browser-a"},
+            None,
         )
         assert status == 201
-        thread_id = opened["thread_id"]
+        conversation_id = opened["conversation_id"]
         assert (
-            daemon._session_for_conversation(ConversationRef("http", thread_id)) is task
+            daemon._session_for_conversation(
+                ConversationRef("http", conversation_id)
+            )
+            is task
         )
 
         event_status, events = await asyncio.to_thread(
             http_channel_request,
             "GET",
-            http.base_url + "/api/channel/events?conversation_id=browser-a&after=0",
+            http.base_url
+            + f"/api/channel/events?conversation_id={conversation_id}&after=0",
             "tok-http",
         )
         assert event_status == 200
-        assert events["events"] == [
-            {
-                "cursor": 1,
-                "type": "thread.created",
-                "thread_id": thread_id,
-                "text": f"[{task.session_id}] first",
-            }
-        ]
+        assert len(events["events"]) == 1
+        created_event = events["events"][0]
+        assert created_event["cursor"] == 1
+        assert created_event["type"] == "conversation.created"
+        assert created_event["message_id"].startswith("http-message-")
+        assert created_event["text"] == f"[{task.session_id}] first"
 
         accepted_status, accepted = await asyncio.to_thread(
             http_channel_request,
@@ -1246,9 +1228,8 @@ async def test_http_task_conversation_round_trip_routes_to_existing_runner():
             http.base_url + "/api/channel/messages",
             "tok-http",
             {
-                "conversation_id": "browser-a",
+                "conversation_id": conversation_id,
                 "message_id": "web-message",
-                "thread_id": thread_id,
                 "sender_id": "web-user",
                 "text": "web follow up",
             },
@@ -1269,7 +1250,8 @@ async def test_http_task_conversation_round_trip_routes_to_existing_runner():
             output_status, output_events = await asyncio.to_thread(
                 http_channel_request,
                 "GET",
-                http.base_url + "/api/channel/events?conversation_id=browser-a&after=1",
+                http.base_url
+                + f"/api/channel/events?conversation_id={conversation_id}&after=1",
                 "tok-http",
             )
             if output_status == 200 and any(
@@ -1285,7 +1267,7 @@ async def test_http_task_conversation_round_trip_routes_to_existing_runner():
         assert any(
             event["type"] == "session.event"
             and event["event"]["type"] == "agent.output.started"
-            and event["presentation"]["target_id"] == thread_id
+            and "target_id" not in event["presentation"]
             for event in output_events["events"]
         )
         assert not any(
@@ -1546,6 +1528,14 @@ def task_by_thread(
     conversation: ConversationRef = _TEST_CONVERSATION,
 ):
     return store.by_thread(conversation, thread)
+
+
+def task_by_conversation(
+    store: SessionStore,
+    conversation_id: str,
+    channel_key: str = "feishu",
+):
+    return store.by_conversation(ConversationRef(channel_key, conversation_id))
 
 
 async def wait_until(cond, timeout: float = 2.0) -> None:
@@ -2437,8 +2427,8 @@ async def test_run_uses_text_only_channel_output_lifecycle():
         def restart(self) -> None:
             self.stopped = False
 
-        def create_thread(self, conversation_id: str, initial_text: str) -> str:
-            self.replies.append((conversation_id, initial_text, False))
+        def create_thread(self, initial_text: str) -> str:
+            self.replies.append((initial_text, False))
             return f"om_root_{len(self.replies)}"
 
         def send_text(self, conversation: ConversationRef, text: str) -> str:
@@ -4784,16 +4774,16 @@ async def test_attach_creates_task_and_resumes_external_session():
     )
     # 新话题经 create_thread 开（root != /attach 消息 id）
     root = "om_newroot_1"
-    await wait_until(lambda: task_by_thread(store, root) is not None)
+    await wait_until(lambda: task_by_conversation(store, root) is not None)
     await wait_until(lambda: len(created) == 2)  # 探针 + 拉起各一个 agent
     await wait_until(lambda: any("已附着外部会话" in t for t in bridge.texts(root)))
 
-    t = task_by_thread(store, root)
+    t = task_by_conversation(store, root)
     assert t.origin == "attach"
     assert t.agent_session_id == "ext_sid_1"
     assert t.agent_label == "opencode"
     assert t.project_name == "demo"
-    assert t.conversation_ref == ConversationRef("feishu", "oc_1")
+    assert t.conversation_ref == ConversationRef("feishu", root)
     assert "附着外部会话 opencode/ext_sid_1" in t.description
     assert "继续之前的活" in t.description
     # 探针：resume_session_id 探测 + 已关闭（进程树清理）
@@ -4927,13 +4917,13 @@ async def test_attach_after_restart_recovers_via_load_session(tmp_path: Path):
     d1, b1, c1 = make_daemon(store=store1)
     await d1._handle_message(root_msg("/attach demo opencode ext_sid_1", mid="om_att"))
     root = "om_newroot_1"
-    await wait_until(lambda: task_by_thread(store1, root) is not None)
+    await wait_until(lambda: task_by_conversation(store1, root) is not None)
     await wait_until(lambda: len(c1) == 2)
-    saved_sid = task_by_thread(store1, root).agent_session_id
+    saved_sid = task_by_conversation(store1, root).agent_session_id
     assert saved_sid == "ext_sid_1"
-    assert task_by_thread(store1, root).origin == "attach"
+    assert task_by_conversation(store1, root).origin == "attach"
     await d1._shutdown()
-    assert task_by_thread(store1, root).status == "suspended"
+    assert task_by_conversation(store1, root).status == "suspended"
 
     # 新 daemon（共享台账）→ 话题回复 → 普通 load_session 恢复（走「已恢复」而非「附着」）
     store2 = SessionStore(store_path)
@@ -4975,13 +4965,13 @@ async def test_sched_attach_session_creates_task_and_resumes_external_session():
     await wait_until(lambda: len(created) == 2)  # 探针 + 拉起各一个 agent
     await wait_until(lambda: any("已附着外部会话" in t for t in bridge.texts(root)))
 
-    t = task_by_thread(store, root)
+    t = task_by_conversation(store, root)
     assert t is not None
     assert t.origin == "attach"
     assert t.agent_session_id == "ext_sid_1"
     assert t.agent_label == "opencode"
     assert t.project_name == "demo"
-    assert t.conversation_ref == ConversationRef("feishu", "oc_1")
+    assert t.conversation_ref == ConversationRef("feishu", root)
     assert "附着外部会话 opencode/ext_sid_1" in t.description
     assert "继续之前的活" in t.description
     # 工具返回给 LLM 的成功摘要带 task_id
@@ -5016,9 +5006,9 @@ async def test_sched_attach_session_routes_thread_and_output_to_source_channel()
         )
     )
 
-    task = task_by_thread(store, root, conversation)
+    task = task_by_conversation(store, root, "web")
     assert task is not None
-    assert task.conversation_ref == conversation
+    assert task.conversation_ref == ConversationRef("web", root)
     assert feishu.created_threads == []
     assert web.created_threads == [
         ("oc_1", "🔗 opencode · demo\n附着外部会话: ext_sid_web\n说明: web attach")
@@ -5046,8 +5036,8 @@ async def test_sched_attach_session_uses_default_agent_when_omitted():
         "demo", "ext_sid_1", conversation=_TEST_CONVERSATION
     )
     root = "om_newroot_1"
-    await wait_until(lambda: task_by_thread(store, root) is not None)
-    t = task_by_thread(store, root)
+    await wait_until(lambda: task_by_conversation(store, root) is not None)
+    t = task_by_conversation(store, root)
     assert t.agent_label == "copilot"  # demo 默认 copilot（agent 缺省）
     assert t.origin == "attach"
     assert "已附着外部会话 copilot/ext_sid_1" in out
@@ -5478,9 +5468,9 @@ async def test_sched_spawn_routes_thread_and_output_to_source_channel():
         )
     )
 
-    task = task_by_thread(daemon.store, root, conversation)
+    task = task_by_conversation(daemon.store, root, "web")
     assert task is not None
-    assert task.conversation_ref == conversation
+    assert task.conversation_ref == ConversationRef("web", root)
     assert feishu.created_threads == []
     assert web.created_threads == [("oc_1", "🚀 copilot · demo\n任务: web task")]
     assert feishu.texts(root) == []
@@ -5512,7 +5502,7 @@ async def test_sched_spawn_with_issue_uses_body_as_brief(monkeypatch):
     # Task 锚定了 issue_url
     t = daemon.store.all()[0]
     assert t.issue_url == "https://github.com/o/r/issues/3"
-    assert t.conversation_ref == ConversationRef("feishu", "oc_1")
+    assert t.conversation_ref == ConversationRef("feishu", "om_newroot_1")
     assert "issue" in out and "issues/3" in out
     # 就绪消息带 issue 链接
     assert any("issues/3" in text for _, text in bridge.roots)

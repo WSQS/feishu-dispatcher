@@ -247,6 +247,17 @@ class SessionStore:
     def get(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
+    def by_conversation(self, conversation: ConversationRef) -> Session | None:
+        if (
+            not conversation.channel_key().strip()
+            or not conversation.conversation_id.strip()
+        ):
+            return None
+        for session in self._sessions.values():
+            if session.conversation_ref == conversation:
+                return session
+        return None
+
     def by_thread(
         self, conversation: ConversationRef, thread_root_id: str
     ) -> Session | None:

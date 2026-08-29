@@ -1044,7 +1044,19 @@ class _Daemon:
             )
             return
 
-        if msg.thread_id:
+        bound_session_id = self._session_id_for_conversation(conversation)
+        persisted_session = None
+        if not msg.thread_id and bound_session_id is None:
+            persisted_session = self.store.by_conversation(conversation)
+            if (
+                persisted_session is not None
+                and persisted_session.thread_root_id != conversation.conversation_id
+            ):
+                persisted_session = None
+        if msg.thread_id or (
+            bound_session_id is not None
+            and bound_session_id != _DISPATCHER_SESSION_ID
+        ) or persisted_session is not None:
             await self._forward_to_agent(msg, conversation=conversation)
             return
 
@@ -1613,11 +1625,8 @@ class _Daemon:
         if description:
             header += f"\n说明: {description}"
         channel = self._channel_for(conversation)
-        root = await asyncio.to_thread(
-            channel.create_thread,
-            conversation.conversation_id,
-            header,
-        )
+        root = await asyncio.to_thread(channel.create_thread, header)
+        session_conversation = ConversationRef(conversation.channel_key(), root)
         #  ② 终查——create_thread 是 await，其间别的并发附着/派发可能占走名额；
         # 终查与 create+_launch 之间**无 await**，守住「check→launch 无 await」不变量。
         # 终查超限属罕见竞态：话题已建，就地提示并放弃，不落 Task。
@@ -1635,7 +1644,7 @@ class _Daemon:
             project_name=project_name,
             agent_label=agent_label,
             description=task_desc,
-            conversation=conversation,
+            conversation=session_conversation,
             thread_root_id=root,
             workspace=str(project.path),
             agent_session_id=session_id,
@@ -2214,7 +2223,6 @@ class _Daemon:
         self, msg: ChannelMessage, *, conversation: ConversationRef
     ) -> None:
         """话题内回复 → 入队给对应 agent；agent 不在则尝试跨重启恢复。"""
-        thread_root = conversation.conversation_id
         text = msg.text.strip()
         # /help 先于 session 检查：不依赖 agent 是否在线（挂起的话题里也能查用法），
         # 且绝不入队 / 触发恢复。
@@ -2234,23 +2242,27 @@ class _Daemon:
                 )
                 return
             forward_raw = True
-        task = self._session_for_conversation(conversation)
-        if task is None:
-            task_source = ConversationRef(
+        session = self._session_for_conversation(conversation)
+        if session is None:
+            session = self.store.by_conversation(conversation)
+        if session is None and msg.thread_id:
+            source = ConversationRef(
                 conversation.channel_key(), msg.conversation_id
             )
-            task = self.store.by_thread(task_source, thread_root)
-            if task is not None:
-                self._bind_conversation(conversation, task.session_id)
+            session = self.store.by_thread(source, conversation.conversation_id)
+        if session is not None:
+            self._bind_conversation(conversation, session.session_id)
         sess = (
-            self._runners.get_for_session(task.session_id) if task is not None else None
+            self._runners.get_for_session(session.session_id)
+            if session is not None
+            else None
         )
         if sess is None:
             # Thread 只负责路由到 Task；无 current runner 时再按 Task 恢复或明确提示。
             await self._recover_or_notify(
                 text,
                 conversation=conversation,
-                task=task,
+                task=session,
                 forward_raw=forward_raw,
             )
             return
@@ -2738,19 +2750,6 @@ class _Daemon:
     async def _http_create_task_conversation(
         self, context: dict, request: dict
     ) -> tuple[int, dict]:
-        body = request.get("body")
-        if not isinstance(body, dict):
-            return 400, {
-                "error": "invalid_request",
-                "message": "请求体必须是 JSON object",
-            }
-        raw_conversation_id = body.get("conversation_id")
-        if not isinstance(raw_conversation_id, str) or not raw_conversation_id.strip():
-            return 400, {
-                "error": "invalid_request",
-                "message": "conversation_id 必须是非空字符串",
-            }
-
         task_id = request["segments"]["task_id"]
         task = self.store.get(task_id)
         if task is None:
@@ -2765,30 +2764,23 @@ class _Daemon:
         channel_key = context.get("channel_key")
         if not isinstance(channel_key, str) or not channel_key.strip():
             return 503, {"error": "channel_unavailable"}
-        parent_conversation_id = raw_conversation_id.strip()
-        parent = ConversationRef(channel_key.strip(), parent_conversation_id)
+        channel_key = channel_key.strip()
         try:
-            channel = self._channel_for(parent)
-        except RuntimeError as exc:
-            return 503, {
-                "error": "channel_unavailable",
-                "message": str(exc),
-            }
-        thread_id = channel.create_thread(
-            parent_conversation_id,
-            f"[{task.session_id}] {task.description}",
-        )
-        if not isinstance(thread_id, str) or not thread_id.strip():
+            channel = self._channels[channel_key]
+        except KeyError:
             return 503, {"error": "channel_unavailable"}
-        thread_id = thread_id.strip()
+        conversation_id = channel.create_thread(
+            f"[{task.session_id}] {task.description}"
+        )
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            return 503, {"error": "channel_unavailable"}
+        conversation_id = conversation_id.strip()
         self._bind_conversation(
-            ConversationRef(parent.channel_key(), thread_id),
-            task.session_id,
+            ConversationRef(channel_key, conversation_id), task.session_id
         )
         return 201, {
             "task_id": task.session_id,
-            "conversation_id": parent_conversation_id,
-            "thread_id": thread_id,
+            "conversation_id": conversation_id,
         }
 
     async def _http_task_events(
@@ -3039,14 +3031,13 @@ class _Daemon:
         if issue_url:
             header += f"\nissue: {issue_url}"
         channel = self._channel_for(conversation)
-        root = await asyncio.to_thread(
-            channel.create_thread, conversation.conversation_id, header
-        )
+        root = await asyncio.to_thread(channel.create_thread, header)
+        session_conversation = ConversationRef(conversation.channel_key(), root)
         new_task = self.store.create(
             project_name=project_name,
             agent_label=agent_label,
             description=task,
-            conversation=conversation,
+            conversation=session_conversation,
             thread_root_id=root,
             workspace=str(project.path),
             issue_url=issue_url,
@@ -3057,7 +3048,7 @@ class _Daemon:
             agent_argv,
             first_turn=TurnRequest(
                 brief,
-                ConversationRef(conversation.channel_key(), root),
+                session_conversation,
             ),
         )
         bound = f"（brief 来自 issue {issue_url}）" if issue_url else note

@@ -819,9 +819,9 @@ class FeishuBridge:
                 if active is output:
                     del self._active_outputs[key]
 
-    def create_thread(self, conversation_id: str, initial_text: str) -> str:
-        """在会话中发送根消息创建话题，返回根 message_id。"""
-        return self.send_root_message(conversation_id, initial_text)
+    def create_thread(self, initial_text: str) -> str:
+        """在配置的根群聊中创建话题，返回根 message_id。"""
+        return self.send_root_message(self._chat_whitelist, initial_text)
 
     def send_text(self, conversation: ConversationRef, text: str) -> str:
         """向 Conversation 发送文本。"""

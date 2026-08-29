@@ -409,7 +409,7 @@ def test_channel_send_text_delegates_to_root_message(monkeypatch):
 
 
 def test_channel_create_thread_delegates_to_root_message(monkeypatch):
-    bridge = make_bridge()
+    bridge = make_bridge(chat_whitelist="oc_chat")
     calls: list[tuple[str, str]] = []
 
     def send_root_message(conversation_id: str, initial_text: str) -> str:
@@ -418,7 +418,7 @@ def test_channel_create_thread_delegates_to_root_message(monkeypatch):
 
     monkeypatch.setattr(bridge, "send_root_message", send_root_message)
 
-    assert bridge.create_thread("oc_chat", "hello") == "om_root"
+    assert bridge.create_thread("hello") == "om_root"
     assert calls == [("oc_chat", "hello")]
 
 

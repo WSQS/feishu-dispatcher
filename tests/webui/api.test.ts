@@ -10,7 +10,6 @@ import type {
   ChannelEventPage,
   ChannelHealth,
   ChannelMessageAccepted,
-  CreateTaskConversationRequest,
   DispatcherTaskSummary,
   FilePreview,
   ProjectSummary,
@@ -124,14 +123,11 @@ describe("createApiClient 类型化方法", () => {
       ChannelEventPage
     >();
     expectTypeOf(api.createTaskConversation).parameters.toEqualTypeOf<
-      [string, string]
+      [string]
     >();
     expectTypeOf(api.createTaskConversation).returns.resolves.toEqualTypeOf<
       TaskConversationCreated
     >();
-    expectTypeOf<CreateTaskConversationRequest>().toEqualTypeOf<{
-      conversation_id: string;
-    }>();
     expectTypeOf(api.sendChannelMessage).parameters.toEqualTypeOf<
       [SendChannelMessageRequest]
     >();
@@ -437,7 +433,6 @@ describe("createApiClient 类型化方法", () => {
           JSON.stringify({
             task_id: "task A",
             conversation_id: "conversation-a",
-            thread_id: "thread-a",
           }),
           { status: 201 },
         ),
@@ -446,8 +441,7 @@ describe("createApiClient 类型化方法", () => {
         new Response(
           JSON.stringify({
             task_id: "other-task",
-            conversation_id: "conversation-a",
-            thread_id: "thread-b",
+            conversation_id: "conversation-b",
           }),
           { status: 201 },
         ),
@@ -456,14 +450,13 @@ describe("createApiClient 类型化方法", () => {
     const api = createApiClient(() => "token-a");
 
     await expect(
-      api.createTaskConversation("task A", "conversation-a"),
+      api.createTaskConversation("task A"),
     ).resolves.toEqual({
       task_id: "task A",
       conversation_id: "conversation-a",
-      thread_id: "thread-a",
     } satisfies TaskConversationCreated);
     await expect(
-      api.createTaskConversation("task A", "conversation-a"),
+      api.createTaskConversation("task A"),
     ).rejects.toThrow("Task Conversation响应格式无效");
 
     expect(fetch.mock.calls.map(([path]) => path)).toEqual([
@@ -473,10 +466,8 @@ describe("createApiClient 类型化方法", () => {
     for (const [, options] of fetch.mock.calls) {
       expect(options).toMatchObject({
         method: "POST",
-        body: JSON.stringify({ conversation_id: "conversation-a" }),
       });
-      expect(options.headers).toBeInstanceOf(Headers);
-      expect(options.headers.get("Content-Type")).toBe("application/json");
+      expect(options.body).toBeUndefined();
     }
   });
 
@@ -494,7 +485,6 @@ describe("createApiClient 类型化方法", () => {
     const message: SendChannelMessageRequest = {
       conversation_id: "conversation-a",
       message_id: "message-a",
-      thread_id: "thread-a",
       sender_id: "webui:conversation-a",
       text: "hello",
     };
