@@ -1868,7 +1868,6 @@ class _Daemon:
         self, sess: _AgentSessionRunner, startup_turn: TurnRequest | None
     ) -> None:
         """一个 agent 的完整生命周期：启动 → 串行消费 Turn 队列 → 关闭。"""
-        root = sess.conversation.conversation_id
         startup_conversation = (
             startup_turn.conversation if startup_turn is not None else sess.conversation
         )
@@ -2175,7 +2174,7 @@ class _Daemon:
                         sess.current_message_chunks.clear()
                         sess.current_thought_chunks.clear()
         except asyncio.CancelledError:
-            logger.debug("agent worker 被取消 root=%s", root)
+            logger.debug("agent worker 被取消 session=%s", sess.session_id)
         finally:
             await self._close_session(sess)
 
