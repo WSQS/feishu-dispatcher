@@ -134,7 +134,7 @@ class FakeBridge:
             if isinstance(body, ToolCallObserved):
                 return
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
-        source = body.source.channel_key if body.source is not None else "unknown"
+        source = body.source.channel_key() if body.source is not None else "unknown"
         self.reply_text(
             conversation_id,
             f"↪️ 同步自 {source}：{body.text}",

@@ -251,7 +251,7 @@ class SessionStore:
         self, conversation: ConversationRef, thread_root_id: str
     ) -> Session | None:
         if (
-            not conversation.channel_key.strip()
+            not conversation.channel_key().strip()
             or not conversation.conversation_id.strip()
             or not thread_root_id
         ):
@@ -303,7 +303,7 @@ class SessionStore:
         model: str = "",
         origin: str = "spawn",
     ) -> Session:
-        if not conversation.channel_key.strip():
+        if not conversation.channel_key().strip():
             raise ValueError("ConversationRef.channel_key 不能为空")
         if not conversation.conversation_id.strip():
             raise ValueError("ConversationRef.conversation_id 不能为空")
@@ -328,7 +328,7 @@ class SessionStore:
             description=description,
             status=status,
             agent_session_id=agent_session_id,
-            channel_key=conversation.channel_key,
+            channel_key=conversation.channel_key(),
             conversation_id=conversation.conversation_id,
             thread_root_id=thread_root_id,
             workspace=workspace,

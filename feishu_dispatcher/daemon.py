@@ -411,7 +411,7 @@ class _FanoutStreamingOutput:
             except Exception:
                 logger.exception(
                     "Session 流式输出 feed 失败 channel=%s conversation=%s",
-                    conversation.channel_key,
+                    conversation.channel_key(),
                     conversation.conversation_id,
                 )
 
@@ -422,7 +422,7 @@ class _FanoutStreamingOutput:
             except Exception:
                 logger.exception(
                     "Session 流式输出 footer 失败 channel=%s conversation=%s",
-                    conversation.channel_key,
+                    conversation.channel_key(),
                     conversation.conversation_id,
                 )
 
@@ -445,7 +445,7 @@ class _FanoutStreamingOutput:
                 logger.exception(
                     "Session 流式输出 %s 失败 channel=%s conversation=%s",
                     method,
-                    conversation.channel_key,
+                    conversation.channel_key(),
                     conversation.conversation_id,
                 )
 
@@ -624,7 +624,7 @@ class _Daemon:
         return ConversationRef(self._primary_channel_key, self.cfg.chat_id)
 
     def _channel_for(self, conversation: ConversationRef) -> Channel:
-        channel_key = conversation.channel_key.strip()
+        channel_key = conversation.channel_key().strip()
         if not channel_key:
             raise RuntimeError("Conversation 缺少 channel_key")
         try:
@@ -636,7 +636,7 @@ class _Daemon:
         self, conversation: ConversationRef, session_id: str
     ) -> None:
         """把完整 Conversation 绑定到一个已知 Session 身份；重复绑定幂等。"""
-        if not conversation.channel_key.strip():
+        if not conversation.channel_key().strip():
             raise ValueError("ConversationRef.channel_key 不能为空")
         if not conversation.conversation_id.strip():
             raise ValueError("ConversationRef.conversation_id 不能为空")
@@ -905,7 +905,7 @@ class _Daemon:
             except Exception:
                 logger.exception(
                     "Session 输出创建失败 channel=%s conversation=%s",
-                    conversation.channel_key,
+                    conversation.channel_key(),
                     conversation.conversation_id,
                 )
                 continue
@@ -1524,7 +1524,8 @@ class _Daemon:
             new_task,
             agent_argv,
             first_turn=TurnRequest(
-                task, ConversationRef(conversation.channel_key, thread_root)
+                task,
+                ConversationRef(conversation.channel_key(), thread_root),
             ),
         )
         await self._safe_reply(
@@ -2269,7 +2270,9 @@ class _Daemon:
             forward_raw = True
         task = self._session_for_conversation(conversation)
         if task is None:
-            task_source = ConversationRef(conversation.channel_key, msg.conversation_id)
+            task_source = ConversationRef(
+                conversation.channel_key(), msg.conversation_id
+            )
             task = self.store.by_thread(task_source, thread_root)
             if task is not None:
                 self._bind_conversation(conversation, task.session_id)
@@ -2834,7 +2837,7 @@ class _Daemon:
             return 503, {"error": "channel_unavailable"}
         thread_id = thread_id.strip()
         self._bind_conversation(
-            ConversationRef(parent.channel_key, thread_id),
+            ConversationRef(parent.channel_key(), thread_id),
             task.session_id,
         )
         return 201, {
@@ -3108,7 +3111,8 @@ class _Daemon:
             new_task,
             agent_argv,
             first_turn=TurnRequest(
-                brief, ConversationRef(conversation.channel_key, root)
+                brief,
+                ConversationRef(conversation.channel_key(), root),
             ),
         )
         bound = f"（brief 来自 issue {issue_url}）" if issue_url else note
@@ -3457,7 +3461,7 @@ class _Daemon:
         except Exception:
             logger.exception(
                 "Channel 独立文本发送失败 channel=%s conversation=%s",
-                conversation.channel_key,
+                conversation.channel_key(),
                 conversation.conversation_id,
             )
 
@@ -3481,7 +3485,7 @@ class _Daemon:
             logger.exception(
                 "Channel SessionEvent 投影失败 event=%s channel=%s conversation=%s",
                 event.event_id,
-                conversation.channel_key,
+                conversation.channel_key(),
                 conversation.conversation_id,
             )
 
@@ -3510,7 +3514,7 @@ class _Daemon:
         except Exception:
             logger.exception(
                 "Channel 发送失败 channel=%s msg=%s",
-                conversation.channel_key,
+                conversation.channel_key(),
                 message_id,
             )
 
@@ -3542,7 +3546,7 @@ class _Daemon:
         except Exception:
             logger.exception(
                 "主线通知发送失败 channel=%s conversation=%s",
-                conversation.channel_key,
+                conversation.channel_key(),
                 conversation.conversation_id,
             )
 
