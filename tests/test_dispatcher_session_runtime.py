@@ -191,7 +191,9 @@ async def test_runtime_publishes_execution_failure_event() -> None:
     reply = await runtime.wait_turn(receipt.turn)
 
     assert reply.startswith("调度器出错：调度器 LLM 未配置")
-    error = next(event for event in events if isinstance(event.body, SessionErrorOccurred))
+    error = next(
+        event for event in events if isinstance(event.body, SessionErrorOccurred)
+    )
     assert error.turn_id == receipt.turn.turn_id
     assert error.body == SessionErrorOccurred(
         phase="execute_turn",

@@ -1053,10 +1053,14 @@ class _Daemon:
                 and persisted_session.thread_root_id != conversation.conversation_id
             ):
                 persisted_session = None
-        if msg.thread_id or (
-            bound_session_id is not None
-            and bound_session_id != _DISPATCHER_SESSION_ID
-        ) or persisted_session is not None:
+        if (
+            msg.thread_id
+            or (
+                bound_session_id is not None
+                and bound_session_id != _DISPATCHER_SESSION_ID
+            )
+            or persisted_session is not None
+        ):
             await self._forward_to_agent(msg, conversation=conversation)
             return
 
@@ -2246,9 +2250,7 @@ class _Daemon:
         if session is None:
             session = self.store.by_conversation(conversation)
         if session is None and msg.thread_id:
-            source = ConversationRef(
-                conversation.channel_key(), msg.conversation_id
-            )
+            source = ConversationRef(conversation.channel_key(), msg.conversation_id)
             session = self.store.by_thread(source, conversation.conversation_id)
         if session is not None:
             self._bind_conversation(conversation, session.session_id)
