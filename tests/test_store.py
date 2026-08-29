@@ -18,7 +18,9 @@ from feishu_dispatcher.store import (
     SessionStore,
 )
 
-_TEST_CONVERSATION = ConversationRef("feishu", "oc_main")
+
+def conversation(conversation_id: str, channel_key: str = "feishu") -> ConversationRef:
+    return ConversationRef(channel_key, conversation_id)
 
 
 def make(
@@ -32,8 +34,7 @@ def make(
         project_name=project,
         agent_label="copilot",
         description=desc,
-        conversation=_TEST_CONVERSATION,
-        thread_root_id=thread,
+        conversation=conversation(thread),
         workspace="C:/x",
     )
 
@@ -74,38 +75,36 @@ def test_create_rejects_blank_conversation_ref_without_consuming_id(
             agent_label="copilot",
             description="做 X",
             conversation=conversation,
-            thread_root_id="om_1",
             workspace="C:/x",
         )
 
     assert make(s).session_id == "t1"
 
 
-def test_get_and_by_thread():
+def test_get_and_by_conversation():
     s = SessionStore(None)
     t = make(s, thread="om_1")
     assert s.get("t1") is t
-    assert s.by_thread(_TEST_CONVERSATION, "om_1") is t
-    assert s.by_thread(_TEST_CONVERSATION, "nope") is None
+    assert s.by_conversation(conversation("om_1")) is t
+    assert s.by_conversation(conversation("nope")) is None
 
 
-def test_by_thread_is_scoped_to_conversation():
+def test_by_conversation_is_scoped_to_channel():
     s = SessionStore(None)
     feishu_task = make(s, thread="shared-thread")
-    web_conversation = ConversationRef("web", "oc_main")
+    web_conversation = conversation("shared-thread", "web")
     web_task = s.create(
         project_name="demo",
         agent_label="copilot",
         description="做 Y",
         conversation=web_conversation,
-        thread_root_id="shared-thread",
         workspace="C:/y",
     )
 
-    assert s.by_thread(_TEST_CONVERSATION, "shared-thread") is feishu_task
-    assert s.by_thread(web_conversation, "shared-thread") is web_task
-    assert s.by_thread(ConversationRef("other", "oc_main"), "shared-thread") is None
-    assert s.by_thread(ConversationRef("", ""), "shared-thread") is None
+    assert s.by_conversation(conversation("shared-thread")) is feishu_task
+    assert s.by_conversation(web_conversation) is web_task
+    assert s.by_conversation(conversation("shared-thread", "other")) is None
+    assert s.by_conversation(ConversationRef("", "")) is None
 
 
 def test_task_conversation_ref_persists_and_reloads(tmp_path: Path):
@@ -117,7 +116,6 @@ def test_task_conversation_ref_persists_and_reloads(tmp_path: Path):
         agent_label="copilot",
         description="做 X",
         conversation=conversation,
-        thread_root_id="thread-1",
         workspace="C:/x",
     )
 
@@ -144,8 +142,7 @@ def test_session_identity_fields_persist_with_new_disk_keys(tmp_path: Path):
         project_name="demo",
         agent_label="copilot",
         description="做 X",
-        conversation=_TEST_CONVERSATION,
-        thread_root_id="om_1",
+        conversation=conversation("om_1"),
         workspace="C:/x",
         agent_session_id="ses_x",
     )
@@ -172,7 +169,7 @@ def test_persists_and_counter_never_reuses(tmp_path: Path):
     s1.update("t1", status="idle")
     s2 = SessionStore(p)  # reload
     assert s2.get("t1").status == "idle"
-    assert s2.by_thread(_TEST_CONVERSATION, "om_2").session_id == "t2"
+    assert s2.by_conversation(conversation("om_2")).session_id == "t2"
     # 计数器随之持久化 → 下一个是 t3，不复用
     assert make(s2, thread="om_3").session_id == "t3"
 
@@ -199,9 +196,9 @@ def test_create_self_heals_reverted_seq_never_reuses_id():
     t = make(s, thread="om_4")
     assert t.session_id == "t4"  # 不是 t2/t3——现有最大 id 是 3，跳到 4
     assert (
-        s.by_thread(_TEST_CONVERSATION, "om_1").session_id == "t1"
+        s.by_conversation(conversation("om_1")).session_id == "t1"
     )  # 老任务映射未被覆盖
-    assert s.by_thread(_TEST_CONVERSATION, "om_4").session_id == "t4"
+    assert s.by_conversation(conversation("om_4")).session_id == "t4"
 
 
 def test_create_reload_with_tampered_seq_does_not_clobber(tmp_path: Path):
@@ -219,8 +216,8 @@ def test_create_reload_with_tampered_seq_does_not_clobber(tmp_path: Path):
     s2 = SessionStore(p)  # 重载：seq=0，但仍有 t1/t2
     t = make(s2, thread="om_3")
     assert t.session_id == "t3"  # 不复用 t1
-    assert s2.by_thread(_TEST_CONVERSATION, "om_1").session_id == "t1"  # 历史未被清空
-    assert s2.by_thread(_TEST_CONVERSATION, "om_2").session_id == "t2"
+    assert s2.by_conversation(conversation("om_1")).session_id == "t1"
+    assert s2.by_conversation(conversation("om_2")).session_id == "t2"
 
 
 def test_failed_is_resumable_not_terminal_and_error_persists(tmp_path: Path):
@@ -316,8 +313,8 @@ def test_corrupt_primary_recovers_from_backup_not_wiped(tmp_path: Path):
     make(s1, thread="om_3")  # t3；.bak = {t1, t2}
     p.write_text("truncated{", encoding="utf-8")  # 系统崩溃把主文件写花
     s2 = SessionStore(p)  # 主损坏 → 回退 .bak（含 t1、t2）
-    assert s2.by_thread(_TEST_CONVERSATION, "om_1").session_id == "t1"
-    assert s2.by_thread(_TEST_CONVERSATION, "om_2").session_id == "t2"
+    assert s2.by_conversation(conversation("om_1")).session_id == "t1"
+    assert s2.by_conversation(conversation("om_2")).session_id == "t2"
     nxt = make(s2, thread="om_4")  # seq 从 .bak 恢复 → 不落回 t1
     assert nxt.session_id not in {"t1", "t2"}
     assert int(nxt.session_id[1:]) >= 3  # 旧行为会给 t1（清空+seq 归零）
@@ -341,7 +338,7 @@ def test_missing_primary_recovers_from_backup(tmp_path: Path):
     make(s1, thread="om_2")  # .bak = {t1}
     p.unlink()
     s2 = SessionStore(p)
-    assert s2.by_thread(_TEST_CONVERSATION, "om_1").session_id == "t1"
+    assert s2.by_conversation(conversation("om_1")).session_id == "t1"
 
 
 def test_clear_terminal():
@@ -461,8 +458,7 @@ def test_task_create_records_model():
         project_name="p",
         agent_label="opencode",
         description="x",
-        conversation=_TEST_CONVERSATION,
-        thread_root_id="om_1",
+        conversation=conversation("om_1"),
         workspace="C:/x",
         model="glm-5",
     )
@@ -580,8 +576,7 @@ def test_task_create_with_origin_attach():
         project_name="p",
         agent_label="opencode",
         description="附着",
-        conversation=_TEST_CONVERSATION,
-        thread_root_id="om_1",
+        conversation=conversation("om_1"),
         workspace="C:/x",
         agent_session_id="ext_sid_1",
         origin="attach",
@@ -597,19 +592,17 @@ def test_task_origin_persists_and_reloads(tmp_path: Path):
         project_name="p",
         agent_label="opencode",
         description="附着",
-        conversation=_TEST_CONVERSATION,
-        thread_root_id="om_2",
+        conversation=conversation("om_2"),
         workspace="C:/x",
         agent_session_id="ext_sid_1",
         origin="attach",
     )
     s2 = SessionStore(p)
-    assert s2.by_thread(_TEST_CONVERSATION, "om_1").origin == "spawn"
-    assert s2.by_thread(_TEST_CONVERSATION, "om_2").origin == "attach"
+    assert s2.by_conversation(conversation("om_1")).origin == "spawn"
+    assert s2.by_conversation(conversation("om_2")).origin == "attach"
 
 
-def test_old_tasks_json_without_origin_reads_spawn(tmp_path: Path):
-    # 新身份 schema 中没有 origin 键：读入时仍缺省补 spawn。
+def test_old_tasks_json_with_thread_root_is_rejected(tmp_path: Path):
     import json
 
     p = tmp_path / "tasks.json"
@@ -623,6 +616,8 @@ def test_old_tasks_json_without_origin_reads_spawn(tmp_path: Path):
                 "description": "旧任务",
                 "status": "suspended",
                 "agent_session_id": "old_sid",
+                "channel_key": "feishu",
+                "conversation_id": "oc_1",
                 "thread_root_id": "om_1",
                 "workspace": "C:/x",
                 "turns": 3,
@@ -637,13 +632,7 @@ def test_old_tasks_json_without_origin_reads_spawn(tmp_path: Path):
         },
     }
     p.write_text(json.dumps(payload), encoding="utf-8")
-    s = SessionStore(p)
-    assert s.get("t1").origin == "spawn"  # 缺省补齐
-    assert s.get("t1").agent_session_id == "old_sid"
-    assert s.get("t1").session_id == "t1"
-    assert not hasattr(s.get("t1"), "task_id")
-    assert s.get("t1").conversation_ref == ConversationRef("", "")
-    assert s.by_thread(_TEST_CONVERSATION, "om_1") is None
+    assert SessionStore(p).all() == []
 
 
 def test_old_session_identity_schema_is_rejected(tmp_path: Path):
@@ -687,8 +676,7 @@ def test_by_agent_session_cross_agent_same_session_id_no_conflict():
         project_name="p",
         agent_label="copilot",
         description="a",
-        conversation=_TEST_CONVERSATION,
-        thread_root_id="om_1",
+        conversation=conversation("om_1"),
         workspace="C:/x",
         agent_session_id="shared_sid",
     )
@@ -696,13 +684,16 @@ def test_by_agent_session_cross_agent_same_session_id_no_conflict():
         project_name="p",
         agent_label="opencode",
         description="b",
-        conversation=_TEST_CONVERSATION,
-        thread_root_id="om_2",
+        conversation=conversation("om_2"),
         workspace="C:/x",
         agent_session_id="shared_sid",
     )
-    assert s.by_agent_session("copilot", "shared_sid").thread_root_id == "om_1"
-    assert s.by_agent_session("opencode", "shared_sid").thread_root_id == "om_2"
+    assert s.by_agent_session("copilot", "shared_sid").conversation_ref == conversation(
+        "om_1"
+    )
+    assert s.by_agent_session(
+        "opencode", "shared_sid"
+    ).conversation_ref == conversation("om_2")
 
 
 def test_by_agent_session_empty_keys_never_match():
