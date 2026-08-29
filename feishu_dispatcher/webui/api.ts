@@ -106,20 +106,14 @@ export interface ChannelEventPage {
   oldest_cursor: number;
 }
 
-export interface CreateTaskConversationRequest {
-  conversation_id: string;
-}
-
 export interface TaskConversationCreated {
   task_id: string;
   conversation_id: string;
-  thread_id: string;
 }
 
 export interface SendChannelMessageRequest {
   conversation_id: string;
   message_id: string;
-  thread_id: string | null;
   sender_id: string;
   text: string;
 }
@@ -278,8 +272,7 @@ function isTaskConversationCreated(
   return (
     isRecord(value) &&
     isNonEmptyString(value.task_id) &&
-    isNonEmptyString(value.conversation_id) &&
-    isNonEmptyString(value.thread_id)
+    isNonEmptyString(value.conversation_id)
   );
 }
 
@@ -362,23 +355,16 @@ export function createApiClient(getToken: () => string) {
 
     async createTaskConversation(
       taskId: string,
-      conversationId: string,
     ): Promise<TaskConversationCreated> {
-      const body: CreateTaskConversationRequest = {
-        conversation_id: conversationId,
-      };
       const payload = await request<unknown>(
         `/api/tasks/${encodeURIComponent(taskId)}/conversations`,
         {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
         },
       );
       if (
         !isTaskConversationCreated(payload) ||
-        payload.task_id !== taskId ||
-        payload.conversation_id !== conversationId
+        payload.task_id !== taskId
       ) {
         throw invalidResponse("Task Conversation");
       }

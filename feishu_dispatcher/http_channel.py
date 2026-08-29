@@ -224,27 +224,23 @@ class HttpChannel:
         self.stop()
         self.start(on_message)
 
-    def create_thread(self, conversation_id: str, initial_text: str) -> str:
-        conversation_id = self._clean_identity(conversation_id, "conversation_id")
-        thread_id = self._new_target(conversation_id, "thread")
+    def create_thread(self, initial_text: str) -> str:
+        conversation_id = f"http-conversation-{uuid4().hex}"
+        self._claim_targets(conversation_id, [])
+        message_id = self._new_target(conversation_id, "message")
         self._append_event(
             conversation_id,
-            "thread.created",
-            thread_id=thread_id,
+            "conversation.created",
+            message_id=message_id,
             text=initial_text,
         )
-        return thread_id
+        return conversation_id
 
     def send_text(self, conversation: ConversationRef, text: str) -> str:
         conversation_id = self._clean_identity(
             conversation.conversation_id, "conversation_id"
         )
-        with self._state_lock:
-            routed_conversation_id = self._target_conversations.get(conversation_id)
-        if routed_conversation_id is not None:
-            conversation_id = routed_conversation_id
-        else:
-            self._claim_targets(conversation_id, [])
+        self._claim_targets(conversation_id, [])
         message_id = self._new_target(conversation_id, "message")
         self._append_event(
             conversation_id,
@@ -275,7 +271,9 @@ class HttpChannel:
             ),
         ):
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
-        owner = self._conversation_for_target(conversation_id)
+        conversation_id = self._clean_identity(conversation_id, "conversation_id")
+        self._claim_targets(conversation_id, [])
+        owner = conversation_id
         presentation: dict[str, object] | None = None
         if isinstance(body, AgentOutputStarted):
             output = self._start_session_output(owner, event)
@@ -324,12 +322,13 @@ class HttpChannel:
         *,
         footer: str = "",
     ) -> _HttpStreamingOutput:
-        target_id = conversation.conversation_id
-        conversation_id = self._conversation_for_target(target_id)
+        conversation_id = self._clean_identity(
+            conversation.conversation_id, "conversation_id"
+        )
+        self._claim_targets(conversation_id, [])
         return _HttpStreamingOutput(
             self,
             conversation_id,
-            target_id,
             title,
             footer=footer,
         )
@@ -407,8 +406,6 @@ class HttpChannel:
             return 503, {"error": "channel_unavailable"}
         try:
             message = self._parse_message(body)
-            if message.thread_id is not None:
-                self._require_target(message.conversation_id, message.thread_id)
             self._claim_targets(message.conversation_id, [message.message_id])
             future = asyncio.run_coroutine_threadsafe(
                 self._on_message(message), self._loop
@@ -497,14 +494,10 @@ class HttpChannel:
         text = body.get("text")
         if not isinstance(text, str):
             raise _HttpRequestError(400, "invalid_request", "text 必须是字符串")
-        raw_thread_id = body.get("thread_id")
-        thread_id = None
-        if raw_thread_id is not None:
-            thread_id = HttpChannel._clean_identity(raw_thread_id, "thread_id")
         return ChannelMessage(
             conversation_id=conversation_id,
             message_id=message_id,
-            thread_id=thread_id,
+            thread_id=None,
             text=text,
             sender_id=sender_id,
         )
@@ -570,24 +563,6 @@ class HttpChannel:
             raise ValueError(f"未知 HTTP Channel target: {target_id}")
         return conversation_id
 
-    def _require_target(self, conversation_id: str, target_id: str) -> None:
-        with self._state_lock:
-            owner = self._target_conversations.get(target_id)
-        if owner is None:
-            raise _HttpRequestError(
-                404,
-                "unknown_target",
-                "thread_id 不是已知 target",
-                target_id=target_id,
-            )
-        if owner != conversation_id:
-            raise _HttpRequestError(
-                409,
-                "target_conflict",
-                "thread_id 属于其它 Conversation",
-                target_id=target_id,
-            )
-
     def _append_event(self, conversation_id: str, event_type: str, **payload) -> int:
         with self._state_lock:
             state = self._conversations.get(conversation_id)
@@ -645,13 +620,11 @@ class _HttpStreamingOutput:
         self,
         channel: HttpChannel,
         conversation_id: str,
-        target_id: str,
         title: str,
         *,
         footer: str,
     ) -> None:
         self._channel = channel
-        self._target_id = target_id
         self._output_id = channel._new_target(conversation_id, "output")
         self.conversation_id = conversation_id
         self._footer = footer
@@ -684,7 +657,6 @@ class _HttpStreamingOutput:
     def started_presentation(self) -> dict[str, object]:
         return {
             "output_id": self._output_id,
-            "target_id": self._target_id,
             "title": self._title,
             "footer": self._footer,
             "status": "running",

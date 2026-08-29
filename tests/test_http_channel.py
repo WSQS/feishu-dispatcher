@@ -81,14 +81,12 @@ def _message(
     conversation_id: str = "browser-a",
     message_id: str = "message-a",
     *,
-    thread_id: str | None = None,
     sender_id: str = "user-a",
     text: str = "/help",
 ) -> dict:
     return {
         "conversation_id": conversation_id,
         "message_id": message_id,
-        "thread_id": thread_id,
         "sender_id": sender_id,
         "text": text,
     }
@@ -195,7 +193,9 @@ def test_webui_recovers_http_channel_instance_and_cursor():
     polling = section("function startPolling", "async function pollTasksOnce")
     send = section("async function sendMessage", "function resetConversation")
     reset = section("function resetConversation", "const COLUMN_DEFAULTS")
-    history = section("async function loadTaskHistory", "async function loadEarlierTaskHistory")
+    history = section(
+        "async function loadTaskHistory", "async function loadEarlierTaskHistory"
+    )
 
     assert (
         'channelInstance: "feishu-dispatcher.http-channel.instance"'
@@ -206,7 +206,7 @@ def test_webui_recovers_http_channel_instance_and_cursor():
         "pollGeneration += 1;",
         "storageRemove(storageKeys.cursor(conversationId));",
         "storageRemove(storageKeys.started(conversationId));",
-        "taskThreads.clear();",
+        "taskConversations.clear();",
         "taskTraceStates.clear();",
         "targetTasks.clear();",
         "outputs.clear();",
@@ -251,8 +251,7 @@ def test_webui_recovers_http_channel_instance_and_cursor():
     )
     assert "renderedCursor = 0;" in reset
     assert (
-        "generation === taskHistoryGeneration && selectedTaskId === taskId"
-        in history
+        "generation === taskHistoryGeneration && selectedTaskId === taskId" in history
     )
 
 
@@ -457,10 +456,7 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert "api.listTasks()" in javascript
         assert 'apiRequest("/api/tasks")' not in javascript
         assert "function indexTasks(items)" in tasks_javascript
-        assert (
-            "new Map(items.map((task) => [task.task_id, task]))"
-            in tasks_javascript
-        )
+        assert "new Map(items.map((task) => [task.task_id, task]))" in tasks_javascript
         assert "function normalizeTasks(items)" not in javascript
         assert "project: task.project ?? null" not in javascript
         assert "api.getChannelHealth()" in javascript
@@ -491,8 +487,8 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
             in javascript
         )
         assert "/conversations`" in api_javascript
-        assert "thread_id: threadId" in javascript
-        assert "const taskThreads = new Map();" in javascript
+        assert "thread_id: null" not in javascript
+        assert "const taskConversations = new Map();" in javascript
         assert "feishu-dispatcher.http-channel.conversation" in storage_javascript
         assert "feishu-dispatcher.http-channel.cursor" in storage_javascript
         assert "feishu-dispatcher.http-channel.thread" not in storage_javascript
@@ -540,7 +536,7 @@ async def test_application_post_route_requires_token_and_marshals_body():
         seen.append((context, request, threading.get_ident()))
         return 201, {
             "task_id": request["segments"]["task_id"],
-            "conversation_id": request["body"]["conversation_id"],
+            "conversation_id": "http-conversation-a",
         }
 
     channel = HttpChannel(
@@ -568,7 +564,7 @@ async def test_application_post_route_requires_token_and_marshals_body():
                 "POST",
                 channel.base_url + "/api/tasks/t1/conversations?source=webui",
                 token,
-                {"conversation_id": "browser-a"},
+                None,
             )
             assert status == 401
             assert payload == {"error": "invalid_token"}
@@ -579,12 +575,12 @@ async def test_application_post_route_requires_token_and_marshals_body():
             "POST",
             channel.base_url + "/api/tasks/t1/conversations?source=webui",
             "tok-http",
-            {"conversation_id": "browser-a"},
+            None,
         )
         assert status == 201
         assert payload == {
             "task_id": "t1",
-            "conversation_id": "browser-a",
+            "conversation_id": "http-conversation-a",
         }
         assert seen == [
             (
@@ -593,7 +589,7 @@ async def test_application_post_route_requires_token_and_marshals_body():
                     "path": "/api/tasks/t1/conversations",
                     "query": {"source": "webui"},
                     "segments": {"task_id": "t1"},
-                    "body": {"conversation_id": "browser-a"},
+                    "body": None,
                 },
                 main_thread_id,
             )
@@ -604,11 +600,10 @@ async def test_application_post_route_requires_token_and_marshals_body():
 
 async def test_application_post_route_preserves_channel_capacity_error():
     async def create_conversation(_context: dict, request: dict) -> tuple[int, dict]:
-        thread_id = channel.create_thread(
-            request["body"]["conversation_id"],
+        conversation_id = channel.create_thread(
             "task",
         )
-        return 201, {"thread_id": thread_id}
+        return 201, {"conversation_id": conversation_id}
 
     channel = HttpChannel(
         "tok-http",
@@ -635,7 +630,7 @@ async def test_application_post_route_preserves_channel_capacity_error():
             "POST",
             channel.base_url + "/api/tasks/t1/conversations",
             "tok-http",
-            {"conversation_id": "browser-b"},
+            None,
         )
         assert status == 429
         assert payload == {
@@ -782,20 +777,11 @@ async def test_invalid_requests_do_not_enter_dispatcher():
             "tok-http",
             [],
         )
-        unknown_thread, unknown_payload = await asyncio.to_thread(
-            _request,
-            "POST",
-            channel.base_url + "/api/channel/messages",
-            "tok-http",
-            _message(thread_id="unknown-thread"),
-        )
         assert unauthenticated_empty == 401
         assert bad_token == 401
         assert blank_sender == 400
         assert payload["error"] == "invalid_request"
         assert list_body == 400
-        assert unknown_thread == 404
-        assert unknown_payload["error"] == "unknown_target"
         await asyncio.sleep(0)
         assert seen == []
     finally:
@@ -884,7 +870,7 @@ async def test_thread_reply_session_event_output_and_restart():
 
     channel.start(ignore)
     try:
-        thread_id = channel.create_thread("browser-a", "start")
+        thread_id = channel.create_thread("start")
         channel.send_text(
             ConversationRef("http", thread_id),
             "reply",
@@ -929,10 +915,10 @@ async def test_thread_reply_session_event_output_and_restart():
             ),
         )
         await output.aclose()
-        events = await _wait_for_events(channel, "browser-a", minimum=5)
+        events = await _wait_for_events(channel, thread_id, minimum=5)
         event_types = [event["type"] for event in events["events"]]
         assert event_types == [
-            "thread.created",
+            "conversation.created",
             "message.created",
             "session.event",
             "session.event",
@@ -943,7 +929,6 @@ async def test_thread_reply_session_event_output_and_restart():
         output_id = events["events"][2]["presentation"]["output_id"]
         assert events["events"][2]["presentation"] == {
             "output_id": output_id,
-            "target_id": thread_id,
             "title": "demo",
             "footer": "model:a",
             "status": "running",
@@ -996,7 +981,7 @@ async def test_session_input_event_projects_to_thread_message():
 
     channel.start(ignore)
     try:
-        thread_id = channel.create_thread("browser-a", "start")
+        thread_id = channel.create_thread("start")
         event = SessionEvent(
             event_id="event-1",
             session_id="t1",
@@ -1010,7 +995,7 @@ async def test_session_input_event_projects_to_thread_message():
 
         channel.handle_session_event(thread_id, event, trace_sequence=42)
 
-        events = await _wait_for_events(channel, "browser-a", minimum=3)
+        events = await _wait_for_events(channel, thread_id, minimum=3)
         raw_event = events["events"][1]
         assert raw_event == {
             "cursor": 2,
@@ -1037,7 +1022,7 @@ async def test_empty_session_input_event_does_not_create_message():
 
     channel.start(ignore)
     try:
-        thread_id = channel.create_thread("browser-a", "start")
+        thread_id = channel.create_thread("start")
         event = SessionEvent(
             event_id="event-empty",
             session_id="t1",
@@ -1048,9 +1033,9 @@ async def test_empty_session_input_event_does_not_create_message():
 
         channel.handle_session_event(thread_id, event)
 
-        events = channel._events_after("browser-a", 0)
+        events = channel._events_after(thread_id, 0)
         assert len(events["events"]) == 2
-        assert events["events"][0]["type"] == "thread.created"
+        assert events["events"][0]["type"] == "conversation.created"
         assert events["events"][1] == {
             "cursor": 2,
             "type": "session.event",
@@ -1070,7 +1055,7 @@ async def test_agent_output_events_project_as_session_events():
 
     channel.start(ignore)
     try:
-        thread_id = channel.create_thread("browser-a", "start")
+        thread_id = channel.create_thread("start")
         bodies = [
             AgentOutputStarted(),
             AgentOutputDelta(stream="thought", text="thinking"),
@@ -1106,9 +1091,9 @@ async def test_agent_output_events_project_as_session_events():
             expected.append(session_event_to_dict(event))
             channel.handle_session_event(thread_id, event)
 
-        events = channel._events_after("browser-a", 0)["events"]
+        events = channel._events_after(thread_id, 0)["events"]
         assert [event["type"] for event in events] == [
-            "thread.created",
+            "conversation.created",
             "session.event",
             "session.event",
             "session.event",
@@ -1131,7 +1116,7 @@ async def test_session_event_presentation_is_the_only_live_output_path():
 
     channel.start(ignore)
     try:
-        thread_id = channel.create_thread("browser-a", "start")
+        thread_id = channel.create_thread("start")
         output = channel.open_output(
             ConversationRef("http", thread_id), "demo", footer="model:a"
         )
@@ -1176,9 +1161,9 @@ async def test_session_event_presentation_is_the_only_live_output_path():
             ),
         )
 
-        events = channel._events_after("browser-a", 0)["events"]
+        events = channel._events_after(thread_id, 0)["events"]
         assert [event["type"] for event in events] == [
-            "thread.created",
+            "conversation.created",
             "session.event",
             "session.event",
             "session.event",
