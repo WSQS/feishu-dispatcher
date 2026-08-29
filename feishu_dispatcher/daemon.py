@@ -577,6 +577,8 @@ class _Daemon:
     _dispatcher_event_tail: asyncio.Task[None] | None = None
     #: 同一 Session 的 Turn 共用一把锁；跨 Channel / runner 串行，不同 Session 可并行。
     _session_turn_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
+    #: 已预留、尚未登记到 runner 的 agent 名额；覆盖 create_thread 的 await 窗口。
+    _pending_agent_launches: int = 0
     #: 由启动装配层注入；稳定 key → Channel 实例。
     _channels: dict[str, Channel] = field(default_factory=dict)
     #: 控制台主线通知与兼容消息入口使用的主 Channel key。
@@ -628,6 +630,17 @@ class _Daemon:
             return self._channels[channel_key]
         except KeyError as exc:
             raise RuntimeError(f"Channel 未注册: {channel_key!r}") from exc
+
+    def _reserve_agent_slot(self) -> bool:
+        if self._runners.count() + self._pending_agent_launches >= self.cfg.max_agents:
+            return False
+        self._pending_agent_launches += 1
+        return True
+
+    def _release_agent_slot(self) -> None:
+        if self._pending_agent_launches <= 0:
+            raise RuntimeError("agent 名额预留计数失衡")
+        self._pending_agent_launches -= 1
 
     def _bind_conversation(
         self, conversation: ConversationRef, session_id: str
@@ -1048,11 +1061,6 @@ class _Daemon:
         persisted_session = None
         if not msg.thread_id and bound_session_id is None:
             persisted_session = self.store.by_conversation(conversation)
-            if (
-                persisted_session is not None
-                and persisted_session.thread_root_id != conversation.conversation_id
-            ):
-                persisted_session = None
         if (
             msg.thread_id
             or (
@@ -1479,45 +1487,40 @@ class _Daemon:
             await self._send_user(err, conversation=conversation)
             return
 
-        thread_root = msg.message_id
-        existing = self.store.by_thread(conversation, thread_root)
-        if (
-            existing is not None
-            and self._runners.get_for_session(existing.session_id) is not None
-        ):
-            logger.info("根消息 %s 已有 agent session，忽略重复 spawn", thread_root)
-            return
-
-        # R11：并发上限检查。check 与 _launch 的登记之间不能有 await，否则两条
-        # 并发 /run 会都通过检查再各自登记，突破上限（TOCTOU）。故先原子地
-        # 检查+登记，再发「🚀」提示。
-        if self._runners.count() >= self.cfg.max_agents:
+        if not self._reserve_agent_slot():
             await self._send_user(
                 f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，请先 `/stop` 一个。",
                 conversation=conversation,
             )
             return
-
-        new_task = self.store.create(
-            project_name=project_name,
-            agent_label=agent_label,
-            description=task,
-            conversation=conversation,
-            thread_root_id=thread_root,
-            workspace=str(project.path),
-        )
-        self._launch(
-            new_task,
-            agent_argv,
-            first_turn=TurnRequest(
-                task,
-                ConversationRef(conversation.channel_key(), thread_root),
-            ),
-        )
+        try:
+            header = f"🚀 {agent_label} · {project_name}\n任务: {task}"
+            channel = self._channel_for(conversation)
+            conversation_id = await asyncio.to_thread(channel.create_thread, header)
+            session_conversation = ConversationRef(
+                conversation.channel_key(), conversation_id
+            )
+            new_task = self.store.create(
+                project_name=project_name,
+                agent_label=agent_label,
+                description=task,
+                conversation=session_conversation,
+                workspace=str(project.path),
+            )
+            self._launch(
+                new_task,
+                agent_argv,
+                first_turn=TurnRequest(
+                    task,
+                    session_conversation,
+                ),
+            )
+        finally:
+            self._release_agent_slot()
         await self._safe_send_text(
             f"🚀 [{new_task.session_id}] 启动 {agent_label} 处理项目 "
             f"{project_name}…\n任务: {task}",
-            conversation=ConversationRef(conversation.channel_key(), thread_root),
+            conversation=session_conversation,
         )
 
     async def _attach_for_root(
@@ -1529,9 +1532,8 @@ class _Daemon:
     ) -> None:
         """解析 ``/attach <项目> <agent> <session_id> [描述...]`` 并附着外部会话。
 
-        参数解析后交给共用底层 :meth:`_attach_task`；按返回结果决定回复目标：
-        成功不额外回（worker 会发附着摘要）；未建话题的失败回原消息；已建话题的
-        罕见竞态失败回新话题。
+        参数解析后交给共用底层 :meth:`_attach_task`；成功不额外回复（worker 会发
+        附着摘要），失败则回复当前 Conversation。
         """
         usage = "格式：`/attach <项目名> <agent> <session_id> [描述...]`"
         parts = arg.split(maxsplit=3)
@@ -1545,7 +1547,7 @@ class _Daemon:
         if not project_name or not agent_in or not session_id:
             await self._send_user(usage, conversation=conversation)
             return
-        task, root, message = await self._attach_task(
+        task, message = await self._attach_task(
             project_name,
             agent_in,
             session_id,
@@ -1554,13 +1556,7 @@ class _Daemon:
         )
         if task is not None:
             return  # 成功：新话题的附着摘要由 worker 发
-        if root:
-            await self._safe_send_text(
-                message,
-                conversation=ConversationRef(conversation.channel_key(), root),
-            )
-        else:
-            await self._send_user(message, conversation=conversation)
+        await self._send_user(message, conversation=conversation)
 
     async def _attach_task(
         self,
@@ -1570,7 +1566,7 @@ class _Daemon:
         description: str = "",
         *,
         conversation: ConversationRef,
-    ) -> tuple["Session | None", str, str]:
+    ) -> tuple["Session | None", str]:
         """附着外部会话为新 Task 的共用底层（``/attach`` 与 ``attach_session`` 工具都调它）。
 
         流程：校验→去重→先 load_session 探测→建 Task + 在来源 Channel 新建话题→
@@ -1578,10 +1574,9 @@ class _Daemon:
         （附着摘要由 worker 就绪后发）。``agent`` 非空则覆盖项目 default_agent（须在
         ``[agents]``），空则用项目默认——``attach_session`` 的 agent 可选正依赖此语义。
 
-        返回 ``(task, thread_root_id, message)``：
+        返回 ``(task, message)``：
         - ``task`` 非 None = 成功建 Task 并拉起（message 为成功摘要）；
-        - ``task`` 为 None 且 ``thread_root_id`` 非空 = 已建话题但终查超限的罕见竞态失败；
-        - ``task`` 为 None 且 ``thread_root_id`` 为空 = 未建话题的失败（校验/去重/探测/预查）。
+        - ``task`` 为 None = 未建 Conversation 的失败（校验/去重/探测/准入）。
 
         无锁 MVP：不探测原 CLI 是否已退出——假定原会话已停止；会话交接锁机制另行立项。
         单次附着约 2× load_session 成本（先探测一次、拉起再恢复一次）——慢后端
@@ -1590,17 +1585,16 @@ class _Daemon:
         project = self._resolve_project(project_name)
         if project is None:
             known = ", ".join(self._all_projects()) or "(无)"
-            return None, "", f"未知项目 '{project_name}'。已知项目: {known}"
+            return None, f"未知项目 '{project_name}'。已知项目: {known}"
         agent_label, agent_argv, err = self._resolve_agent(project, agent)
         if agent_argv is None:
-            return None, "", err
+            return None, err
 
         # 重复附着：同 (agent, session_id) 已有 Task → 拒绝并引导到已有 task。
         existing = self.store.by_agent_session(agent_label, session_id)
         if existing is not None:
             return (
                 None,
-                "",
                 (
                     f"⚠️ 该会话已由任务 [{existing.session_id}] 附着（agent={agent_label}）。"
                     "请回到其话题继续，勿重复附着。"
@@ -1612,58 +1606,46 @@ class _Daemon:
             agent_label, agent_argv, str(project.path), session_id
         )
         if not ok:
-            return None, "", why
+            return None, why
 
-        # 并发上限双保险（同 /run 的 TOCTOU 防护）：
-        #  ① 先查——超限直接回原消息、**不建新话题**（避免孤儿话题）。
-        if self._runners.count() >= self.cfg.max_agents:
+        if not self._reserve_agent_slot():
             return (
                 None,
-                "",
                 f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，请先 `/stop` 一个。",
             )
-        # 新话题（Channel.create_thread 开新话题拿 thread_root_id），header = 固定摘要 + 截断
-        # session_id + 可选描述。
-        sid = _short_sid(session_id)
-        header = f"🔗 {agent_label} · {project_name}\n附着外部会话: {sid}"
-        if description:
-            header += f"\n说明: {description}"
-        channel = self._channel_for(conversation)
-        root = await asyncio.to_thread(channel.create_thread, header)
-        session_conversation = ConversationRef(conversation.channel_key(), root)
-        #  ② 终查——create_thread 是 await，其间别的并发附着/派发可能占走名额；
-        # 终查与 create+_launch 之间**无 await**，守住「check→launch 无 await」不变量。
-        # 终查超限属罕见竞态：话题已建，就地提示并放弃，不落 Task。
-        if self._runners.count() >= self.cfg.max_agents:
-            return (
-                None,
-                root,
-                f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，附着未完成。"
-                "请先 `/stop` 一个再试。",
+        try:
+            sid = _short_sid(session_id)
+            header = f"🔗 {agent_label} · {project_name}\n附着外部会话: {sid}"
+            if description:
+                header += f"\n说明: {description}"
+            channel = self._channel_for(conversation)
+            conversation_id = await asyncio.to_thread(channel.create_thread, header)
+            session_conversation = ConversationRef(
+                conversation.channel_key(), conversation_id
             )
-        task_desc = f"附着外部会话 {agent_label}/{sid}"
-        if description:
-            task_desc += f" — {description}"
-        new_task = self.store.create(
-            project_name=project_name,
-            agent_label=agent_label,
-            description=task_desc,
-            conversation=session_conversation,
-            thread_root_id=root,
-            workspace=str(project.path),
-            agent_session_id=session_id,
-            origin="attach",
-        )
-        self._launch(
-            new_task,
-            agent_argv,
-            first_turn=None,
-            resume_session_id=session_id,
-            attached=True,
-        )
+            task_desc = f"附着外部会话 {agent_label}/{sid}"
+            if description:
+                task_desc += f" — {description}"
+            new_task = self.store.create(
+                project_name=project_name,
+                agent_label=agent_label,
+                description=task_desc,
+                conversation=session_conversation,
+                workspace=str(project.path),
+                agent_session_id=session_id,
+                origin="attach",
+            )
+            self._launch(
+                new_task,
+                agent_argv,
+                first_turn=None,
+                resume_session_id=session_id,
+                attached=True,
+            )
+        finally:
+            self._release_agent_slot()
         return (
             new_task,
-            root,
             f"已附着外部会话 {agent_label}/{sid} 为任务 [{new_task.session_id}]。",
         )
 
@@ -1743,9 +1725,7 @@ class _Daemon:
         ``attached=True`` 仅由 ``/attach`` 的**首次**拉起置位——附着摘要文案；该 Session
         事后经 ``_try_resume`` 恢复时仍走普通「已恢复」路径（attached 默认 False）。
         """
-        session_conversation = ConversationRef(
-            session.channel_key, session.thread_root_id
-        )
+        session_conversation = session.conversation_ref
         self._bind_conversation(session_conversation, session.session_id)
         sess = _AgentSessionRunner(
             project_name=session.project_name,
@@ -2249,9 +2229,6 @@ class _Daemon:
         session = self._session_for_conversation(conversation)
         if session is None:
             session = self.store.by_conversation(conversation)
-        if session is None and msg.thread_id:
-            source = ConversationRef(conversation.channel_key(), msg.conversation_id)
-            session = self.store.by_thread(source, conversation.conversation_id)
         if session is not None:
             self._bind_conversation(conversation, session.session_id)
         sess = (
@@ -2260,7 +2237,7 @@ class _Daemon:
             else None
         )
         if sess is None:
-            # Thread 只负责路由到 Task；无 current runner 时再按 Task 恢复或明确提示。
+            # Conversation 只负责路由到 Session；无 current runner 时再尝试恢复或明确提示。
             await self._recover_or_notify(
                 text,
                 conversation=conversation,
@@ -2438,9 +2415,8 @@ class _Daemon:
     ) -> tuple[bool, str]:
         """把一个非活跃任务 load_session 惰性重连；返回 (成功, 失败文案)。
 
-        check（agent 配置 / 会话 / max_agents）与 ``_launch`` 登记之间**无 await**，
-        保证并发下不突破 max_agents（TOCTOU，同 _spawn_for_root）。调用点务必也别
-        在 check 与本调用之间插入 await。
+        用统一的预留计数覆盖 ``create_thread`` 等其它入口的 await 窗口，保证并发下
+        不突破 max_agents。
         """
         if self._runners.get_for_session(task.session_id) is not None:
             return False, f"任务 [{task.session_id}] 已在运行，无需恢复。"
@@ -2451,17 +2427,20 @@ class _Daemon:
             return False, (
                 f"⚠️ 无法恢复任务 [{task.session_id}]（{why}）。发送 `/run` 重开。"
             )
-        if self._runners.count() >= self.cfg.max_agents:
+        if not self._reserve_agent_slot():
             return False, (
                 f"⚠️ 活跃 agent 已达上限 {self.cfg.max_agents}，无法恢复。"
                 "请先 `/stop` 一个再试。"
             )
-        self._launch(
-            task,
-            agent_argv,
-            first_turn=first_turn,
-            resume_session_id=task.agent_session_id,
-        )
+        try:
+            self._launch(
+                task,
+                agent_argv,
+                first_turn=first_turn,
+                resume_session_id=task.agent_session_id,
+            )
+        finally:
+            self._release_agent_slot()
         return True, ""
 
     def _finish_task(self, task_id: str, status: str) -> bool:
@@ -2907,11 +2886,7 @@ class _Daemon:
             return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
         sess = self._runners.get_for_session(task.session_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
-            sess.enqueue(
-                TurnRequest(
-                    message, ConversationRef(task.channel_key, task.thread_root_id)
-                )
-            )
+            sess.enqueue(TurnRequest(message, task.conversation_ref))
             logger.info(
                 "send_to_task[%s] 入队（活跃 session，队列深度=%d，task.status=%s）",
                 task_id,
@@ -2930,9 +2905,7 @@ class _Daemon:
         # 非活跃且可恢复：load_session 惰性重连，把消息作为首轮。check→launch 无 await。
         ok, why = self._try_resume(
             task,
-            first_turn=TurnRequest(
-                message, ConversationRef(task.channel_key, task.thread_root_id)
-            ),
+            first_turn=TurnRequest(message, task.conversation_ref),
         )
         logger.info(
             "send_to_task[%s] 非活跃 status=%s → 恢复%s",
@@ -2978,7 +2951,7 @@ class _Daemon:
         ``agent`` 可选：非空则覆盖项目 default_agent（须在 [agents]），空则用默认。
         仅新建；重复 (agent, session_id) 由底层 :meth:`_attach_task` 去重拒绝。
         """
-        _task, _root, message = await self._attach_task(
+        _task, message = await self._attach_task(
             project_name,
             agent,
             session_id,
@@ -3026,33 +2999,36 @@ class _Daemon:
             brief, issue_url, note = await self._compose_issue_brief(
                 project, task, issue
             )
-        if self._runners.count() >= self.cfg.max_agents:
+        if not self._reserve_agent_slot():
             return f"已达并发上限 {self.cfg.max_agents}，请先 `/stop` 一个再派发。"
-        # 每个派发新建一个话题根消息，agent 输出流进该话题
-        header = f"🚀 {agent_label} · {project_name}\n任务: {task}"
-        if issue_url:
-            header += f"\nissue: {issue_url}"
-        channel = self._channel_for(conversation)
-        root = await asyncio.to_thread(channel.create_thread, header)
-        session_conversation = ConversationRef(conversation.channel_key(), root)
-        new_task = self.store.create(
-            project_name=project_name,
-            agent_label=agent_label,
-            description=task,
-            conversation=session_conversation,
-            thread_root_id=root,
-            workspace=str(project.path),
-            issue_url=issue_url,
-            model=model,
-        )
-        self._launch(
-            new_task,
-            agent_argv,
-            first_turn=TurnRequest(
-                brief,
-                session_conversation,
-            ),
-        )
+        try:
+            header = f"🚀 {agent_label} · {project_name}\n任务: {task}"
+            if issue_url:
+                header += f"\nissue: {issue_url}"
+            channel = self._channel_for(conversation)
+            conversation_id = await asyncio.to_thread(channel.create_thread, header)
+            session_conversation = ConversationRef(
+                conversation.channel_key(), conversation_id
+            )
+            new_task = self.store.create(
+                project_name=project_name,
+                agent_label=agent_label,
+                description=task,
+                conversation=session_conversation,
+                workspace=str(project.path),
+                issue_url=issue_url,
+                model=model,
+            )
+            self._launch(
+                new_task,
+                agent_argv,
+                first_turn=TurnRequest(
+                    brief,
+                    session_conversation,
+                ),
+            )
+        finally:
+            self._release_agent_slot()
         bound = f"（brief 来自 issue {issue_url}）" if issue_url else note
         return (
             f"已建任务 [{new_task.session_id}]，在项目 {project_name} 启动 "
@@ -3338,7 +3314,7 @@ class _Daemon:
         # 先把「结果」发到话题（可见），再驱动 agent 接续
         await self._safe_send_text(
             self._bg_result_message(job, rc),
-            conversation=ConversationRef(task.channel_key, task.thread_root_id),
+            conversation=task.conversation_ref,
         )
         sess = self._runners.get_for_session(task.session_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
@@ -3367,7 +3343,7 @@ class _Daemon:
             task,
             first_turn=TurnRequest(
                 self._build_bg_prompt(job, rc),
-                ConversationRef(task.channel_key, task.thread_root_id),
+                task.conversation_ref,
             ),
         )
         if ok:

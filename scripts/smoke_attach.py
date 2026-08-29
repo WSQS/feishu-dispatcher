@@ -1,11 +1,11 @@
-"""端到端验证 /attach：真实 opencode 外部会话 → daemon 附着接管 → load_session 恢复并召回秘密。
+"""端到端验证 /attach：真实 opencode 外部会话 → daemon 附着接管 → load_session 恢复。
 
 不经过飞书（用 fake bridge 组装 ``_Daemon`` 实例，照 tests 基建），验证 /attach 的核心链路：
 
 1. 真实 opencode ``new_session``，让它记住一个秘密数字，拿 session_id，关闭（模拟外部 CLI 已停）。
 2. 用 fake bridge 组装 ``_Daemon``（agent=opencode、项目=仓库根），走 ``/attach`` 附着该 session
    （先 load_session 探测、成功才建 Task、拉起时复用 load_session 恢复路径）。
-3. 在新话题里回复「召回秘密数字」，验证 load_session 接回原上下文、召回成功。
+3. 在新 Conversation 里回复「召回秘密数字」，验证 load_session 接回原上下文。
 
 用法：uv run python scripts/smoke_attach.py
 前置：opencode 已配好 provider（`opencode providers`）。
@@ -19,10 +19,13 @@ import sys
 from pathlib import Path
 
 from feishu_dispatcher.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
+from feishu_dispatcher.channel import ChannelMessage, StreamingOutput
 from feishu_dispatcher.config import Config, Project
+from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.daemon import _Daemon
-from feishu_dispatcher.feishu import IncomingMessage
+from feishu_dispatcher.session_event import SessionEvent
 from feishu_dispatcher.store import ProjectStore, SessionStore
+from feishu_dispatcher.throttler import StreamThrottler
 
 REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 SECRET = "4287"
@@ -47,7 +50,7 @@ class Collector:
 
 
 class Bridge:
-    """最小飞书桥：记录话题内文本（text 模式 sink），不真发飞书。"""
+    """最小 Channel：记录 Conversation 内文本，不真发飞书。"""
 
     def __init__(self) -> None:
         self.threads: dict[str, list[str]] = {}
@@ -64,6 +67,33 @@ class Bridge:
         self.threads.setdefault(root_message_id, []).append(text)
         return f"om_rep_{len(self.threads[root_message_id])}"
 
+    def create_thread(self, initial_text: str) -> str:
+        return self.send_root_message("oc_smoke", initial_text)
+
+    def send_text(self, conversation: ConversationRef, text: str) -> str:
+        return self.reply_in_thread(conversation.conversation_id, text)
+
+    def handle_session_event(
+        self,
+        conversation_id: str,
+        event: SessionEvent,
+        *,
+        trace_sequence: int | None = None,
+    ) -> None:
+        return None
+
+    def open_output(
+        self,
+        conversation: ConversationRef,
+        title: str,
+        *,
+        footer: str = "",
+    ) -> StreamingOutput:
+        async def send_piece(piece: str) -> None:
+            await asyncio.to_thread(self.send_text, conversation, piece)
+
+        return StreamThrottler(send_piece, window=0.01)
+
     def reply(self, message_id: str, text: str) -> str:
         self.plains.append(text)
         return "om_plain"
@@ -75,6 +105,12 @@ class Bridge:
         return None
 
     def stop(self) -> None:
+        return None
+
+    def is_alive(self) -> bool:
+        return True
+
+    def restart(self) -> None:
         return None
 
     def all_text(self) -> str:
@@ -94,27 +130,25 @@ async def _wait_for(cond, timeout: float, what: str) -> None:
 
 def _attach_root(store: SessionStore) -> str | None:
     tasks = store.all()
-    return tasks[0].thread_root_id if tasks else None
+    return tasks[0].conversation_ref.conversation_id if tasks else None
 
 
-def _root_msg(text: str) -> IncomingMessage:
-    return IncomingMessage(
-        chat_id="oc_smoke",
+def _root_msg(text: str) -> ChannelMessage:
+    return ChannelMessage(
+        conversation_id="oc_smoke",
         message_id="om_att",
-        thread_root_id=None,
+        thread_id=None,
         text=text,
-        chat_type="group",
         sender_id="ou_user",
     )
 
 
-def _thread_msg(root: str, text: str) -> IncomingMessage:
-    return IncomingMessage(
-        chat_id="oc_smoke",
+def _conversation_msg(conversation_id: str, text: str) -> ChannelMessage:
+    return ChannelMessage(
+        conversation_id=conversation_id,
         message_id="om_t2",
-        thread_root_id=root,
+        thread_id=None,
         text=text,
-        chat_type="group",
         sender_id="ou_user",
     )
 
@@ -144,17 +178,22 @@ async def main() -> int:
         agent_start_timeout=60.0,
     )
     store = SessionStore(None)
-    daemon = _Daemon(cfg, store=store, project_store=ProjectStore(None))
     bridge = Bridge()
-    daemon._bridge = bridge
+    daemon = _Daemon(
+        cfg,
+        store=store,
+        project_store=ProjectStore(None),
+        _channels={"feishu": bridge},
+        _primary_channel_key="feishu",
+    )
 
     await daemon._handle_message(_root_msg(f"/attach demo {AGENT} {sid}"))
     await _wait_for(lambda: _attach_root(store) is not None, 120, "附着建 Task")
     root = _attach_root(store)
-    task = store.by_thread(root)
+    task = store.by_conversation(ConversationRef("feishu", root))
     assert task is not None
     print(
-        f"=== attached root={root} task={task.task_id} origin={task.origin} ===",
+        f"=== attached conversation={root} session={task.session_id} origin={task.origin} ===",
         flush=True,
     )
     await _wait_for(
@@ -163,13 +202,14 @@ async def main() -> int:
         "附着摘要",
     )
 
-    # 3. 话题回复 → load_session 接回原上下文 → 召回秘密
-    await daemon._handle_message(
-        _thread_msg(
-            root,
+    # 3. Conversation 回复 → load_session 接回原上下文 → 召回秘密
+    await daemon._handle_channel_message(
+        "feishu",
+        _conversation_msg(
+            task.conversation_ref.conversation_id,
             "What is the secret number I asked you to remember? "
             "Reply with just the number.",
-        )
+        ),
     )
     try:
         await _wait_for(lambda: SECRET in bridge.all_text(), 240, "召回秘密数字")

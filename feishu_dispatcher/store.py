@@ -1,9 +1,9 @@
 """Session 台账持久化：Session 是 daemon 拥有的内存模型。
 
 一个 Session = 派发在某项目上的一个工作单元，持有它的 agent_session_id（agent 侧记忆）、
-ConversationRef + thread_root_id（交互入口）、workspace（工作目录）。落盘到 tasks.json，
-按 `session_id`（短自增 `t<N>`，持久单调计数器、**永不复用**）索引；按
-ConversationRef + thread_root_id 路由交互线程。
+ConversationRef（交互入口）、workspace（工作目录）。落盘到 tasks.json，按
+`session_id`（短自增 `t<N>`，持久单调计数器、**永不复用**）索引；按
+ConversationRef 路由交互消息。
 
 status 生命周期：
 - 机械态（worker 自动）：starting → running ↔ idle → suspended；turn 异常 → failed
@@ -113,7 +113,6 @@ _SESSION_RECORD_FIELDS = (
     "agent_session_id",
     "channel_key",
     "conversation_id",
-    "thread_root_id",
     "workspace",
     "turns",
     "created_at",
@@ -137,7 +136,6 @@ class Session:
     agent_session_id: str = ""
     channel_key: str = ""
     conversation_id: str = ""
-    thread_root_id: str = ""
     workspace: str = ""
     turns: int = 0
     created_at: float = 0.0
@@ -154,7 +152,7 @@ class Session:
     #: 单字段、控制平面拥有；PR 不存这里（经 forge 的 Closes #N 反查）。
     issue_url: str = ""
     #: 会话来源：spawn = daemon 新建会话（/run、spawn_agent），attach = 附着外部会话
-    #: （/attach，#99）。旧 tasks.json 无此键时缺省为 spawn（向后兼容）。
+    #: （/attach，#99）。
     origin: str = "spawn"
 
     @property
@@ -175,8 +173,9 @@ class Session:
 
 
 def _session_from_record(record: dict) -> Session:
-    if "task_id" in record:
-        raise ValueError("不支持旧版 Session 记录字段 task_id")
+    unknown_fields = set(record) - set(_SESSION_RECORD_FIELDS)
+    if unknown_fields:
+        raise ValueError(f"Session 记录包含未知字段: {sorted(unknown_fields)}")
     values = {key: record[key] for key in _SESSION_RECORD_FIELDS if key in record}
     return Session(**values)
 
@@ -186,7 +185,7 @@ def _session_to_record(session: Session) -> dict:
 
 
 class SessionStore:
-    """session_id → Session 台账 + Channel-scoped thread 路由 + 单调计数器。
+    """session_id → Session 台账 + Conversation 路由 + 单调计数器。
 
     只被单个 daemon 实例（单线程 event loop）读写，无需加锁。
     ``keep_terminal`` 限制终止 Session 的历史条数，防 tasks.json 无限涨。
@@ -258,23 +257,6 @@ class SessionStore:
                 return session
         return None
 
-    def by_thread(
-        self, conversation: ConversationRef, thread_root_id: str
-    ) -> Session | None:
-        if (
-            not conversation.channel_key().strip()
-            or not conversation.conversation_id.strip()
-            or not thread_root_id
-        ):
-            return None
-        for session in self._sessions.values():
-            if (
-                session.conversation_ref == conversation
-                and session.thread_root_id == thread_root_id
-            ):
-                return session
-        return None
-
     def all(self) -> list[Session]:
         return list(self._sessions.values())
 
@@ -306,7 +288,6 @@ class SessionStore:
         agent_label: str,
         description: str,
         conversation: ConversationRef,
-        thread_root_id: str,
         workspace: str,
         agent_session_id: str = "",
         status: str = "starting",
@@ -341,7 +322,6 @@ class SessionStore:
             agent_session_id=agent_session_id,
             channel_key=conversation.channel_key(),
             conversation_id=conversation.conversation_id,
-            thread_root_id=thread_root_id,
             workspace=workspace,
             created_at=now,
             updated_at=now,
