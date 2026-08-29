@@ -633,10 +633,6 @@ class _Daemon:
         self, conversation: ConversationRef, session_id: str
     ) -> None:
         """把完整 Conversation 绑定到一个已知 Session 身份；重复绑定幂等。"""
-        if not conversation.channel_key().strip():
-            raise ValueError("ConversationRef.channel_key 不能为空")
-        if not conversation.conversation_id.strip():
-            raise ValueError("ConversationRef.conversation_id 不能为空")
         if not self._session_identity_exists(session_id):
             raise ValueError(f"Task 不存在: {session_id}")
 
