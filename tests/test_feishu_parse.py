@@ -395,7 +395,7 @@ def test_channel_stop_cancels_websocket_task():
 
 
 def test_channel_send_text_delegates_to_root_message(monkeypatch):
-    bridge = make_bridge()
+    bridge = make_bridge(chat_whitelist="oc_chat")
     calls: list[tuple[str, str]] = []
 
     def send_root_message(conversation_id: str, text: str) -> str:
@@ -404,7 +404,7 @@ def test_channel_send_text_delegates_to_root_message(monkeypatch):
 
     monkeypatch.setattr(bridge, "send_root_message", send_root_message)
 
-    assert bridge.send_text("oc_chat", "hello") == "om_root"
+    assert bridge.send_text(ConversationRef("feishu", "oc_chat"), "hello") == "om_root"
     assert calls == [("oc_chat", "hello")]
 
 
@@ -422,8 +422,8 @@ def test_channel_create_thread_delegates_to_root_message(monkeypatch):
     assert calls == [("oc_chat", "hello")]
 
 
-def test_channel_reply_text_selects_plain_or_threaded_reply(monkeypatch):
-    bridge = make_bridge()
+def test_channel_send_text_selects_root_or_thread(monkeypatch):
+    bridge = make_bridge(chat_whitelist="oc_chat")
     calls: list[tuple[str, str, str]] = []
 
     def reply(target_id: str, text: str) -> str:
@@ -434,13 +434,16 @@ def test_channel_reply_text_selects_plain_or_threaded_reply(monkeypatch):
         calls.append(("threaded", target_id, text))
         return "om_threaded"
 
-    monkeypatch.setattr(bridge, "reply", reply)
     monkeypatch.setattr(bridge, "reply_in_thread", reply_in_thread)
 
-    assert bridge.reply_text("om_message", "plain") == "om_plain"
-    assert bridge.reply_text("om_root", "threaded", threaded=True) == "om_threaded"
+    monkeypatch.setattr(bridge, "send_root_message", reply)
+    assert bridge.send_text(ConversationRef("feishu", "oc_chat"), "plain") == "om_plain"
+    assert (
+        bridge.send_text(ConversationRef("feishu", "om_root"), "threaded")
+        == "om_threaded"
+    )
     assert calls == [
-        ("plain", "om_message", "plain"),
+        ("plain", "oc_chat", "plain"),
         ("threaded", "om_root", "threaded"),
     ]
 
@@ -449,11 +452,11 @@ def test_channel_projects_session_input_event_to_thread(monkeypatch):
     bridge = make_bridge()
     calls: list[tuple[str, str, bool]] = []
 
-    def reply_text(target_id: str, text: str, *, threaded: bool = False) -> str:
-        calls.append((target_id, text, threaded))
+    def send_text(conversation: ConversationRef, text: str) -> str:
+        calls.append((conversation.conversation_id, text, True))
         return "om_reply"
 
-    monkeypatch.setattr(bridge, "reply_text", reply_text)
+    monkeypatch.setattr(bridge, "send_text", send_text)
     event = SessionEvent(
         event_id="event-1",
         session_id="t1",
@@ -481,8 +484,8 @@ def test_channel_projects_session_input_event_to_root_chat(monkeypatch):
         )
         calls: list[tuple[str, str]] = []
 
-        def send_text(conversation_id: str, text: str) -> str:
-            calls.append((conversation_id, text))
+        def send_text(conversation: ConversationRef, text: str) -> str:
+            calls.append((conversation.conversation_id, text))
             return "om_root"
 
         monkeypatch.setattr(bridge, "send_text", send_text)
@@ -508,11 +511,11 @@ def test_channel_skips_empty_session_input_event(monkeypatch):
     bridge = make_bridge()
     calls: list[tuple[str, str, bool]] = []
 
-    def reply_text(target_id: str, text: str, *, threaded: bool = False) -> str:
-        calls.append((target_id, text, threaded))
+    def send_text(conversation: ConversationRef, text: str) -> str:
+        calls.append((conversation.conversation_id, text, True))
         return "om_reply"
 
-    monkeypatch.setattr(bridge, "reply_text", reply_text)
+    monkeypatch.setattr(bridge, "send_text", send_text)
     event = SessionEvent(
         event_id="event-empty",
         session_id="t1",
@@ -530,11 +533,11 @@ def test_channel_accepts_agent_output_events_without_rendering(monkeypatch):
     bridge = make_bridge()
     calls: list[tuple[str, str, bool]] = []
 
-    def reply_text(target_id: str, text: str, *, threaded: bool = False) -> str:
-        calls.append((target_id, text, threaded))
+    def send_text(conversation: ConversationRef, text: str) -> str:
+        calls.append((conversation.conversation_id, text, True))
         return "om_reply"
 
-    monkeypatch.setattr(bridge, "reply_text", reply_text)
+    monkeypatch.setattr(bridge, "send_text", send_text)
     bodies = [
         AgentOutputStarted(),
         AgentOutputDelta(stream="message", text="answer"),
@@ -600,11 +603,11 @@ async def test_channel_open_output_uses_text_mode(monkeypatch):
     bridge = make_bridge(stream_mode="text", throttle_window=60.0)
     calls: list[tuple[str, str, bool]] = []
 
-    def reply_text(target_id: str, text: str, *, threaded: bool = False) -> str:
-        calls.append((target_id, text, threaded))
+    def send_text(conversation: ConversationRef, text: str) -> str:
+        calls.append((conversation.conversation_id, text, True))
         return "om_text"
 
-    monkeypatch.setattr(bridge, "reply_text", reply_text)
+    monkeypatch.setattr(bridge, "send_text", send_text)
     output = bridge.open_output(ConversationRef("feishu", "om_root"), "demo")
 
     assert isinstance(output._output, StreamThrottler)
@@ -652,11 +655,11 @@ async def test_text_output_is_driven_by_session_events(monkeypatch):
     )
     calls: list[tuple[str, str, bool]] = []
 
-    def reply_text(target_id: str, text: str, *, threaded: bool = False) -> str:
-        calls.append((target_id, text, threaded))
+    def send_text(conversation: ConversationRef, text: str) -> str:
+        calls.append((conversation.conversation_id, text, True))
         return "om_text"
 
-    monkeypatch.setattr(bridge, "reply_text", reply_text)
+    monkeypatch.setattr(bridge, "send_text", send_text)
     output = bridge.open_output(ConversationRef("feishu", "om_root"), "demo")
     output.feed("legacy")
 
@@ -842,7 +845,10 @@ async def test_card_output_maps_session_outcome(monkeypatch, outcome, template):
 
 
 def make_bridge(
-    *, stream_mode: str = "card", throttle_window: float = 0.5
+    *,
+    stream_mode: str = "card",
+    throttle_window: float = 0.5,
+    chat_whitelist: str = "",
 ) -> FeishuBridge:
     async def _noop(_msg):  # pragma: no cover
         pass
@@ -856,6 +862,7 @@ def make_bridge(
             on_event=_noop,
             stream_mode=stream_mode,
             throttle_window=throttle_window,
+            chat_whitelist=chat_whitelist,
         )
     finally:
         loop.close()
