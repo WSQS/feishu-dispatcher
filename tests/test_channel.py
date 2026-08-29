@@ -7,5 +7,7 @@ def test_conversation_ref_scopes_conversation_id_by_channel() -> None:
 
     assert feishu.channel_key() == "feishu"
     assert web.channel_key() == "web"
+    assert feishu.to_log_string() == "feishu:main"
+    assert web.to_log_string() == "web:main"
     assert feishu != web
     assert len({feishu, web}) == 2

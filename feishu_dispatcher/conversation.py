@@ -19,3 +19,7 @@ class ConversationRef:
     def channel_key(self) -> str:
         """返回持有该会话的 Channel 路由键。"""
         return self._channel_key
+
+    def to_log_string(self) -> str:
+        """返回用于日志记录的稳定会话标识。"""
+        return f"{self.channel_key()}:{self.conversation_id}"

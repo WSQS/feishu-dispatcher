@@ -410,9 +410,8 @@ class _FanoutStreamingOutput:
                 output.feed(text)
             except Exception:
                 logger.exception(
-                    "Session 流式输出 feed 失败 channel=%s conversation=%s",
-                    conversation.channel_key(),
-                    conversation.conversation_id,
+                    "Session 流式输出 feed 失败 conversation=%s",
+                    conversation.to_log_string(),
                 )
 
     def set_footer(self, footer: str) -> None:
@@ -421,9 +420,8 @@ class _FanoutStreamingOutput:
                 output.set_footer(footer)
             except Exception:
                 logger.exception(
-                    "Session 流式输出 footer 失败 channel=%s conversation=%s",
-                    conversation.channel_key(),
-                    conversation.conversation_id,
+                    "Session 流式输出 footer 失败 conversation=%s",
+                    conversation.to_log_string(),
                 )
 
     async def flush(self) -> None:
@@ -443,10 +441,9 @@ class _FanoutStreamingOutput:
                 await getattr(output, method)(*args)
             except Exception:
                 logger.exception(
-                    "Session 流式输出 %s 失败 channel=%s conversation=%s",
+                    "Session 流式输出 %s 失败 conversation=%s",
                     method,
-                    conversation.channel_key(),
-                    conversation.conversation_id,
+                    conversation.to_log_string(),
                 )
 
         await asyncio.gather(
@@ -904,9 +901,8 @@ class _Daemon:
                 )
             except Exception:
                 logger.exception(
-                    "Session 输出创建失败 channel=%s conversation=%s",
-                    conversation.channel_key(),
-                    conversation.conversation_id,
+                    "Session 输出创建失败 conversation=%s",
+                    conversation.to_log_string(),
                 )
                 continue
             outputs.append((conversation, output))
@@ -3460,9 +3456,8 @@ class _Daemon:
             )
         except Exception:
             logger.exception(
-                "Channel 独立文本发送失败 channel=%s conversation=%s",
-                conversation.channel_key(),
-                conversation.conversation_id,
+                "Channel 独立文本发送失败 conversation=%s",
+                conversation.to_log_string(),
             )
 
     async def _safe_handle_session_event(
@@ -3483,10 +3478,9 @@ class _Daemon:
             )
         except Exception:
             logger.exception(
-                "Channel SessionEvent 投影失败 event=%s channel=%s conversation=%s",
+                "Channel SessionEvent 投影失败 event=%s conversation=%s",
                 event.event_id,
-                conversation.channel_key(),
-                conversation.conversation_id,
+                conversation.to_log_string(),
             )
 
     async def _safe_reply(
@@ -3545,9 +3539,8 @@ class _Daemon:
             )
         except Exception:
             logger.exception(
-                "主线通知发送失败 channel=%s conversation=%s",
-                conversation.channel_key(),
-                conversation.conversation_id,
+                "主线通知发送失败 conversation=%s",
+                conversation.to_log_string(),
             )
 
     async def _shutdown(self) -> None:
