@@ -322,7 +322,7 @@ class HttpChannel:
             return
         if not body.text:
             return
-        source = body.source.channel_key if body.source is not None else "unknown"
+        source = body.source.channel_key() if body.source is not None else "unknown"
         self.reply_text(
             conversation_id,
             f"↪️ 同步自 {source}：{body.text}",

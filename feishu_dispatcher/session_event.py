@@ -177,7 +177,7 @@ def session_event_to_dict(event: SessionEvent) -> dict[str, object]:
         payload: dict[str, object] = {"text": body.text, "source": None}
         if body.source is not None:
             payload["source"] = {
-                "channel_key": body.source.channel_key,
+                "channel_key": body.source.channel_key(),
                 "conversation_id": body.source.conversation_id,
             }
     elif isinstance(body, AgentOutputStarted):
