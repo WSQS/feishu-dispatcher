@@ -282,11 +282,13 @@ async def test_webui_browser_channel_restart_reloads_task_history_from_clean_sta
                     ".task-item", has_text="task-restart · project-restart"
                 )
                 await task_button.click()
-                await _wait_for_status(page, "已打开 task-restart · project-restart 的历史")
-                timeline = page.locator(
-                    '.task-timeline[data-task-id="task-restart"]'
+                await _wait_for_status(
+                    page, "已打开 task-restart · project-restart 的历史"
                 )
-                await timeline.get_by_text("history after restart", exact=True).wait_for()
+                timeline = page.locator('.task-timeline[data-task-id="task-restart"]')
+                await timeline.get_by_text(
+                    "history after restart", exact=True
+                ).wait_for()
                 assert history_requests == 1
                 assert await timeline.locator(".event").count() == 1
 
@@ -313,11 +315,13 @@ async def test_webui_browser_channel_restart_reloads_task_history_from_clean_sta
                 )
 
                 await task_button.click()
-                await _wait_for_status(page, "已打开 task-restart · project-restart 的历史")
-                timeline = page.locator(
-                    '.task-timeline[data-task-id="task-restart"]'
+                await _wait_for_status(
+                    page, "已打开 task-restart · project-restart 的历史"
                 )
-                await timeline.get_by_text("history after restart", exact=True).wait_for()
+                timeline = page.locator('.task-timeline[data-task-id="task-restart"]')
+                await timeline.get_by_text(
+                    "history after restart", exact=True
+                ).wait_for()
                 assert history_requests == 3
                 assert await timeline.locator(".event").count() == 1
                 assert page_errors == []
@@ -328,7 +332,9 @@ async def test_webui_browser_channel_restart_reloads_task_history_from_clean_sta
         await asyncio.to_thread(channel.stop)
 
 
-@pytest.mark.parametrize("history_first", [True, False], ids=["history-first", "live-first"])
+@pytest.mark.parametrize(
+    "history_first", [True, False], ids=["history-first", "live-first"]
+)
 @pytest.mark.asyncio
 async def test_webui_browser_running_task_history_merges_output_deltas(history_first):
     loop = asyncio.get_running_loop()
@@ -448,15 +454,11 @@ async def test_webui_browser_running_task_history_merges_output_deltas(history_f
                     ".task-item", has_text="task-running · project-running"
                 ).click()
 
-                timeline = page.locator(
-                    '.task-timeline[data-task-id="task-running"]'
-                )
+                timeline = page.locator('.task-timeline[data-task-id="task-running"]')
                 await asyncio.wait_for(recent_history_started.wait(), timeout=3)
                 if history_first:
                     release_recent_history.set()
-                    await timeline.get_by_text(
-                        "quick brown fox", exact=True
-                    ).wait_for()
+                    await timeline.get_by_text("quick brown fox", exact=True).wait_for()
 
                 thread_id = thread_ids[0]
                 channel.handle_session_event(

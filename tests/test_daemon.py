@@ -1201,9 +1201,7 @@ async def test_http_task_conversation_round_trip_routes_to_existing_runner():
         assert status == 201
         conversation_id = opened["conversation_id"]
         assert (
-            daemon._session_for_conversation(
-                ConversationRef("http", conversation_id)
-            )
+            daemon._session_for_conversation(ConversationRef("http", conversation_id))
             is task
         )
 
@@ -1425,12 +1423,8 @@ def test_conversation_binding_does_not_inspect_ref_fields():
 async def test_invalid_output_channel_never_falls_back_to_primary():
     daemon, feishu, _ = make_daemon()
 
-    await daemon._safe_send_text(
-        "empty", conversation=ConversationRef("", "oc_1")
-    )
-    await daemon._safe_send_text(
-        "unknown", conversation=ConversationRef("web", "oc_1")
-    )
+    await daemon._safe_send_text("empty", conversation=ConversationRef("", "oc_1"))
+    await daemon._safe_send_text("unknown", conversation=ConversationRef("web", "oc_1"))
 
     assert feishu.replies == []
 
@@ -3738,9 +3732,7 @@ async def test_nl_dispatch_spawns_agent_via_llm():
     assert bridge.roots  # agent 有自己的话题根消息
     assert bridge.created_threads  # 调度器派发必须创建独立话题
     # LLM 对用户的回复是**普通回复、不建话题**（bug 修复：只有派 agent 才建话题）
-    assert any(
-        m == "oc_1" and "已给 demo 派发" in t for m, t in bridge.sent_texts
-    )
+    assert any(m == "oc_1" and "已给 demo 派发" in t for m, t in bridge.sent_texts)
     # 用户的对话消息 om_nl 不应成为任何 agent 话题的根
     assert all(root != "om_nl" for root, _ in bridge.roots)
     await daemon._shutdown()
@@ -4004,9 +3996,7 @@ async def test_nl_reply_does_not_create_thread():
     daemon._llm = ScriptedLLM([LLMResponse(content="你好，需要我做什么？")])
     await daemon._handle_message(root_msg("在吗", mid="om_chat"))
     # 纯对话（无 spawn）：发送到当前 Conversation，不创建 agent 话题
-    assert any(
-        m == "oc_1" and "需要我做什么" in t for m, t in bridge.sent_texts
-    )
+    assert any(m == "oc_1" and "需要我做什么" in t for m, t in bridge.sent_texts)
     assert created == []
     assert bridge.roots == [("oc_1", "你好，需要我做什么？")]
 
@@ -4809,11 +4799,7 @@ async def test_attach_backend_unsupported_leaves_no_task():
         root_msg("/attach demo opencode ext_sid_1", mid="om_att")
     )
     assert store.all() == []  # 探测失败不落 Task
-    assert any(
-        "不支持 load_session" in t
-        for m, t in bridge.sent_texts
-        if m == "oc_1"
-    )
+    assert any("不支持 load_session" in t for m, t in bridge.sent_texts if m == "oc_1")
     assert len(created) == 1  # 只有探针，无拉起
     assert created[0].closed
 
@@ -4826,9 +4812,7 @@ async def test_attach_invalid_session_leaves_no_task():
     )
     assert store.all() == []
     assert any(
-        "无法恢复该外部 session" in t
-        for m, t in bridge.sent_texts
-        if m == "oc_1"
+        "无法恢复该外部 session" in t for m, t in bridge.sent_texts if m == "oc_1"
     )
     assert len(created) == 1
     assert created[0].closed
@@ -4851,11 +4835,7 @@ async def test_attach_duplicate_rejected_and_guides_to_existing():
     await daemon._handle_message(
         root_msg("/attach demo opencode ext_sid_1", mid="om_dup")
     )
-    assert any(
-        "已由任务 [t1] 附着" in t
-        for m, t in bridge.sent_texts
-        if m == "oc_1"
-    )
+    assert any("已由任务 [t1] 附着" in t for m, t in bridge.sent_texts if m == "oc_1")
     assert len(created) == 0  # 去重在探测前，不起探针
     assert len(store.all()) == 1  # 未新增任务
 
@@ -5644,28 +5624,20 @@ async def test_llm_command_switches_and_rebuilds_client():
     await daemon._handle_message(root_msg("/llm gpt5", mid="om_l2"))
     assert daemon._llm_active == "gpt5"
     assert isinstance(daemon._llm, ResponsesAPIClient)  # 重建成 responses client
-    assert any(
-        "切换" in t and "gpt5" in t
-        for m, t in bridge.sent_texts
-        if m == "oc_1"
-    )
+    assert any("切换" in t and "gpt5" in t for m, t in bridge.sent_texts if m == "oc_1")
 
 
 async def test_llm_command_unknown_profile():
     daemon, bridge = _daemon_with_llm_profiles()
     await daemon._handle_message(root_msg("/llm nope", mid="om_l3"))
     assert daemon._llm_active == "deepseek"  # 未切
-    assert any(
-        "未知 profile" in t for m, t in bridge.sent_texts if m == "oc_1"
-    )
+    assert any("未知 profile" in t for m, t in bridge.sent_texts if m == "oc_1")
 
 
 async def test_llm_command_no_profiles_configured():
     daemon, bridge, _ = make_daemon()  # 无 [llm]
     await daemon._handle_message(root_msg("/llm", mid="om_l4"))
-    assert any(
-        "未配置调度器 LLM" in t for m, t in bridge.sent_texts if m == "oc_1"
-    )
+    assert any("未配置调度器 LLM" in t for m, t in bridge.sent_texts if m == "oc_1")
 
 
 # ---------------------------------------------------------------------- #

@@ -97,9 +97,7 @@ class DispatcherSessionRuntime(SessionRuntime):
             SessionInputAccepted(text=request.text, source=request.conversation),
         )
         placement = (
-            "current"
-            if self._current_task is None and not self._pending
-            else "pending"
+            "current" if self._current_task is None and not self._pending else "pending"
         )
         self._results[request.turn_id] = asyncio.get_running_loop().create_future()
         self._pending.append(request)
@@ -113,7 +111,9 @@ class DispatcherSessionRuntime(SessionRuntime):
     async def wait_turn(self, turn: TurnRef) -> str:
         """等待指定 Dispatcher Turn 完成并返回回复。"""
         if turn.session_id != self.session_id:
-            raise ValueError(f"Turn 不属于 Session {self.session_id}: {turn.session_id}")
+            raise ValueError(
+                f"Turn 不属于 Session {self.session_id}: {turn.session_id}"
+            )
         try:
             future = self._results[turn.turn_id]
         except KeyError as exc:
@@ -203,7 +203,9 @@ class DispatcherSessionRuntime(SessionRuntime):
                 request.turn_id,
                 SessionErrorOccurred(phase="execute_turn", message=str(exc)),
             )
-            reply = f"调度器出错：{str(exc)[:200]}。可用 `/run <项目> <任务>` 直接派发。"
+            reply = (
+                f"调度器出错：{str(exc)[:200]}。可用 `/run <项目> <任务>` 直接派发。"
+            )
         reply = reply or "（调度器无输出）"
         if turn:
             self._memory.add_turn(turn)
