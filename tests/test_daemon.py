@@ -142,8 +142,9 @@ class FakeBridge:
         )
 
     def open_output(
-        self, target_id: str, title: str, *, footer: str = ""
+        self, conversation: ConversationRef, title: str, *, footer: str = ""
     ) -> StreamingOutput:
+        target_id = conversation.conversation_id
         if self.stream_mode == "card":
             return LiveCard(self, target_id, title, footer=footer)
 
@@ -2423,7 +2424,7 @@ async def test_run_uses_text_only_channel_output_lifecycle():
         def __init__(self) -> None:
             self.replies: list[tuple[str, str, bool]] = []
             self.outputs: list[RecordingOutput] = []
-            self.opened: list[tuple[str, str, str]] = []
+            self.opened: list[tuple[ConversationRef, str, str]] = []
             self.stopped = False
 
         def start(self, on_message) -> None:
@@ -2458,14 +2459,14 @@ async def test_run_uses_text_only_channel_output_lifecycle():
 
         def open_output(
             self,
-            target_id: str,
+            conversation: ConversationRef,
             title: str,
             *,
             footer: str = "",
         ) -> StreamingOutput:
             output = RecordingOutput()
             self.outputs.append(output)
-            self.opened.append((target_id, title, footer))
+            self.opened.append((conversation, title, footer))
             return output
 
     daemon, _, created = make_daemon()
@@ -2479,7 +2480,9 @@ async def test_run_uses_text_only_channel_output_lifecycle():
     await wait_until(lambda: channel.outputs and channel.outputs[0].closed)
 
     output = channel.outputs[0]
-    assert channel.opened == [("om_root1", "demo · copilot", "demo")]
+    assert channel.opened == [
+        (ConversationRef("feishu", "om_root1"), "demo · copilot", "demo")
+    ]
     assert output.text == "echo:do stuff"
     assert output.flush_count == 1
     assert output.statuses == ["done"]
@@ -3122,7 +3125,7 @@ async def test_session_output_creation_failure_keeps_other_conversation_running(
 ):
     class BrokenOutputBridge(FakeBridge):
         def open_output(
-            self, target_id: str, title: str, *, footer: str = ""
+            self, conversation: ConversationRef, title: str, *, footer: str = ""
         ) -> StreamingOutput:
             raise RuntimeError("open output boom")
 

@@ -891,7 +891,7 @@ class _Daemon:
         for conversation in conversations:
             try:
                 output = self._channel_for(conversation).open_output(
-                    conversation.conversation_id,
+                    conversation,
                     title,
                     footer=footer,
                 )

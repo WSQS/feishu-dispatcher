@@ -19,6 +19,7 @@ from uuid import uuid4
 from . import __version__
 from ._atomic import atomic_write
 from .channel import ChannelMessage, MessageHandler, OutputStatus
+from .conversation import ConversationRef
 from .session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
@@ -331,11 +332,12 @@ class HttpChannel:
 
     def open_output(
         self,
-        target_id: str,
+        conversation: ConversationRef,
         title: str,
         *,
         footer: str = "",
     ) -> _HttpStreamingOutput:
+        target_id = conversation.conversation_id
         conversation_id = self._conversation_for_target(target_id)
         return _HttpStreamingOutput(
             self,
