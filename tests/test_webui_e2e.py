@@ -123,7 +123,10 @@ async def test_webui_browser_help_refresh_cursor_and_token_storage():
 
     async def handle(message: ChannelMessage) -> None:
         if message.text == "/help":
-            channel.reply_text(message.message_id, "browser help reply")
+            channel.send_text(
+                ConversationRef("http", message.conversation_id),
+                "browser help reply",
+            )
 
     channel.start(handle)
     try:

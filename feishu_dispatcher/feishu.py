@@ -710,9 +710,7 @@ class FeishuBridge:
             from .throttler import StreamThrottler
 
             async def send_piece(piece: str) -> None:
-                await asyncio.to_thread(
-                    self.reply_text, target_id, piece, threaded=True
-                )
+                await asyncio.to_thread(self.send_text, conversation, piece)
 
             output = StreamThrottler(send_piece, window=self._throttle_window)
         session_output = _FeishuSessionEventOutput(
@@ -739,10 +737,7 @@ class FeishuBridge:
                 return
             source = body.source.channel_key() if body.source is not None else "unknown"
             text = f"↪️ 同步自 {source}：{body.text}"
-            if conversation_id == self._chat_whitelist:
-                self.send_text(conversation_id, text)
-            else:
-                self.reply_text(conversation_id, text, threaded=True)
+            self.send_text(ConversationRef("feishu", conversation_id), text)
             return
         if not isinstance(
             body,
@@ -828,9 +823,12 @@ class FeishuBridge:
         """在会话中发送根消息创建话题，返回根 message_id。"""
         return self.send_root_message(conversation_id, initial_text)
 
-    def send_text(self, conversation_id: str, text: str) -> str:
-        """向会话发送一条新的文本消息。"""
-        return self.send_root_message(conversation_id, text)
+    def send_text(self, conversation: ConversationRef, text: str) -> str:
+        """向 Conversation 发送文本。"""
+        conversation_id = conversation.conversation_id
+        if conversation_id == self._chat_whitelist:
+            return self.send_root_message(conversation_id, text)
+        return self.reply_in_thread(conversation_id, text)
 
     def reply_in_thread(self, root_message_id: str, text: str) -> str:
         """在话题（root_message_id）内追加回复，返回 message_id。"""
@@ -859,18 +857,6 @@ class FeishuBridge:
             },
         )
         return result["data"]["message_id"]
-
-    def reply_text(
-        self,
-        target_id: str,
-        text: str,
-        *,
-        threaded: bool = False,
-    ) -> str:
-        """回复文本，按 threaded 选择普通回复或话题回复。"""
-        if threaded:
-            return self.reply_in_thread(target_id, text)
-        return self.reply(target_id, text)
 
     def reply_card(self, root_message_id: str, card: dict) -> str:
         """在话题内发一张 interactive 卡片，返回新消息 message_id。"""

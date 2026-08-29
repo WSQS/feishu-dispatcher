@@ -74,7 +74,8 @@ class FakeBridge:
 
         self.roots: list[tuple[str, str]] = []
         self.created_threads: list[tuple[str, str]] = []
-        self.plain: list[tuple[str, str]] = []  # reply_in_thread=False（不建话题）
+        self.sent_texts: list[tuple[str, str]] = []
+        self.plain = self.sent_texts
         self.session_events: list[tuple[str, SessionEvent]] = []
         self.session_event_trace_sequences: list[int | None] = []
 
@@ -93,22 +94,16 @@ class FakeBridge:
         self.replies.append((root_message_id, text))
         return f"om_reply_{len(self.replies)}"
 
-    def reply(self, message_id: str, text: str) -> str:
-        self.replies.append((message_id, text))
-        self.plain.append((message_id, text))
-        return f"om_reply_{len(self.replies)}"
-
-    def send_text(self, conversation_id: str, text: str) -> str:
+    def send_text(self, conversation: ConversationRef, text: str) -> str:
+        conversation_id = conversation.conversation_id
+        self.sent_texts.append((conversation_id, text))
+        if conversation_id.startswith("om_"):
+            return self.reply_in_thread(conversation_id, text)
         return self.send_root_message(conversation_id, text)
 
     def create_thread(self, conversation_id: str, initial_text: str) -> str:
         self.created_threads.append((conversation_id, initial_text))
         return self.send_root_message(conversation_id, initial_text)
-
-    def reply_text(self, target_id: str, text: str, *, threaded: bool = False) -> str:
-        if threaded:
-            return self.reply_in_thread(target_id, text)
-        return self.reply(target_id, text)
 
     def handle_session_event(
         self,
@@ -135,10 +130,9 @@ class FakeBridge:
                 return
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
         source = body.source.channel_key() if body.source is not None else "unknown"
-        self.reply_text(
-            conversation_id,
+        self.send_text(
+            ConversationRef("feishu", conversation_id),
             f"↪️ 同步自 {source}：{body.text}",
-            threaded=True,
         )
 
     def open_output(
@@ -149,7 +143,11 @@ class FakeBridge:
             return LiveCard(self, target_id, title, footer=footer)
 
         async def send_piece(piece: str) -> None:
-            await asyncio.to_thread(self.reply_text, target_id, piece, threaded=True)
+            await asyncio.to_thread(
+                self.send_text,
+                conversation,
+                piece,
+            )
 
         return StreamThrottler(send_piece, window=self.throttle_window)
 
@@ -184,7 +182,7 @@ class FakeBridge:
         self.stopped = True
 
     def texts(self, root: str | None = None) -> list[str]:
-        return [t for r, t in self.replies if root is None or r == root]
+        return [t for target, t in self.sent_texts if root is None or target == root]
 
 
 class FakeAgent:
@@ -713,7 +711,7 @@ async def test_http_channel_help_round_trip_stays_in_http_conversation():
         assert len(payload["events"]) == 1
         event = payload["events"][0]
         assert event["type"] == "message.created"
-        assert event["target_id"] == "message-a"
+        assert "target_id" not in event
         assert "用法" in event["text"]
         assert feishu.replies == []
         assert feishu.roots == []
@@ -1445,11 +1443,11 @@ def test_conversation_binding_does_not_inspect_ref_fields():
 async def test_invalid_output_channel_never_falls_back_to_primary():
     daemon, feishu, _ = make_daemon()
 
-    await daemon._safe_reply(
-        "om_empty", "empty", conversation=ConversationRef("", "oc_1")
+    await daemon._safe_send_text(
+        "empty", conversation=ConversationRef("", "oc_1")
     )
-    await daemon._safe_reply(
-        "om_unknown", "unknown", conversation=ConversationRef("web", "oc_1")
+    await daemon._safe_send_text(
+        "unknown", conversation=ConversationRef("web", "oc_1")
     )
 
     assert feishu.replies == []
@@ -2443,19 +2441,9 @@ async def test_run_uses_text_only_channel_output_lifecycle():
             self.replies.append((conversation_id, initial_text, False))
             return f"om_root_{len(self.replies)}"
 
-        def send_text(self, conversation_id: str, text: str) -> str:
-            self.replies.append((conversation_id, text, False))
+        def send_text(self, conversation: ConversationRef, text: str) -> str:
+            self.replies.append((conversation.conversation_id, text, False))
             return f"om_root_{len(self.replies)}"
-
-        def reply_text(
-            self,
-            target_id: str,
-            text: str,
-            *,
-            threaded: bool = False,
-        ) -> str:
-            self.replies.append((target_id, text, threaded))
-            return f"om_reply_{len(self.replies)}"
 
         def open_output(
             self,
@@ -2576,7 +2564,7 @@ async def test_run_without_agent_flag_uses_default():
 async def test_run_unknown_agent_errors_no_spawn():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo 做点事 --agent nope"))
-    assert any("未知 agent" in t for m, t in bridge.plain if m == "om_root1")
+    assert any("未知 agent" in t for m, t in bridge.roots if m == "oc_1")
     assert created == []  # 未知 agent 直接报错，不启动
     assert task_by_thread(daemon.store, "om_root1") is None
 
@@ -2740,7 +2728,7 @@ async def test_help_on_root_shows_console_usage():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/help", mid="om_h"))
     # root 主线 /help 走普通回复（不建话题），给控制台用法
-    assert any(m == "om_h" and "用法" in t for m, t in bridge.plain)
+    assert any(m == "oc_1" and "用法" in t for m, t in bridge.roots)
 
 
 async def test_raw_forwards_reserved_command_to_agent():
@@ -2815,12 +2803,12 @@ async def test_same_message_id_help_replies_on_source_channel():
     message = root_msg("/help", mid="om_shared")
 
     await daemon._handle_channel_message("feishu", message)
-    assert [target for target, _ in feishu.plain] == ["om_shared"]
+    assert [target for target, _ in feishu.roots] == ["oc_1"]
     assert web.plain == []
 
     await daemon._handle_channel_message("web", message)
-    assert [target for target, _ in feishu.plain] == ["om_shared"]
-    assert [target for target, _ in web.plain] == ["om_shared"]
+    assert [target for target, _ in feishu.roots] == ["oc_1"]
+    assert [target for target, _ in web.roots] == ["oc_1"]
     assert daemon._session_id_for_conversation(ConversationRef("web", "oc_1")) is None
 
 
@@ -2852,7 +2840,7 @@ async def test_non_primary_channel_uses_own_admission_scope():
     )
 
     assert feishu.plain == []
-    assert [target for target, _ in web.plain] == ["om_web"]
+    assert [target for target, _ in web.roots] == ["web-room"]
 
 
 async def test_same_inbound_ids_are_isolated_by_channel():
@@ -3204,13 +3192,13 @@ async def test_agent_error_reports_and_closes_session():
 async def test_unknown_project_replies_error():
     daemon, bridge, _ = make_daemon()
     await daemon._handle_message(root_msg("/run nope task"))
-    assert any("未知项目" in t for t in bridge.texts("om_root1"))
+    assert any("未知项目" in t for t in bridge.texts("oc_1"))
 
 
 async def test_plain_root_message_replies_usage():
     daemon, bridge, _ = make_daemon()
     await daemon._handle_message(root_msg("你好"))
-    assert any("用法" in t for t in bridge.texts("om_root1"))
+    assert any("用法" in t for t in bridge.texts("oc_1"))
 
 
 async def test_shutdown_cancels_workers_and_stops_bridge():
@@ -3325,7 +3313,7 @@ async def test_max_agents_limit_blocks_excess_spawns():
     # 此时已有 1 个活跃 agent，第二个 /run 应被拒绝
     await daemon._handle_message(root_msg("/run demo task2", mid="om_r2"))
     assert len(created) == 1
-    assert any("上限" in t for t in bridge.texts("om_r2"))
+    assert any("上限" in t for t in bridge.texts("oc_1"))
     # 清理
     await daemon._shutdown()
 
@@ -3722,7 +3710,7 @@ async def test_max_agents_cap_atomic_under_concurrent_run():
     )
     await wait_until(lambda: created and created[0].prompts)
     assert len(created) == 1  # 只起了一个，没突破上限
-    rejected = bridge.texts("om_a") + bridge.texts("om_b")
+    rejected = bridge.texts("oc_1")
     assert any("上限" in t for t in rejected)
     await daemon._shutdown()
 
@@ -3760,7 +3748,9 @@ async def test_nl_dispatch_spawns_agent_via_llm():
     assert bridge.roots  # agent 有自己的话题根消息
     assert bridge.created_threads  # 调度器派发必须创建独立话题
     # LLM 对用户的回复是**普通回复、不建话题**（bug 修复：只有派 agent 才建话题）
-    assert any(m == "om_nl" and "已给 demo 派发" in t for m, t in bridge.plain)
+    assert any(
+        m == "oc_1" and "已给 demo 派发" in t for m, t in bridge.sent_texts
+    )
     # 用户的对话消息 om_nl 不应成为任何 agent 话题的根
     assert all(root != "om_nl" for root, _ in bridge.roots)
     await daemon._shutdown()
@@ -3824,14 +3814,15 @@ async def test_nl_channel_tools_receive_source_conversation():
         "spawn_agent": conversation,
         "attach_session": conversation,
     }
-    assert feishu.plain == []
-    assert feishu.roots == [
+    assert feishu.sent_texts == [
+        ("oc_1", "↪️ 同步自 web：dispatch through web"),
         ("oc_1", "web tools done"),
     ]
-    assert feishu.replies == [
+    assert feishu.roots == [
         ("oc_1", "↪️ 同步自 web：dispatch through web"),
+        ("oc_1", "web tools done"),
     ]
-    assert web.plain == [("om_web_nl", "web tools done")]
+    assert web.sent_texts == [("oc_1", "web tools done")]
 
 
 async def test_dispatcher_root_turns_sync_between_channels():
@@ -3862,14 +3853,12 @@ async def test_dispatcher_root_turns_sync_between_channels():
         feishu_conversation,
         web_conversation,
     }
-    assert web.plain == [("web-message", "web reply")]
-    assert web.roots == []
+    assert web.sent_texts == [("web-room", "web reply")]
     assert feishu.roots == [
+        ("oc_1", "↪️ 同步自 web：web turn"),
         ("oc_1", "web reply"),
     ]
-    assert feishu.replies == [
-        ("oc_1", "↪️ 同步自 web：web turn"),
-    ]
+    assert feishu.sent_texts == feishu.roots
     assert [type(event.body) for _, event in feishu.session_events] == [
         SessionInputAccepted,
         AgentOutputStarted,
@@ -3885,13 +3874,14 @@ async def test_dispatcher_root_turns_sync_between_channels():
         root_msg("feishu turn", mid="feishu-message"),
     )
 
-    assert feishu.plain == [("feishu-message", "feishu reply")]
-    assert web.roots == [
-        ("web-room", "feishu reply"),
+    assert feishu.sent_texts[-2:] == [
+        ("oc_1", "web reply"),
+        ("oc_1", "feishu reply"),
     ]
-    assert web.replies == [
-        ("web-message", "web reply"),
+    assert web.sent_texts == [
+        ("web-room", "web reply"),
         ("web-room", "↪️ 同步自 feishu：feishu turn"),
+        ("web-room", "feishu reply"),
     ]
     assert [type(event.body) for _, event in feishu.session_events] == [
         SessionInputAccepted,
@@ -3975,7 +3965,7 @@ async def test_dispatcher_turns_are_serialized_across_channels():
 
 async def test_dispatcher_target_send_failure_does_not_abort_turn(caplog):
     class BrokenSendBridge(FakeBridge):
-        def send_text(self, conversation_id: str, text: str) -> str:
+        def send_text(self, conversation: ConversationRef, text: str) -> str:
             raise RuntimeError("send boom")
 
     daemon, feishu, _ = make_daemon()
@@ -3999,8 +3989,12 @@ async def test_dispatcher_target_send_failure_does_not_abort_turn(caplog):
             "feishu", root_msg("continue", mid="feishu-message")
         )
 
-    assert broken.plain == [("broken-message", "joined")]
-    assert feishu.plain == [("feishu-message", "still works")]
+    assert broken.sent_texts == []
+    assert feishu.sent_texts == [
+        ("oc_1", "↪️ 同步自 broken：join"),
+        ("oc_1", "joined"),
+        ("oc_1", "still works"),
+    ]
     assert daemon._sched_memory.history() == [
         {"role": "user", "content": "join"},
         {"role": "assistant", "content": "joined"},
@@ -4008,11 +4002,10 @@ async def test_dispatcher_target_send_failure_does_not_abort_turn(caplog):
         {"role": "assistant", "content": "still works"},
     ]
     assert healthy.roots == [
+        ("healthy-room", "↪️ 同步自 feishu：continue"),
         ("healthy-room", "still works"),
     ]
-    assert healthy.replies == [
-        ("healthy-room", "↪️ 同步自 feishu：continue"),
-    ]
+    assert healthy.replies == []
     assert "Channel 独立文本发送失败 conversation=broken:broken-room" in caplog.text
 
 
@@ -4020,10 +4013,12 @@ async def test_nl_reply_does_not_create_thread():
     daemon, bridge, created = make_daemon()
     daemon._llm = ScriptedLLM([LLMResponse(content="你好，需要我做什么？")])
     await daemon._handle_message(root_msg("在吗", mid="om_chat"))
-    # 纯对话（无 spawn）：回复走普通回复、不建话题、不起 agent
-    assert any(m == "om_chat" and "需要我做什么" in t for m, t in bridge.plain)
+    # 纯对话（无 spawn）：发送到当前 Conversation，不创建 agent 话题
+    assert any(
+        m == "oc_1" and "需要我做什么" in t for m, t in bridge.sent_texts
+    )
     assert created == []
-    assert bridge.roots == []
+    assert bridge.roots == [("oc_1", "你好，需要我做什么？")]
 
 
 # ---------------------------------------------------------------------- #
@@ -4270,14 +4265,14 @@ async def test_nl_dispatch_unknown_project_reported_to_llm():
     )
     await daemon._handle_message(root_msg("给 ghost 做点事", mid="om_g"))
     assert created == []  # 未 spawn
-    assert any("没找到项目" in t for t in bridge.texts("om_g"))
+    assert any("没找到项目" in t for t in bridge.texts("oc_1"))
 
 
 async def test_nl_without_llm_falls_back_to_usage():
     daemon, bridge, created = make_daemon()  # _llm is None
     await daemon._handle_message(root_msg("帮我做点什么", mid="om_x"))
     assert created == []
-    assert any("用法" in t for t in bridge.texts("om_x"))
+    assert any("用法" in t for t in bridge.texts("oc_1"))
 
 
 # ---------------------------------------------------------------------- #
@@ -4404,7 +4399,7 @@ async def test_clear_command_clears_terminal_history():
     _seed_task(store, thread="om_old", status="stopped")  # 终止历史
     daemon, bridge, created = make_daemon(store=store)
     await daemon._handle_message(root_msg("/clear", mid="om_c"))
-    assert any("已清理 1" in t for t in bridge.texts("om_c"))
+    assert any("已清理 1" in t for t in bridge.texts("oc_1"))
     assert store.get("t1") is None  # 终止任务被清掉
 
 
@@ -4415,7 +4410,7 @@ async def test_reboot_command_requests_restart_and_replies():
     # 置位 + 唤醒主循环（run() 返回 True → cli.py re-exec）；先回执再重启
     assert daemon._reboot_requested is True
     assert daemon._stop_event.is_set()
-    assert any("重启" in t for t in bridge.texts("om_rb"))
+    assert any("重启" in t for t in bridge.texts("oc_1"))
 
 
 async def test_get_task_returns_detail():
@@ -4493,7 +4488,7 @@ async def test_task_command_shows_detail_and_actions():
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
     await daemon._handle_message(root_msg("/task t1", mid="om_q"))
-    reply = "\n".join(bridge.texts("om_q"))
+    reply = "\n".join(bridge.texts("oc_1"))
     assert "t1" in reply and "Editing build.py" in reply and "pytest" in reply
     await daemon._shutdown()
 
@@ -4501,7 +4496,7 @@ async def test_task_command_shows_detail_and_actions():
 async def test_task_command_unknown_id_replies_not_found():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/task t404", mid="om_q"))
-    assert any("未找到" in t for t in bridge.texts("om_q"))
+    assert any("未找到" in t for t in bridge.texts("oc_1"))
 
 
 async def test_last_output_captured_from_agent_reply():
@@ -4537,7 +4532,7 @@ async def test_task_command_shows_last_output():
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
     await daemon._handle_message(root_msg("/task t1", mid="om_q"))
-    reply = "\n".join(bridge.texts("om_q"))
+    reply = "\n".join(bridge.texts("oc_1"))
     assert "最近回复: reply:build" in reply
     await daemon._shutdown()
 
@@ -4567,7 +4562,7 @@ async def test_task_command_shows_model():
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
     await daemon._handle_message(root_msg("/task t1", mid="om_q"))
-    reply = "\n".join(bridge.texts("om_q"))
+    reply = "\n".join(bridge.texts("oc_1"))
     assert "模型: ns-deepseek/deepseek-v4-pro" in reply
     await daemon._shutdown()
 
@@ -4824,7 +4819,11 @@ async def test_attach_backend_unsupported_leaves_no_task():
         root_msg("/attach demo opencode ext_sid_1", mid="om_att")
     )
     assert store.all() == []  # 探测失败不落 Task
-    assert any("不支持 load_session" in t for m, t in bridge.plain if m == "om_att")
+    assert any(
+        "不支持 load_session" in t
+        for m, t in bridge.sent_texts
+        if m == "oc_1"
+    )
     assert len(created) == 1  # 只有探针，无拉起
     assert created[0].closed
 
@@ -4836,7 +4835,11 @@ async def test_attach_invalid_session_leaves_no_task():
         root_msg("/attach demo opencode ext_sid_1", mid="om_att")
     )
     assert store.all() == []
-    assert any("无法恢复该外部 session" in t for m, t in bridge.plain if m == "om_att")
+    assert any(
+        "无法恢复该外部 session" in t
+        for m, t in bridge.sent_texts
+        if m == "oc_1"
+    )
     assert len(created) == 1
     assert created[0].closed
 
@@ -4858,7 +4861,11 @@ async def test_attach_duplicate_rejected_and_guides_to_existing():
     await daemon._handle_message(
         root_msg("/attach demo opencode ext_sid_1", mid="om_dup")
     )
-    assert any("已由任务 [t1] 附着" in t for m, t in bridge.plain if m == "om_dup")
+    assert any(
+        "已由任务 [t1] 附着" in t
+        for m, t in bridge.sent_texts
+        if m == "oc_1"
+    )
     assert len(created) == 0  # 去重在探测前，不起探针
     assert len(store.all()) == 1  # 未新增任务
 
@@ -4868,9 +4875,9 @@ async def test_attach_unknown_project_or_agent_errors_no_probe():
     await daemon._handle_message(
         root_msg("/attach nope opencode ext_sid_1", mid="om_p")
     )
-    assert any("未知项目" in t for m, t in bridge.plain if m == "om_p")
+    assert any("未知项目" in t for m, t in bridge.sent_texts if m == "oc_1")
     await daemon._handle_message(root_msg("/attach demo nope ext_sid_1", mid="om_a"))
-    assert any("未知 agent" in t for m, t in bridge.plain if m == "om_a")
+    assert any("未知 agent" in t for m, t in bridge.sent_texts if m == "oc_1")
     assert created == []  # 校验失败，不起探针
 
 
@@ -4883,8 +4890,8 @@ async def test_attach_respects_max_agents_replies_to_original_no_orphan_thread()
     await daemon._handle_message(
         root_msg("/attach demo opencode ext_sid_1", mid="om_att")
     )
-    assert any("上限" in t for m, t in bridge.plain if m == "om_att")  # 回原消息
-    assert bridge.roots == []  # 没开新话题（无孤儿话题）
+    assert any("上限" in t for m, t in bridge.sent_texts if m == "oc_1")
+    assert bridge.created_threads == []  # 没开新话题（无孤儿话题）
     assert len(store.all()) == 1  # 只有 /run 的任务，没建 attach Task
     await daemon._shutdown()
 
@@ -5634,7 +5641,7 @@ def _daemon_with_llm_profiles() -> tuple[_Daemon, FakeBridge]:
 async def test_llm_command_lists_profiles_marks_active():
     daemon, bridge = _daemon_with_llm_profiles()
     await daemon._handle_message(root_msg("/llm", mid="om_l1"))
-    txt = "\n".join(t for m, t in bridge.plain if m == "om_l1")
+    txt = "\n".join(t for m, t in bridge.sent_texts if m == "oc_1")
     assert "deepseek" in txt and "gpt5" in txt
     assert "gpt-5.4" in txt and "responses" in txt
     assert "▶" in txt  # 标了激活的
@@ -5647,20 +5654,28 @@ async def test_llm_command_switches_and_rebuilds_client():
     await daemon._handle_message(root_msg("/llm gpt5", mid="om_l2"))
     assert daemon._llm_active == "gpt5"
     assert isinstance(daemon._llm, ResponsesAPIClient)  # 重建成 responses client
-    assert any("切换" in t and "gpt5" in t for m, t in bridge.plain if m == "om_l2")
+    assert any(
+        "切换" in t and "gpt5" in t
+        for m, t in bridge.sent_texts
+        if m == "oc_1"
+    )
 
 
 async def test_llm_command_unknown_profile():
     daemon, bridge = _daemon_with_llm_profiles()
     await daemon._handle_message(root_msg("/llm nope", mid="om_l3"))
     assert daemon._llm_active == "deepseek"  # 未切
-    assert any("未知 profile" in t for m, t in bridge.plain if m == "om_l3")
+    assert any(
+        "未知 profile" in t for m, t in bridge.sent_texts if m == "oc_1"
+    )
 
 
 async def test_llm_command_no_profiles_configured():
     daemon, bridge, _ = make_daemon()  # 无 [llm]
     await daemon._handle_message(root_msg("/llm", mid="om_l4"))
-    assert any("未配置调度器 LLM" in t for m, t in bridge.plain if m == "om_l4")
+    assert any(
+        "未配置调度器 LLM" in t for m, t in bridge.sent_texts if m == "oc_1"
+    )
 
 
 # ---------------------------------------------------------------------- #

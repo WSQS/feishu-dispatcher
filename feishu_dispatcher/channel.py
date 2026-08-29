@@ -54,15 +54,7 @@ class Channel(Protocol):
         """在指定会话中创建交互线程并返回线程标识。"""
         ...
 
-    def send_text(self, conversation_id: str, text: str) -> str: ...
-
-    def reply_text(
-        self,
-        target_id: str,
-        text: str,
-        *,
-        threaded: bool = False,
-    ) -> str: ...
+    def send_text(self, conversation: ConversationRef, text: str) -> str: ...
 
     def handle_session_event(
         self,

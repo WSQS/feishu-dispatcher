@@ -235,34 +235,22 @@ class HttpChannel:
         )
         return thread_id
 
-    def send_text(self, conversation_id: str, text: str) -> str:
-        conversation_id = self._clean_identity(conversation_id, "conversation_id")
-        message_id = self._new_target(conversation_id, "message")
-        self._append_event(
-            conversation_id,
-            "message.created",
-            message_id=message_id,
-            text=text,
-            threaded=False,
+    def send_text(self, conversation: ConversationRef, text: str) -> str:
+        conversation_id = self._clean_identity(
+            conversation.conversation_id, "conversation_id"
         )
-        return message_id
-
-    def reply_text(
-        self,
-        target_id: str,
-        text: str,
-        *,
-        threaded: bool = False,
-    ) -> str:
-        conversation_id = self._conversation_for_target(target_id)
+        with self._state_lock:
+            routed_conversation_id = self._target_conversations.get(conversation_id)
+        if routed_conversation_id is not None:
+            conversation_id = routed_conversation_id
+        else:
+            self._claim_targets(conversation_id, [])
         message_id = self._new_target(conversation_id, "message")
         self._append_event(
             conversation_id,
             "message.created",
             message_id=message_id,
-            target_id=target_id,
             text=text,
-            threaded=threaded,
         )
         return message_id
 
@@ -324,10 +312,9 @@ class HttpChannel:
         if not body.text:
             return
         source = body.source.channel_key() if body.source is not None else "unknown"
-        self.reply_text(
-            conversation_id,
+        self.send_text(
+            ConversationRef("http", conversation_id),
             f"↪️ 同步自 {source}：{body.text}",
-            threaded=True,
         )
 
     def open_output(

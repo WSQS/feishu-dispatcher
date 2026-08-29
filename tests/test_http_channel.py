@@ -629,7 +629,7 @@ async def test_application_post_route_preserves_channel_capacity_error():
 
     channel.start(ignore)
     try:
-        channel.send_text("browser-a", "existing")
+        channel.send_text(ConversationRef("http", "browser-a"), "existing")
         status, payload = await asyncio.to_thread(
             _request,
             "POST",
@@ -655,7 +655,10 @@ async def test_message_dispatch_and_reply_round_trip():
 
     async def handle(message: ChannelMessage) -> None:
         received.append(message)
-        channel.reply_text(message.message_id, "help reply")
+        channel.send_text(
+            ConversationRef("http", message.conversation_id),
+            "help reply",
+        )
         handled.set()
 
     channel.start(handle)
@@ -681,7 +684,8 @@ async def test_message_dispatch_and_reply_round_trip():
             )
         ]
         assert events["events"][0]["type"] == "message.created"
-        assert events["events"][0]["target_id"] == "message-a"
+        assert "target_id" not in events["events"][0]
+        assert "threaded" not in events["events"][0]
         assert events["events"][0]["text"] == "help reply"
     finally:
         channel.stop()
@@ -696,7 +700,10 @@ async def test_conversations_are_isolated_and_target_conflicts_are_rejected():
 
     async def handle(message: ChannelMessage) -> None:
         seen.append(message.conversation_id)
-        channel.reply_text(message.message_id, f"reply:{message.conversation_id}")
+        channel.send_text(
+            ConversationRef("http", message.conversation_id),
+            f"reply:{message.conversation_id}",
+        )
         if len(seen) == 2:
             handled.set()
 
@@ -816,9 +823,9 @@ async def test_cursor_expiry_invalid_cursor_and_conversation_capacity():
             _events_url(channel, "missing"),
             "tok-http",
         )
-        channel.send_text("browser-a", "one")
-        channel.send_text("browser-a", "two")
-        channel.send_text("browser-a", "three")
+        channel.send_text(ConversationRef("http", "browser-a"), "one")
+        channel.send_text(ConversationRef("http", "browser-a"), "two")
+        channel.send_text(ConversationRef("http", "browser-a"), "three")
         expired_status, expired = await asyncio.to_thread(
             _request,
             "GET",
@@ -878,7 +885,10 @@ async def test_thread_reply_session_event_output_and_restart():
     channel.start(ignore)
     try:
         thread_id = channel.create_thread("browser-a", "start")
-        channel.reply_text(thread_id, "reply", threaded=True)
+        channel.send_text(
+            ConversationRef("http", thread_id),
+            "reply",
+        )
         output = channel.open_output(
             ConversationRef("http", thread_id), "demo", footer="model:a"
         )
@@ -928,6 +938,8 @@ async def test_thread_reply_session_event_output_and_restart():
             "session.event",
             "session.event",
         ]
+        assert "target_id" not in events["events"][1]
+        assert "threaded" not in events["events"][1]
         output_id = events["events"][2]["presentation"]["output_id"]
         assert events["events"][2]["presentation"] == {
             "output_id": output_id,
@@ -1008,9 +1020,9 @@ async def test_session_input_event_projects_to_thread_message():
         }
         projected = events["events"][2]
         assert projected["type"] == "message.created"
-        assert projected["target_id"] == thread_id
         assert projected["text"] == "↪️ 同步自 feishu：检查状态"
-        assert projected["threaded"] is True
+        assert "target_id" not in projected
+        assert "threaded" not in projected
     finally:
         channel.stop()
 
