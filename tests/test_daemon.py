@@ -2154,7 +2154,7 @@ async def test_tool_call_projection_failure_does_not_abort_turn(caplog):
         await wait_until(lambda: "Channel SessionEvent 投影失败" in caplog.text)
 
     assert "Channel SessionEvent 投影失败" in caplog.text
-    assert "channel=broken conversation=broken-thread" in caplog.text
+    assert "conversation=broken:broken-thread" in caplog.text
     assert any(
         isinstance(event.body, ToolCallObserved) for _, event in feishu.session_events
     )
@@ -2533,7 +2533,7 @@ async def test_fanout_streaming_output_isolates_target_failures(caplog):
         assert target.flush_count == 1
         assert target.statuses == ["done"]
         assert target.closed
-    assert "channel=broken conversation=thread-c" in caplog.text
+    assert "conversation=broken:thread-c" in caplog.text
 
 
 async def test_run_agent_flag_overrides_default():
@@ -3033,7 +3033,7 @@ async def test_session_input_event_projection_failure_does_not_abort_turn(caplog
         source=source,
     )
     assert "Channel SessionEvent 投影失败" in caplog.text
-    assert "channel=broken conversation=broken-thread" in caplog.text
+    assert "conversation=broken:broken-thread" in caplog.text
     await daemon._shutdown()
 
 
@@ -3143,9 +3143,7 @@ async def test_session_output_creation_failure_keeps_other_conversation_running(
         await wait_until(lambda: daemon.store.get(task.session_id).status == "idle")
 
     assert daemon.store.get(task.session_id).status == "idle"
-    assert (
-        "Session 输出创建失败 channel=broken conversation=broken-thread" in caplog.text
-    )
+    assert "Session 输出创建失败 conversation=broken:broken-thread" in caplog.text
     await daemon._shutdown()
 
 
@@ -3994,10 +3992,7 @@ async def test_dispatcher_target_send_failure_does_not_abort_turn(caplog):
     assert healthy.replies == [
         ("healthy-room", "↪️ 同步自 feishu：continue"),
     ]
-    assert (
-        "Channel 独立文本发送失败 channel=broken conversation=broken-room"
-        in caplog.text
-    )
+    assert "Channel 独立文本发送失败 conversation=broken:broken-room" in caplog.text
 
 
 async def test_nl_reply_does_not_create_thread():
