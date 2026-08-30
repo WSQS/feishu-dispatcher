@@ -57,8 +57,13 @@ from feishu_dispatcher.trace_store import SessionTraceStore
 
 class FakeBridge:
     def __init__(
-        self, *, stream_mode: str = "text", throttle_window: float = 0.01
+        self,
+        *,
+        channel_key: str = "feishu",
+        stream_mode: str = "text",
+        throttle_window: float = 0.01,
     ) -> None:
+        self.channel_key = channel_key
         self.stream_mode = stream_mode
         self.throttle_window = throttle_window
         self.replies: list[tuple[str, str]] = []
@@ -101,10 +106,13 @@ class FakeBridge:
             return self.reply_in_thread(conversation_id, text)
         return self.send_root_message(conversation_id, text)
 
-    def create_thread(self, initial_text: str) -> str:
+    def create_thread(self, initial_text: str) -> ConversationRef:
         self.created_threads.append(("oc_1", initial_text))
         self.roots.append(("oc_1", initial_text))
-        return f"om_root{len(self.created_threads)}"
+        return ConversationRef(
+            self.channel_key,
+            f"om_root{len(self.created_threads)}",
+        )
 
     def handle_session_event(
         self,
@@ -388,6 +396,7 @@ def make_daemon(
         stream_mode=stream_mode,
     )
     bridge = FakeBridge(
+        channel_key=channel_key,
         stream_mode=cfg.stream_mode,
         throttle_window=cfg.throttle_window,
     )
@@ -2429,9 +2438,9 @@ async def test_run_uses_text_only_channel_output_lifecycle():
         def restart(self) -> None:
             self.stopped = False
 
-        def create_thread(self, initial_text: str) -> str:
+        def create_thread(self, initial_text: str) -> ConversationRef:
             self.replies.append((initial_text, False))
-            return f"om_root_{len(self.replies)}"
+            return ConversationRef("feishu", f"om_root_{len(self.replies)}")
 
         def send_text(self, conversation: ConversationRef, text: str) -> str:
             self.replies.append((conversation.conversation_id, text, False))
@@ -2861,7 +2870,7 @@ async def test_non_primary_channel_uses_own_admission_scope():
 
 async def test_same_inbound_ids_are_isolated_by_channel():
     daemon, feishu, created = make_daemon()
-    web = FakeBridge()
+    web = FakeBridge(channel_key="web")
     daemon._channels["web"] = web
     root = "om_shared"
     feishu_conversation = ConversationRef("feishu", "oc_1")
@@ -3747,7 +3756,7 @@ async def test_pending_run_slot_blocks_concurrent_resume():
             self.create_started = threading.Event()
             self.resume_create = threading.Event()
 
-        def create_thread(self, initial_text: str) -> str:
+        def create_thread(self, initial_text: str) -> ConversationRef:
             self.create_started.set()
             assert self.resume_create.wait(3)
             return super().create_thread(initial_text)
@@ -5059,7 +5068,7 @@ async def test_sched_attach_session_creates_task_and_resumes_external_session():
 async def test_sched_attach_session_routes_thread_and_output_to_source_channel():
     store = SessionStore(None)
     daemon, feishu, created = make_daemon(store=store)
-    web = FakeBridge()
+    web = FakeBridge(channel_key="web")
     daemon._channels["web"] = web
     conversation = ConversationRef("web", "oc_1")
 
@@ -5529,7 +5538,7 @@ def test_issue_tag_extracts_number():
 
 async def test_sched_spawn_routes_thread_and_output_to_source_channel():
     daemon, feishu, created = make_daemon()
-    web = FakeBridge()
+    web = FakeBridge(channel_key="web")
     daemon._channels["web"] = web
     conversation = ConversationRef("web", "oc_1")
 

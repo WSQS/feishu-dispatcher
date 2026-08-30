@@ -224,8 +224,9 @@ class HttpChannel:
         self.stop()
         self.start(on_message)
 
-    def create_thread(self, initial_text: str) -> str:
+    def create_thread(self, initial_text: str) -> ConversationRef:
         conversation_id = f"http-conversation-{uuid4().hex}"
+        conversation = ConversationRef("http", conversation_id)
         self._claim_targets(conversation_id, [])
         message_id = self._new_target(conversation_id, "message")
         self._append_event(
@@ -234,7 +235,7 @@ class HttpChannel:
             message_id=message_id,
             text=initial_text,
         )
-        return conversation_id
+        return conversation
 
     def send_text(self, conversation: ConversationRef, text: str) -> str:
         conversation_id = self._clean_identity(
