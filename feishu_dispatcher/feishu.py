@@ -28,7 +28,6 @@ from urllib.parse import parse_qs, urlparse
 
 import requests
 import websockets
-from lark_oapi.ws.pb import pbbp2_pb2
 from lark_oapi.ws.const import (
     HEADER_BIZ_RT,
     HEADER_MESSAGE_ID,
@@ -36,6 +35,7 @@ from lark_oapi.ws.const import (
     HEADER_SUM,
     HEADER_TYPE,
 )
+from lark_oapi.ws.pb import pbbp2_pb2
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -44,8 +44,8 @@ from .conversation import ConversationRef
 from .session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
-    AgentPlanUpdated,
     AgentOutputStarted,
+    AgentPlanUpdated,
     SessionEvent,
     SessionInputAccepted,
     ToolCallObserved,

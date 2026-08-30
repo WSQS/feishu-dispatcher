@@ -2,36 +2,35 @@
 
 from __future__ import annotations
 
-from acp import (
-    update_agent_message_text,
-    update_agent_thought_text,
-    start_tool_call,
-    update_tool_call,
-)
-from acp.connection import StreamDirection
-from acp.schema import ToolCallLocation
-
 import asyncio
 import logging
 from types import SimpleNamespace as NS
 
 import pytest
+from acp import (
+    start_tool_call,
+    update_agent_message_text,
+    update_agent_thought_text,
+    update_tool_call,
+)
+from acp.connection import StreamDirection
+from acp.schema import ToolCallLocation
 
 from feishu_dispatcher.acp_client import (
     AcpAgent,
     AgentOutputChunk,
-    AgentToolCallUpdate,
     AgentSpawn,
+    AgentToolCallUpdate,
     _Callbacks,
     _ClientImpl,
-    _MethodNotFoundTap,
-    _StreamFormatter,
     _extract_action,
     _extract_model,
     _extract_model_options,
     _extract_tool_detail,
     _extract_usage_tokens,
+    _MethodNotFoundTap,
     _proc_tree_pids,
+    _StreamFormatter,
 )
 
 

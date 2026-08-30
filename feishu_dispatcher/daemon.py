@@ -21,19 +21,19 @@ import re
 import secrets
 import time
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from functools import partial
-
 from pathlib import Path
-from typing import Awaitable, Callable
 
 from . import forge
+from ._scan_executor import ScanExecutor
 from .acp_client import (
     AcpAgent,
     AgentOutputChunk,
-    AgentToolCallUpdate,
     AgentSpawn,
+    AgentToolCallUpdate,
     OnAction,
     OnOutput,
     OnToolCall,
@@ -41,10 +41,11 @@ from .acp_client import (
 )
 from .channel import Channel, ChannelMessage, OutputStatus, StreamingOutput
 from .config import DEFAULT_CONFIG_PATH, Config, Project
-from .conversation import ConversationRef
 from .control import ControlServer
+from .conversation import ConversationRef
 from .feishu import FeishuBridge
-from .http_channel import HttpChannel, ensure_token as ensure_http_channel_token
+from .http_channel import HttpChannel
+from .http_channel import ensure_token as ensure_http_channel_token
 from .llm import build_llm_client
 from .scheduler import (
     LLMClient,
@@ -55,9 +56,9 @@ from .session import DispatcherSessionRuntime, TurnRequest
 from .session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
+    AgentOutputStarted,
     AgentPlanEntry,
     AgentPlanUpdated,
-    AgentOutputStarted,
     OutputOutcome,
     SessionEvent,
     SessionInputAccepted,
@@ -70,11 +71,16 @@ from .trace_store import (
     SessionTraceStore,
     SessionTraceStoreClosed,
 )
-from ._scan_executor import ScanExecutor
 from .workspace_api import (
     file as workspace_file,
+)
+from .workspace_api import (
     health as workspace_health,
+)
+from .workspace_api import (
     list_projects as workspace_list_projects,
+)
+from .workspace_api import (
     tree_children as workspace_tree_children,
 )
 
