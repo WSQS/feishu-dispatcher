@@ -842,6 +842,26 @@ class FeishuBridge:
                 if active is output:
                     del self._active_outputs[key]
 
+    def serialize_conversation_ref(
+        self,
+        conversation: ConversationRef,
+    ) -> dict[str, object]:
+        if conversation.channel_key() != "feishu":
+            raise ValueError("ConversationRef 不属于 Feishu Channel")
+        conversation_id = conversation.conversation_id.strip()
+        if not conversation_id:
+            raise ValueError("Feishu ConversationRef.conversation_id 不能为空")
+        return {"conversation_id": conversation_id}
+
+    def deserialize_conversation_ref(
+        self,
+        payload: dict[str, object],
+    ) -> FeishuConversationRef:
+        conversation_id = payload.get("conversation_id")
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            raise ValueError("Feishu ConversationRef.conversation_id 不能为空")
+        return FeishuConversationRef(ConversationRef("feishu", conversation_id.strip()))
+
     def create_thread(self, initial_text: str) -> FeishuConversationRef:
         """在配置的根群聊中创建话题并返回其 ConversationRef。"""
         root_message_id = self.send_root_message(self._chat_whitelist, initial_text)

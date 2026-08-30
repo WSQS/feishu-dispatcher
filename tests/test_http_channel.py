@@ -496,6 +496,68 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         channel.stop()
 
 
+def test_http_conversation_ref_codec_round_trips() -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        channel = HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
+        conversation = ConversationRef("http", "browser-a")
+
+        payload = channel.serialize_conversation_ref(conversation)
+
+        assert payload == {"conversation_id": "browser-a"}
+        assert channel.deserialize_conversation_ref(payload) == conversation
+    finally:
+        loop.close()
+
+
+def test_http_conversation_ref_codec_normalizes_serialized_id() -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        channel = HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
+
+        assert channel.serialize_conversation_ref(
+            ConversationRef("http", "  browser-a  ")
+        ) == {"conversation_id": "browser-a"}
+    finally:
+        loop.close()
+
+
+def test_http_conversation_ref_codec_rejects_other_channel() -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        channel = HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
+
+        with pytest.raises(ValueError, match="不属于 HTTP Channel"):
+            channel.serialize_conversation_ref(ConversationRef("feishu", "om-root"))
+    finally:
+        loop.close()
+
+
+def test_http_conversation_ref_codec_rejects_blank_serialized_id() -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        channel = HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
+
+        with pytest.raises(ValueError, match="conversation_id 不能为空"):
+            channel.serialize_conversation_ref(ConversationRef("http", " "))
+    finally:
+        loop.close()
+
+
+@pytest.mark.parametrize("payload", [{}, {"conversation_id": " "}])
+def test_http_conversation_ref_codec_rejects_invalid_payload(
+    payload: dict[str, object],
+) -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        channel = HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
+
+        with pytest.raises(ValueError, match="conversation_id 不能为空"):
+            channel.deserialize_conversation_ref(payload)
+    finally:
+        loop.close()
+
+
 async def test_health_requires_token_and_returns_channel_version():
     channel = HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0

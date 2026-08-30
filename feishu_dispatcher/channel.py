@@ -49,6 +49,16 @@ class Channel(Protocol):
 
     def restart(self) -> None: ...
 
+    def serialize_conversation_ref(
+        self,
+        conversation: ConversationRef,
+    ) -> dict[str, object]: ...
+
+    def deserialize_conversation_ref(
+        self,
+        payload: dict[str, object],
+    ) -> ConversationRef: ...
+
     def create_thread(self, initial_text: str) -> ConversationRef:
         """创建新的交互会话并返回其引用。"""
         ...

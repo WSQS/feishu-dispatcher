@@ -246,6 +246,26 @@ class HttpChannel:
         self.stop()
         self.start(on_message)
 
+    def serialize_conversation_ref(
+        self,
+        conversation: ConversationRef,
+    ) -> dict[str, object]:
+        if conversation.channel_key() != "http":
+            raise ValueError("ConversationRef 不属于 HTTP Channel")
+        conversation_id = conversation.conversation_id.strip()
+        if not conversation_id:
+            raise ValueError("HTTP ConversationRef.conversation_id 不能为空")
+        return {"conversation_id": conversation_id}
+
+    def deserialize_conversation_ref(
+        self,
+        payload: dict[str, object],
+    ) -> HttpConversationRef:
+        conversation_id = payload.get("conversation_id")
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            raise ValueError("HTTP ConversationRef.conversation_id 不能为空")
+        return HttpConversationRef(ConversationRef("http", conversation_id.strip()))
+
     def create_thread(self, initial_text: str) -> HttpConversationRef:
         conversation_id = f"http-conversation-{uuid4().hex}"
         conversation = HttpConversationRef(ConversationRef("http", conversation_id))
