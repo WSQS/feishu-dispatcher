@@ -18,11 +18,9 @@ class ChannelMessage:
     message_id: str
     text: str
     sender_id: str
-    route: MessageRoute = "auto"
 
 
 MessageHandler = Callable[[ChannelMessage], Awaitable[None]]
-MessageRoute = Literal["dispatcher", "session", "auto"]
 OutputStatus = Literal["running", "done", "error", "stopped"]
 
 

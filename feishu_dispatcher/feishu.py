@@ -636,7 +636,6 @@ class FeishuBridge:
             message_id=message_id,
             text=text,
             sender_id=sender_id,
-            route="session" if thread_root is not None else "dispatcher",
         )
 
     # ------------------------------------------------------------------ #
