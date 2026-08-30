@@ -26,6 +26,7 @@ from .session_event import (
     AgentOutputFinished,
     AgentOutputStarted,
     AgentPlanUpdated,
+    ConversationRefSerializer,
     SessionEvent,
     SessionInputAccepted,
     ToolCallObserved,
@@ -132,6 +133,7 @@ class HttpChannel:
         route_context: dict | None = None,
         session_conversation_header: SessionConversationHeaderProvider | None = None,
         bind_conversation: ConversationBinder | None = None,
+        conversation_ref_serializer: ConversationRefSerializer | None = None,
         throttle_window: float = 0.5,
         max_conversations: int = _DEFAULT_MAX_CONVERSATIONS,
         max_events: int = _DEFAULT_MAX_EVENTS,
@@ -161,6 +163,7 @@ class HttpChannel:
         self._route_context = dict(route_context or {})
         self._session_conversation_header = session_conversation_header
         self._bind_conversation = bind_conversation
+        self._conversation_ref_serializer = conversation_ref_serializer
         self._max_conversations = max_conversations
         self._max_events = max_events
         self._max_targets = max_targets
@@ -375,7 +378,12 @@ class HttpChannel:
             output = self._active_output(owner, event)
             if output is not None:
                 presentation = output.tool_call_presentation(body)
-        payload: dict[str, object] = {"event": session_event_to_dict(event)}
+        payload: dict[str, object] = {
+            "event": session_event_to_dict(
+                event,
+                conversation_ref_serializer=self._conversation_ref_serializer,
+            )
+        }
         if trace_sequence is not None:
             payload["trace_sequence"] = trace_sequence
         if presentation is not None:

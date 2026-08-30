@@ -22,6 +22,21 @@ from feishu_dispatcher.session_event import (
 _OCCURRED_AT = datetime(2026, 8, 23, 14, 30, tzinfo=timezone.utc)
 
 
+def _serialize_conversation_ref(
+    conversation: ConversationRef,
+) -> dict[str, object]:
+    return {"conversation_id": conversation.conversation_id}
+
+
+def _deserialize_conversation_ref(
+    channel_key: str,
+    payload: dict[str, object],
+) -> ConversationRef:
+    conversation_id = payload["conversation_id"]
+    assert isinstance(conversation_id, str)
+    return ConversationRef(channel_key, conversation_id)
+
+
 @pytest.mark.parametrize(
     "body, turn_id",
     [
@@ -108,13 +123,131 @@ def test_session_event_round_trip(body, turn_id):
         body=body,
     )
 
-    record = session_event_to_dict(event)
+    record = session_event_to_dict(
+        event,
+        conversation_ref_serializer=_serialize_conversation_ref,
+    )
 
     assert record["schema_version"] == 1
     assert record["occurred_at"] == "2026-08-23T14:30:00Z"
     json_record = json.loads(json.dumps(record, ensure_ascii=False))
 
-    assert session_event_from_dict(json_record) == event
+    assert (
+        session_event_from_dict(
+            json_record,
+            conversation_ref_deserializer=_deserialize_conversation_ref,
+        )
+        == event
+    )
+
+
+def test_session_event_uses_conversation_ref_codec_callbacks() -> None:
+    serialized: list[ConversationRef] = []
+    deserialized: list[tuple[str, dict[str, object]]] = []
+
+    def serialize(conversation: ConversationRef) -> dict[str, object]:
+        serialized.append(conversation)
+        return {"opaque_id": conversation.conversation_id}
+
+    def deserialize(
+        channel_key: str,
+        payload: dict[str, object],
+    ) -> ConversationRef:
+        deserialized.append((channel_key, payload))
+        opaque_id = payload["opaque_id"]
+        assert isinstance(opaque_id, str)
+        return ConversationRef(channel_key, opaque_id)
+
+    event = SessionEvent(
+        event_id="event-1",
+        session_id="t1",
+        turn_id="turn-1",
+        occurred_at=_OCCURRED_AT,
+        body=SessionInputAccepted(
+            text="检查当前状态",
+            source=ConversationRef("feishu", "om_thread"),
+        ),
+    )
+
+    record = session_event_to_dict(
+        event,
+        conversation_ref_serializer=serialize,
+    )
+    restored = session_event_from_dict(
+        record,
+        conversation_ref_deserializer=deserialize,
+    )
+
+    assert record["payload"] == {
+        "text": "检查当前状态",
+        "source": {
+            "channel_key": "feishu",
+            "opaque_id": "om_thread",
+        },
+    }
+    assert restored == event
+    assert serialized == [ConversationRef("feishu", "om_thread")]
+    assert deserialized == [
+        ("feishu", {"opaque_id": "om_thread"}),
+    ]
+
+
+def test_session_event_rejects_codec_payload_channel_key_override() -> None:
+    event = SessionEvent(
+        event_id="event-1",
+        session_id="t1",
+        turn_id="turn-1",
+        occurred_at=_OCCURRED_AT,
+        body=SessionInputAccepted(
+            text="检查当前状态",
+            source=ConversationRef("feishu", "om_thread"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="不能包含 channel_key"):
+        session_event_to_dict(
+            event,
+            conversation_ref_serializer=lambda _conversation: {
+                "channel_key": "http",
+                "conversation_id": "om_thread",
+            },
+        )
+
+
+def test_session_event_source_requires_conversation_ref_serializer() -> None:
+    event = SessionEvent(
+        event_id="event-1",
+        session_id="t1",
+        turn_id="turn-1",
+        occurred_at=_OCCURRED_AT,
+        body=SessionInputAccepted(
+            text="检查当前状态",
+            source=ConversationRef("feishu", "om_thread"),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="需要 ConversationRef serializer"):
+        session_event_to_dict(event)
+
+
+def test_session_event_source_requires_conversation_ref_deserializer() -> None:
+    event = SessionEvent(
+        event_id="event-1",
+        session_id="t1",
+        turn_id="turn-1",
+        occurred_at=_OCCURRED_AT,
+        body=SessionInputAccepted(
+            text="检查当前状态",
+            source=ConversationRef("feishu", "om_thread"),
+        ),
+    )
+    record = session_event_to_dict(
+        event,
+        conversation_ref_serializer=_serialize_conversation_ref,
+    )
+
+    with pytest.raises(ValueError, match="需要 ConversationRef deserializer"):
+        session_event_from_dict(record)
 
 
 @pytest.mark.parametrize(
@@ -214,7 +347,10 @@ def test_session_event_wire_contract(body, turn_id, event_type, payload):
         body=body,
     )
 
-    record = session_event_to_dict(event)
+    record = session_event_to_dict(
+        event,
+        conversation_ref_serializer=_serialize_conversation_ref,
+    )
 
     assert record["type"] == event_type
     assert record["payload"] == payload

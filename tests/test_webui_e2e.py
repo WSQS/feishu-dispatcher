@@ -25,6 +25,12 @@ from feishu_dispatcher.session_event import (
 pytestmark = pytest.mark.webui_e2e
 
 
+def _serialize_conversation_ref(
+    conversation: ConversationRef,
+) -> dict[str, object]:
+    return {"conversation_id": conversation.conversation_id}
+
+
 async def _wait_for_status(page, text: str) -> None:
     await page.wait_for_function(
         """expected => document.querySelector("#status")
@@ -70,7 +76,13 @@ def _trace_record(
             )
         ),
     )
-    return {"sequence": sequence, "event": session_event_to_dict(event)}
+    return {
+        "sequence": sequence,
+        "event": session_event_to_dict(
+            event,
+            conversation_ref_serializer=_serialize_conversation_ref,
+        ),
+    }
 
 
 def _session_trace_record(
