@@ -408,7 +408,10 @@ class HttpChannel:
             return 503, {"error": "channel_unavailable"}
         try:
             message = self._parse_message(body)
-            self._claim_targets(message.conversation_id, [message.message_id])
+            self._claim_targets(
+                message.conversation.conversation_id,
+                [message.message_id],
+            )
             future = asyncio.run_coroutine_threadsafe(
                 self._on_message(message), self._loop
             )
@@ -497,9 +500,8 @@ class HttpChannel:
         if not isinstance(text, str):
             raise _HttpRequestError(400, "invalid_request", "text 必须是字符串")
         return ChannelMessage(
-            conversation_id=conversation_id,
+            conversation=ConversationRef("http", conversation_id),
             message_id=message_id,
-            thread_id=None,
             text=text,
             sender_id=sender_id,
         )

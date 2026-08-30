@@ -1186,7 +1186,7 @@ async def test_http_task_conversation_round_trip_routes_to_existing_runner():
     daemon._channels["http"] = http
 
     async def handle(message: ChannelMessage) -> None:
-        await daemon._handle_channel_message("http", message)
+        await daemon._handle_channel_message(message)
 
     http.start(handle)
     try:
@@ -1330,8 +1330,8 @@ async def test_run_uses_injected_channel_lifecycle(monkeypatch, tmp_path):
         def start(self, on_message) -> None:
             self.started = True
             self.on_message = on_message
-            daemon = on_message.func.__self__
-            assert on_message.args == ("test",)
+            daemon = on_message.__self__
+            assert on_message.__func__ is _Daemon._handle_channel_message
             assert daemon._primary_channel_key == "test"
             assert daemon._stop_event is not None
             daemon._stop_event.set()
@@ -1349,9 +1349,8 @@ async def test_run_uses_injected_channel_lifecycle(monkeypatch, tmp_path):
     assert reboot is False
     assert channel.started
     assert channel.stopped
-    assert isinstance(channel.on_message.func.__self__, _Daemon)
-    assert channel.on_message.func.__func__ is _Daemon._handle_channel_message
-    assert channel.on_message.args == ("test",)
+    assert isinstance(channel.on_message.__self__, _Daemon)
+    assert channel.on_message.__func__ is _Daemon._handle_channel_message
     assert len(controls) == 1
     assert controls[0].started
     assert controls[0].stopped
@@ -1375,14 +1374,14 @@ async def test_channel_registry_starts_all_with_scoped_handlers():
     daemon = make_channel_registry_daemon({"feishu": feishu, "web": web})
     seen: list[tuple[str, str]] = []
 
-    async def record_message(channel_key: str, msg: ChannelMessage) -> None:
-        seen.append((channel_key, msg.message_id))
+    async def record_message(msg: ChannelMessage) -> None:
+        seen.append((msg.conversation.channel_key(), msg.message_id))
 
     daemon._handle_channel_message = record_message  # type: ignore[method-assign]
     daemon._start_channels()
     try:
         await feishu.on_message(root_msg("ignored", mid="om_feishu"))
-        await web.on_message(root_msg("ignored", mid="om_web"))
+        await web.on_message(root_msg("ignored", mid="om_web", channel_key="web"))
     finally:
         daemon._stop_channels()
 
@@ -1502,14 +1501,17 @@ def test_channel_registry_stops_all_when_one_channel_fails():
 
 
 def root_msg(
-    text: str, mid: str = "om_command1", conversation_id: str = "oc_1"
+    text: str,
+    mid: str = "om_command1",
+    conversation_id: str = "oc_1",
+    channel_key: str = "feishu",
 ) -> ChannelMessage:
     return ChannelMessage(
-        conversation_id=conversation_id,
+        conversation=ConversationRef(channel_key, conversation_id),
         message_id=mid,
-        thread_id=None,
         text=text,
         sender_id="ou_user",
+        route="dispatcher",
     )
 
 
@@ -1518,13 +1520,14 @@ def thread_msg(
     root: str = "om_root1",
     mid: str = "om_t1",
     conversation_id: str = "oc_1",
+    channel_key: str = "feishu",
 ) -> ChannelMessage:
     return ChannelMessage(
-        conversation_id=conversation_id,
+        conversation=ConversationRef(channel_key, root),
         message_id=mid,
-        thread_id=root,
         text=text,
         sender_id="ou_user",
+        route="session",
     )
 
 
@@ -2804,13 +2807,13 @@ async def test_same_message_id_help_replies_on_source_channel():
     daemon, feishu, _ = make_daemon()
     web = FakeBridge()
     daemon._channels["web"] = web
-    message = root_msg("/help", mid="om_shared")
-
-    await daemon._handle_channel_message("feishu", message)
+    await daemon._handle_channel_message(root_msg("/help", mid="om_shared"))
     assert [target for target, _ in feishu.roots] == ["oc_1"]
     assert web.plain == []
 
-    await daemon._handle_channel_message("web", message)
+    await daemon._handle_channel_message(
+        root_msg("/help", mid="om_shared", channel_key="web")
+    )
     assert [target for target, _ in feishu.roots] == ["oc_1"]
     assert [target for target, _ in web.roots] == ["oc_1"]
     assert daemon._session_id_for_conversation(ConversationRef("web", "oc_1")) is None
@@ -2826,8 +2829,7 @@ async def test_thread_message_uses_thread_conversation_ref():
     daemon._forward_to_agent = capture  # type: ignore[method-assign]
 
     await daemon._handle_channel_message(
-        "feishu",
-        thread_msg("continue", root="om_thread", conversation_id="oc_chat"),
+        thread_msg("continue", root="om_thread", conversation_id="oc_chat")
     )
 
     assert seen == [ConversationRef("feishu", "om_thread")]
@@ -2839,8 +2841,12 @@ async def test_non_primary_channel_uses_own_admission_scope():
     daemon._channels["web"] = web
 
     await daemon._handle_channel_message(
-        "web",
-        root_msg("/help", mid="om_web", conversation_id="web-room"),
+        root_msg(
+            "/help",
+            mid="om_web",
+            conversation_id="web-room",
+            channel_key="web",
+        )
     )
 
     assert feishu.plain == []
@@ -2855,11 +2861,9 @@ async def test_same_inbound_ids_are_isolated_by_channel():
     feishu_conversation = ConversationRef("feishu", "oc_1")
     web_conversation = ConversationRef("web", "oc_1")
 
+    await daemon._handle_channel_message(root_msg("/run demo feishu task", mid=root))
     await daemon._handle_channel_message(
-        "feishu", root_msg("/run demo feishu task", mid=root)
-    )
-    await daemon._handle_channel_message(
-        "web", root_msg("/run demo web task", mid=root)
+        root_msg("/run demo web task", mid=root, channel_key="web")
     )
     await wait_until(
         lambda: (
@@ -2890,8 +2894,12 @@ async def test_same_inbound_ids_are_isolated_by_channel():
     assert not any("feishu task" in text for text in web.texts("om_root1"))
 
     await daemon._handle_channel_message(
-        "web",
-        thread_msg("web follow up", root="om_root1", mid="om_follow"),
+        thread_msg(
+            "web follow up",
+            root="om_root1",
+            mid="om_follow",
+            channel_key="web",
+        )
     )
     await wait_until(lambda: created[1].prompts == ["web task", "web follow up"])
     assert created[0].prompts == ["feishu task"]
@@ -3070,12 +3078,12 @@ async def test_bound_cross_channel_thread_routes_to_existing_runner():
     assert daemon._session_for_conversation(main_conversation) is task
     daemon._bind_conversation(web_conversation, task.session_id)
     await daemon._handle_channel_message(
-        "web",
         thread_msg(
             "web follow up",
             root="web-thread",
             mid="web-message",
             conversation_id="web-room",
+            channel_key="web",
         ),
     )
     await wait_until(
@@ -3094,12 +3102,12 @@ async def test_bound_cross_channel_thread_routes_to_existing_runner():
     assert "↪️ 同步自 web：web follow up" not in web.texts("web-thread")
 
     await daemon._handle_channel_message(
-        "web",
         thread_msg(
             "/stop",
             root="web-thread",
             mid="web-stop",
             conversation_id="web-room",
+            channel_key="web",
         ),
     )
     await wait_until(lambda: daemon.store.get(task.session_id).status == "stopped")
@@ -3138,12 +3146,12 @@ async def test_session_output_creation_failure_keeps_other_conversation_running(
 
     with caplog.at_level("ERROR"):
         await daemon._handle_channel_message(
-            "broken",
             thread_msg(
                 "continue",
                 root="broken-thread",
                 mid="broken-message",
                 conversation_id="broken-room",
+                channel_key="broken",
             ),
         )
         await wait_until(
@@ -3459,7 +3467,7 @@ async def test_run_creates_task():
     store = SessionStore(None)
     daemon, bridge, created = make_daemon(store=store, channel_key="test")
     conversation = ConversationRef("test", "oc_1")
-    await daemon._handle_message(root_msg("/run demo task"))
+    await daemon._handle_message(root_msg("/run demo task", channel_key="test"))
     await wait_until(
         lambda: (
             task_by_conversation(store, "om_root1", conversation)
@@ -3852,7 +3860,7 @@ async def test_nl_channel_tools_receive_source_conversation():
     )
 
     await daemon._handle_channel_message(
-        "web", root_msg("dispatch through web", mid="om_web_nl")
+        root_msg("dispatch through web", mid="om_web_nl", channel_key="web")
     )
 
     conversation = ConversationRef("web", "oc_1")
@@ -3883,8 +3891,12 @@ async def test_dispatcher_root_turns_sync_between_channels():
     )
 
     await daemon._handle_channel_message(
-        "web",
-        root_msg("web turn", mid="web-message", conversation_id="web-room"),
+        root_msg(
+            "web turn",
+            mid="web-message",
+            conversation_id="web-room",
+            channel_key="web",
+        ),
     )
 
     feishu_conversation = ConversationRef("feishu", "oc_1")
@@ -3916,7 +3928,6 @@ async def test_dispatcher_root_turns_sync_between_channels():
     ]
 
     await daemon._handle_channel_message(
-        "feishu",
         root_msg("feishu turn", mid="feishu-message"),
     )
 
@@ -3972,13 +3983,17 @@ async def test_dispatcher_turns_are_serialized_across_channels():
     llm = BlockingFirstLLM()
     daemon._llm = llm
     first = asyncio.create_task(
-        daemon._handle_channel_message("feishu", root_msg("first", mid="first-message"))
+        daemon._handle_channel_message(root_msg("first", mid="first-message"))
     )
     await llm.first_started.wait()
     second = asyncio.create_task(
         daemon._handle_channel_message(
-            "web",
-            root_msg("second", mid="second-message", conversation_id="web-room"),
+            root_msg(
+                "second",
+                mid="second-message",
+                conversation_id="web-room",
+                channel_key="web",
+            ),
         )
     )
     await asyncio.sleep(0)
@@ -4024,16 +4039,18 @@ async def test_dispatcher_target_send_failure_does_not_abort_turn(caplog):
     )
 
     await daemon._handle_channel_message(
-        "broken",
-        root_msg("join", mid="broken-message", conversation_id="broken-room"),
+        root_msg(
+            "join",
+            mid="broken-message",
+            conversation_id="broken-room",
+            channel_key="broken",
+        ),
     )
     daemon._bind_conversation(
         ConversationRef("healthy", "healthy-room"), _DISPATCHER_SESSION_ID
     )
     with caplog.at_level("ERROR"):
-        await daemon._handle_channel_message(
-            "feishu", root_msg("continue", mid="feishu-message")
-        )
+        await daemon._handle_channel_message(root_msg("continue", mid="feishu-message"))
 
     assert broken.sent_texts == []
     assert feishu.sent_texts == [
@@ -5065,7 +5082,12 @@ async def test_sched_attach_session_routes_thread_and_output_to_source_channel()
     assert feishu.texts(root) == []
 
     await daemon._handle_channel_message(
-        "web", thread_msg("continue", root=root, mid="om_web_follow")
+        thread_msg(
+            "continue",
+            root=root,
+            mid="om_web_follow",
+            channel_key="web",
+        )
     )
     await wait_until(
         lambda: (

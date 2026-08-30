@@ -65,11 +65,11 @@ def test_parse_root_message_has_no_thread_root():
         _event(message_id="om_root", root_id=None, content={"text": "hello"})
     )
     assert msg == ChannelMessage(
-        conversation_id="oc_chat1",
+        conversation=ConversationRef("feishu", "oc_chat1"),
         message_id="om_root",
-        thread_id=None,
         text="hello",
         sender_id="ou_test",
+        route="dispatcher",
     )
 
 
@@ -81,7 +81,8 @@ def test_parse_thread_reply_thread_root_is_root_id():
             content={"text": "agent plz do X"},
         )
     )
-    assert msg.thread_id == "om_root"
+    assert msg.conversation == ConversationRef("feishu", "om_root")
+    assert msg.route == "session"
     assert msg.message_id == "om_reply"
 
 
@@ -89,7 +90,8 @@ def test_parse_message_where_root_id_equals_message_id_is_root():
     msg = FeishuBridge._parse_event_message(
         _event(message_id="om_root", root_id="om_root", content={"text": "x"})
     )
-    assert msg.thread_id is None
+    assert msg.conversation == ConversationRef("feishu", "oc_chat1")
+    assert msg.route == "dispatcher"
 
 
 def test_parse_non_text_message_returns_none_and_logs(caplog):
@@ -151,7 +153,8 @@ def test_parse_post_message_extracts_text():
     )
     assert msg is not None
     assert msg.text == "帮我改一下 这个文件\n加日志"  # 段落间换行、run 文本拼接
-    assert msg.thread_id == "om_root"
+    assert msg.conversation == ConversationRef("feishu", "om_root")
+    assert msg.route == "session"
 
 
 def test_parse_post_direct_body_received_shape():
@@ -362,11 +365,11 @@ async def test_channel_accepts_whitelisted_chat_and_sender():
 
     assert received == [
         ChannelMessage(
-            conversation_id="oc_allowed",
+            conversation=ConversationRef("feishu", "oc_allowed"),
             message_id="om_allowed",
-            thread_id=None,
             text="hello",
             sender_id="ou_allowed",
+            route="dispatcher",
         )
     ]
 

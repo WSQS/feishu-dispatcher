@@ -14,14 +14,15 @@ from .session_event import SessionEvent
 class ChannelMessage:
     """通道收到的、已规整的消息。"""
 
-    conversation_id: str
+    conversation: ConversationRef
     message_id: str
-    thread_id: str | None
     text: str
     sender_id: str
+    route: MessageRoute = "auto"
 
 
 MessageHandler = Callable[[ChannelMessage], Awaitable[None]]
+MessageRoute = Literal["dispatcher", "session", "auto"]
 OutputStatus = Literal["running", "done", "error", "stopped"]
 
 

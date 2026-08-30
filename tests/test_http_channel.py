@@ -650,10 +650,7 @@ async def test_message_dispatch_and_reply_round_trip():
 
     async def handle(message: ChannelMessage) -> None:
         received.append(message)
-        channel.send_text(
-            ConversationRef("http", message.conversation_id),
-            "help reply",
-        )
+        channel.send_text(message.conversation, "help reply")
         handled.set()
 
     channel.start(handle)
@@ -671,9 +668,8 @@ async def test_message_dispatch_and_reply_round_trip():
         events = await _wait_for_events(channel, "browser-a")
         assert received == [
             ChannelMessage(
-                conversation_id="browser-a",
+                conversation=ConversationRef("http", "browser-a"),
                 message_id="message-a",
-                thread_id=None,
                 text="/help",
                 sender_id="user-a",
             )
@@ -694,10 +690,11 @@ async def test_conversations_are_isolated_and_target_conflicts_are_rejected():
     seen: list[str] = []
 
     async def handle(message: ChannelMessage) -> None:
-        seen.append(message.conversation_id)
+        conversation_id = message.conversation.conversation_id
+        seen.append(conversation_id)
         channel.send_text(
-            ConversationRef("http", message.conversation_id),
-            f"reply:{message.conversation_id}",
+            message.conversation,
+            f"reply:{conversation_id}",
         )
         if len(seen) == 2:
             handled.set()
