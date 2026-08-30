@@ -561,9 +561,11 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
             port: int,
             routes,
             route_context,
+            session_conversation_header,
+            bind_conversation,
             throttle_window: float,
         ) -> None:
-            super().__init__()
+            super().__init__(channel_key="http")
             constructed.update(
                 token=token,
                 main_loop=main_loop,
@@ -571,6 +573,8 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
                 port=port,
                 routes=routes,
                 route_context=route_context,
+                session_conversation_header=session_conversation_header,
+                bind_conversation=bind_conversation,
                 throttle_window=throttle_window,
             )
 
@@ -606,7 +610,6 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
     assert set(routes) == {
         ("GET", "/api/health"),
         ("GET", "/api/tasks"),
-        ("POST", "/api/tasks/{task_id}/conversations"),
         ("GET", "/api/tasks/{task_id}/events"),
         ("GET", "/api/projects"),
         ("GET", "/api/projects/{name}/tree/children"),
@@ -615,8 +618,9 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
     route_context = constructed["route_context"]
     assert isinstance(route_context, dict)
     assert callable(route_context["all_projects"])
-    assert route_context["channel_key"] == "http"
     assert isinstance(route_context["scan_executor"], daemon_module.ScanExecutor)
+    assert callable(constructed["session_conversation_header"])
+    assert callable(constructed["bind_conversation"])
     await route_context["scan_executor"].aclose()
 
 
@@ -1070,30 +1074,30 @@ async def test_http_create_task_conversation_validates_request_and_task_state():
         workspace="C:/tmp/demo",
         status="done",
     )
-    daemon, http, _ = make_daemon(store=store, channel_key="http")
+    daemon, _, _ = make_daemon(store=store)
+    http = HttpChannel(
+        "tok-http",
+        asyncio.get_running_loop(),
+        host="127.0.0.1",
+        port=0,
+        session_conversation_header=daemon.session_conversation_header,
+        bind_conversation=daemon.bind_conversation,
+    )
+    daemon._channels["http"] = http
 
     cases = [
         (
-            {
-                "segments": {"task_id": "missing"},
-                "body": None,
-            },
+            "missing",
             404,
             {"error": "task_not_found", "task_id": "missing"},
         ),
         (
-            {
-                "segments": {"task_id": _DISPATCHER_SESSION_ID},
-                "body": None,
-            },
+            _DISPATCHER_SESSION_ID,
             404,
             {"error": "task_not_found", "task_id": _DISPATCHER_SESSION_ID},
         ),
         (
-            {
-                "segments": {"task_id": terminal.session_id},
-                "body": None,
-            },
+            terminal.session_id,
             409,
             {
                 "error": "task_terminal",
@@ -1103,24 +1107,26 @@ async def test_http_create_task_conversation_validates_request_and_task_state():
         ),
     ]
 
-    for request, expected_status, expected_payload in cases:
-        status, payload = await daemon._http_create_task_conversation(
-            {"channel_key": "http"},
-            request,
-        )
-        assert status == expected_status
-        assert payload == expected_payload
-    unavailable_status, unavailable = await daemon._http_create_task_conversation(
-        {},
-        {
-            "segments": {"task_id": active.session_id},
-            "body": None,
-        },
-    )
-    assert unavailable_status == 503
-    assert unavailable == {"error": "channel_unavailable"}
-    assert http.created_threads == []
-    assert daemon._conversations_for_session(active.session_id) == ()
+    async def ignore(_message: ChannelMessage) -> None:
+        return None
+
+    http.start(ignore)
+    try:
+        for session_id, expected_status, expected_payload in cases:
+            status, payload = await asyncio.to_thread(
+                http_channel_request,
+                "POST",
+                http.base_url + f"/api/tasks/{session_id}/conversations",
+                "tok-http",
+                None,
+            )
+            assert status == expected_status
+            assert payload == expected_payload
+            assert http._conversations == {}
+            assert http._target_conversations == {}
+        assert daemon._conversations_for_session(active.session_id) == ()
+    finally:
+        http.stop()
 
 
 @pytest.mark.asyncio
@@ -1134,36 +1140,46 @@ async def test_http_create_task_conversation_creates_thread_and_binds_task():
         workspace="C:/tmp/demo",
         status="idle",
     )
-    daemon, http, _ = make_daemon(store=store, channel_key="http")
-
-    status, payload = await daemon._http_create_task_conversation(
-        {"channel_key": "http"},
-        {
-            "segments": {"task_id": task.session_id},
-            "body": None,
-        },
+    daemon, _, _ = make_daemon(store=store)
+    http = HttpChannel(
+        "tok-http",
+        asyncio.get_running_loop(),
+        host="127.0.0.1",
+        port=0,
+        session_conversation_header=daemon.session_conversation_header,
+        bind_conversation=daemon.bind_conversation,
     )
+    daemon._channels["http"] = http
 
-    assert status == 201
-    assert payload == {
-        "task_id": task.session_id,
-        "conversation_id": "om_root1",
-    }
-    assert http.created_threads == [("oc_1", "[t1] review changes")]
-    task_conversation = ConversationRef("http", "om_root1")
-    assert daemon._session_for_conversation(task_conversation) is task
-    assert task.conversation_ref == ConversationRef("feishu", "oc_1")
+    async def ignore(_message: ChannelMessage) -> None:
+        return None
 
-    second_status, second_payload = await daemon._http_create_task_conversation(
-        {"channel_key": "http"},
-        {
-            "segments": {"task_id": task.session_id},
-            "body": None,
-        },
-    )
-    assert second_status == 201
-    assert second_payload["conversation_id"] == "om_root2"
-    assert daemon._session_for_conversation(ConversationRef("http", "om_root2")) is task
+    http.start(ignore)
+    try:
+        conversation_ids = []
+        for _ in range(2):
+            status, payload = await asyncio.to_thread(
+                http_channel_request,
+                "POST",
+                http.base_url + f"/api/tasks/{task.session_id}/conversations",
+                "tok-http",
+                None,
+            )
+            assert status == 201
+            assert payload["task_id"] == task.session_id
+            conversation_id = payload["conversation_id"]
+            assert conversation_id.startswith("http-conversation-")
+            conversation_ids.append(conversation_id)
+            task_conversation = ConversationRef("http", conversation_id)
+            assert daemon._session_for_conversation(task_conversation) is task
+            events = http._events_after(conversation_id, 0)["events"]
+            assert events[0]["type"] == "conversation.created"
+            assert events[0]["text"] == f"[{task.session_id}] review changes"
+
+        assert conversation_ids[0] != conversation_ids[1]
+        assert task.conversation_ref == ConversationRef("feishu", "oc_1")
+    finally:
+        http.stop()
 
 
 @pytest.mark.asyncio
@@ -1183,13 +1199,8 @@ async def test_http_task_conversation_round_trip_routes_to_existing_runner():
         asyncio.get_running_loop(),
         host="127.0.0.1",
         port=0,
-        routes={
-            (
-                "POST",
-                "/api/tasks/{task_id}/conversations",
-            ): daemon._http_create_task_conversation
-        },
-        route_context={"channel_key": "http"},
+        session_conversation_header=daemon.session_conversation_header,
+        bind_conversation=daemon.bind_conversation,
         throttle_window=0.01,
     )
     daemon._channels["http"] = http
@@ -1437,7 +1448,7 @@ def test_conversation_binding_does_not_inspect_ref_fields():
     )
 
     conversation = ConversationRef("", "")
-    daemon._bind_conversation(conversation, task.session_id)
+    daemon.bind_conversation(task.session_id, conversation)
 
     assert daemon._session_id_for_conversation(conversation) == task.session_id
     assert created == []
@@ -1646,12 +1657,12 @@ def test_conversation_binding_is_idempotent_and_rejects_conflict():
     daemon, _, _ = make_daemon(store=store)
     conversation = ConversationRef("web", "web-thread")
 
-    daemon._bind_conversation(conversation, task_a.session_id)
-    daemon._bind_conversation(conversation, task_a.session_id)
+    daemon.bind_conversation(task_a.session_id, conversation)
+    daemon.bind_conversation(task_a.session_id, conversation)
 
     assert daemon._session_for_conversation(conversation) is task_a
-    with pytest.raises(RuntimeError, match="已绑定 Task t1"):
-        daemon._bind_conversation(conversation, task_b.session_id)
+    with pytest.raises(RuntimeError, match="已绑定 Session t1"):
+        daemon.bind_conversation(task_b.session_id, conversation)
 
 
 def test_conversation_binding_has_no_task_named_private_aliases():
@@ -1671,12 +1682,13 @@ def test_conversation_binding_drops_deleted_session():
         description="done",
         conversation=ConversationRef("feishu", "oc_1"),
         workspace="C:/tmp/demo",
-        status="done",
+        status="idle",
     )
     daemon, _, _ = make_daemon(store=store)
     conversation = ConversationRef("web", "web-thread")
-    daemon._bind_conversation(conversation, task.session_id)
+    daemon.bind_conversation(task.session_id, conversation)
 
+    store.update(task.session_id, status="done")
     assert store.clear_terminal() == 1
     assert daemon._session_for_conversation(conversation) is None
     assert conversation not in daemon._conversation_session_ids
@@ -1687,11 +1699,29 @@ def test_dispatcher_session_identity_constant_has_no_task_alias():
     assert not hasattr(daemon_module, "_DISPATCHER_TASK_ID")
 
 
+def test_session_conversation_header_uses_session_description():
+    daemon, _, _ = make_daemon()
+    session = daemon.store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="review changes",
+        conversation=_TEST_CONVERSATION,
+        workspace=".",
+    )
+
+    assert daemon.session_conversation_header(session.session_id) == (
+        f"[{session.session_id}] review changes"
+    )
+
+    with pytest.raises(ValueError, match="Session 不存在"):
+        daemon.session_conversation_header("missing")
+
+
 def test_conversation_binding_supports_runtime_dispatcher_session_identity():
     daemon, _, _ = make_daemon(control_conversation=None)
     conversation = ConversationRef("web", "web-root")
 
-    daemon._bind_conversation(conversation, _DISPATCHER_SESSION_ID)
+    daemon.bind_conversation(_DISPATCHER_SESSION_ID, conversation)
 
     assert daemon._session_id_for_conversation(conversation) == _DISPATCHER_SESSION_ID
     assert daemon._session_for_conversation(conversation) is None
@@ -1926,7 +1956,7 @@ async def test_daemon_persists_session_events_once_across_conversation_fanout(
     assert task is not None
 
     web_conversation = ConversationRef("web", "web-thread")
-    daemon._bind_conversation(web_conversation, task.session_id)
+    daemon.bind_conversation(task.session_id, web_conversation)
     current_runner(daemon).enqueue(TurnRequest("second", web_conversation))
     await wait_until(
         lambda: (
@@ -2020,7 +2050,7 @@ async def test_daemon_emits_and_projects_tool_call_session_events():
     )
     task = task_by_conversation(daemon.store, "om_root1")
     assert task is not None
-    daemon._bind_conversation(ConversationRef("web", "web-thread"), task.session_id)
+    daemon.bind_conversation(task.session_id, ConversationRef("web", "web-thread"))
 
     await daemon._handle_message(thread_msg("second"))
     await wait_until(
@@ -2157,8 +2187,8 @@ async def test_tool_call_projection_failure_does_not_abort_turn(caplog):
     await wait_until(lambda: created and created[0].prompts == ["first"])
     task = task_by_conversation(daemon.store, "om_root1")
     assert task is not None
-    daemon._bind_conversation(
-        ConversationRef("broken", "broken-thread"), task.session_id
+    daemon.bind_conversation(
+        task.session_id, ConversationRef("broken", "broken-thread")
     )
 
     with caplog.at_level("ERROR"):
@@ -2836,7 +2866,7 @@ async def test_bound_message_uses_conversation_ref():
         conversation=_TEST_CONVERSATION,
         workspace=".",
     )
-    daemon._bind_conversation(conversation, session.session_id)
+    daemon.bind_conversation(session.session_id, conversation)
 
     async def capture(msg: ChannelMessage, *, conversation: ConversationRef) -> None:
         seen.append(conversation)
@@ -2943,7 +2973,7 @@ async def test_runner_fans_out_turns_to_bound_conversations():
             for _, event in feishu.session_events
         )
     )
-    daemon._bind_conversation(web_conversation, task.session_id)
+    daemon.bind_conversation(task.session_id, web_conversation)
 
     runner.enqueue(TurnRequest("web turn", web_conversation))
     await wait_until(
@@ -3039,13 +3069,13 @@ async def test_session_input_event_projection_failure_does_not_abort_turn(caplog
     task = task_by_conversation(daemon.store, "om_root1")
     runner = current_runner(daemon)
     source = ConversationRef("feishu", "om_root1")
-    daemon._bind_conversation(
+    daemon.bind_conversation(
+        task.session_id,
         ConversationRef("broken", "broken-thread"),
-        task.session_id,
     )
-    daemon._bind_conversation(
-        ConversationRef("healthy", "healthy-thread"),
+    daemon.bind_conversation(
         task.session_id,
+        ConversationRef("healthy", "healthy-thread"),
     )
 
     with caplog.at_level("ERROR"):
@@ -3091,7 +3121,7 @@ async def test_bound_cross_channel_thread_routes_to_existing_runner():
     web_conversation = ConversationRef("web", "web-thread")
 
     assert daemon._session_for_conversation(main_conversation) is task
-    daemon._bind_conversation(web_conversation, task.session_id)
+    daemon.bind_conversation(task.session_id, web_conversation)
     await daemon._handle_channel_message(
         thread_msg(
             "web follow up",
@@ -3157,7 +3187,7 @@ async def test_session_output_creation_failure_keeps_other_conversation_running(
     )
     task = task_by_conversation(daemon.store, "om_root1")
     broken_conversation = ConversationRef("broken", "broken-thread")
-    daemon._bind_conversation(broken_conversation, task.session_id)
+    daemon.bind_conversation(task.session_id, broken_conversation)
 
     with caplog.at_level("ERROR"):
         await daemon._handle_channel_message(
@@ -3614,7 +3644,7 @@ async def test_cross_channel_turn_error_fans_out():
     web = FakeBridge()
     daemon._channels["web"] = web
     web_conversation = ConversationRef("web", "web-thread")
-    daemon._bind_conversation(web_conversation, task.session_id)
+    daemon.bind_conversation(task.session_id, web_conversation)
 
     daemon._launch(
         task,
@@ -4061,8 +4091,8 @@ async def test_dispatcher_target_send_failure_does_not_abort_turn(caplog):
             channel_key="broken",
         ),
     )
-    daemon._bind_conversation(
-        ConversationRef("healthy", "healthy-room"), _DISPATCHER_SESSION_ID
+    daemon.bind_conversation(
+        _DISPATCHER_SESSION_ID, ConversationRef("healthy", "healthy-room")
     )
     with caplog.at_level("ERROR"):
         await daemon._handle_channel_message(root_msg("continue", mid="feishu-message"))
@@ -5837,7 +5867,7 @@ async def test_bg_job_completion_fans_out_to_bound_conversations():
     await wait_until(lambda: created and created[0].prompts == ["task"])
     runner = current_runner(daemon)
     web_conversation = ConversationRef("web", "web-thread")
-    daemon._bind_conversation(web_conversation, "t1")
+    daemon.bind_conversation("t1", web_conversation)
 
     runner.enqueue(TurnRequest("web turn", web_conversation))
     await wait_until(

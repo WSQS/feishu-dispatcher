@@ -40,6 +40,13 @@ _DEFAULT_MAX_TARGETS = 4096
 _DISPATCH_TIMEOUT = 30.0
 
 RouteHandler = Callable[[dict, dict], Awaitable[tuple[int, dict]]]
+SessionConversationHeaderProvider = Callable[[str], str]
+ConversationBinder = Callable[[str, ConversationRef], str | None]
+
+_CREATE_TASK_CONVERSATION_ROUTE = (
+    "POST",
+    "/api/tasks/{task_id}/conversations",
+)
 
 
 class _HttpServer(ThreadingHTTPServer):
@@ -120,6 +127,8 @@ class HttpChannel:
         port: int = 7322,
         routes: dict[tuple[str, str], RouteHandler] | None = None,
         route_context: dict | None = None,
+        session_conversation_header: SessionConversationHeaderProvider | None = None,
+        bind_conversation: ConversationBinder | None = None,
         throttle_window: float = 0.5,
         max_conversations: int = _DEFAULT_MAX_CONVERSATIONS,
         max_events: int = _DEFAULT_MAX_EVENTS,
@@ -133,12 +142,22 @@ class HttpChannel:
             raise ValueError("max_events 必须大于 0")
         if max_targets <= 0:
             raise ValueError("max_targets 必须大于 0")
+        if (session_conversation_header is None) != (bind_conversation is None):
+            raise ValueError("Session Conversation 标题与绑定回调必须同时提供")
         self._token = token
         self._loop = main_loop
         self._host = host
         self._port = port
         self._routes = dict(routes or {})
+        if session_conversation_header is not None:
+            if _CREATE_TASK_CONVERSATION_ROUTE in self._routes:
+                raise ValueError("Task Conversation 路由不能重复注册")
+            self._routes[_CREATE_TASK_CONVERSATION_ROUTE] = (
+                self._create_task_conversation
+            )
         self._route_context = dict(route_context or {})
+        self._session_conversation_header = session_conversation_header
+        self._bind_conversation = bind_conversation
         self._max_conversations = max_conversations
         self._max_events = max_events
         self._max_targets = max_targets
@@ -236,6 +255,41 @@ class HttpChannel:
             text=initial_text,
         )
         return conversation
+
+    async def _create_task_conversation(
+        self, _context: dict, request: dict
+    ) -> tuple[int, dict]:
+        session_id = request["segments"]["task_id"]
+        header_provider = self._session_conversation_header
+        binder = self._bind_conversation
+        if header_provider is None or binder is None:
+            return 503, {"error": "channel_unavailable"}
+        try:
+            header = header_provider(session_id)
+        except ValueError:
+            return 404, {"error": "task_not_found", "task_id": session_id}
+
+        conversation = self.create_thread(header)
+        try:
+            terminal_status = binder(session_id, conversation)
+        except ValueError:
+            self._rollback_conversation(conversation)
+            return 404, {"error": "task_not_found", "task_id": session_id}
+        except Exception:
+            self._rollback_conversation(conversation)
+            logger.exception("HTTP Channel 绑定 Session Conversation 失败")
+            return 503, {"error": "channel_unavailable"}
+        if terminal_status is not None:
+            self._rollback_conversation(conversation)
+            return 409, {
+                "error": "task_terminal",
+                "task_id": session_id,
+                "status": terminal_status,
+            }
+        return 201, {
+            "task_id": session_id,
+            "conversation_id": conversation.conversation_id,
+        }
 
     def send_text(self, conversation: ConversationRef, text: str) -> str:
         conversation_id = self._clean_identity(
@@ -550,6 +604,20 @@ class HttpChannel:
             for target_id in additions:
                 state.targets.add(target_id)
                 self._target_conversations[target_id] = conversation_id
+
+    def _rollback_conversation(self, conversation: ConversationRef) -> None:
+        conversation_id = conversation.conversation_id
+        with self._state_lock:
+            state = self._conversations.pop(conversation_id, None)
+            if state is not None:
+                for target_id in state.targets:
+                    if self._target_conversations.get(target_id) == conversation_id:
+                        del self._target_conversations[target_id]
+            self._pending_outputs.pop(conversation_id, None)
+            for key in [
+                key for key in self._active_outputs if key[0] == conversation_id
+            ]:
+                del self._active_outputs[key]
 
     def _new_target(self, conversation_id: str, kind: str) -> str:
         while True:
