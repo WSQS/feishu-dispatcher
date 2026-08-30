@@ -361,10 +361,6 @@ async def run(
                 routes={
                     ("GET", "/api/health"): workspace_health,
                     ("GET", "/api/tasks"): daemon._http_list_tasks,
-                    (
-                        "POST",
-                        "/api/tasks/{task_id}/conversations",
-                    ): daemon._http_create_task_conversation,
                     ("GET", "/api/tasks/{task_id}/events"): daemon._http_task_events,
                     ("GET", "/api/projects"): workspace_list_projects,
                     (
@@ -375,9 +371,10 @@ async def run(
                 },
                 route_context={
                     "all_projects": daemon._all_projects,
-                    "channel_key": "http",
                     "scan_executor": scan_executor,
                 },
+                session_conversation_header=daemon.session_conversation_header,
+                bind_conversation=daemon.bind_conversation,
                 throttle_window=cfg.throttle_window,
             )
         except BaseException:
@@ -631,9 +628,9 @@ class _Daemon:
 
     def __post_init__(self) -> None:
         if self._control_conversation is not None:
-            self._bind_conversation(
-                self._control_conversation,
+            self.bind_conversation(
                 _DISPATCHER_SESSION_ID,
+                self._control_conversation,
             )
 
     def _validate_channel_registry(self) -> None:
@@ -665,12 +662,16 @@ class _Daemon:
             raise RuntimeError("agent 名额预留计数失衡")
         self._pending_agent_launches -= 1
 
-    def _bind_conversation(
-        self, conversation: ConversationRef, session_id: str
-    ) -> None:
-        """把完整 Conversation 绑定到一个已知 Session 身份；重复绑定幂等。"""
-        if not self._session_identity_exists(session_id):
-            raise ValueError(f"Task 不存在: {session_id}")
+    def bind_conversation(
+        self, session_id: str, conversation: ConversationRef
+    ) -> str | None:
+        """绑定 Conversation；Session 已终止时返回其状态，重复绑定幂等。"""
+        if session_id != _DISPATCHER_SESSION_ID:
+            session = self.store.get(session_id)
+            if session is None:
+                raise ValueError(f"Session 不存在: {session_id}")
+            if session.is_terminal:
+                return session.status
 
         bound_session_id = self._conversation_session_ids.get(conversation)
         if bound_session_id is not None and not self._session_identity_exists(
@@ -683,12 +684,20 @@ class _Daemon:
                 f"Conversation {conversation!r} 已绑定 Task {bound_session_id}"
             )
         self._conversation_session_ids[conversation] = session_id
+        return None
 
     def _session_identity_exists(self, session_id: str) -> bool:
         return (
             session_id == _DISPATCHER_SESSION_ID
             or self.store.get(session_id) is not None
         )
+
+    def session_conversation_header(self, session_id: str) -> str:
+        """返回 Session 新 Conversation 的展示标题。"""
+        session = self.store.get(session_id)
+        if session is None:
+            raise ValueError(f"Session 不存在: {session_id}")
+        return f"[{session.session_id}] {session.description}"
 
     def _session_turn_lock(self, session_id: str) -> asyncio.Lock:
         """返回 Session 身份对应的进程内 Turn 锁。"""
@@ -1738,7 +1747,7 @@ class _Daemon:
         事后经 ``_try_resume`` 恢复时仍走普通「已恢复」路径（attached 默认 False）。
         """
         session_conversation = session.conversation_ref
-        self._bind_conversation(session_conversation, session.session_id)
+        self.bind_conversation(session.session_id, session_conversation)
         sess = _AgentSessionRunner(
             project_name=session.project_name,
             agent_label=session.agent_label,
@@ -2242,7 +2251,7 @@ class _Daemon:
         if session is None:
             session = self.store.by_conversation(conversation)
         if session is not None:
-            self._bind_conversation(conversation, session.session_id)
+            self.bind_conversation(session.session_id, conversation)
         sess = (
             self._runners.get_for_session(session.session_id)
             if session is not None
@@ -2584,7 +2593,7 @@ class _Daemon:
     ) -> None:
         """自然语言 → 调度器 LLM 理解并调用工具派发（P2）。"""
         assert self._llm is not None
-        self._bind_conversation(conversation, _DISPATCHER_SESSION_ID)
+        self.bind_conversation(_DISPATCHER_SESSION_ID, conversation)
 
         async with self._session_turn_lock(_DISPATCHER_SESSION_ID):
             conversations = self._conversations_for_session(
@@ -2736,39 +2745,6 @@ class _Daemon:
             )
             tasks.append(summary)
         return 200, {"tasks": tasks}
-
-    async def _http_create_task_conversation(
-        self, context: dict, request: dict
-    ) -> tuple[int, dict]:
-        task_id = request["segments"]["task_id"]
-        task = self.store.get(task_id)
-        if task is None:
-            return 404, {"error": "task_not_found", "task_id": task_id}
-        if task.is_terminal:
-            return 409, {
-                "error": "task_terminal",
-                "task_id": task.session_id,
-                "status": task.status,
-            }
-
-        channel_key = context.get("channel_key")
-        if not isinstance(channel_key, str) or not channel_key.strip():
-            return 503, {"error": "channel_unavailable"}
-        channel_key = channel_key.strip()
-        try:
-            channel = self._channels[channel_key]
-        except KeyError:
-            return 503, {"error": "channel_unavailable"}
-        task_conversation = channel.create_thread(
-            f"[{task.session_id}] {task.description}"
-        )
-        if not isinstance(task_conversation, ConversationRef):
-            return 503, {"error": "channel_unavailable"}
-        self._bind_conversation(task_conversation, task.session_id)
-        return 201, {
-            "task_id": task.session_id,
-            "conversation_id": task_conversation.conversation_id,
-        }
 
     async def _http_task_events(
         self, _context: dict, request: dict
