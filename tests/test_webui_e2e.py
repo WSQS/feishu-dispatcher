@@ -392,8 +392,9 @@ async def test_webui_browser_running_task_history_merges_output_deltas(history_f
     async def create_task_conversation(
         _context: dict, request: dict
     ) -> tuple[int, dict]:
-        conversation_id = channel.create_thread("task-running")
-        channel.open_output(ConversationRef("http", conversation_id), "Agent")
+        conversation = channel.create_thread("task-running")
+        channel.open_output(conversation, "Agent")
+        conversation_id = conversation.conversation_id
         thread_ids.append(conversation_id)
         return 200, {
             "task_id": request["segments"]["task_id"],

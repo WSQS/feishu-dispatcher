@@ -1510,9 +1510,8 @@ class _Daemon:
         try:
             header = f"🚀 {agent_label} · {project_name}\n任务: {task}"
             channel = self._channel_for(conversation)
-            conversation_id = await asyncio.to_thread(channel.create_thread, header)
-            session_conversation = ConversationRef(
-                conversation.channel_key(), conversation_id
+            session_conversation = await asyncio.to_thread(
+                channel.create_thread, header
             )
             new_task = self.store.create(
                 project_name=project_name,
@@ -1633,9 +1632,8 @@ class _Daemon:
             if description:
                 header += f"\n说明: {description}"
             channel = self._channel_for(conversation)
-            conversation_id = await asyncio.to_thread(channel.create_thread, header)
-            session_conversation = ConversationRef(
-                conversation.channel_key(), conversation_id
+            session_conversation = await asyncio.to_thread(
+                channel.create_thread, header
             )
             task_desc = f"附着外部会话 {agent_label}/{sid}"
             if description:
@@ -2761,18 +2759,15 @@ class _Daemon:
             channel = self._channels[channel_key]
         except KeyError:
             return 503, {"error": "channel_unavailable"}
-        conversation_id = channel.create_thread(
+        task_conversation = channel.create_thread(
             f"[{task.session_id}] {task.description}"
         )
-        if not isinstance(conversation_id, str) or not conversation_id.strip():
+        if not isinstance(task_conversation, ConversationRef):
             return 503, {"error": "channel_unavailable"}
-        conversation_id = conversation_id.strip()
-        self._bind_conversation(
-            ConversationRef(channel_key, conversation_id), task.session_id
-        )
+        self._bind_conversation(task_conversation, task.session_id)
         return 201, {
             "task_id": task.session_id,
-            "conversation_id": conversation_id,
+            "conversation_id": task_conversation.conversation_id,
         }
 
     async def _http_task_events(
@@ -3017,9 +3012,8 @@ class _Daemon:
             if issue_url:
                 header += f"\nissue: {issue_url}"
             channel = self._channel_for(conversation)
-            conversation_id = await asyncio.to_thread(channel.create_thread, header)
-            session_conversation = ConversationRef(
-                conversation.channel_key(), conversation_id
+            session_conversation = await asyncio.to_thread(
+                channel.create_thread, header
             )
             new_task = self.store.create(
                 project_name=project_name,

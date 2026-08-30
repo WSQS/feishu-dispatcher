@@ -825,9 +825,10 @@ class FeishuBridge:
                 if active is output:
                     del self._active_outputs[key]
 
-    def create_thread(self, initial_text: str) -> str:
-        """在配置的根群聊中创建话题，返回根 message_id。"""
-        return self.send_root_message(self._chat_whitelist, initial_text)
+    def create_thread(self, initial_text: str) -> ConversationRef:
+        """在配置的根群聊中创建话题并返回其 ConversationRef。"""
+        root_message_id = self.send_root_message(self._chat_whitelist, initial_text)
+        return ConversationRef("feishu", root_message_id)
 
     def control_conversation(self) -> ConversationRef | None:
         """返回配置的控制会话；未配置控制群聊时返回 None。"""

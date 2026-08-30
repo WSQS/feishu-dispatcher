@@ -416,7 +416,7 @@ def test_channel_create_thread_delegates_to_root_message(monkeypatch):
 
     monkeypatch.setattr(bridge, "send_root_message", send_root_message)
 
-    assert bridge.create_thread("hello") == "om_root"
+    assert bridge.create_thread("hello") == ConversationRef("feishu", "om_root")
     assert calls == [("oc_chat", "hello")]
 
 
