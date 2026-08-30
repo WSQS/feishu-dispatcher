@@ -462,7 +462,7 @@ async def test_webui_browser_running_task_history_merges_output_deltas(history_f
 
                 thread_id = thread_ids[0]
                 channel.handle_session_event(
-                    thread_id,
+                    ConversationRef("http", thread_id),
                     SessionEvent(
                         event_id="event-live-started",
                         session_id="task-running",
@@ -473,7 +473,7 @@ async def test_webui_browser_running_task_history_merges_output_deltas(history_f
                     trace_sequence=103,
                 )
                 channel.handle_session_event(
-                    thread_id,
+                    ConversationRef("http", thread_id),
                     SessionEvent(
                         event_id="event-live-delta",
                         session_id="task-running",
@@ -494,7 +494,7 @@ async def test_webui_browser_running_task_history_merges_output_deltas(history_f
                 )
 
                 channel.handle_session_event(
-                    thread_id,
+                    ConversationRef("http", thread_id),
                     SessionEvent(
                         event_id="event-live-finished",
                         session_id="task-running",

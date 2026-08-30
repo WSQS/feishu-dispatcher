@@ -76,7 +76,7 @@ class FakeBridge:
         self.created_threads: list[tuple[str, str]] = []
         self.sent_texts: list[tuple[str, str]] = []
         self.plain = self.sent_texts
-        self.session_events: list[tuple[str, SessionEvent]] = []
+        self.session_events: list[tuple[ConversationRef, SessionEvent]] = []
         self.session_event_trace_sequences: list[int | None] = []
 
     def start(self, on_message) -> None:
@@ -108,12 +108,12 @@ class FakeBridge:
 
     def handle_session_event(
         self,
-        conversation_id: str,
+        conversation: ConversationRef,
         event: SessionEvent,
         *,
         trace_sequence: int | None = None,
     ) -> None:
-        self.session_events.append((conversation_id, event))
+        self.session_events.append((conversation, event))
         self.session_event_trace_sequences.append(trace_sequence)
         body = event.body
         if not isinstance(body, SessionInputAccepted):
@@ -132,7 +132,7 @@ class FakeBridge:
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
         source = body.source.channel_key() if body.source is not None else "unknown"
         self.send_text(
-            ConversationRef("feishu", conversation_id),
+            conversation,
             f"↪️ 同步自 {source}：{body.text}",
         )
 
@@ -2127,7 +2127,7 @@ async def test_tool_call_projection_failure_does_not_abort_turn(caplog):
     class BrokenEventBridge(FakeBridge):
         def handle_session_event(
             self,
-            conversation_id: str,
+            conversation: ConversationRef,
             event: SessionEvent,
             *,
             trace_sequence: int | None = None,
@@ -2135,7 +2135,7 @@ async def test_tool_call_projection_failure_does_not_abort_turn(caplog):
             if isinstance(event.body, ToolCallObserved):
                 raise RuntimeError("tool event boom")
             super().handle_session_event(
-                conversation_id,
+                conversation,
                 event,
                 trace_sequence=trace_sequence,
             )
@@ -2438,7 +2438,7 @@ async def test_run_uses_text_only_channel_output_lifecycle():
 
         def handle_session_event(
             self,
-            conversation_id: str,
+            conversation: ConversationRef,
             event: SessionEvent,
             *,
             trace_sequence: int | None = None,
@@ -2999,7 +2999,7 @@ async def test_session_input_event_projection_failure_does_not_abort_turn(caplog
     class BrokenEventBridge(FakeBridge):
         def handle_session_event(
             self,
-            conversation_id: str,
+            conversation: ConversationRef,
             event: SessionEvent,
             *,
             trace_sequence: int | None = None,
@@ -3036,11 +3036,11 @@ async def test_session_input_event_projection_failure_does_not_abort_turn(caplog
         )
 
     projected_conversation, projected_event = next(
-        (conversation_id, event)
-        for conversation_id, event in healthy.session_events
+        (conversation, event)
+        for conversation, event in healthy.session_events
         if isinstance(event.body, SessionInputAccepted)
     )
-    assert projected_conversation == "healthy-thread"
+    assert projected_conversation == ConversationRef("healthy", "healthy-thread")
     assert projected_event.body == SessionInputAccepted(
         text="continue",
         source=source,

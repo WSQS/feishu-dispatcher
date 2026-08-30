@@ -725,7 +725,7 @@ class FeishuBridge:
 
     def handle_session_event(
         self,
-        conversation_id: str,
+        conversation: ConversationRef,
         event: SessionEvent,
         *,
         trace_sequence: int | None = None,
@@ -737,7 +737,7 @@ class FeishuBridge:
                 return
             source = body.source.channel_key() if body.source is not None else "unknown"
             text = f"↪️ 同步自 {source}：{body.text}"
-            self.send_text(ConversationRef("feishu", conversation_id), text)
+            self.send_text(conversation, text)
             return
         if not isinstance(
             body,
@@ -750,7 +750,9 @@ class FeishuBridge:
             ),
         ):
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
-        self._run_on_main_loop(self._project_session_event(conversation_id, event))
+        self._run_on_main_loop(
+            self._project_session_event(conversation.conversation_id, event)
+        )
 
     def _run_on_main_loop(self, coroutine) -> None:
         try:
