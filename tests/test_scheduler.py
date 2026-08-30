@@ -5,8 +5,8 @@ from __future__ import annotations
 from pathlib import Path
 
 from feishu_dispatcher.scheduler import (
-    LLMResponse,
     SYSTEM_PROMPT,
+    LLMResponse,
     SchedulerMemory,
     ToolCall,
     build_scheduler_tools,

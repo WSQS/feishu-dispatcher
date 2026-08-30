@@ -2,8 +2,8 @@
 
 from .dispatcher_session_runtime import DispatcherSessionRuntime
 from .session_runtime import (
-    SessionRuntime,
     SessionEventListener,
+    SessionRuntime,
     TurnPlacement,
     TurnReceipt,
     TurnRef,

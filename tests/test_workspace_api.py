@@ -14,9 +14,13 @@ from feishu_dispatcher.config import Project
 from feishu_dispatcher.http_channel import HttpChannel
 from feishu_dispatcher.workspace_api import (
     _MAX_FILE_BYTES,
-    file as workspace_file,
     health,
     list_projects,
+)
+from feishu_dispatcher.workspace_api import (
+    file as workspace_file,
+)
+from feishu_dispatcher.workspace_api import (
     tree_children as workspace_tree_children,
 )
 

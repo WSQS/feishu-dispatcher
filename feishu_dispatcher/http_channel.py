@@ -23,8 +23,8 @@ from .conversation import ConversationRef
 from .session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
-    AgentPlanUpdated,
     AgentOutputStarted,
+    AgentPlanUpdated,
     SessionEvent,
     SessionInputAccepted,
     ToolCallObserved,

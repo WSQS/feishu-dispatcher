@@ -19,20 +19,20 @@ import pytest
 
 import feishu_dispatcher.daemon as daemon_module
 from feishu_dispatcher.acp_client import AgentOutputChunk, AgentToolCallUpdate
+from feishu_dispatcher.channel import ChannelMessage, StreamingOutput
 from feishu_dispatcher.config import (
     Config,
     HttpChannelConfig,
     LLMSettings,
     Project,
 )
-from feishu_dispatcher.channel import ChannelMessage, StreamingOutput
 from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.daemon import (
+    _DISPATCHER_SESSION_ID,
     TurnRequest,
     _AgentSessionRunner,
     _CurrentRunnerRegistry,
     _Daemon,
-    _DISPATCHER_SESSION_ID,
     _FanoutStreamingOutput,
 )
 from feishu_dispatcher.http_channel import HttpChannel
@@ -4774,8 +4774,9 @@ async def test_model_command_unsupported_agent():
 async def test_load_session_replay_does_not_log_actions():
     # 恢复时 load_session 会重放历史 session/update；抑制期不应重复记动作。
     # 这里直接验证：suppress=True 时 session_update 不触发 on_action。
-    from feishu_dispatcher.acp_client import _Callbacks, _ClientImpl
     from acp import start_tool_call
+
+    from feishu_dispatcher.acp_client import _Callbacks, _ClientImpl
 
     logged: list[dict] = []
 
