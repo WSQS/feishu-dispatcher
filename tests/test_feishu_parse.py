@@ -468,7 +468,7 @@ def test_channel_projects_session_input_event_to_thread(monkeypatch):
         ),
     )
 
-    bridge.handle_session_event("om_root", event)
+    bridge.handle_session_event(ConversationRef("feishu", "om_root"), event)
 
     assert calls == [("om_root", "↪️ 同步自 http：检查状态", True)]
 
@@ -500,7 +500,7 @@ def test_channel_projects_session_input_event_to_root_chat(monkeypatch):
             ),
         )
 
-        bridge.handle_session_event("oc_main", event)
+        bridge.handle_session_event(ConversationRef("feishu", "oc_main"), event)
 
         assert calls == [("oc_main", "↪️ 同步自 http：检查状态")]
     finally:
@@ -524,7 +524,7 @@ def test_channel_skips_empty_session_input_event(monkeypatch):
         body=SessionInputAccepted(text=""),
     )
 
-    bridge.handle_session_event("om_root", event)
+    bridge.handle_session_event(ConversationRef("feishu", "om_root"), event)
 
     assert calls == []
 
@@ -553,7 +553,7 @@ def test_channel_accepts_agent_output_events_without_rendering(monkeypatch):
 
     for index, body in enumerate(bodies, start=1):
         bridge.handle_session_event(
-            "om_root",
+            ConversationRef("feishu", "om_root"),
             SessionEvent(
                 event_id=f"event-{index}",
                 session_id="t1",
@@ -691,7 +691,7 @@ async def test_text_output_is_driven_by_session_events(monkeypatch):
     for index, body in enumerate(events, start=1):
         await asyncio.to_thread(
             bridge.handle_session_event,
-            "om_root",
+            ConversationRef("feishu", "om_root"),
             SessionEvent(
                 event_id=f"event-{index}",
                 session_id="t1",
@@ -736,7 +736,7 @@ async def test_card_output_is_driven_by_session_events(monkeypatch):
 
     await asyncio.to_thread(
         bridge.handle_session_event,
-        "om_root",
+        ConversationRef("feishu", "om_root"),
         SessionEvent(
             event_id="event-started",
             session_id="t1",
@@ -747,7 +747,7 @@ async def test_card_output_is_driven_by_session_events(monkeypatch):
     )
     await asyncio.to_thread(
         bridge.handle_session_event,
-        "om_root",
+        ConversationRef("feishu", "om_root"),
         SessionEvent(
             event_id="event-delta",
             session_id="t1",
@@ -758,7 +758,7 @@ async def test_card_output_is_driven_by_session_events(monkeypatch):
     )
     await asyncio.to_thread(
         bridge.handle_session_event,
-        "om_root",
+        ConversationRef("feishu", "om_root"),
         SessionEvent(
             event_id="event-plan",
             session_id="t1",
@@ -771,7 +771,7 @@ async def test_card_output_is_driven_by_session_events(monkeypatch):
     )
     await asyncio.to_thread(
         bridge.handle_session_event,
-        "om_root",
+        ConversationRef("feishu", "om_root"),
         SessionEvent(
             event_id="event-finished",
             session_id="t1",
@@ -825,7 +825,7 @@ async def test_card_output_maps_session_outcome(monkeypatch, outcome, template):
     ):
         await asyncio.to_thread(
             bridge.handle_session_event,
-            "om_root",
+            ConversationRef("feishu", "om_root"),
             SessionEvent(
                 event_id=f"event-{index}",
                 session_id="t1",

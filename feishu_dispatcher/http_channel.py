@@ -252,7 +252,7 @@ class HttpChannel:
 
     def handle_session_event(
         self,
-        conversation_id: str,
+        conversation: ConversationRef,
         event: SessionEvent,
         *,
         trace_sequence: int | None = None,
@@ -271,7 +271,9 @@ class HttpChannel:
             ),
         ):
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
-        conversation_id = self._clean_identity(conversation_id, "conversation_id")
+        conversation_id = self._clean_identity(
+            conversation.conversation_id, "conversation_id"
+        )
         self._claim_targets(conversation_id, [])
         owner = conversation_id
         presentation: dict[str, object] | None = None

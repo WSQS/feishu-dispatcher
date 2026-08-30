@@ -58,7 +58,7 @@ class Channel(Protocol):
 
     def handle_session_event(
         self,
-        conversation_id: str,
+        conversation: ConversationRef,
         event: SessionEvent,
         *,
         trace_sequence: int | None = None,

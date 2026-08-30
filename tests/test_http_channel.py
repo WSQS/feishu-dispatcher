@@ -879,7 +879,7 @@ async def test_thread_reply_session_event_output_and_restart():
             ConversationRef("http", thread_id), "demo", footer="model:a"
         )
         channel.handle_session_event(
-            thread_id,
+            ConversationRef("http", thread_id),
             SessionEvent(
                 event_id="event-started",
                 session_id="t1",
@@ -889,7 +889,7 @@ async def test_thread_reply_session_event_output_and_restart():
             ),
         )
         channel.handle_session_event(
-            thread_id,
+            ConversationRef("http", thread_id),
             SessionEvent(
                 event_id="event-delta",
                 session_id="t1",
@@ -901,7 +901,7 @@ async def test_thread_reply_session_event_output_and_restart():
         output.set_footer("model:b")
         await output.set_status("done")
         channel.handle_session_event(
-            thread_id,
+            ConversationRef("http", thread_id),
             SessionEvent(
                 event_id="event-finished",
                 session_id="t1",
@@ -993,7 +993,11 @@ async def test_session_input_event_projects_to_thread_message():
             ),
         )
 
-        channel.handle_session_event(thread_id, event, trace_sequence=42)
+        channel.handle_session_event(
+            ConversationRef("http", thread_id),
+            event,
+            trace_sequence=42,
+        )
 
         events = await _wait_for_events(channel, thread_id, minimum=3)
         raw_event = events["events"][1]
@@ -1031,7 +1035,7 @@ async def test_empty_session_input_event_does_not_create_message():
             body=SessionInputAccepted(text=""),
         )
 
-        channel.handle_session_event(thread_id, event)
+        channel.handle_session_event(ConversationRef("http", thread_id), event)
 
         events = channel._events_after(thread_id, 0)
         assert len(events["events"]) == 2
@@ -1089,7 +1093,7 @@ async def test_agent_output_events_project_as_session_events():
                 body=body,
             )
             expected.append(session_event_to_dict(event))
-            channel.handle_session_event(thread_id, event)
+            channel.handle_session_event(ConversationRef("http", thread_id), event)
 
         events = channel._events_after(thread_id, 0)["events"]
         assert [event["type"] for event in events] == [
@@ -1123,7 +1127,7 @@ async def test_session_event_presentation_is_the_only_live_output_path():
         output.feed("legacy text must not be emitted")
         await output.flush()
         channel.handle_session_event(
-            thread_id,
+            ConversationRef("http", thread_id),
             SessionEvent(
                 event_id="event-started",
                 session_id="t1",
@@ -1133,7 +1137,7 @@ async def test_session_event_presentation_is_the_only_live_output_path():
             ),
         )
         channel.handle_session_event(
-            thread_id,
+            ConversationRef("http", thread_id),
             SessionEvent(
                 event_id="event-tool",
                 session_id="t1",
@@ -1149,7 +1153,7 @@ async def test_session_event_presentation_is_the_only_live_output_path():
             ),
         )
         channel.handle_session_event(
-            thread_id,
+            ConversationRef("http", thread_id),
             SessionEvent(
                 event_id="event-plan",
                 session_id="t1",

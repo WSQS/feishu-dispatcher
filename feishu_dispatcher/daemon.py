@@ -3401,7 +3401,7 @@ class _Daemon:
             channel = self._channel_for(conversation)
             await asyncio.to_thread(
                 channel.handle_session_event,
-                conversation.conversation_id,
+                conversation,
                 event,
                 trace_sequence=trace_sequence,
             )
