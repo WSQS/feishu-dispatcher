@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, NewType, cast
 from urllib.parse import parse_qs
 from uuid import uuid4
 
@@ -31,6 +31,8 @@ from .session_event import (
     ToolCallObserved,
     session_event_to_dict,
 )
+
+HttpConversationRef = NewType("HttpConversationRef", ConversationRef)
 
 logger = logging.getLogger(__name__)
 
@@ -244,9 +246,9 @@ class HttpChannel:
         self.stop()
         self.start(on_message)
 
-    def create_thread(self, initial_text: str) -> ConversationRef:
+    def create_thread(self, initial_text: str) -> HttpConversationRef:
         conversation_id = f"http-conversation-{uuid4().hex}"
-        conversation = ConversationRef("http", conversation_id)
+        conversation = HttpConversationRef(ConversationRef("http", conversation_id))
         self._claim_targets(conversation_id, [])
         message_id = self._new_target(conversation_id, "message")
         self._append_event(
@@ -369,7 +371,7 @@ class HttpChannel:
             return
         source = body.source.channel_key() if body.source is not None else "unknown"
         self.send_text(
-            ConversationRef("http", conversation_id),
+            HttpConversationRef(ConversationRef("http", conversation_id)),
             f"↪️ 同步自 {source}：{body.text}",
         )
 
@@ -558,8 +560,9 @@ class HttpChannel:
         text = body.get("text")
         if not isinstance(text, str):
             raise _HttpRequestError(400, "invalid_request", "text 必须是字符串")
+        conversation = HttpConversationRef(ConversationRef("http", conversation_id))
         return ChannelMessage(
-            conversation=ConversationRef("http", conversation_id),
+            conversation=conversation,
             message_id=message_id,
             text=text,
             sender_id=sender_id,
