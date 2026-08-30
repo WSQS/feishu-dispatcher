@@ -420,6 +420,48 @@ def test_channel_create_thread_delegates_to_root_message(monkeypatch):
     assert calls == [("oc_chat", "hello")]
 
 
+def test_feishu_conversation_ref_codec_round_trips() -> None:
+    bridge = make_bridge()
+    conversation = ConversationRef("feishu", "om_root")
+
+    payload = bridge.serialize_conversation_ref(conversation)
+
+    assert payload == {"conversation_id": "om_root"}
+    assert bridge.deserialize_conversation_ref(payload) == conversation
+
+
+def test_feishu_conversation_ref_codec_normalizes_serialized_id() -> None:
+    bridge = make_bridge()
+
+    assert bridge.serialize_conversation_ref(
+        ConversationRef("feishu", "  om_root  ")
+    ) == {"conversation_id": "om_root"}
+
+
+def test_feishu_conversation_ref_codec_rejects_other_channel() -> None:
+    bridge = make_bridge()
+
+    with pytest.raises(ValueError, match="不属于 Feishu Channel"):
+        bridge.serialize_conversation_ref(ConversationRef("http", "http-thread"))
+
+
+def test_feishu_conversation_ref_codec_rejects_blank_serialized_id() -> None:
+    bridge = make_bridge()
+
+    with pytest.raises(ValueError, match="conversation_id 不能为空"):
+        bridge.serialize_conversation_ref(ConversationRef("feishu", " "))
+
+
+@pytest.mark.parametrize("payload", [{}, {"conversation_id": " "}])
+def test_feishu_conversation_ref_codec_rejects_invalid_payload(
+    payload: dict[str, object],
+) -> None:
+    bridge = make_bridge()
+
+    with pytest.raises(ValueError, match="conversation_id 不能为空"):
+        bridge.deserialize_conversation_ref(payload)
+
+
 def test_channel_send_text_selects_root_or_thread(monkeypatch):
     bridge = make_bridge(chat_whitelist="oc_chat")
     calls: list[tuple[str, str, str]] = []
