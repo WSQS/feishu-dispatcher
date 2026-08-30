@@ -8,11 +8,12 @@ import logging
 import secrets
 import threading
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
+from typing import Any, cast
 from urllib.parse import parse_qs
 from uuid import uuid4
 
@@ -39,7 +40,7 @@ _DEFAULT_MAX_EVENTS = 512
 _DEFAULT_MAX_TARGETS = 4096
 _DISPATCH_TIMEOUT = 30.0
 
-RouteHandler = Callable[[dict, dict], Awaitable[tuple[int, dict]]]
+RouteHandler = Callable[[dict, dict], Coroutine[Any, Any, tuple[int, dict]]]
 SessionConversationHeaderProvider = Callable[[str], str]
 ConversationBinder = Callable[[str, ConversationRef], str | None]
 
@@ -459,7 +460,8 @@ class HttpChannel:
     def _dispatch_message(self, token: str, body: object) -> tuple[int, dict]:
         if not self._authorized(token):
             return 401, {"error": "invalid_token"}
-        if self._on_message is None or not self._loop.is_running():
+        handler = self._on_message
+        if handler is None or not self._loop.is_running():
             return 503, {"error": "channel_unavailable"}
         try:
             message = self._parse_message(body)
@@ -467,9 +469,11 @@ class HttpChannel:
                 message.conversation.conversation_id,
                 [message.message_id],
             )
-            future = asyncio.run_coroutine_threadsafe(
-                self._on_message(message), self._loop
-            )
+
+            async def dispatch() -> None:
+                await handler(message)
+
+            future = asyncio.run_coroutine_threadsafe(dispatch(), self._loop)
             future.add_done_callback(self._log_handler_result)
         except _HttpRequestError as exc:
             return exc.status, exc.payload()
@@ -771,11 +775,14 @@ class _HttpStreamingOutput:
             self._message_text = event.message
         else:
             suffix = ""
-        status: OutputStatus = {
-            "completed": "done",
-            "cancelled": "stopped",
-            "failed": "error",
-        }[event.outcome]
+        status = cast(
+            OutputStatus,
+            {
+                "completed": "done",
+                "cancelled": "stopped",
+                "failed": "error",
+            }[event.outcome],
+        )
         return {
             "output_id": self._output_id,
             "text": suffix,
@@ -836,7 +843,7 @@ def _parse_query(query: str) -> dict[str, str]:
 
 def _make_handler(channel: HttpChannel):
     class _Handler(BaseHTTPRequestHandler):
-        def log_message(self, *args) -> None:  # noqa: D401
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002, D401
             return None
 
         def _token(self) -> str:

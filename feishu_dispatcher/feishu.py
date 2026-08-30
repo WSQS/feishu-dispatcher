@@ -24,6 +24,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Collection
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -180,7 +181,7 @@ class _FeishuSessionEventOutput:
         self._message_text = ""
         self._last_stream: str | None = None
 
-    def feed(self, _text: str) -> None:
+    def feed(self, text: str) -> None:
         return None
 
     def set_footer(self, footer: str) -> None:
@@ -190,7 +191,7 @@ class _FeishuSessionEventOutput:
     async def flush(self) -> None:
         return None
 
-    async def set_status(self, _status: OutputStatus) -> None:
+    async def set_status(self, status: OutputStatus) -> None:
         return None
 
     async def aclose(self) -> None:
@@ -251,11 +252,14 @@ class _FeishuSessionEventOutput:
                 self._output.feed(suffix)
             self._message_text = body.message
         self._output.set_footer(self._footer)
-        status = {
-            "completed": "done",
-            "cancelled": "stopped",
-            "failed": "error",
-        }[body.outcome]
+        status = cast(
+            OutputStatus,
+            {
+                "completed": "done",
+                "cancelled": "stopped",
+                "failed": "error",
+            }[body.outcome],
+        )
         await self._output.set_status(status)
         await self._output.flush()
 
@@ -412,6 +416,8 @@ class FeishuBridge:
             ping_task = asyncio.create_task(self._ping_loop(ws, conn_url))
             try:
                 async for raw in ws:
+                    if isinstance(raw, str):
+                        raw = raw.encode("utf-8")
                     await self._handle_frame(ws, raw)
             finally:
                 ping_task.cancel()
@@ -529,14 +535,15 @@ class FeishuBridge:
 
         entry = self._frag_cache.get(msg_id)
         if entry is None:
-            entry = (now, [None] * total)
+            buf: list[bytes | None] = [None] * total
+            entry = (now, buf)
             self._frag_cache[msg_id] = entry
         buf = entry[1]
         if 0 <= seq < len(buf):
             buf[seq] = bs
         if all(piece is not None for piece in buf):
             del self._frag_cache[msg_id]
-            return b"".join(buf)  # type: ignore[arg-type]
+            return b"".join(piece for piece in buf if piece is not None)
         return None
 
     def _dispatch_event(self, payload: bytes) -> None:
@@ -562,11 +569,16 @@ class FeishuBridge:
                 msg.message_id,
             )
             return
-        if self._on_event is None:
+        handler = self._on_event
+        if handler is None:
             logger.warning("飞书消息处理器未注册，丢弃 message_id=%s", msg.message_id)
             return
+
+        async def dispatch() -> None:
+            await handler(msg)
+
         # 线程安全地交回主 loop
-        fut = asyncio.run_coroutine_threadsafe(self._on_event(msg), self._main_loop)
+        fut = asyncio.run_coroutine_threadsafe(dispatch(), self._main_loop)
         fut.add_done_callback(_log_future_exception)
 
     @staticmethod
@@ -924,7 +936,7 @@ class FeishuBridge:
 # ---------------------------------------------------------------------- #
 
 
-def _new_ping_frame(service_id: int) -> pbbp2_pb2.Frame:
+def _new_ping_frame(service_id: int) -> Any:
     frame = pbbp2_pb2.Frame()
     header = frame.headers.add()
     header.key = HEADER_TYPE

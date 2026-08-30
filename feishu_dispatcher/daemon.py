@@ -1882,11 +1882,13 @@ class _Daemon:
         self, sess: _AgentSessionRunner, startup_turn: TurnRequest | None
     ) -> None:
         """一个 agent 的完整生命周期：启动 → 串行消费 Turn 队列 → 关闭。"""
+        agent = sess.agent
+        assert agent is not None
         startup_conversation = (
             startup_turn.conversation if startup_turn is not None else sess.conversation
         )
         try:
-            await sess.agent.start()
+            await agent.start()
         except Exception as exc:
             logger.exception("agent 启动失败")
             if self._runners.is_current(sess.session_id, sess):
@@ -1914,7 +1916,7 @@ class _Daemon:
             await self._close_session(sess)
             return
         # 启动成功：把 agent_session_id + 模型落进 Task 并置 idle（供重启后恢复）
-        reported = getattr(sess.agent, "model", "") or ""
+        reported = getattr(agent, "model", "") or ""
         model = reported
         # 模型黏住（恢复后）：agent 后端重载会话（load_session）时可能把模型重置回默认，
         # 报回的 current_value 即是默认——若直接采信就会把用户此前 /model 切过的模型覆盖掉
@@ -1922,13 +1924,13 @@ class _Daemon:
         # 保证「切模型 → 挂起 → 恢复」后仍用用户选的模型。后端已持久化（reported==pinned）时跳过。
         task = self.store.get(sess.session_id)
         pinned = (task.model if task else "") or ""
-        available = getattr(sess.agent, "available_models", None) or []
+        available = getattr(agent, "available_models", None) or []
         # 被动刷新模型缓存：真实 agent 一启动就把它报的 available_models 存下来，
         # 供 spawn 前 /models、list_models 列出/校验（copilot 报空也如实存）。
         self.model_store.update(sess.agent_label, list(available))
         if pinned and pinned != reported and pinned in available:
             try:
-                await sess.agent.set_model(pinned)
+                await agent.set_model(pinned)
                 model = pinned
                 logger.info("恢复后重新应用模型 task=%s → %s", sess.session_id, pinned)
             except Exception:
@@ -1948,13 +1950,13 @@ class _Daemon:
             return
         self.store.update(
             sess.session_id,
-            agent_session_id=sess.agent.session_id or "",
+            agent_session_id=agent.session_id or "",
             status="idle",
             model=model,
         )
         if sess.attached:
             # 附着摘要（区别于普通「已就绪」/「已恢复」文案）：说明来源 + 后续回复续接上下文
-            sid = _short_sid(sess.agent.session_id or "")
+            sid = _short_sid(agent.session_id or "")
             model_tail = f"，模型：{model}" if model else ""
             base = (
                 f"🔗 已附着外部会话（agent={sess.agent_label}，session={sid}{model_tail}）。\n"
@@ -2050,7 +2052,7 @@ class _Daemon:
                             ),
                         )
                     title = f"{sess.project_name} · {sess.agent_label}"
-                    model = getattr(sess.agent, "model", "") or ""
+                    model = getattr(agent, "model", "") or ""
                     # footer 与模型同一行显示项目名（#44）：在任意输出单元都可辨归属
                     footer = sess.project_name
                     if model:
@@ -2093,7 +2095,7 @@ class _Daemon:
                     )
                     outcome: OutputOutcome | None = None
                     try:
-                        stop_reason = await sess.agent.prompt(prompt)
+                        stop_reason = await agent.prompt(prompt)
                         await output.flush()
                         if not self._runners.is_current(sess.session_id, sess):
                             break
@@ -2109,14 +2111,14 @@ class _Daemon:
                             continue
                         # footer 追加本轮 token 用量（#53）：取不到就不显示、不报错。
                         # 只标脏，紧随的 set_status("done") 会把新 footer 一起 emit。
-                        tokens = getattr(sess.agent, "last_usage_tokens", None)
+                        tokens = getattr(agent, "last_usage_tokens", None)
                         if tokens is not None:
                             output.set_footer(_with_tokens(footer, tokens))
                         await output.set_status("done")
                         if not self._runners.is_current(sess.session_id, sess):
                             break
                         # 落 last_output：本轮 agent 的收尾回复（截断），供 get_task/通知摘要
-                        last_output = _clip(sess.agent.last_message, _LAST_OUTPUT_MAX)
+                        last_output = _clip(agent.last_message, _LAST_OUTPUT_MAX)
                         cur = self.store.get(sess.session_id)
                         turns = (cur.turns if cur else 0) + 1
                         logger.info(
@@ -2332,6 +2334,12 @@ class _Daemon:
         对下一轮生效。agent 不暴露模型选项（如 copilot）则提示不支持。
         """
         agent = sess.agent
+        if agent is None:
+            await self._safe_send_text(
+                "⚠️ agent 尚未就绪，无法切换模型。",
+                conversation=conversation,
+            )
+            return
         models = list(getattr(agent, "available_models", []) or [])
         current = getattr(agent, "model", "") or ""
         if not models:

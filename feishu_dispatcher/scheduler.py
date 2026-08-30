@@ -293,7 +293,7 @@ async def run_tool_loop(
 def build_scheduler_tools(
     *,
     list_projects: Callable[[], list[dict[str, Any]]],
-    spawn_agent: Callable[[str, str, str, int], Awaitable[str]],
+    spawn_agent: Callable[[str, str, str, int, str], Awaitable[str]],
     list_tasks: Callable[[], list[dict[str, Any]]],
     get_task: Callable[[str], dict[str, Any] | None],
     send_to_task: Callable[[str, str], Awaitable[str]],
@@ -397,8 +397,11 @@ def build_scheduler_tools(
             return "参数不足：project 必填。"
         if kind not in ("issue", "pr"):
             return "参数不足：kind 必须为 issue 或 pr。"
+        raw_number = args.get("number")
+        if raw_number is None:
+            return "参数不足：number 必须为整数。"
         try:
-            number = int(args.get("number"))
+            number = int(raw_number)
         except (TypeError, ValueError):
             return "参数不足：number 必须为整数。"
         return await get_forge(project, kind, number)

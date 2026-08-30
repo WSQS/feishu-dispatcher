@@ -83,6 +83,17 @@ uv run playwright install chromium
 uv run pytest -q -m webui_e2e
 ```
 
+### Python 类型检查
+
+项目使用 Pyright 检查 Python 类型，依赖和版本由 `uv` 管理：
+
+```powershell
+uv run pyright
+```
+
+当前基线覆盖整个 `feishu_dispatcher` Python 包；`tests`、`scripts`、`build`
+及 WebUI 资源不纳入 Python 类型检查范围。
+
 ## 注释规范
 
 注释的职责是说明「**是什么 / 为什么这样写**」，让代码自包含可读。
