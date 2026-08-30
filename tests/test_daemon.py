@@ -374,6 +374,7 @@ def make_daemon(
     idle_timeout: float = 1800.0,
     channel_key: str = "feishu",
     sender_whitelist: list[str] | None = None,
+    control_conversation: ConversationRef | None = ConversationRef("feishu", "oc_1"),
 ) -> tuple[_Daemon, FakeBridge, list[FakeAgent]]:
     cfg = Config(
         app_id="a",
@@ -397,6 +398,7 @@ def make_daemon(
         project_store=project_store or ProjectStore(None),
         _channels={channel_key: bridge},
         _primary_channel_key=channel_key,
+        _control_conversation=control_conversation,
     )
     created: list[FakeAgent] = []
 
@@ -476,6 +478,7 @@ async def test_run_builds_default_feishu_channel_and_injects_it(
             throttle_window: float,
         ) -> None:
             super().__init__()
+            self._control_conversation = ConversationRef("feishu", chat_whitelist)
             constructed.update(
                 app_id=app_id,
                 app_secret=app_secret,
@@ -487,9 +490,13 @@ async def test_run_builds_default_feishu_channel_and_injects_it(
                 throttle_window=throttle_window,
             )
 
+        def control_conversation(self) -> ConversationRef:
+            return self._control_conversation
+
     async def fake_daemon_run(self) -> None:
         constructed["channels"] = dict(self._channels)
         constructed["primary_channel_key"] = self._primary_channel_key
+        constructed["control_conversation"] = self._control_conversation
 
     monkeypatch.setattr(daemon_module, "FeishuBridge", FakeFeishuChannel)
     monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
@@ -514,6 +521,7 @@ async def test_run_builds_default_feishu_channel_and_injects_it(
     assert set(channels) == {"feishu"}
     assert isinstance(channels["feishu"], FakeFeishuChannel)
     assert constructed["primary_channel_key"] == "feishu"
+    assert constructed["control_conversation"] == ConversationRef("feishu", "oc-main")
     assert (tmp_path / "session-trace.sqlite").exists()
 
 
@@ -1281,6 +1289,23 @@ async def test_run_rejects_injected_channel_without_stable_key(tmp_path, channel
 
 
 @pytest.mark.asyncio
+async def test_run_rejects_control_conversation_with_mismatched_channel_key(tmp_path):
+    class MismatchedControlChannel(FakeBridge):
+        def control_conversation(self) -> ConversationRef:
+            return ConversationRef("feishu", "oc-main")
+
+    cfg = Config(app_id="a", app_secret="b", chat_id="oc-main")
+
+    with pytest.raises(ValueError, match="与注册 key 'web' 不一致"):
+        await daemon_module.run(
+            cfg,
+            store_path=tmp_path / "sessions.json",
+            channel=MismatchedControlChannel(),
+            channel_key="web",
+        )
+
+
+@pytest.mark.asyncio
 async def test_run_uses_injected_channel_lifecycle(monkeypatch, tmp_path):
     cfg = Config(app_id="a", app_secret="b", chat_id="oc-main")
     controls = []
@@ -1653,7 +1678,7 @@ def test_dispatcher_session_identity_constant_has_no_task_alias():
 
 
 def test_conversation_binding_supports_runtime_dispatcher_session_identity():
-    daemon, _, _ = make_daemon()
+    daemon, _, _ = make_daemon(control_conversation=None)
     conversation = ConversationRef("web", "web-root")
 
     daemon._bind_conversation(conversation, _DISPATCHER_SESSION_ID)
@@ -3558,7 +3583,11 @@ async def test_cross_channel_turn_error_fans_out():
         conversation=ConversationRef("feishu", "oc_1"),
         workspace="C:/tmp/demo",
     )
-    daemon, feishu, created = make_daemon(store=store, agent_cls=CountingFailAgent)
+    daemon, feishu, created = make_daemon(
+        store=store,
+        agent_cls=CountingFailAgent,
+        control_conversation=None,
+    )
     web = FakeBridge()
     daemon._channels["web"] = web
     web_conversation = ConversationRef("web", "web-thread")
@@ -4904,7 +4933,11 @@ async def test_attach_respects_max_agents_replies_to_original_no_orphan_thread()
 
 async def test_attach_launch_failure_reports_attach_error():
     store = SessionStore(None)
-    daemon, bridge, created = make_daemon(store=store, agent_cls=StartupFailAgent)
+    daemon, bridge, created = make_daemon(
+        store=store,
+        agent_cls=StartupFailAgent,
+        control_conversation=None,
+    )
     task = store.create(
         project_name="demo",
         agent_label="opencode",
