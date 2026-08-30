@@ -24,7 +24,7 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Collection
-from typing import Any, cast
+from typing import Any, NewType, cast
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -51,6 +51,8 @@ from .session_event import (
     SessionInputAccepted,
     ToolCallObserved,
 )
+
+FeishuConversationRef = NewType("FeishuConversationRef", ConversationRef)
 
 # 延迟 import：event 模型属于 im.v1 namespace（单 ns，安全），但顶部 import
 # 会触发 lark_oapi/__init__；shim 必须先装好。调用方 import 顺序：
@@ -640,11 +642,14 @@ class FeishuBridge:
             or sender_id_obj.get("union_id")
             or ""
         )
-        return ChannelMessage(
-            conversation=ConversationRef(
+        conversation = FeishuConversationRef(
+            ConversationRef(
                 "feishu",
                 thread_root or msg.get("chat_id", ""),
-            ),
+            )
+        )
+        return ChannelMessage(
+            conversation=conversation,
             message_id=message_id,
             text=text,
             sender_id=sender_id,
@@ -837,17 +842,17 @@ class FeishuBridge:
                 if active is output:
                     del self._active_outputs[key]
 
-    def create_thread(self, initial_text: str) -> ConversationRef:
+    def create_thread(self, initial_text: str) -> FeishuConversationRef:
         """在配置的根群聊中创建话题并返回其 ConversationRef。"""
         root_message_id = self.send_root_message(self._chat_whitelist, initial_text)
-        return ConversationRef("feishu", root_message_id)
+        return FeishuConversationRef(ConversationRef("feishu", root_message_id))
 
-    def control_conversation(self) -> ConversationRef | None:
+    def control_conversation(self) -> FeishuConversationRef | None:
         """返回配置的控制会话；未配置控制群聊时返回 None。"""
         chat_id = self._chat_whitelist.strip()
         if not chat_id:
             return None
-        return ConversationRef("feishu", chat_id)
+        return FeishuConversationRef(ConversationRef("feishu", chat_id))
 
     def send_text(self, conversation: ConversationRef, text: str) -> str:
         """向 Conversation 发送文本。"""
