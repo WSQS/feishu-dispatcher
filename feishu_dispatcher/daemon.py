@@ -681,7 +681,7 @@ class _Daemon:
             bound_session_id = None
         if bound_session_id is not None and bound_session_id != session_id:
             raise RuntimeError(
-                f"Conversation {conversation!r} 已绑定 Task {bound_session_id}"
+                f"Conversation {conversation!r} 已绑定 Session {bound_session_id}"
             )
         self._conversation_session_ids[conversation] = session_id
         return None

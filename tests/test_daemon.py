@@ -1661,7 +1661,7 @@ def test_conversation_binding_is_idempotent_and_rejects_conflict():
     daemon.bind_conversation(task_a.session_id, conversation)
 
     assert daemon._session_for_conversation(conversation) is task_a
-    with pytest.raises(RuntimeError, match="已绑定 Task t1"):
+    with pytest.raises(RuntimeError, match="已绑定 Session t1"):
         daemon.bind_conversation(task_b.session_id, conversation)
 
 
@@ -1682,12 +1682,13 @@ def test_conversation_binding_drops_deleted_session():
         description="done",
         conversation=ConversationRef("feishu", "oc_1"),
         workspace="C:/tmp/demo",
-        status="done",
+        status="idle",
     )
     daemon, _, _ = make_daemon(store=store)
     conversation = ConversationRef("web", "web-thread")
     daemon.bind_conversation(task.session_id, conversation)
 
+    store.update(task.session_id, status="done")
     assert store.clear_terminal() == 1
     assert daemon._session_for_conversation(conversation) is None
     assert conversation not in daemon._conversation_session_ids
