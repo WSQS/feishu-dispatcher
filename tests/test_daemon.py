@@ -1511,7 +1511,6 @@ def root_msg(
         message_id=mid,
         text=text,
         sender_id="ou_user",
-        route="dispatcher",
     )
 
 
@@ -1527,7 +1526,6 @@ def thread_msg(
         message_id=mid,
         text=text,
         sender_id="ou_user",
-        route="session",
     )
 
 
@@ -2723,11 +2721,10 @@ async def test_help_in_thread_shows_usage_not_forwarded_to_agent():
     await daemon._shutdown()
 
 
-async def test_help_in_dormant_thread_replies_without_recovery():
+async def test_help_in_unbound_conversation_uses_dispatcher_usage():
     daemon, bridge, created = make_daemon()
-    # 没有活跃 session 的话题里发 /help：仍回用法，且不为此拉起/恢复任何 agent
     await daemon._handle_message(thread_msg("/help", root="om_orphan", mid="om_z"))
-    assert any("话题内用法" in t for t in bridge.texts("om_orphan"))
+    assert any(text.startswith("用法：") for text in bridge.texts("om_orphan"))
     assert created == []
 
 
@@ -2819,9 +2816,18 @@ async def test_same_message_id_help_replies_on_source_channel():
     assert daemon._session_id_for_conversation(ConversationRef("web", "oc_1")) is None
 
 
-async def test_thread_message_uses_thread_conversation_ref():
+async def test_bound_message_uses_conversation_ref():
     daemon, _, _ = make_daemon()
     seen: list[ConversationRef] = []
+    conversation = ConversationRef("feishu", "om_thread")
+    session = daemon.store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="bound conversation",
+        conversation=_TEST_CONVERSATION,
+        workspace=".",
+    )
+    daemon._bind_conversation(conversation, session.session_id)
 
     async def capture(msg: ChannelMessage, *, conversation: ConversationRef) -> None:
         seen.append(conversation)
@@ -2832,7 +2838,7 @@ async def test_thread_message_uses_thread_conversation_ref():
         thread_msg("continue", root="om_thread", conversation_id="oc_chat")
     )
 
-    assert seen == [ConversationRef("feishu", "om_thread")]
+    assert seen == [conversation]
 
 
 async def test_non_primary_channel_uses_own_admission_scope():
@@ -3619,11 +3625,11 @@ async def test_cross_channel_turn_error_fans_out():
     assert daemon._runners.get_for_session(task.session_id) is None
 
 
-async def test_reply_to_unknown_topic_notifies_not_silent():
-    daemon, bridge, created = make_daemon()  # 空 store
+async def test_unbound_conversation_uses_dispatcher_fallback():
+    daemon, bridge, created = make_daemon()
     await daemon._handle_message(thread_msg("hello", root="om_unknown", mid="om_x"))
     assert created == []
-    assert any("没有对应任务" in t for t in bridge.texts("om_unknown"))
+    assert any(text.startswith("用法：") for text in bridge.texts("om_unknown"))
 
 
 async def test_stop_marks_task_stopped():

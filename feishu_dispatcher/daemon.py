@@ -1059,10 +1059,9 @@ class _Daemon:
             )
             return
         logger.info(
-            "收到消息 conversation=%s msg=%s route=%s text=%r",
+            "收到消息 conversation=%s msg=%s text=%r",
             conversation.to_log_string(),
             msg.message_id,
-            msg.route,
             msg.text,
         )
 
@@ -1076,17 +1075,14 @@ class _Daemon:
             return
 
         bound_session_id = self._session_id_for_conversation(conversation)
-        persisted_session = None
-        if msg.route != "session" and bound_session_id is None:
-            persisted_session = self.store.by_conversation(conversation)
+        persisted_session = (
+            self.store.by_conversation(conversation)
+            if bound_session_id is None
+            else None
+        )
         if (
-            msg.route == "session"
-            or (
-                bound_session_id is not None
-                and bound_session_id != _DISPATCHER_SESSION_ID
-            )
-            or persisted_session is not None
-        ):
+            bound_session_id is not None and bound_session_id != _DISPATCHER_SESSION_ID
+        ) or persisted_session is not None:
             await self._forward_to_agent(msg, conversation=conversation)
             return
 
