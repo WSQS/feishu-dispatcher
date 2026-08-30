@@ -547,11 +547,13 @@ class FeishuBridge:
         if event_type != "im.message.receive_v1":
             return
         event = data.get("event", {})
+        event_message = event.get("message") or {}
+        chat_id = event_message.get("chat_id", "")
+        if self._chat_whitelist and chat_id != self._chat_whitelist:
+            logger.debug("忽略非白名单群消息 chat_id=%s", chat_id)
+            return
         msg = self._parse_event_message(event)
         if msg is None:
-            return
-        if self._chat_whitelist and msg.conversation_id != self._chat_whitelist:
-            logger.debug("忽略非白名单群消息 chat_id=%s", msg.conversation_id)
             return
         if self._sender_whitelist and msg.sender_id not in self._sender_whitelist:
             logger.debug(
@@ -627,11 +629,14 @@ class FeishuBridge:
             or ""
         )
         return ChannelMessage(
-            conversation_id=msg.get("chat_id", ""),
+            conversation=ConversationRef(
+                "feishu",
+                thread_root or msg.get("chat_id", ""),
+            ),
             message_id=message_id,
-            thread_id=thread_root,
             text=text,
             sender_id=sender_id,
+            route="session" if thread_root is not None else "dispatcher",
         )
 
     # ------------------------------------------------------------------ #

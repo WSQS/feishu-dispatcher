@@ -941,7 +941,7 @@ class _Daemon:
         started: list[tuple[str, Channel]] = []
         try:
             for channel_key, channel in self._channels.items():
-                channel.start(partial(self._handle_channel_message, channel_key))
+                channel.start(self._handle_channel_message)
                 started.append((channel_key, channel))
         except Exception:
             for channel_key, channel in reversed(started):
@@ -1040,18 +1040,14 @@ class _Daemon:
 
     async def _handle_message(self, msg: ChannelMessage) -> None:
         """当前主 Channel 的直接消息入口（测试与内部兼容路径）。"""
-        await self._handle_channel_message(self._primary_channel_key, msg)
+        await self._handle_channel_message(msg)
 
-    async def _handle_channel_message(
-        self, channel_key: str, msg: ChannelMessage
-    ) -> None:
+    async def _handle_channel_message(self, msg: ChannelMessage) -> None:
         """携带稳定 Channel 身份的内部消息入口。"""
-        channel_key = channel_key.strip()
+        conversation = msg.conversation
+        channel_key = conversation.channel_key().strip()
         if not channel_key:
             raise ValueError("channel_key 不能为空")
-        conversation = ConversationRef(
-            channel_key, msg.thread_id or msg.conversation_id
-        )
         # 忽略无发送者的系统消息
         if not msg.sender_id:
             return
@@ -1063,29 +1059,28 @@ class _Daemon:
             )
             return
         logger.info(
-            "收到消息 channel=%s chat=%s msg=%s thread_root=%s text=%r",
-            channel_key,
-            msg.conversation_id,
+            "收到消息 conversation=%s msg=%s route=%s text=%r",
+            conversation.to_log_string(),
             msg.message_id,
-            msg.thread_id,
+            msg.route,
             msg.text,
         )
 
-        # R10：discover 模式只打印 chat_id 帮助发现，不执行任何命令
+        # R10：discover 模式只打印会话标识帮助发现，不执行任何命令
         if self.discover:
             logger.info(
-                "[discover] chat_id=%r sender_id=%r — 填入 config.toml 的 chat_id 即可",
-                msg.conversation_id,
+                "[discover] conversation=%r sender_id=%r — 填入 config.toml 的 chat_id 即可",
+                conversation.to_log_string(),
                 msg.sender_id,
             )
             return
 
         bound_session_id = self._session_id_for_conversation(conversation)
         persisted_session = None
-        if not msg.thread_id and bound_session_id is None:
+        if msg.route != "session" and bound_session_id is None:
             persisted_session = self.store.by_conversation(conversation)
         if (
-            msg.thread_id
+            msg.route == "session"
             or (
                 bound_session_id is not None
                 and bound_session_id != _DISPATCHER_SESSION_ID
