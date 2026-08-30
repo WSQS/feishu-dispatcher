@@ -868,6 +868,37 @@ def make_bridge(
         loop.close()
 
 
+def test_control_conversation_uses_whitelisted_chat(monkeypatch):
+    bridge = make_bridge(chat_whitelist=" oc-control ")
+    roots: list[tuple[str, str]] = []
+    replies: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        bridge,
+        "send_root_message",
+        lambda conversation_id, text: roots.append((conversation_id, text)) or "root",
+    )
+    monkeypatch.setattr(
+        bridge,
+        "reply_in_thread",
+        lambda conversation_id, text: (
+            replies.append((conversation_id, text)) or "reply"
+        ),
+    )
+
+    conversation = bridge.control_conversation()
+
+    assert conversation == ConversationRef("feishu", "oc-control")
+    assert bridge.send_text(conversation, "notice") == "root"
+    assert roots == [("oc-control", "notice")]
+    assert replies == []
+
+
+def test_control_conversation_is_optional():
+    bridge = make_bridge()
+
+    assert bridge.control_conversation() is None
+
+
 def test_combine_assembles_fragments_in_seq_order():
     bridge = make_bridge()
     assert bridge._combine("m1", 3, 1, b"BB") is None

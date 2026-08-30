@@ -286,7 +286,7 @@ class FeishuBridge:
         self._app_secret = app_secret
         self._main_loop = main_loop
         self._on_event = on_event
-        self._chat_whitelist = chat_whitelist
+        self._chat_whitelist = chat_whitelist.strip()
         self._sender_whitelist = frozenset(sender_whitelist)
         self._domain = domain.rstrip("/")
         self._stream_mode = stream_mode
@@ -822,6 +822,13 @@ class FeishuBridge:
     def create_thread(self, initial_text: str) -> str:
         """在配置的根群聊中创建话题，返回根 message_id。"""
         return self.send_root_message(self._chat_whitelist, initial_text)
+
+    def control_conversation(self) -> ConversationRef | None:
+        """返回配置的控制会话；未配置控制群聊时返回 None。"""
+        chat_id = self._chat_whitelist.strip()
+        if not chat_id:
+            return None
+        return ConversationRef("feishu", chat_id)
 
     def send_text(self, conversation: ConversationRef, text: str) -> str:
         """向 Conversation 发送文本。"""

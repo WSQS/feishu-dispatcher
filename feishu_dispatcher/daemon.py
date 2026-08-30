@@ -313,6 +313,17 @@ async def run(
             throttle_window=cfg.throttle_window,
         )
     channels = {resolved_channel_key: channel}
+    control_provider = getattr(channel, "control_conversation", None)
+    control_conversation = control_provider() if callable(control_provider) else None
+    if control_conversation is not None:
+        if not isinstance(control_conversation, ConversationRef):
+            raise TypeError("control_conversation() 必须返回 ConversationRef 或 None")
+        control_channel_key = control_conversation.channel_key()
+        if control_channel_key != resolved_channel_key:
+            raise ValueError(
+                "控制 Conversation 的 Channel key "
+                f"{control_channel_key!r} 与注册 key {resolved_channel_key!r} 不一致"
+            )
     daemon = _Daemon(
         cfg,
         discover=discover,
@@ -329,6 +340,7 @@ async def run(
         ),
         _channels=channels,
         _primary_channel_key=resolved_channel_key,
+        _control_conversation=control_conversation,
     )
     if default_assembly and cfg.http_channel and cfg.http_channel.enabled:
         http_token_path = store_path.parent / "http-channel.token"
@@ -581,8 +593,10 @@ class _Daemon:
     _pending_agent_launches: int = 0
     #: 由启动装配层注入；稳定 key → Channel 实例。
     _channels: dict[str, Channel] = field(default_factory=dict)
-    #: 控制台主线通知与兼容消息入口使用的主 Channel key。
+    #: 兼容消息入口使用的主 Channel key。
     _primary_channel_key: str = "feishu"
+    #: Feishu Channel 提供的固定控制 Conversation；没有则为 None。
+    _control_conversation: ConversationRef | None = None
     #: 进程内 Conversation → Session 身份绑定；Dispatcher Session 与额外入口不持久化。
     _conversation_session_ids: dict[ConversationRef, str] = field(default_factory=dict)
     #: 每个 Session 的单活 current runner；Thread 只经 Session 路由到这里。
@@ -609,6 +623,13 @@ class _Daemon:
     #: run() 里创建的退出事件；/reboot 或退出信号 set 它跳出主循环
     _stop_event: "asyncio.Event | None" = None
 
+    def __post_init__(self) -> None:
+        if self._control_conversation is not None:
+            self._bind_conversation(
+                self._control_conversation,
+                _DISPATCHER_SESSION_ID,
+            )
+
     def _validate_channel_registry(self) -> None:
         if not self._channels:
             raise RuntimeError("Channel registry 不能为空")
@@ -617,10 +638,6 @@ class _Daemon:
                 raise ValueError("Channel key 必须非空且不能包含首尾空白")
         if self._primary_channel_key not in self._channels:
             raise RuntimeError(f"主 Channel 未注册: {self._primary_channel_key!r}")
-
-    @property
-    def _main_conversation(self) -> ConversationRef:
-        return ConversationRef(self._primary_channel_key, self.cfg.chat_id)
 
     def _channel_for(self, conversation: ConversationRef) -> Channel:
         channel_key = conversation.channel_key().strip()
@@ -2572,9 +2589,6 @@ class _Daemon:
     ) -> None:
         """自然语言 → 调度器 LLM 理解并调用工具派发（P2）。"""
         assert self._llm is not None
-        main_conversation = self._main_conversation
-        if main_conversation.conversation_id:
-            self._bind_conversation(main_conversation, _DISPATCHER_SESSION_ID)
         self._bind_conversation(conversation, _DISPATCHER_SESSION_ID)
 
         async with self._session_turn_lock(_DISPATCHER_SESSION_ID):
@@ -3409,8 +3423,8 @@ class _Daemon:
 
     async def _notify_main(self, text: str) -> None:
         """向控制台主线推一条独立通知（不建话题）——agent 完成/出错/挂起时用。"""
-        conversation = self._main_conversation
-        if not conversation.conversation_id:
+        conversation = self._control_conversation
+        if conversation is None:
             return
         await self._safe_send_text(text, conversation=conversation)
 
