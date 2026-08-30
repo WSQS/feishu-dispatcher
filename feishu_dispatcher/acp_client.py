@@ -17,7 +17,7 @@ import signal
 import sys
 from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import acp
 from acp import text_block
@@ -460,10 +460,13 @@ class _StreamFormatter:
             entries = tuple(
                 AgentPlanEntryUpdate(
                     content=getattr(entry, "content", ""),
-                    status=(
-                        getattr(entry, "status", "")
-                        if getattr(entry, "status", "") in marks
-                        else "pending"
+                    status=cast(
+                        AgentPlanEntryStatus,
+                        (
+                            getattr(entry, "status", "")
+                            if getattr(entry, "status", "") in marks
+                            else "pending"
+                        ),
                     ),
                 )
                 for entry in (getattr(update, "entries", None) or [])

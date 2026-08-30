@@ -14,6 +14,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "playwright>=1.62.0",
+    "pyright>=1.1.411",
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
     "ruff>=0.15.22",
@@ -38,6 +39,12 @@ target-version = "py311"
 
 [tool.ruff.lint]
 extend-select = ["I", "UP035"]
+
+[tool.pyright]
+include = ["feishu_dispatcher"]
+exclude = ["build", "scripts", "tests", "feishu_dispatcher/webui"]
+pythonVersion = "3.11"
+typeCheckingMode = "basic"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

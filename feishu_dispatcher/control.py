@@ -18,13 +18,14 @@ import asyncio
 import json
 import logging
 import threading
-from collections.abc import Awaitable, Callable
+from collections.abc import Callable, Coroutine
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
 #: 路由处理器：async (task_id, body) -> (http_status, response_dict)。在主 loop 上执行。
-RouteHandler = Callable[[str, dict], Awaitable[tuple[int, dict]]]
+RouteHandler = Callable[[str, dict], Coroutine[Any, Any, tuple[int, dict]]]
 #: token → task_id（无效/未知 token 返回 None）
 TokenResolver = Callable[[str], "str | None"]
 
@@ -100,7 +101,7 @@ class ControlServer:
 def _make_handler(cs: ControlServer):
     class _Handler(BaseHTTPRequestHandler):
         # 静音默认往 stderr 打的访问日志（daemon 有自己的日志）
-        def log_message(self, *args) -> None:  # noqa: D401
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002, D401
             return None
 
         def _token(self) -> str:
