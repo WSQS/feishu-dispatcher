@@ -95,6 +95,23 @@ class FakeBridge:
         self.restart_count += 1
         self.stopped = False
 
+    def serialize_conversation_ref(
+        self,
+        conversation: ConversationRef,
+    ) -> dict[str, object]:
+        if conversation.channel_key() != self.channel_key:
+            raise ValueError("ConversationRef 不属于 Fake Channel")
+        return {"conversation_id": conversation.conversation_id}
+
+    def deserialize_conversation_ref(
+        self,
+        payload: dict[str, object],
+    ) -> ConversationRef:
+        conversation_id = payload.get("conversation_id")
+        if not isinstance(conversation_id, str) or not conversation_id.strip():
+            raise ValueError("Fake ConversationRef.conversation_id 不能为空")
+        return ConversationRef(self.channel_key, conversation_id.strip())
+
     def reply_in_thread(self, root_message_id: str, text: str) -> str:
         self.replies.append((root_message_id, text))
         return f"om_reply_{len(self.replies)}"
@@ -563,6 +580,7 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
             route_context,
             session_conversation_header,
             bind_conversation,
+            conversation_ref_serializer,
             throttle_window: float,
         ) -> None:
             super().__init__(channel_key="http")
@@ -575,6 +593,7 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
                 route_context=route_context,
                 session_conversation_header=session_conversation_header,
                 bind_conversation=bind_conversation,
+                conversation_ref_serializer=conversation_ref_serializer,
                 throttle_window=throttle_window,
             )
 
@@ -1947,7 +1966,7 @@ async def test_daemon_persists_session_events_once_across_conversation_fanout(
     trace_path = tmp_path / "session-trace.sqlite"
     trace_store = SessionTraceStore(trace_path)
     daemon, feishu, created = make_daemon(trace_store=trace_store)
-    web = FakeBridge()
+    web = FakeBridge(channel_key="web")
     daemon._channels["web"] = web
 
     await daemon._handle_message(root_msg("/run demo first"))
@@ -1964,7 +1983,10 @@ async def test_daemon_persists_session_events_once_across_conversation_fanout(
             and len(
                 [
                     record
-                    for record in trace_store.read_after(task.session_id)
+                    for record in trace_store.read_after(
+                        task.session_id,
+                        conversation_ref_deserializer=daemon._deserialize_conversation_ref,
+                    )
                     if isinstance(record.event.body, AgentOutputFinished)
                 ]
             )
@@ -1979,7 +2001,10 @@ async def test_daemon_persists_session_events_once_across_conversation_fanout(
 
     assert daemon.trace_store is None
     with SessionTraceStore(trace_path) as reopened:
-        records = reopened.read_after(task.session_id)
+        records = reopened.read_after(
+            task.session_id,
+            conversation_ref_deserializer=daemon._deserialize_conversation_ref,
+        )
 
     assert [record.sequence for record in records] == list(range(1, 9))
     assert [type(record.event.body) for record in records] == [
@@ -4156,7 +4181,10 @@ async def test_dispatcher_events_are_persisted_in_order(tmp_path):
     await daemon._handle_message(root_msg("你好", mid="om_dispatcher_trace"))
     await daemon._wait_dispatcher_events()
 
-    records = trace_store.read_after(_DISPATCHER_SESSION_ID)
+    records = trace_store.read_after(
+        _DISPATCHER_SESSION_ID,
+        conversation_ref_deserializer=daemon._deserialize_conversation_ref,
+    )
     assert consumed_events == [record.event for record in records]
     assert [type(record.event.body) for record in records] == [
         SessionInputAccepted,

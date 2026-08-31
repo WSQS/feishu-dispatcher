@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal, TypeAlias, cast
@@ -9,6 +10,15 @@ from typing import Literal, TypeAlias, cast
 from .conversation import ConversationRef
 
 SESSION_EVENT_SCHEMA_VERSION = 1
+
+ConversationRefSerializer: TypeAlias = Callable[
+    [ConversationRef],
+    dict[str, object],
+]
+ConversationRefDeserializer: TypeAlias = Callable[
+    [str, dict[str, object]],
+    ConversationRef,
+]
 
 OutputStream = Literal["message", "thought"]
 OutputOutcome = Literal["completed", "cancelled", "failed"]
@@ -165,7 +175,11 @@ class SessionEvent:
             raise ValueError("occurred_at 必须使用 UTC 时区")
 
 
-def session_event_to_dict(event: SessionEvent) -> dict[str, object]:
+def session_event_to_dict(
+    event: SessionEvent,
+    *,
+    conversation_ref_serializer: ConversationRefSerializer | None = None,
+) -> dict[str, object]:
     """把 SessionEvent 编码为 V1 JSON 兼容字典。"""
 
     body = event.body
@@ -176,9 +190,16 @@ def session_event_to_dict(event: SessionEvent) -> dict[str, object]:
     if isinstance(body, SessionInputAccepted):
         payload: dict[str, object] = {"text": body.text, "source": None}
         if body.source is not None:
+            if conversation_ref_serializer is None:
+                raise ValueError(
+                    "SessionInputAccepted.source 需要 ConversationRef serializer"
+                )
+            source_payload = conversation_ref_serializer(body.source)
+            if "channel_key" in source_payload:
+                raise ValueError("ConversationRef codec payload 不能包含 channel_key")
             payload["source"] = {
                 "channel_key": body.source.channel_key(),
-                "conversation_id": body.source.conversation_id,
+                **source_payload,
             }
     elif isinstance(body, AgentOutputStarted):
         payload = {}
@@ -229,7 +250,11 @@ def session_event_to_dict(event: SessionEvent) -> dict[str, object]:
     }
 
 
-def session_event_from_dict(record: dict[str, object]) -> SessionEvent:
+def session_event_from_dict(
+    record: dict[str, object],
+    *,
+    conversation_ref_deserializer: ConversationRefDeserializer | None = None,
+) -> SessionEvent:
     """从 V1 JSON 兼容字典解码 SessionEvent。"""
 
     schema_version = record.get("schema_version")
@@ -241,7 +266,11 @@ def session_event_from_dict(record: dict[str, object]) -> SessionEvent:
 
     event_type = _require_string(record, "type")
     payload = _require_dict(record, "payload")
-    body = _decode_body(event_type, payload)
+    body = _decode_body(
+        event_type,
+        payload,
+        conversation_ref_deserializer=conversation_ref_deserializer,
+    )
 
     turn_id_value = record.get("turn_id")
     if turn_id_value is not None and not isinstance(turn_id_value, str):
@@ -262,17 +291,29 @@ def session_event_from_dict(record: dict[str, object]) -> SessionEvent:
     )
 
 
-def _decode_body(event_type: str, payload: dict[str, object]) -> SessionEventBody:
+def _decode_body(
+    event_type: str,
+    payload: dict[str, object],
+    *,
+    conversation_ref_deserializer: ConversationRefDeserializer | None = None,
+) -> SessionEventBody:
     if event_type == "session.input.accepted":
         source_value = payload.get("source")
         source = None
         if source_value is not None:
             if not isinstance(source_value, dict):
                 raise ValueError("source 必须是对象或 null")
-            source = ConversationRef(
-                channel_key=_require_string(source_value, "channel_key"),
-                conversation_id=_require_string(source_value, "conversation_id"),
-            )
+            channel_key = _require_string(source_value, "channel_key")
+            source_payload = {
+                key: value
+                for key, value in source_value.items()
+                if key != "channel_key"
+            }
+            if conversation_ref_deserializer is None:
+                raise ValueError(
+                    "SessionInputAccepted.source 需要 ConversationRef deserializer"
+                )
+            source = conversation_ref_deserializer(channel_key, source_payload)
         return SessionInputAccepted(
             text=_require_string(payload, "text"),
             source=source,

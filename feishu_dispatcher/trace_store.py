@@ -8,7 +8,13 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from .session_event import SessionEvent, session_event_from_dict, session_event_to_dict
+from .session_event import (
+    ConversationRefDeserializer,
+    ConversationRefSerializer,
+    SessionEvent,
+    session_event_from_dict,
+    session_event_to_dict,
+)
 
 
 @dataclass(frozen=True)
@@ -61,7 +67,13 @@ class SessionTraceStore:
     def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
         self.close()
 
-    def append(self, event: SessionEvent) -> SessionTraceRecord:
+    def append(
+        self,
+        event: SessionEvent,
+        *,
+        conversation_ref_serializer: ConversationRefSerializer | None = None,
+        conversation_ref_deserializer: ConversationRefDeserializer | None = None,
+    ) -> SessionTraceRecord:
         _validate_session_id(event.session_id)
         with self._lock:
             self._connection.execute("BEGIN IMMEDIATE")
@@ -75,7 +87,10 @@ class SessionTraceStore:
                     (event.session_id, event.event_id),
                 ).fetchone()
                 if existing is not None:
-                    record = self._record_from_row(existing)
+                    record = self._record_from_row(
+                        existing,
+                        conversation_ref_deserializer=conversation_ref_deserializer,
+                    )
                     if record.event != event:
                         raise ValueError("event_id 已存在但对应的 SessionEvent 不一致")
                     self._connection.execute("COMMIT")
@@ -90,7 +105,10 @@ class SessionTraceStore:
                     (event.session_id,),
                 ).fetchone()[0]
                 event_json = json.dumps(
-                    session_event_to_dict(event),
+                    session_event_to_dict(
+                        event,
+                        conversation_ref_serializer=conversation_ref_serializer,
+                    ),
                     ensure_ascii=False,
                     separators=(",", ":"),
                 )
@@ -114,6 +132,7 @@ class SessionTraceStore:
         *,
         after: int = 0,
         limit: int = 100,
+        conversation_ref_deserializer: ConversationRefDeserializer | None = None,
     ) -> tuple[SessionTraceRecord, ...]:
         _validate_session_id(session_id)
         if after < 0:
@@ -131,7 +150,13 @@ class SessionTraceStore:
                 """,
                 (session_id, after, limit),
             ).fetchall()
-        return tuple(self._record_from_row(row) for row in rows)
+        return tuple(
+            self._record_from_row(
+                row,
+                conversation_ref_deserializer=conversation_ref_deserializer,
+            )
+            for row in rows
+        )
 
     def read_before(
         self,
@@ -139,6 +164,7 @@ class SessionTraceStore:
         *,
         before: int | None = None,
         limit: int = 100,
+        conversation_ref_deserializer: ConversationRefDeserializer | None = None,
     ) -> tuple[SessionTraceRecord, ...]:
         _validate_session_id(session_id)
         if before is not None and before <= 0:
@@ -158,7 +184,13 @@ class SessionTraceStore:
         parameters += (limit,)
         with self._lock:
             rows = self._connection.execute(query, parameters).fetchall()
-        return tuple(self._record_from_row(row) for row in reversed(rows))
+        return tuple(
+            self._record_from_row(
+                row,
+                conversation_ref_deserializer=conversation_ref_deserializer,
+            )
+            for row in reversed(rows)
+        )
 
     def sequence_bounds(self, session_id: str) -> tuple[int | None, int | None]:
         _validate_session_id(session_id)
@@ -180,6 +212,7 @@ class SessionTraceStore:
         before: int | None = None,
         after: int | None = None,
         limit: int = 100,
+        conversation_ref_deserializer: ConversationRefDeserializer | None = None,
     ) -> SessionTracePage:
         _validate_session_id(session_id)
         if before is not None and after is not None:
@@ -192,15 +225,21 @@ class SessionTraceStore:
                     session_id,
                     before=before,
                     limit=limit,
+                    conversation_ref_deserializer=conversation_ref_deserializer,
                 )
             elif after is not None:
                 records = self.read_after(
                     session_id,
                     after=after,
                     limit=limit,
+                    conversation_ref_deserializer=conversation_ref_deserializer,
                 )
             else:
-                records = self.read_before(session_id, limit=limit)
+                records = self.read_before(
+                    session_id,
+                    limit=limit,
+                    conversation_ref_deserializer=conversation_ref_deserializer,
+                )
             oldest, latest = self.sequence_bounds(session_id)
         return SessionTracePage(
             records=records,
@@ -224,9 +263,16 @@ class SessionTraceStore:
             )
 
     @staticmethod
-    def _record_from_row(row: tuple[int, str]) -> SessionTraceRecord:
+    def _record_from_row(
+        row: tuple[int, str],
+        *,
+        conversation_ref_deserializer: ConversationRefDeserializer | None = None,
+    ) -> SessionTraceRecord:
         sequence, event_json = row
-        event = session_event_from_dict(json.loads(event_json))
+        event = session_event_from_dict(
+            json.loads(event_json),
+            conversation_ref_deserializer=conversation_ref_deserializer,
+        )
         return SessionTraceRecord(sequence=sequence, event=event)
 
 

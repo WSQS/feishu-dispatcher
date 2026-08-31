@@ -375,6 +375,7 @@ async def run(
                 },
                 session_conversation_header=daemon.session_conversation_header,
                 bind_conversation=daemon.bind_conversation,
+                conversation_ref_serializer=daemon._serialize_conversation_ref,
                 throttle_window=cfg.throttle_window,
             )
         except BaseException:
@@ -651,6 +652,26 @@ class _Daemon:
         except KeyError as exc:
             raise RuntimeError(f"Channel 未注册: {channel_key!r}") from exc
 
+    def _serialize_conversation_ref(
+        self,
+        conversation: ConversationRef,
+    ) -> dict[str, object]:
+        return self._channel_for(conversation).serialize_conversation_ref(conversation)
+
+    def _deserialize_conversation_ref(
+        self,
+        channel_key: str,
+        payload: dict[str, object],
+    ) -> ConversationRef:
+        channel_key = channel_key.strip()
+        if not channel_key:
+            raise ValueError("Conversation 缺少 channel_key")
+        try:
+            channel = self._channels[channel_key]
+        except KeyError as exc:
+            raise ValueError(f"Channel 未注册: {channel_key!r}") from exc
+        return channel.deserialize_conversation_ref(payload)
+
     def _reserve_agent_slot(self) -> bool:
         if self._runners.count() + self._pending_agent_launches >= self.cfg.max_agents:
             return False
@@ -801,7 +822,12 @@ class _Daemon:
         record = None
         if self.trace_store is not None:
             try:
-                record = await asyncio.to_thread(self.trace_store.append, event)
+                record = await asyncio.to_thread(
+                    self.trace_store.append,
+                    event,
+                    conversation_ref_serializer=self._serialize_conversation_ref,
+                    conversation_ref_deserializer=self._deserialize_conversation_ref,
+                )
             except Exception:
                 logger.exception(
                     "SessionEvent 持久化失败 event=%s",
@@ -2824,6 +2850,7 @@ class _Daemon:
                 before=before,
                 after=after,
                 limit=limit,
+                conversation_ref_deserializer=self._deserialize_conversation_ref,
             )
         except SessionTraceStoreClosed:
             return 503, {"error": "trace_unavailable"}
@@ -2832,7 +2859,10 @@ class _Daemon:
             "events": [
                 {
                     "sequence": record.sequence,
-                    "event": session_event_to_dict(record.event),
+                    "event": session_event_to_dict(
+                        record.event,
+                        conversation_ref_serializer=self._serialize_conversation_ref,
+                    ),
                 }
                 for record in page.records
             ],

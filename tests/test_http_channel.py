@@ -1029,8 +1029,18 @@ async def test_thread_reply_session_event_output_and_restart():
 
 
 async def test_session_input_event_projects_to_thread_message():
+    serialized: list[ConversationRef] = []
+
+    def serialize(conversation: ConversationRef) -> dict[str, object]:
+        serialized.append(conversation)
+        return {"opaque_id": conversation.conversation_id}
+
     channel = HttpChannel(
-        "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
+        "tok-http",
+        asyncio.get_running_loop(),
+        host="127.0.0.1",
+        port=0,
+        conversation_ref_serializer=serialize,
     )
 
     async def ignore(_message: ChannelMessage) -> None:
@@ -1063,9 +1073,20 @@ async def test_session_input_event_projects_to_thread_message():
         assert raw_event == {
             "cursor": 2,
             "type": "session.event",
-            "event": session_event_to_dict(event),
+            "event": session_event_to_dict(
+                event,
+                conversation_ref_serializer=serialize,
+            ),
             "trace_sequence": 42,
         }
+        assert raw_event["event"]["payload"]["source"] == {
+            "channel_key": "feishu",
+            "opaque_id": "om_root",
+        }
+        assert serialized == [
+            ConversationRef("feishu", "om_root"),
+            ConversationRef("feishu", "om_root"),
+        ]
         projected = events["events"][2]
         assert projected["type"] == "message.created"
         assert projected["text"] == "↪️ 同步自 feishu：检查状态"
