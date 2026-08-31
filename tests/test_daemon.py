@@ -84,6 +84,8 @@ class FakeBridge:
         self.plain = self.sent_texts
         self.session_events: list[tuple[ConversationRef, SessionEvent]] = []
         self.session_event_trace_sequences: list[int | None] = []
+        self.pending_output_counts: dict[ConversationRef, int] = {}
+        self.active_output_turns: set[tuple[ConversationRef, str, str]] = set()
 
     def start(self, on_message) -> None:
         self.start_count += 1
@@ -142,18 +144,36 @@ class FakeBridge:
         self.session_events.append((conversation, event))
         self.session_event_trace_sequences.append(trace_sequence)
         body = event.body
+        turn_key = (
+            (conversation, event.session_id, event.turn_id)
+            if event.turn_id is not None
+            else None
+        )
+        if isinstance(body, AgentOutputStarted):
+            pending = self.pending_output_counts.get(conversation, 0)
+            if pending and turn_key is not None:
+                if pending == 1:
+                    self.pending_output_counts.pop(conversation)
+                else:
+                    self.pending_output_counts[conversation] = pending - 1
+                self.active_output_turns.add(turn_key)
+            return
+        if isinstance(body, AgentOutputDelta):
+            if (
+                turn_key not in self.active_output_turns
+                and body.stream == "message"
+                and body.text
+            ):
+                self.send_text(conversation, body.text)
+            return
         if isinstance(body, AgentOutputFinished):
-            if event.session_id == _DISPATCHER_SESSION_ID and body.message:
-                self.send_text(conversation, body.message)
+            if turn_key is not None:
+                self.active_output_turns.discard(turn_key)
             return
         if not isinstance(body, SessionInputAccepted):
             if isinstance(
                 body,
-                (
-                    AgentOutputStarted,
-                    AgentOutputDelta,
-                    AgentPlanUpdated,
-                ),
+                (AgentPlanUpdated,),
             ):
                 return
             if isinstance(body, ToolCallObserved):
@@ -168,6 +188,9 @@ class FakeBridge:
     def open_output(
         self, conversation: ConversationRef, title: str, *, footer: str = ""
     ) -> StreamingOutput:
+        self.pending_output_counts[conversation] = (
+            self.pending_output_counts.get(conversation, 0) + 1
+        )
         target_id = conversation.conversation_id
         if self.stream_mode == "card":
             return LiveCard(self, target_id, title, footer=footer)
@@ -4068,10 +4091,12 @@ async def test_dispatcher_root_turns_sync_between_channels():
     assert [type(event.body) for _, event in feishu.session_events] == [
         SessionInputAccepted,
         AgentOutputStarted,
+        AgentOutputDelta,
         AgentOutputFinished,
     ]
     assert [type(event.body) for _, event in web.session_events] == [
         AgentOutputStarted,
+        AgentOutputDelta,
         AgentOutputFinished,
     ]
 
@@ -4092,15 +4117,19 @@ async def test_dispatcher_root_turns_sync_between_channels():
     assert [type(event.body) for _, event in feishu.session_events] == [
         SessionInputAccepted,
         AgentOutputStarted,
+        AgentOutputDelta,
         AgentOutputFinished,
         AgentOutputStarted,
+        AgentOutputDelta,
         AgentOutputFinished,
     ]
     assert [type(event.body) for _, event in web.session_events] == [
         AgentOutputStarted,
+        AgentOutputDelta,
         AgentOutputFinished,
         SessionInputAccepted,
         AgentOutputStarted,
+        AgentOutputDelta,
         AgentOutputFinished,
     ]
     assert daemon._sched_memory.history() == [
@@ -4275,23 +4304,30 @@ async def test_dispatcher_events_are_persisted_in_order(tmp_path):
         SessionInputAccepted,
         SessionStateChanged,
         AgentOutputStarted,
+        AgentOutputDelta,
         AgentOutputFinished,
         SessionStateChanged,
     ]
     assert records[0].event.turn_id == records[2].event.turn_id
     assert records[2].event.turn_id == records[3].event.turn_id
+    assert records[3].event.turn_id == records[4].event.turn_id
     assert records[1].event.turn_id is None
-    assert records[4].event.turn_id is None
-    assert records[3].event.body == AgentOutputFinished(
+    assert records[5].event.turn_id is None
+    assert records[3].event.body == AgentOutputDelta(
+        stream="message",
+        text="收到",
+    )
+    assert records[4].event.body == AgentOutputFinished(
         message="收到",
         thought="",
         outcome="completed",
     )
     assert [type(event.body) for _, event in bridge.session_events] == [
         AgentOutputStarted,
+        AgentOutputDelta,
         AgentOutputFinished,
     ]
-    assert bridge.session_event_trace_sequences == [3, 4]
+    assert bridge.session_event_trace_sequences == [3, 4, 5]
     await daemon._shutdown()
 
 

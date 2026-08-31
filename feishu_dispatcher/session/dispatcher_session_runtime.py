@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from ..conversation import ConversationRef
 from ..scheduler import LLMClient, SchedulerMemory, ToolSpec, run_tool_loop
 from ..session_event import (
+    AgentOutputDelta,
     AgentOutputFinished,
     AgentOutputStarted,
     OutputOutcome,
@@ -182,6 +183,10 @@ class DispatcherSessionRuntime(SessionRuntime):
             self._memory.add_turn(turn)
         else:
             self._memory.add_exchange(request.text, reply)
+        self._emit_event(
+            request.turn_id,
+            AgentOutputDelta(stream="message", text=reply),
+        )
         self._emit_event(
             request.turn_id,
             AgentOutputFinished(message=reply, thought="", outcome=outcome),
