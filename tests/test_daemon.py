@@ -606,7 +606,7 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
             routes,
             route_context,
             session_conversation_header,
-            bind_conversation,
+            open_session_conversation,
             conversation_ref_serializer,
             throttle_window: float,
         ) -> None:
@@ -619,7 +619,7 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
                 routes=routes,
                 route_context=route_context,
                 session_conversation_header=session_conversation_header,
-                bind_conversation=bind_conversation,
+                open_session_conversation=open_session_conversation,
                 conversation_ref_serializer=conversation_ref_serializer,
                 throttle_window=throttle_window,
             )
@@ -666,7 +666,7 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
     assert callable(route_context["all_projects"])
     assert isinstance(route_context["scan_executor"], daemon_module.ScanExecutor)
     assert callable(constructed["session_conversation_header"])
-    assert callable(constructed["bind_conversation"])
+    assert callable(constructed["open_session_conversation"])
     await route_context["scan_executor"].aclose()
 
 
@@ -1127,7 +1127,7 @@ async def test_http_create_task_conversation_validates_request_and_task_state():
         host="127.0.0.1",
         port=0,
         session_conversation_header=daemon.session_conversation_header,
-        bind_conversation=daemon.bind_conversation,
+        open_session_conversation=daemon.open_session_conversation,
     )
     daemon._channels["http"] = http
 
@@ -1193,7 +1193,7 @@ async def test_http_create_task_conversation_creates_thread_and_binds_task():
         host="127.0.0.1",
         port=0,
         session_conversation_header=daemon.session_conversation_header,
-        bind_conversation=daemon.bind_conversation,
+        open_session_conversation=daemon.open_session_conversation,
     )
     daemon._channels["http"] = http
 
@@ -1231,6 +1231,71 @@ async def test_http_create_task_conversation_creates_thread_and_binds_task():
 
 
 @pytest.mark.asyncio
+async def test_http_create_manager_conversation_uses_session_identity_prefix():
+    daemon, _, _ = make_daemon()
+    daemon._llm = ScriptedLLM([LLMResponse(content="manager reply")])
+    http = HttpChannel(
+        "tok-http",
+        asyncio.get_running_loop(),
+        host="127.0.0.1",
+        port=0,
+        session_conversation_header=daemon.session_conversation_header,
+        open_session_conversation=daemon.open_session_conversation,
+    )
+    daemon._channels["http"] = http
+
+    async def handle(message: ChannelMessage) -> None:
+        await daemon._handle_channel_message(message)
+
+    http.start(handle)
+    try:
+        status, payload = await asyncio.to_thread(
+            http_channel_request,
+            "POST",
+            http.base_url + "/api/tasks/manager:demo/conversations",
+            "tok-http",
+            None,
+        )
+
+        assert status == 201
+        assert payload["task_id"] == "manager:demo"
+        conversation = HttpConversationRef(payload["conversation_id"])
+        assert daemon._session_id_for_conversation(conversation) == "manager:demo"
+        events = http._events_after(conversation.conversation_id, 0)["events"]
+        assert events[0]["type"] == "conversation.created"
+        assert events[0]["text"] == "🧭 Project Manager · demo"
+
+        accepted_status, accepted = await asyncio.to_thread(
+            http_channel_request,
+            "POST",
+            http.base_url + "/api/channel/messages",
+            "tok-http",
+            {
+                "conversation_id": conversation.conversation_id,
+                "message_id": "manager-message",
+                "sender_id": "web-user",
+                "text": "检查项目状态",
+            },
+        )
+        assert accepted_status == 202
+        assert accepted == {"accepted": True}
+
+        runtime = daemon._get_project_manager_runtime("demo")
+        await runtime.wait_idle()
+        await daemon._wait_runtime_events(runtime.session_id)
+
+        output_events = http._events_after(conversation.conversation_id, 0)["events"]
+        assert any(
+            event["type"] == "session.event"
+            and event["event"]["type"] == "agent.output.delta"
+            and event["event"]["payload"]["text"] == "manager reply"
+            for event in output_events
+        )
+    finally:
+        http.stop()
+
+
+@pytest.mark.asyncio
 async def test_http_task_conversation_round_trip_routes_to_existing_runner():
     daemon, feishu, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo first"))
@@ -1248,7 +1313,7 @@ async def test_http_task_conversation_round_trip_routes_to_existing_runner():
         host="127.0.0.1",
         port=0,
         session_conversation_header=daemon.session_conversation_header,
-        bind_conversation=daemon.bind_conversation,
+        open_session_conversation=daemon.open_session_conversation,
         throttle_window=0.01,
     )
     daemon._channels["http"] = http
