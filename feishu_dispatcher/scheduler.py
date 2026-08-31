@@ -217,6 +217,11 @@ async def run_tool_loop(
     system_prompt: str = SYSTEM_PROMPT,
     history: list[dict[str, Any]] | None = None,
     max_iters: int = 6,
+    max_iterations_reply: str = (
+        "（调度器思考步数超限，请把需求说得更具体，"
+        "或用 `/run <项目> <任务>` 直接派发。）"
+    ),
+    log_context: str = "调度器",
 ) -> tuple[str, list[dict[str, Any]]]:
     """驱动 LLM 工具循环，返回 ``(给用户的最终文本, 本轮完整消息序列)``。
 
@@ -225,8 +230,8 @@ async def run_tool_loop(
     :class:`SchedulerMemory`）。下次作为 ``history`` 回喂时，模型能看到自己真实的工具
     调用史，而非只有「口头说做了」的文本——后者会训练模型幻觉工具调用（说了不做）。
 
-    ``history`` 是主线之前若干轮的消息（拍平），插在 system 之后、本轮 user 之前，
-    给调度器跨消息的上下文（追问/修正/指代）。
+    ``history`` 是当前 Session 之前若干轮的消息（拍平），插在 system 之后、
+    本轮 user 之前，为本次工具循环提供跨消息上下文（追问/修正/指代）。
 
     每轮：LLM 应答 → 若无工具调用则收尾；否则执行每个工具、把结果作为 ``role=tool``
     消息喂回，继续下一轮。达到 ``max_iters`` 仍未收敛则兜底。工具 handler 抛异常不会
@@ -246,7 +251,7 @@ async def run_tool_loop(
             # 诊断：LLM 未调任何工具直接收尾——若用户本想「派发/发消息」，这里就能
             # 看出它其实什么都没做（只回了话），是排查「说了没做」的关键信号。
             final = resp.content or ""
-            logger.info("调度器收尾（无工具调用）: %s", _short(final))
+            logger.info("%s 收尾（无工具调用）: %s", log_context, _short(final))
             messages.append({"role": "assistant", "content": final})
             return final, messages[turn_start:]
         messages.append(
@@ -274,18 +279,19 @@ async def run_tool_loop(
                 try:
                     result = await spec.handler(tc.arguments)
                 except Exception as exc:  # 喂回 LLM，让它决定怎么办
-                    logger.exception("调度器工具 %s 执行失败", tc.name)
+                    logger.exception("%s 工具 %s 执行失败", log_context, tc.name)
                     result = f"工具 {tc.name} 执行出错: {exc}"
             # 诊断：记下 LLM 到底调了哪个工具、参数、返回什么——排查「发消息不生效」
             # 时能直接看出它有没有真的调 send_to_task、用的哪个 task_id、结果如何。
             logger.info(
-                "调度器工具 %s(%s) -> %s",
+                "%s 工具 %s(%s) -> %s",
+                log_context,
                 tc.name,
                 _short(tc.arguments),
                 _short(result),
             )
             messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
-    final = "（调度器思考步数超限，请把需求说得更具体，或用 `/run <项目> <任务>` 直接派发。）"
+    final = max_iterations_reply
     messages.append({"role": "assistant", "content": final})
     return final, messages[turn_start:]
 
