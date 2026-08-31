@@ -1370,7 +1370,7 @@ def test_http_channel_rejects_blank_token():
 def test_http_channel_requires_session_conversation_callbacks_as_a_pair():
     loop = asyncio.new_event_loop()
     try:
-        with pytest.raises(ValueError, match="标题与绑定回调必须同时提供"):
+        with pytest.raises(ValueError, match="标题与打开回调必须同时提供"):
             HttpChannel(
                 "tok-http",
                 loop,
@@ -1378,13 +1378,13 @@ def test_http_channel_requires_session_conversation_callbacks_as_a_pair():
                 port=0,
                 session_conversation_header=lambda _session_id: "header",
             )
-        with pytest.raises(ValueError, match="标题与绑定回调必须同时提供"):
+        with pytest.raises(ValueError, match="标题与打开回调必须同时提供"):
             HttpChannel(
                 "tok-http",
                 loop,
                 host="127.0.0.1",
                 port=0,
-                bind_conversation=lambda _session_id, _conversation: None,
+                open_session_conversation=lambda _session_id, _conversation: None,
             )
     finally:
         loop.close()
@@ -1409,7 +1409,7 @@ def test_http_channel_rejects_duplicate_task_conversation_route():
                     ): route,
                 },
                 session_conversation_header=lambda _session_id: "header",
-                bind_conversation=lambda _session_id, _conversation: None,
+                open_session_conversation=lambda _session_id, _conversation: None,
             )
     finally:
         loop.close()

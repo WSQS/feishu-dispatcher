@@ -57,7 +57,7 @@ _DISPATCH_TIMEOUT = 30.0
 
 RouteHandler = Callable[[dict, dict], Coroutine[Any, Any, tuple[int, dict]]]
 SessionConversationHeaderProvider = Callable[[str], str]
-ConversationBinder = Callable[[str, ConversationRef], str | None]
+SessionConversationOpener = Callable[[str, ConversationRef], str | None]
 
 _CREATE_TASK_CONVERSATION_ROUTE = (
     "POST",
@@ -144,7 +144,7 @@ class HttpChannel:
         routes: dict[tuple[str, str], RouteHandler] | None = None,
         route_context: dict | None = None,
         session_conversation_header: SessionConversationHeaderProvider | None = None,
-        bind_conversation: ConversationBinder | None = None,
+        open_session_conversation: SessionConversationOpener | None = None,
         conversation_ref_serializer: ConversationRefSerializer | None = None,
         throttle_window: float = 0.5,
         max_conversations: int = _DEFAULT_MAX_CONVERSATIONS,
@@ -159,8 +159,8 @@ class HttpChannel:
             raise ValueError("max_events 必须大于 0")
         if max_targets <= 0:
             raise ValueError("max_targets 必须大于 0")
-        if (session_conversation_header is None) != (bind_conversation is None):
-            raise ValueError("Session Conversation 标题与绑定回调必须同时提供")
+        if (session_conversation_header is None) != (open_session_conversation is None):
+            raise ValueError("Session Conversation 标题与打开回调必须同时提供")
         self._token = token
         self._loop = main_loop
         self._host = host
@@ -174,7 +174,7 @@ class HttpChannel:
             )
         self._route_context = dict(route_context or {})
         self._session_conversation_header = session_conversation_header
-        self._bind_conversation = bind_conversation
+        self._open_session_conversation = open_session_conversation
         self._conversation_ref_serializer = conversation_ref_serializer
         self._max_conversations = max_conversations
         self._max_events = max_events
@@ -306,8 +306,8 @@ class HttpChannel:
     ) -> tuple[int, dict]:
         session_id = request["segments"]["task_id"]
         header_provider = self._session_conversation_header
-        binder = self._bind_conversation
-        if header_provider is None or binder is None:
+        opener = self._open_session_conversation
+        if header_provider is None or opener is None:
             return 503, {"error": "channel_unavailable"}
         try:
             header = header_provider(session_id)
@@ -316,7 +316,7 @@ class HttpChannel:
 
         conversation = self.create_thread(header)
         try:
-            terminal_status = binder(session_id, conversation)
+            terminal_status = opener(session_id, conversation)
         except ValueError:
             self._rollback_conversation(conversation)
             return 404, {"error": "task_not_found", "task_id": session_id}

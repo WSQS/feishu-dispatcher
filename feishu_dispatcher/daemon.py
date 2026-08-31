@@ -383,7 +383,7 @@ async def run(
                     "scan_executor": scan_executor,
                 },
                 session_conversation_header=daemon.session_conversation_header,
-                bind_conversation=daemon.bind_conversation,
+                open_session_conversation=daemon.open_session_conversation,
                 conversation_ref_serializer=daemon._serialize_conversation_ref,
                 throttle_window=cfg.throttle_window,
             )
@@ -746,10 +746,28 @@ class _Daemon:
 
     def session_conversation_header(self, session_id: str) -> str:
         """返回 Session 新 Conversation 的展示标题。"""
+        if session_id.startswith(_PROJECT_MANAGER_SESSION_PREFIX):
+            project_name = session_id.removeprefix(_PROJECT_MANAGER_SESSION_PREFIX)
+            project = self._resolve_project(project_name)
+            if project is None:
+                raise ValueError(f"项目不存在: {project_name}")
+            return f"🧭 Project Manager · {project.name}"
         session = self.store.get(session_id)
         if session is None:
             raise ValueError(f"Session 不存在: {session_id}")
         return f"[{session.session_id}] {session.description}"
+
+    def open_session_conversation(
+        self,
+        session_id: str,
+        conversation: ConversationRef,
+    ) -> str | None:
+        """按 Session 身份打开并绑定一个 Channel Conversation。"""
+        if session_id.startswith(_PROJECT_MANAGER_SESSION_PREFIX):
+            project_name = session_id.removeprefix(_PROJECT_MANAGER_SESSION_PREFIX)
+            self.open_project_manager(project_name, conversation)
+            return None
+        return self.bind_conversation(session_id, conversation)
 
     def _session_turn_lock(self, session_id: str) -> asyncio.Lock:
         """返回 Session 身份对应的进程内 Turn 锁。"""
