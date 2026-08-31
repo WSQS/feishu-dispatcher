@@ -112,6 +112,7 @@ _MODELS_CMD = "/models"  # root：/models 列缓存，/models refresh [agent] �
 _LLM_CMD = "/llm"  # root：/llm 列出调度器 LLM profile，/llm <名> 运行时切换（#74）
 _REBOOT_CMD = "/reboot"  # root：重启整个 daemon 进程（cli.py re-exec）
 _ATTACH_CMD = "/attach"  # root：附着 daemon 外部的 agent 会话为新 Task
+_MANAGER_CMD = "/manager"  # root：创建项目 Manager Conversation
 _HELP_CMDS = ("/help", "/?", "/usage")  # root 与话题内通用
 
 #: 环境变量：re-exec 重启时置位，新进程据此发「已重启」回执
@@ -129,6 +130,7 @@ _USAGE = (
     "• `/run <项目名> <任务描述> [--agent <名>]`  派发任务给 agent（可选覆盖默认 agent）\n"
     "• `/attach <项目名> <agent> <session_id> [描述]`  附着外部 agent 会话为新任务"
     "（假定原会话已停止）\n"
+    "• `/manager <项目名>`  创建该项目的 Project Manager 话题\n"
     "• `/agents`  列出活跃 + 历史任务\n"
     "• `/task <任务id>`  查看某任务详情与动作日志\n"
     "• `/project`  列出项目；`/project add <名> <agent> <路径>` 注册，`/project remove <名>` 删除\n"
@@ -1310,6 +1312,13 @@ class _Daemon:
                 text[len(_ATTACH_CMD) :].strip(),
                 conversation=conversation,
             )
+        elif conversation.channel_key() == "feishu" and (
+            text == _MANAGER_CMD or text.startswith(_MANAGER_CMD + " ")
+        ):
+            await self._open_project_manager_for_root(
+                text[len(_MANAGER_CMD) :].strip(),
+                conversation=conversation,
+            )
         elif text.startswith(_TASK_PREFIX):
             await self._show_task(
                 msg,
@@ -1748,6 +1757,52 @@ class _Daemon:
             f"🚀 [{new_task.session_id}] 启动 {agent_label} 处理项目 "
             f"{project_name}…\n任务: {task}",
             conversation=session_conversation,
+        )
+
+    async def _open_project_manager_for_root(
+        self,
+        arg: str,
+        *,
+        conversation: ConversationRef,
+    ) -> None:
+        """解析 ``/manager <项目名>``，创建并绑定项目 Manager 话题。"""
+        usage = "格式：`/manager <项目名>`"
+        project_name = arg.strip()
+        if not project_name:
+            await self._send_user(usage, conversation=conversation)
+            return
+        project = self._resolve_project(project_name)
+        if project is None:
+            known = ", ".join(self._all_projects()) or "(无)"
+            await self._send_user(
+                f"未知项目 '{project_name}'。已知项目: {known}",
+                conversation=conversation,
+            )
+            return
+
+        manager_session_id = self._project_manager_session_id(project.name)
+        header = self.session_conversation_header(manager_session_id)
+        channel = self._channel_for(conversation)
+        try:
+            runtime = self._get_project_manager_runtime(project.name)
+            manager_conversation = await asyncio.to_thread(
+                channel.create_thread,
+                header,
+            )
+            self.bind_conversation(runtime.session_id, manager_conversation)
+        except Exception as exc:
+            logger.exception(
+                "创建项目 Manager Conversation 失败 project=%s",
+                project.name,
+            )
+            await self._send_user(
+                f"⚠️ 创建项目 {project.name} 的 Manager 话题失败：{str(exc)[:200]}",
+                conversation=conversation,
+            )
+            return
+        await self._send_user(
+            f"✅ 已创建项目 {project.name} 的 Manager 话题，请在新话题中继续对话。",
+            conversation=conversation,
         )
 
     async def _attach_for_root(

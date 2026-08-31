@@ -4599,6 +4599,63 @@ def test_project_manager_conversation_conflict_does_not_create_runtime():
     assert "demo" not in daemon._project_manager_memories
 
 
+async def test_manager_command_creates_feishu_conversation_and_routes_messages():
+    daemon, bridge, _ = make_daemon()
+    daemon._llm = ScriptedLLM([LLMResponse(content="manager reply")])
+
+    await daemon._handle_message(root_msg("/manager demo"))
+
+    manager_conversation = ConversationRef("feishu", "om_root1")
+    assert bridge.created_threads == [
+        ("oc_1", "🧭 Project Manager · demo"),
+    ]
+    assert daemon._session_id_for_conversation(manager_conversation) == "manager:demo"
+    assert any(
+        "已创建项目 demo 的 Manager 话题" in text
+        for target, text in bridge.sent_texts
+        if target == "oc_1"
+    )
+
+    await daemon._handle_message(thread_msg("检查项目状态"))
+    runtime = daemon._get_project_manager_runtime("demo")
+    await runtime.wait_idle()
+    await daemon._wait_runtime_events(runtime.session_id)
+
+    assert ("om_root1", "manager reply") in bridge.sent_texts
+
+
+@pytest.mark.parametrize(
+    ("command", "expected"),
+    [
+        ("/manager", "格式"),
+        ("/manager missing", "未知项目"),
+    ],
+)
+async def test_manager_command_rejects_invalid_project(command: str, expected: str):
+    daemon, bridge, _ = make_daemon()
+
+    await daemon._handle_message(root_msg(command))
+
+    assert bridge.created_threads == []
+    assert any(
+        expected in text for target, text in bridge.sent_texts if target == "oc_1"
+    )
+    assert daemon._session_runtimes.values() == []
+
+
+async def test_manager_command_is_only_available_on_feishu_channel():
+    daemon, _, _ = make_daemon()
+    web = FakeBridge(channel_key="web")
+    daemon._channels["web"] = web
+
+    await daemon._handle_channel_message(
+        root_msg("/manager demo", channel_key="web", conversation_id="web-root")
+    )
+
+    assert web.created_threads == []
+    assert daemon._session_runtimes.values() == []
+
+
 def test_register_session_runtime_subscribes_once():
     daemon, _, _ = make_daemon()
 
