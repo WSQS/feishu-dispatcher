@@ -56,9 +56,8 @@ class DispatcherSessionRuntime(SessionRuntime):
         self._state: SessionState = "idle"
         self._listeners: list[SessionEventListener] = []
         self._pending: deque[TurnRequest] = deque()
-        self._results: dict[str, asyncio.Future[str]] = {}
         self._worker: asyncio.Task[None] | None = None
-        self._current_task: asyncio.Task[str] | None = None
+        self._current_task: asyncio.Task[None] | None = None
         self._idle = asyncio.Event()
         self._idle.set()
         self._closed = False
@@ -89,8 +88,6 @@ class DispatcherSessionRuntime(SessionRuntime):
             raise RuntimeError(f"Session {self.session_id} 已关闭")
         if not request.text:
             raise ValueError("TurnRequest.text 不能为空")
-        if request.turn_id in self._results:
-            raise ValueError(f"turn_id 已存在: {request.turn_id}")
 
         self._emit_event(
             request.turn_id,
@@ -99,7 +96,6 @@ class DispatcherSessionRuntime(SessionRuntime):
         placement = (
             "current" if self._current_task is None and not self._pending else "pending"
         )
-        self._results[request.turn_id] = asyncio.get_running_loop().create_future()
         self._pending.append(request)
         self._idle.clear()
         self._ensure_worker()
@@ -107,22 +103,6 @@ class DispatcherSessionRuntime(SessionRuntime):
             turn=TurnRef(self.session_id, request.turn_id),
             placement=placement,
         )
-
-    async def wait_turn(self, turn: TurnRef) -> str:
-        """等待指定 Dispatcher Turn 完成并返回回复。"""
-        if turn.session_id != self.session_id:
-            raise ValueError(
-                f"Turn 不属于 Session {self.session_id}: {turn.session_id}"
-            )
-        try:
-            future = self._results[turn.turn_id]
-        except KeyError as exc:
-            raise ValueError(f"未知 turn_id: {turn.turn_id}") from exc
-        try:
-            return await asyncio.shield(future)
-        finally:
-            if future.done():
-                self._results.pop(turn.turn_id, None)
 
     async def cancel(self) -> None:
         """取消当前 Dispatcher Turn；无当前 Turn 时幂等。"""
@@ -140,9 +120,6 @@ class DispatcherSessionRuntime(SessionRuntime):
             return
         self._closed = True
         self._pending.clear()
-        for future in self._results.values():
-            if not future.done():
-                future.cancel()
         await self.cancel()
         if self._worker is not None:
             await self._worker
@@ -157,12 +134,11 @@ class DispatcherSessionRuntime(SessionRuntime):
         try:
             while self._pending and not self._closed:
                 request = self._pending.popleft()
-                future = self._results[request.turn_id]
                 self._set_state("running")
                 self._emit_event(request.turn_id, AgentOutputStarted())
                 self._current_task = asyncio.create_task(self._execute_turn(request))
                 try:
-                    result = await self._current_task
+                    await self._current_task
                 except asyncio.CancelledError:
                     self._emit_event(
                         request.turn_id,
@@ -172,18 +148,13 @@ class DispatcherSessionRuntime(SessionRuntime):
                             outcome="cancelled",
                         ),
                     )
-                    if not future.done():
-                        future.cancel()
-                else:
-                    if not future.done():
-                        future.set_result(result)
                 finally:
                     self._current_task = None
         finally:
             self._set_state("stopped" if self._closed else "idle")
             self._idle.set()
 
-    async def _execute_turn(self, request: TurnRequest) -> str:
+    async def _execute_turn(self, request: TurnRequest) -> None:
         turn: list[dict] | None = None
         outcome: OutputOutcome = "completed"
         try:
@@ -215,7 +186,6 @@ class DispatcherSessionRuntime(SessionRuntime):
             request.turn_id,
             AgentOutputFinished(message=reply, thought="", outcome=outcome),
         )
-        return reply
 
     def _set_state(self, state: SessionState) -> None:
         previous_state = self._state

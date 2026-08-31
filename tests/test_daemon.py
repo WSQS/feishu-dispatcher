@@ -142,6 +142,10 @@ class FakeBridge:
         self.session_events.append((conversation, event))
         self.session_event_trace_sequences.append(trace_sequence)
         body = event.body
+        if isinstance(body, AgentOutputFinished):
+            if event.session_id == _DISPATCHER_SESSION_ID and body.message:
+                self.send_text(conversation, body.message)
+            return
         if not isinstance(body, SessionInputAccepted):
             if isinstance(
                 body,
@@ -149,7 +153,6 @@ class FakeBridge:
                     AgentOutputStarted,
                     AgentOutputDelta,
                     AgentPlanUpdated,
-                    AgentOutputFinished,
                 ),
             ):
                 return
@@ -1605,6 +1608,13 @@ async def wait_until(cond, timeout: float = 2.0) -> None:
             await asyncio.sleep(0.01)
 
     await asyncio.wait_for(_poll(), timeout)
+
+
+async def wait_dispatcher_idle(daemon: _Daemon) -> None:
+    runtime = daemon._dispatcher_runtime
+    assert runtime is not None
+    await runtime.wait_idle()
+    await daemon._wait_dispatcher_events()
 
 
 def current_runner(daemon: _Daemon, conversation_id: str = "om_root1"):
@@ -3885,6 +3895,35 @@ class ScriptedLLM:
         return self.script.pop(0)
 
 
+async def test_dispatcher_message_handler_returns_before_turn_finishes():
+    daemon, bridge, _ = make_daemon()
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingLLM:
+        async def chat(self, messages, tools) -> LLMResponse:
+            started.set()
+            await release.wait()
+            return LLMResponse(content="done")
+
+    daemon._llm = BlockingLLM()
+
+    handler = asyncio.create_task(
+        daemon._handle_message(root_msg("hello", mid="om_async"))
+    )
+    await started.wait()
+    await asyncio.wait_for(handler, timeout=0.5)
+
+    assert not release.is_set()
+    assert bridge.sent_texts == []
+
+    release.set()
+    await wait_dispatcher_idle(daemon)
+
+    assert bridge.sent_texts == [("oc_1", "done")]
+    await daemon._shutdown()
+
+
 async def test_nl_dispatch_spawns_agent_via_llm():
     daemon, bridge, created = make_daemon()
     daemon._llm = ScriptedLLM(
@@ -3902,6 +3941,12 @@ async def test_nl_dispatch_spawns_agent_via_llm():
     )
     await daemon._handle_message(root_msg("帮 demo 加个 dark mode", mid="om_nl"))
     await wait_until(lambda: created and created[0].prompts == ["加 dark mode"])
+    await wait_until(
+        lambda: any(
+            message == "oc_1" and "已给 demo 派发" in text
+            for message, text in bridge.sent_texts
+        )
+    )
     assert bridge.roots  # agent 有自己的话题根消息
     assert bridge.created_threads  # 调度器派发必须创建独立话题
     # LLM 对用户的回复是**普通回复、不建话题**（bug 修复：只有派 agent 才建话题）
@@ -3963,6 +4008,7 @@ async def test_nl_channel_tools_receive_source_conversation():
     await daemon._handle_channel_message(
         root_msg("dispatch through web", mid="om_web_nl", channel_key="web")
     )
+    await wait_dispatcher_idle(daemon)
 
     conversation = ConversationRef("web", "oc_1")
     assert seen == {
@@ -3999,6 +4045,7 @@ async def test_dispatcher_root_turns_sync_between_channels():
             channel_key="web",
         ),
     )
+    await wait_dispatcher_idle(daemon)
 
     feishu_conversation = ConversationRef("feishu", "oc_1")
     web_conversation = ConversationRef("web", "web-room")
@@ -4031,6 +4078,7 @@ async def test_dispatcher_root_turns_sync_between_channels():
     await daemon._handle_channel_message(
         root_msg("feishu turn", mid="feishu-message"),
     )
+    await wait_dispatcher_idle(daemon)
 
     assert feishu.sent_texts[-2:] == [
         ("oc_1", "web reply"),
@@ -4106,6 +4154,7 @@ async def test_dispatcher_turns_are_serialized_across_channels():
     assert len(llm.calls) == 1
     llm.release_first.set()
     await asyncio.gather(first, second)
+    await wait_dispatcher_idle(daemon)
 
     second_messages = [
         (message["role"], message.get("content"))
@@ -4147,11 +4196,13 @@ async def test_dispatcher_target_send_failure_does_not_abort_turn(caplog):
             channel_key="broken",
         ),
     )
+    await wait_dispatcher_idle(daemon)
     daemon.bind_conversation(
         _DISPATCHER_SESSION_ID, ConversationRef("healthy", "healthy-room")
     )
     with caplog.at_level("ERROR"):
         await daemon._handle_channel_message(root_msg("continue", mid="feishu-message"))
+        await wait_dispatcher_idle(daemon)
 
     assert broken.sent_texts == []
     assert feishu.sent_texts == [
@@ -4170,13 +4221,15 @@ async def test_dispatcher_target_send_failure_does_not_abort_turn(caplog):
         ("healthy-room", "still works"),
     ]
     assert healthy.replies == []
-    assert "Channel 独立文本发送失败 conversation=broken:broken-room" in caplog.text
+    assert "Channel SessionEvent 投影失败" in caplog.text
+    assert "conversation=broken:broken-room" in caplog.text
 
 
 async def test_nl_reply_does_not_create_thread():
     daemon, bridge, created = make_daemon()
     daemon._llm = ScriptedLLM([LLMResponse(content="你好，需要我做什么？")])
     await daemon._handle_message(root_msg("在吗", mid="om_chat"))
+    await wait_dispatcher_idle(daemon)
     # 纯对话（无 spawn）：发送到当前 Conversation，不创建 agent 话题
     assert any(m == "oc_1" and "需要我做什么" in t for m, t in bridge.sent_texts)
     assert created == []
@@ -4192,6 +4245,7 @@ async def test_scheduler_records_exchange_in_memory():
     daemon, bridge, created = make_daemon()
     daemon._llm = ScriptedLLM([LLMResponse(content="收到")])
     await daemon._handle_message(root_msg("记住我叫小明", mid="om_m"))
+    await wait_dispatcher_idle(daemon)
     assert daemon._sched_memory.history() == [
         {"role": "user", "content": "记住我叫小明"},
         {"role": "assistant", "content": "收到"},
@@ -4210,7 +4264,7 @@ async def test_dispatcher_events_are_persisted_in_order(tmp_path):
     daemon._session_event_handler = consume
 
     await daemon._handle_message(root_msg("你好", mid="om_dispatcher_trace"))
-    await daemon._wait_dispatcher_events()
+    await wait_dispatcher_idle(daemon)
 
     records = trace_store.read_after(
         _DISPATCHER_SESSION_ID,
@@ -4259,6 +4313,7 @@ async def test_scheduler_feeds_history_on_next_message():
     daemon._llm = RecordingLLM()
     await daemon._handle_message(root_msg("我叫小明", mid="om_1"))
     await daemon._handle_message(root_msg("我叫什么", mid="om_2"))
+    await wait_dispatcher_idle(daemon)
     contents = [m.get("content") for m in daemon._llm.second_messages]
     assert "我叫小明" in contents and "好的，小明" in contents
 
@@ -4429,6 +4484,7 @@ async def test_nl_dispatch_unknown_project_reported_to_llm():
         ]
     )
     await daemon._handle_message(root_msg("给 ghost 做点事", mid="om_g"))
+    await wait_dispatcher_idle(daemon)
     assert created == []  # 未 spawn
     assert any("没找到项目" in t for t in bridge.texts("oc_1"))
 

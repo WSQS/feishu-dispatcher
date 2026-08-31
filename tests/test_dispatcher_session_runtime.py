@@ -60,16 +60,33 @@ async def test_runtime_executes_turn_and_updates_memory() -> None:
         ),
     )
 
-    receipt = runtime.submit(request("hello"))
-    reply = await runtime.wait_turn(receipt.turn)
+    runtime.submit(request("hello"))
+    await runtime.wait_idle()
 
-    assert reply == "reply"
     assert seen_conversations == [ConversationRef("test", "conversation")]
     assert runtime.state == "idle"
     assert runtime._memory.history() == [
         {"role": "user", "content": "hello"},
         {"role": "assistant", "content": "reply"},
     ]
+    await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_does_not_cache_turn_results() -> None:
+    runtime = DispatcherSessionRuntime(
+        session_id="dispatcher",
+        llm_provider=lambda: FakeLLM(["reply"]),
+        memory=SchedulerMemory(None),
+        tools_provider=lambda _conversation: [],
+    )
+
+    receipt = runtime.submit(request("hello"))
+    await runtime.wait_idle()
+
+    assert receipt.turn.session_id == runtime.session_id
+    assert not hasattr(runtime, "_results")
+    assert not hasattr(runtime, "wait_turn")
     await runtime.close()
 
 
@@ -105,8 +122,8 @@ async def test_runtime_notifies_multiple_subscribers_independently() -> None:
     runtime.subscribe(first_events.append)
     runtime.subscribe(second_events.append)
 
-    receipt = runtime.submit(request("hello"))
-    assert await runtime.wait_turn(receipt.turn) == "reply"
+    runtime.submit(request("hello"))
+    await runtime.wait_idle()
 
     assert first_events == second_events
     assert len({event.event_id for event in first_events}) == len(first_events)
@@ -129,9 +146,9 @@ async def test_runtime_isolates_subscriber_failure() -> None:
     runtime.subscribe(broken_listener)
     runtime.subscribe(received.append)
 
-    receipt = runtime.submit(request("hello"))
+    runtime.submit(request("hello"))
 
-    assert await runtime.wait_turn(receipt.turn) == "reply"
+    await runtime.wait_idle()
     assert received
     assert all(event.session_id == "dispatcher" for event in received)
     await runtime.close()
@@ -149,7 +166,7 @@ async def test_runtime_publishes_turn_lifecycle_events() -> None:
     runtime.subscribe(events.append)
 
     receipt = runtime.submit(request("hello"))
-    assert await runtime.wait_turn(receipt.turn) == "reply"
+    await runtime.wait_idle()
 
     assert [type(event.body) for event in events] == [
         SessionInputAccepted,
@@ -188,9 +205,18 @@ async def test_runtime_publishes_execution_failure_event() -> None:
     runtime.subscribe(events.append)
 
     receipt = runtime.submit(request("hello"))
-    reply = await runtime.wait_turn(receipt.turn)
+    await runtime.wait_idle()
 
-    assert reply.startswith("调度器出错：调度器 LLM 未配置")
+    assert runtime._memory.history() == [
+        {
+            "role": "user",
+            "content": "hello",
+        },
+        {
+            "role": "assistant",
+            "content": "调度器出错：调度器 LLM 未配置。可用 `/run <项目> <任务>` 直接派发。",
+        },
+    ]
     error = next(
         event for event in events if isinstance(event.body, SessionErrorOccurred)
     )
@@ -235,9 +261,17 @@ async def test_runtime_processes_pending_turns_in_order() -> None:
     assert first.placement == "current"
     assert second.placement == "pending"
     release_first.set()
-    assert await runtime.wait_turn(first.turn) == "reply 1"
-    assert await runtime.wait_turn(second.turn) == "reply 2"
     await runtime.wait_idle()
+    second_messages = [
+        (message["role"], message.get("content"))
+        for message in llm.calls[1]
+        if message["role"] != "system"
+    ]
+    assert second_messages == [
+        ("user", "first"),
+        ("assistant", "reply 1"),
+        ("user", "second"),
+    ]
     await runtime.close()
 
 
@@ -263,9 +297,7 @@ async def test_runtime_publishes_cancellation_event() -> None:
     receipt = runtime.submit(request("hello"))
     await started.wait()
     await runtime.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await runtime.wait_turn(receipt.turn)
+    await runtime.wait_idle()
     finished = next(
         event for event in events if isinstance(event.body, AgentOutputFinished)
     )
@@ -295,11 +327,8 @@ async def test_runtime_close_cancels_current_turn() -> None:
         tools_provider=lambda _conversation: [],
     )
 
-    receipt = runtime.submit(request("hello"))
+    runtime.submit(request("hello"))
     await started.wait()
-    waiter = asyncio.create_task(runtime.wait_turn(receipt.turn))
     await runtime.close()
 
-    with pytest.raises(asyncio.CancelledError):
-        await waiter
     assert runtime.state == "stopped"
