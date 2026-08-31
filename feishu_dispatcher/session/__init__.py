@@ -9,11 +9,14 @@ from .session_runtime import (
     TurnRef,
     TurnRequest,
 )
+from .tool_loop_session_runtime import SessionMemory, ToolLoopSessionRuntime
 
 __all__ = [
     "DispatcherSessionRuntime",
     "SessionRuntime",
     "SessionEventListener",
+    "SessionMemory",
+    "ToolLoopSessionRuntime",
     "TurnPlacement",
     "TurnReceipt",
     "TurnRef",
