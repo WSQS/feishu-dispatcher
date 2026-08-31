@@ -817,6 +817,17 @@ class FeishuBridge:
         output = self._output_for_event(conversation_id, event)
         if output is not None:
             await output.handle_event(event)
+            return
+        if (
+            event.session_id == "dispatcher"
+            and isinstance(event.body, AgentOutputFinished)
+            and event.body.message
+        ):
+            await asyncio.to_thread(
+                self.send_text,
+                FeishuConversationRef(conversation_id),
+                event.body.message,
+            )
 
     def _output_for_event(
         self,

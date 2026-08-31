@@ -608,6 +608,33 @@ def test_channel_accepts_agent_output_events_without_rendering(monkeypatch):
     assert calls == []
 
 
+def test_channel_projects_dispatcher_finished_without_open_output(monkeypatch):
+    bridge = make_bridge()
+    calls: list[tuple[str, str]] = []
+
+    def send_text(conversation: ConversationRef, text: str) -> str:
+        calls.append((conversation.conversation_id, text))
+        return "om_reply"
+
+    monkeypatch.setattr(bridge, "send_text", send_text)
+    bridge.handle_session_event(
+        ConversationRef("feishu", "om_root"),
+        SessionEvent(
+            event_id="event-dispatcher-finished",
+            session_id="dispatcher",
+            turn_id="turn-1",
+            occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+            body=AgentOutputFinished(
+                message="answer",
+                thought="",
+                outcome="completed",
+            ),
+        ),
+    )
+
+    assert calls == [("om_root", "answer")]
+
+
 def test_feishu_card_methods_delegate_to_feishu_card_methods(monkeypatch):
     bridge = make_bridge()
     calls: list[tuple[str, str, dict]] = []

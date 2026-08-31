@@ -2649,24 +2649,8 @@ class _Daemon:
         self.bind_conversation(_DISPATCHER_SESSION_ID, conversation)
 
         async with self._session_turn_lock(_DISPATCHER_SESSION_ID):
-            conversations = self._conversations_for_session(
-                _DISPATCHER_SESSION_ID,
-                source=conversation,
-            )
-            targets = tuple(
-                target for target in conversations if target != conversation
-            )
             runtime = self._get_dispatcher_runtime()
-            receipt = runtime.submit(TurnRequest(text, conversation))
-            reply = await runtime.wait_turn(receipt.turn)
-            await self._wait_dispatcher_events()
-            await asyncio.gather(
-                self._send_user(reply, conversation=conversation),
-                *(
-                    self._safe_send_text(reply, conversation=target)
-                    for target in targets
-                ),
-            )
+            runtime.submit(TurnRequest(text, conversation))
 
     def _get_dispatcher_runtime(self) -> DispatcherSessionRuntime:
         runtime = self._dispatcher_runtime
