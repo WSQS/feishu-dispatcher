@@ -4493,6 +4493,47 @@ async def test_project_manager_callbacks_are_scoped_to_project():
     assert sent == [(demo.session_id, "继续")]
 
 
+async def test_project_manager_conversation_routes_messages_to_runtime():
+    daemon, bridge, _ = make_daemon()
+    daemon._llm = ScriptedLLM([LLMResponse(content="manager reply")])
+    conversation = ConversationRef("feishu", "manager-thread")
+
+    runtime = daemon.open_project_manager("demo", conversation)
+
+    assert daemon._session_id_for_conversation(conversation) == runtime.session_id
+    assert daemon._session_identity_exists(runtime.session_id)
+
+    await daemon._handle_channel_message(
+        root_msg(
+            "检查项目状态", mid="manager-message", conversation_id="manager-thread"
+        )
+    )
+    await runtime.wait_idle()
+    await daemon._wait_runtime_events(runtime.session_id)
+
+    assert bridge.sent_texts == [("manager-thread", "manager reply")]
+    assert daemon._session_runtimes.get_for_session(runtime.session_id) is runtime
+
+
+def test_project_manager_conversation_rejects_unknown_project():
+    daemon, _, _ = make_daemon()
+
+    with pytest.raises(ValueError, match="项目不存在: missing"):
+        daemon.open_project_manager("missing", ConversationRef("feishu", "thread"))
+
+
+def test_project_manager_conversation_conflict_does_not_create_runtime():
+    daemon, _, _ = make_daemon()
+    conversation = ConversationRef("feishu", "shared-thread")
+    daemon.bind_conversation(_DISPATCHER_SESSION_ID, conversation)
+
+    with pytest.raises(RuntimeError, match="已绑定 Session dispatcher"):
+        daemon.open_project_manager("demo", conversation)
+
+    assert daemon._session_runtimes.get_for_session("manager:demo") is None
+    assert "demo" not in daemon._project_manager_memories
+
+
 def test_register_session_runtime_subscribes_once():
     daemon, _, _ = make_daemon()
 

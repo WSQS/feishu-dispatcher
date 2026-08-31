@@ -715,11 +715,13 @@ class _Daemon:
         self, session_id: str, conversation: ConversationRef
     ) -> str | None:
         """绑定 Conversation；Session 已终止时返回其状态，重复绑定幂等。"""
+        session = (
+            self.store.get(session_id) if session_id != _DISPATCHER_SESSION_ID else None
+        )
         if session_id != _DISPATCHER_SESSION_ID:
-            session = self.store.get(session_id)
-            if session is None:
+            if session is None and not self._session_identity_exists(session_id):
                 raise ValueError(f"Session 不存在: {session_id}")
-            if session.is_terminal:
+            if session is not None and session.is_terminal:
                 return session.status
 
         bound_session_id = self._conversation_session_ids.get(conversation)
@@ -739,6 +741,7 @@ class _Daemon:
         return (
             session_id == _DISPATCHER_SESSION_ID
             or self.store.get(session_id) is not None
+            or self._session_runtimes.get_for_session(session_id) is not None
         )
 
     def session_conversation_header(self, session_id: str) -> str:
@@ -1019,6 +1022,26 @@ class _Daemon:
         self._register_session_runtime(runtime)
         return runtime
 
+    def open_project_manager(
+        self,
+        project_name: str,
+        conversation: ConversationRef,
+    ) -> ProjectManagerSessionRuntime:
+        """打开项目 Manager Conversation，并返回其 Session Runtime。"""
+        project_name = project_name.strip()
+        project = self._resolve_project(project_name)
+        if project is None:
+            raise ValueError(f"项目不存在: {project_name}")
+        session_id = self._project_manager_session_id(project.name)
+        bound_session_id = self._session_id_for_conversation(conversation)
+        if bound_session_id is not None and bound_session_id != session_id:
+            raise RuntimeError(
+                f"Conversation {conversation!r} 已绑定 Session {bound_session_id}"
+            )
+        runtime = self._get_project_manager_runtime(project.name)
+        self.bind_conversation(runtime.session_id, conversation)
+        return runtime
+
     async def _close_trace_store(self) -> None:
         """幂等关闭 daemon 持有的 Session Trace Store。"""
         trace_store = self.trace_store
@@ -1244,6 +1267,12 @@ class _Daemon:
             if bound_session_id is None
             else None
         )
+        if bound_session_id is not None and bound_session_id != _DISPATCHER_SESSION_ID:
+            runtime = self._session_runtimes.get_for_session(bound_session_id)
+            if runtime is not None:
+                if msg.text.strip():
+                    runtime.submit(TurnRequest(msg.text.strip(), conversation))
+                return
         if (
             bound_session_id is not None and bound_session_id != _DISPATCHER_SESSION_ID
         ) or persisted_session is not None:
