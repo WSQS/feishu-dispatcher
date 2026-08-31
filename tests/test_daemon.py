@@ -4399,6 +4399,100 @@ async def test_runtime_events_for_different_sessions_run_in_parallel():
     assert consumed == ["second", "first"]
 
 
+def test_project_manager_runtime_is_cached_and_registered_per_project():
+    daemon, _, _ = make_daemon()
+    daemon.cfg.projects["other"] = Project(
+        name="other",
+        path=Path("C:/tmp/other"),
+    )
+
+    demo_runtime = daemon._get_project_manager_runtime(" demo ")
+    assert daemon._get_project_manager_runtime("demo") is demo_runtime
+    other_runtime = daemon._get_project_manager_runtime("other")
+
+    assert demo_runtime.session_id == "manager:demo"
+    assert other_runtime.session_id == "manager:other"
+    assert other_runtime is not demo_runtime
+    assert daemon._session_runtimes.values() == [demo_runtime, other_runtime]
+    assert (
+        daemon._project_manager_memories["demo"]
+        is not daemon._project_manager_memories["other"]
+    )
+
+    with pytest.raises(ValueError, match="项目不存在: missing"):
+        daemon._get_project_manager_runtime("missing")
+
+
+def test_project_manager_memory_is_persistent_and_project_scoped(tmp_path):
+    daemon, _, _ = make_daemon()
+    daemon._project_manager_memory_dir = tmp_path
+    daemon._project_manager_memory("demo").add_exchange("demo input", "demo reply")
+    daemon._project_manager_memory("other").add_exchange("other input", "other reply")
+
+    restarted, _, _ = make_daemon()
+    restarted._project_manager_memory_dir = tmp_path
+
+    assert restarted._project_manager_memory("demo").history() == [
+        {"role": "user", "content": "demo input"},
+        {"role": "assistant", "content": "demo reply"},
+    ]
+    assert restarted._project_manager_memory("other").history() == [
+        {"role": "user", "content": "other input"},
+        {"role": "assistant", "content": "other reply"},
+    ]
+    assert len(list(tmp_path.glob("*.json"))) == 2
+
+
+async def test_project_manager_callbacks_are_scoped_to_project():
+    store = SessionStore(None)
+    demo = store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="demo session",
+        **stored_conversation_kwargs(ConversationRef("feishu", "demo-thread")),
+        workspace="C:/tmp/demo",
+    )
+    other = store.create(
+        project_name="other",
+        agent_label="copilot",
+        description="other session",
+        **stored_conversation_kwargs(ConversationRef("feishu", "other-thread")),
+        workspace="C:/tmp/other",
+    )
+    daemon, _, _ = make_daemon(store=store)
+    sent: list[tuple[str, str]] = []
+
+    async def send_to_session(session_id: str, message: str) -> str:
+        sent.append((session_id, message))
+        return f"已转达 {session_id}"
+
+    daemon._sched_send_to_task = send_to_session  # type: ignore[method-assign]
+    runtime = daemon._get_project_manager_runtime("demo")
+    tools = {tool.name: tool for tool in runtime._tools_provider(_TEST_CONVERSATION)}
+
+    listed = json.loads(await tools["list_sessions"].handler({}))
+    assert [session["session_id"] for session in listed] == [demo.session_id]
+    assert (
+        json.loads(await tools["get_session"].handler({"session_id": demo.session_id}))[
+            "session_id"
+        ]
+        == demo.session_id
+    )
+    assert "未找到项目 demo" in await tools["get_session"].handler(
+        {"session_id": other.session_id}
+    )
+    assert (
+        await tools["send_to_session"].handler(
+            {"session_id": demo.session_id, "message": "继续"}
+        )
+        == f"已转达 {demo.session_id}"
+    )
+    assert "未找到项目 demo" in await tools["send_to_session"].handler(
+        {"session_id": other.session_id, "message": "继续"}
+    )
+    assert sent == [(demo.session_id, "继续")]
+
+
 def test_register_session_runtime_subscribes_once():
     daemon, _, _ = make_daemon()
 

@@ -14,6 +14,7 @@ P0 原型范围（设计文档）：
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -54,6 +55,7 @@ from .scheduler import (
 )
 from .session import (
     DispatcherSessionRuntime,
+    ProjectManagerSessionRuntime,
     SessionRuntime,
     SessionRuntimeRegistry,
     TurnRequest,
@@ -94,6 +96,7 @@ logger = logging.getLogger(__name__)
 SessionEventHandler = Callable[[SessionEvent], Awaitable[None]]
 
 _DISPATCHER_SESSION_ID = "dispatcher"
+_PROJECT_MANAGER_SESSION_PREFIX = "manager:"
 _DISPATCH_PREFIX = "/run "
 _TASK_PREFIX = "/task "
 _LIST_CMD = "/agents"
@@ -349,6 +352,7 @@ async def run(
             # [llm].memory_rounds 可配；未配 [llm] 时记忆不参与派发，取默认即可
             max_turns=cfg.llm.memory_rounds if cfg.llm else 12,
         ),
+        _project_manager_memory_dir=store_path.parent / "project-manager-memory",
         _channels=channels,
         _primary_channel_key=resolved_channel_key,
         _control_conversation=control_conversation,
@@ -594,6 +598,10 @@ class _Daemon:
     _session_runtimes: SessionRuntimeRegistry = field(
         default_factory=SessionRuntimeRegistry
     )
+    #: 每个项目 Manager 的独立对话记忆；首次使用时惰性构造。
+    _project_manager_memories: dict[str, SchedulerMemory] = field(default_factory=dict)
+    #: Project Manager 记忆目录；测试默认 None，不写盘。
+    _project_manager_memory_dir: "Path | None" = None
     #: Tool Loop Runtime 的每 Session 事件消费者尾任务；关闭前等待收尾。
     _runtime_event_tails: dict[str, asyncio.Task[None]] = field(default_factory=dict)
     #: 同一 Session 的 Turn 共用一把锁；跨 Channel / runner 串行，不同 Session 可并行。
@@ -919,6 +927,97 @@ class _Daemon:
         """登记 Runtime 并接入 daemon 的统一 SessionEvent 管线。"""
         if self._session_runtimes.register(runtime):
             runtime.subscribe(self._queue_runtime_event)
+
+    def _project_manager_session_id(self, project_name: str) -> str:
+        return f"{_PROJECT_MANAGER_SESSION_PREFIX}{project_name}"
+
+    def _project_manager_memory(self, project_name: str) -> SchedulerMemory:
+        memory = self._project_manager_memories.get(project_name)
+        if memory is not None:
+            return memory
+        path = None
+        if self._project_manager_memory_dir is not None:
+            digest = hashlib.sha256(project_name.encode("utf-8")).hexdigest()[:16]
+            path = self._project_manager_memory_dir / f"{digest}.json"
+        memory = SchedulerMemory(
+            path,
+            max_turns=self.cfg.llm.memory_rounds if self.cfg.llm else 12,
+        )
+        self._project_manager_memories[project_name] = memory
+        return memory
+
+    def _project_manager_list_sessions(self, project_name: str) -> list[dict]:
+        return [
+            {
+                "session_id": session.session_id,
+                "project": session.project_name,
+                "agent": session.agent_label,
+                "description": session.description,
+                "status": session.status,
+                "turns": session.turns,
+                "active": self._runners.get_for_session(session.session_id) is not None,
+            }
+            for session in self.store.all()
+            if session.project_name == project_name
+        ]
+
+    def _project_manager_get_session(
+        self,
+        project_name: str,
+        session_id: str,
+    ) -> dict | None:
+        session = self.store.get(session_id)
+        if session is None or session.project_name != project_name:
+            return None
+        details = self._sched_get_task(session_id)
+        if details is None:
+            return None
+        return {
+            "session_id": details["task_id"],
+            **{key: value for key, value in details.items() if key != "task_id"},
+        }
+
+    async def _project_manager_send_to_session(
+        self,
+        project_name: str,
+        session_id: str,
+        message: str,
+    ) -> str:
+        if self._project_manager_get_session(project_name, session_id) is None:
+            return f"未找到项目 {project_name} 下的 Session {session_id}。"
+        return await self._sched_send_to_task(session_id, message)
+
+    def _get_project_manager_runtime(
+        self,
+        project_name: str,
+    ) -> ProjectManagerSessionRuntime:
+        """按项目惰性创建并注册 Project Manager Runtime。"""
+        project_name = project_name.strip()
+        project = self._resolve_project(project_name)
+        if project is None:
+            raise ValueError(f"项目不存在: {project_name}")
+
+        session_id = self._project_manager_session_id(project.name)
+        runtime = self._session_runtimes.get_for_session(session_id)
+        if runtime is not None:
+            if not isinstance(runtime, ProjectManagerSessionRuntime):
+                raise RuntimeError("Project Manager Session Runtime 类型不匹配")
+            return runtime
+
+        runtime = ProjectManagerSessionRuntime(
+            session_id=session_id,
+            project_name=project.name,
+            llm_provider=lambda: self._llm,
+            memory=self._project_manager_memory(project.name),
+            list_sessions=partial(self._project_manager_list_sessions, project.name),
+            get_session=partial(self._project_manager_get_session, project.name),
+            send_to_session=partial(
+                self._project_manager_send_to_session,
+                project.name,
+            ),
+        )
+        self._register_session_runtime(runtime)
+        return runtime
 
     async def _close_trace_store(self) -> None:
         """幂等关闭 daemon 持有的 Session Trace Store。"""
