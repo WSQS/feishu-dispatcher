@@ -828,7 +828,7 @@ async def test_http_task_events_route_reads_trace_with_before_after_and_auth(tmp
         project_name="demo",
         agent_label="copilot",
         description="trace task",
-        conversation=ConversationRef("feishu", "oc_trace"),
+        **stored_conversation_kwargs(ConversationRef("feishu", "oc_trace")),
         workspace="C:/tmp/demo",
         status="done",
     )
@@ -993,7 +993,7 @@ async def test_http_task_events_route_returns_unavailable_when_shutdown_wins_rea
         project_name="demo",
         agent_label="copilot",
         description="trace task",
-        conversation=ConversationRef("feishu", "oc_trace"),
+        **stored_conversation_kwargs(ConversationRef("feishu", "oc_trace")),
         workspace="C:/tmp/demo",
     )
     trace_store = PausingTraceStore(tmp_path / "trace.sqlite")
@@ -1036,7 +1036,7 @@ async def test_http_task_events_route_completes_when_read_wins_shutdown_race(tmp
         project_name="demo",
         agent_label="copilot",
         description="trace task",
-        conversation=ConversationRef("feishu", "oc_trace"),
+        **stored_conversation_kwargs(ConversationRef("feishu", "oc_trace")),
         workspace="C:/tmp/demo",
     )
     trace_store = PausingTraceStore(tmp_path / "trace.sqlite")
@@ -1081,7 +1081,7 @@ async def test_http_create_task_conversation_validates_request_and_task_state():
         project_name="demo",
         agent_label="copilot",
         description="active task",
-        conversation=ConversationRef("feishu", "oc_active"),
+        **stored_conversation_kwargs(ConversationRef("feishu", "oc_active")),
         workspace="C:/tmp/demo",
         status="idle",
     )
@@ -1089,7 +1089,7 @@ async def test_http_create_task_conversation_validates_request_and_task_state():
         project_name="demo",
         agent_label="copilot",
         description="done task",
-        conversation=ConversationRef("feishu", "oc_done"),
+        **stored_conversation_kwargs(ConversationRef("feishu", "oc_done")),
         workspace="C:/tmp/demo",
         status="done",
     )
@@ -1155,7 +1155,7 @@ async def test_http_create_task_conversation_creates_thread_and_binds_task():
         project_name="demo",
         agent_label="copilot",
         description="review changes",
-        conversation=ConversationRef("feishu", "oc_1"),
+        **stored_conversation_kwargs(ConversationRef("feishu", "oc_1")),
         workspace="C:/tmp/demo",
         status="idle",
     )
@@ -1196,7 +1196,9 @@ async def test_http_create_task_conversation_creates_thread_and_binds_task():
             assert events[0]["text"] == f"[{task.session_id}] review changes"
 
         assert conversation_ids[0] != conversation_ids[1]
-        assert task.conversation_ref == ConversationRef("feishu", "oc_1")
+        assert daemon._conversation_for_session(task) == ConversationRef(
+            "feishu", "oc_1"
+        )
     finally:
         http.stop()
 
@@ -1462,7 +1464,7 @@ def test_conversation_binding_does_not_inspect_ref_fields():
         project_name="demo",
         agent_label="test",
         description="binding",
-        conversation=_TEST_CONVERSATION,
+        **stored_conversation_kwargs(_TEST_CONVERSATION),
         workspace=".",
     )
 
@@ -1571,6 +1573,15 @@ def thread_msg(
 _TEST_CONVERSATION = ConversationRef("feishu", "oc_1")
 
 
+def stored_conversation_kwargs(
+    conversation: ConversationRef,
+) -> dict[str, object]:
+    return {
+        "channel_key": conversation.channel_key(),
+        "conversation_payload": {"conversation_id": conversation.conversation_id},
+    }
+
+
 def task_by_conversation(
     store: SessionStore,
     conversation_id: str,
@@ -1579,7 +1590,10 @@ def task_by_conversation(
     channel_key = (
         channel.channel_key() if isinstance(channel, ConversationRef) else channel
     )
-    return store.by_conversation(ConversationRef(channel_key, conversation_id))
+    return store.by_conversation(
+        channel_key,
+        {"conversation_id": conversation_id},
+    )
 
 
 async def wait_until(cond, timeout: float = 2.0) -> None:
@@ -1663,14 +1677,14 @@ def test_conversation_binding_is_idempotent_and_rejects_conflict():
         project_name="demo",
         agent_label="copilot",
         description="a",
-        conversation=parent,
+        **stored_conversation_kwargs(parent),
         workspace="C:/tmp/demo",
     )
     task_b = store.create(
         project_name="demo",
         agent_label="copilot",
         description="b",
-        conversation=parent,
+        **stored_conversation_kwargs(parent),
         workspace="C:/tmp/demo",
     )
     daemon, _, _ = make_daemon(store=store)
@@ -1699,7 +1713,7 @@ def test_conversation_binding_drops_deleted_session():
         project_name="demo",
         agent_label="copilot",
         description="done",
-        conversation=ConversationRef("feishu", "oc_1"),
+        **stored_conversation_kwargs(ConversationRef("feishu", "oc_1")),
         workspace="C:/tmp/demo",
         status="idle",
     )
@@ -1724,7 +1738,7 @@ def test_session_conversation_header_uses_session_description():
         project_name="demo",
         agent_label="copilot",
         description="review changes",
-        conversation=_TEST_CONVERSATION,
+        **stored_conversation_kwargs(_TEST_CONVERSATION),
         workspace=".",
     )
 
@@ -2493,6 +2507,20 @@ async def test_run_uses_text_only_channel_output_lifecycle():
         def restart(self) -> None:
             self.stopped = False
 
+        def serialize_conversation_ref(
+            self,
+            conversation: ConversationRef,
+        ) -> dict[str, object]:
+            return {"conversation_id": conversation.conversation_id}
+
+        def deserialize_conversation_ref(
+            self,
+            payload: dict[str, object],
+        ) -> ConversationRef:
+            conversation_id = payload["conversation_id"]
+            assert isinstance(conversation_id, str)
+            return ConversationRef("feishu", conversation_id)
+
         def create_thread(self, initial_text: str) -> ConversationRef:
             self.replies.append((initial_text, False))
             return ConversationRef("feishu", f"om_root_{len(self.replies)}")
@@ -2866,7 +2894,7 @@ def test_duplicate_message_id_is_scoped_to_conversation():
 
 async def test_same_message_id_help_replies_on_source_channel():
     daemon, feishu, _ = make_daemon()
-    web = FakeBridge()
+    web = FakeBridge(channel_key="web")
     daemon._channels["web"] = web
     await daemon._handle_channel_message(root_msg("/help", mid="om_shared"))
     assert [target for target, _ in feishu.roots] == ["oc_1"]
@@ -2888,7 +2916,7 @@ async def test_bound_message_uses_conversation_ref():
         project_name="demo",
         agent_label="copilot",
         description="bound conversation",
-        conversation=_TEST_CONVERSATION,
+        **stored_conversation_kwargs(_TEST_CONVERSATION),
         workspace=".",
     )
     daemon.bind_conversation(session.session_id, conversation)
@@ -2907,7 +2935,7 @@ async def test_bound_message_uses_conversation_ref():
 
 async def test_non_primary_channel_uses_own_admission_scope():
     daemon, feishu, _ = make_daemon(sender_whitelist=["ou_feishu"])
-    web = FakeBridge()
+    web = FakeBridge(channel_key="web")
     daemon._channels["web"] = web
 
     await daemon._handle_channel_message(
@@ -3526,7 +3554,7 @@ def _seed_task(
         project_name="demo",
         agent_label=agent,
         description="旧任务",
-        conversation=ConversationRef("feishu", thread),
+        **stored_conversation_kwargs(ConversationRef("feishu", thread)),
         workspace="C:/tmp/demo",
     )
     store.update(t.session_id, agent_session_id=session_id, status=status)
@@ -3549,7 +3577,7 @@ async def test_run_creates_task():
     assert t.agent_label == "copilot"
     assert t.agent_session_id == created[0].session_id
     assert t.description == "task"
-    assert t.conversation_ref == ConversationRef("test", "om_root1")
+    assert daemon._conversation_for_session(t) == ConversationRef("test", "om_root1")
     await daemon._shutdown()
 
 
@@ -3608,7 +3636,7 @@ async def test_recovery_turn_fans_out_start_and_output():
     )
 
     runner = daemon._runners.get_for_session(task.session_id)
-    assert runner.conversation == task.conversation_ref
+    assert runner.conversation == daemon._conversation_for_session(task)
     assert any("正在恢复任务" in text for text in feishu.texts("om_main"))
     assert any("已恢复会话" in text for text in feishu.texts("om_main"))
     assert "↪️ 同步自 web：continue" in feishu.texts("om_main")
@@ -3658,7 +3686,7 @@ async def test_cross_channel_turn_error_fans_out():
         project_name="demo",
         agent_label="copilot",
         description="fail",
-        conversation=ConversationRef("feishu", "oc_1"),
+        **stored_conversation_kwargs(ConversationRef("feishu", "oc_1")),
         workspace="C:/tmp/demo",
     )
     daemon, feishu, created = make_daemon(
@@ -3882,7 +3910,7 @@ async def test_nl_dispatch_spawns_agent_via_llm():
 
 async def test_nl_channel_tools_receive_source_conversation():
     daemon, feishu, _ = make_daemon()
-    web = FakeBridge()
+    web = FakeBridge(channel_key="web")
     daemon._channels["web"] = web
     seen: dict[str, ConversationRef] = {}
 
@@ -3951,7 +3979,7 @@ async def test_nl_channel_tools_receive_source_conversation():
 
 async def test_dispatcher_root_turns_sync_between_channels():
     daemon, feishu, _ = make_daemon()
-    web = FakeBridge()
+    web = FakeBridge(channel_key="web")
     daemon._channels["web"] = web
     daemon._llm = ScriptedLLM(
         [
@@ -4034,7 +4062,7 @@ async def test_dispatcher_root_turns_sync_between_channels():
 
 async def test_dispatcher_turns_are_serialized_across_channels():
     daemon, _, _ = make_daemon()
-    daemon._channels["web"] = FakeBridge()
+    daemon._channels["web"] = FakeBridge(channel_key="web")
 
     class BlockingFirstLLM:
         def __init__(self) -> None:
@@ -4100,8 +4128,8 @@ async def test_dispatcher_target_send_failure_does_not_abort_turn(caplog):
             raise RuntimeError("send boom")
 
     daemon, feishu, _ = make_daemon()
-    broken = BrokenSendBridge()
-    healthy = FakeBridge()
+    broken = BrokenSendBridge(channel_key="broken")
+    healthy = FakeBridge(channel_key="healthy")
     daemon._channels["broken"] = broken
     daemon._channels["healthy"] = healthy
     daemon._llm = ScriptedLLM(
@@ -4320,7 +4348,7 @@ async def test_http_list_tasks_reports_dispatcher_and_agent_runtime_state():
         project_name="demo",
         agent_label="copilot",
         description="active task",
-        conversation=ConversationRef("feishu", "oc_active"),
+        **stored_conversation_kwargs(ConversationRef("feishu", "oc_active")),
         workspace="C:/tmp/demo",
         status="running",
         issue_url="https://github.com/o/r/issues/7",
@@ -4330,7 +4358,7 @@ async def test_http_list_tasks_reports_dispatcher_and_agent_runtime_state():
         project_name="demo",
         agent_label="opencode",
         description="done task",
-        conversation=ConversationRef("feishu", "oc_done"),
+        **stored_conversation_kwargs(ConversationRef("feishu", "oc_done")),
         workspace="C:/tmp/demo",
         status="done",
     )
@@ -4341,7 +4369,7 @@ async def test_http_list_tasks_reports_dispatcher_and_agent_runtime_state():
             "demo",
             "copilot",
             session_id=active.session_id,
-            conversation=active.conversation_ref,
+            conversation=daemon._conversation_for_session(active),
         ),
     )
 
@@ -4928,7 +4956,7 @@ async def test_attach_creates_task_and_resumes_external_session():
     assert t.agent_session_id == "ext_sid_1"
     assert t.agent_label == "opencode"
     assert t.project_name == "demo"
-    assert t.conversation_ref == ConversationRef("feishu", root)
+    assert daemon._conversation_for_session(t) == ConversationRef("feishu", root)
     assert "附着外部会话 opencode/ext_sid_1" in t.description
     assert "继续之前的活" in t.description
     # 探针：resume_session_id 探测 + 已关闭（进程树清理）
@@ -4980,7 +5008,7 @@ async def test_attach_duplicate_rejected_and_guides_to_existing():
         project_name="demo",
         agent_label="opencode",
         description="附着外部会话 opencode/ext_sid_1",
-        conversation=ConversationRef("feishu", "om_existing"),
+        **stored_conversation_kwargs(ConversationRef("feishu", "om_existing")),
         workspace="C:/tmp/demo",
         agent_session_id="ext_sid_1",
         origin="attach",
@@ -5033,7 +5061,7 @@ async def test_attach_launch_failure_reports_attach_error():
         project_name="demo",
         agent_label="opencode",
         description="附着外部会话 opencode/ext_sid_1",
-        conversation=ConversationRef("feishu", "oc_1"),
+        **stored_conversation_kwargs(ConversationRef("feishu", "oc_1")),
         workspace="C:/tmp/demo",
         agent_session_id="ext_sid_1",
         origin="attach",
@@ -5110,7 +5138,7 @@ async def test_sched_attach_session_creates_task_and_resumes_external_session():
     assert t.agent_session_id == "ext_sid_1"
     assert t.agent_label == "opencode"
     assert t.project_name == "demo"
-    assert t.conversation_ref == ConversationRef("feishu", root)
+    assert daemon._conversation_for_session(t) == ConversationRef("feishu", root)
     assert "附着外部会话 opencode/ext_sid_1" in t.description
     assert "继续之前的活" in t.description
     # 工具返回给 LLM 的成功摘要带 task_id
@@ -5147,7 +5175,7 @@ async def test_sched_attach_session_routes_thread_and_output_to_source_channel()
 
     task = task_by_conversation(store, root, "web")
     assert task is not None
-    assert task.conversation_ref == ConversationRef("web", root)
+    assert daemon._conversation_for_session(task) == ConversationRef("web", root)
     assert feishu.created_threads == []
     assert web.created_threads == [
         ("oc_1", "🔗 opencode · demo\n附着外部会话: ext_sid_web\n说明: web attach")
@@ -5209,7 +5237,7 @@ async def test_sched_attach_session_duplicate_rejected():
         project_name="demo",
         agent_label="opencode",
         description="附着外部会话 opencode/ext_sid_1",
-        conversation=ConversationRef("feishu", "oc_1"),
+        **stored_conversation_kwargs(ConversationRef("feishu", "oc_1")),
         workspace="C:/tmp/demo",
         agent_session_id="ext_sid_1",
         origin="attach",
@@ -5613,7 +5641,7 @@ async def test_sched_spawn_routes_thread_and_output_to_source_channel():
 
     task = task_by_conversation(daemon.store, root, "web")
     assert task is not None
-    assert task.conversation_ref == ConversationRef("web", root)
+    assert daemon._conversation_for_session(task) == ConversationRef("web", root)
     assert feishu.created_threads == []
     assert web.created_threads == [("oc_1", "🚀 copilot · demo\n任务: web task")]
     assert feishu.texts(root) == []
@@ -5645,7 +5673,7 @@ async def test_sched_spawn_with_issue_uses_body_as_brief(monkeypatch):
     # Task 锚定了 issue_url
     t = daemon.store.all()[0]
     assert t.issue_url == "https://github.com/o/r/issues/3"
-    assert t.conversation_ref == ConversationRef("feishu", "om_root1")
+    assert daemon._conversation_for_session(t) == ConversationRef("feishu", "om_root1")
     assert "issue" in out and "issues/3" in out
     # 就绪消息带 issue 链接
     assert any("issues/3" in text for _, text in bridge.roots)
@@ -5681,7 +5709,7 @@ async def test_sched_get_task_reports_issue_url():
         project_name="demo",
         agent_label="copilot",
         description="x",
-        conversation=ConversationRef("feishu", "oc_1"),
+        **stored_conversation_kwargs(ConversationRef("feishu", "oc_1")),
         workspace="C:/tmp/demo",
         issue_url="https://github.com/o/r/issues/7",
     )
@@ -5940,14 +5968,14 @@ async def test_bg_job_completion_posts_visible_result_to_thread(tmp_path: Path):
 async def test_bg_job_visible_result_uses_task_channel(tmp_path: Path):
     store = SessionStore(None)
     daemon, feishu, _ = make_daemon(store=store)
-    web = FakeBridge()
+    web = FakeBridge(channel_key="web")
     daemon._channels["web"] = web
     conversation = ConversationRef("web", "oc_1")
     task = store.create(
         project_name="demo",
         agent_label="copilot",
         description="web background task",
-        conversation=conversation,
+        **stored_conversation_kwargs(conversation),
         workspace="C:/tmp/demo",
         status="done",
     )

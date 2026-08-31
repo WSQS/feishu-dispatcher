@@ -1,9 +1,9 @@
 """Session 台账持久化：Session 是 daemon 拥有的内存模型。
 
 一个 Session = 派发在某项目上的一个工作单元，持有它的 agent_session_id（agent 侧记忆）、
-ConversationRef（交互入口）、workspace（工作目录）。落盘到 tasks.json，按
+序列化 Conversation 身份（交互入口）、workspace（工作目录）。落盘到 tasks.json，按
 `session_id`（短自增 `t<N>`，持久单调计数器、**永不复用**）索引；按
-ConversationRef 路由交互消息。
+Channel 身份与序列化 Conversation payload 路由交互消息。
 
 status 生命周期：
 - 机械态（worker 自动）：starting → running ↔ idle → suspended；turn 异常 → failed
@@ -26,7 +26,6 @@ from pathlib import Path
 
 from ._atomic import atomic_write
 from .config import Project
-from .conversation import ConversationRef
 
 logger = logging.getLogger(__name__)
 
@@ -112,7 +111,7 @@ _SESSION_RECORD_FIELDS = (
     "status",
     "agent_session_id",
     "channel_key",
-    "conversation_id",
+    "conversation_payload",
     "workspace",
     "turns",
     "created_at",
@@ -135,7 +134,7 @@ class Session:
     status: str  # starting/running/idle/suspended/done/stopped/failed
     agent_session_id: str = ""
     channel_key: str = ""
-    conversation_id: str = ""
+    conversation_payload: dict[str, object] = field(default_factory=dict)
     workspace: str = ""
     turns: int = 0
     created_at: float = 0.0
@@ -154,10 +153,6 @@ class Session:
     #: 会话来源：spawn = daemon 新建会话（/run、spawn_agent），attach = 附着外部会话
     #: （/attach，#99）。
     origin: str = "spawn"
-
-    @property
-    def conversation_ref(self) -> ConversationRef:
-        return ConversationRef(self.channel_key, self.conversation_id)
 
     @property
     def is_active(self) -> bool:
@@ -246,14 +241,18 @@ class SessionStore:
     def get(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
-    def by_conversation(self, conversation: ConversationRef) -> Session | None:
-        if (
-            not conversation.channel_key().strip()
-            or not conversation.conversation_id.strip()
-        ):
+    def by_conversation(
+        self,
+        channel_key: str,
+        conversation_payload: dict[str, object],
+    ) -> Session | None:
+        if not channel_key.strip():
             return None
         for session in self._sessions.values():
-            if session.conversation_ref == conversation:
+            if (
+                session.channel_key == channel_key
+                and session.conversation_payload == conversation_payload
+            ):
                 return session
         return None
 
@@ -287,7 +286,8 @@ class SessionStore:
         project_name: str,
         agent_label: str,
         description: str,
-        conversation: ConversationRef,
+        channel_key: str,
+        conversation_payload: dict[str, object],
         workspace: str,
         agent_session_id: str = "",
         status: str = "starting",
@@ -295,10 +295,9 @@ class SessionStore:
         model: str = "",
         origin: str = "spawn",
     ) -> Session:
-        if not conversation.channel_key().strip():
-            raise ValueError("ConversationRef.channel_key 不能为空")
-        if not conversation.conversation_id.strip():
-            raise ValueError("ConversationRef.conversation_id 不能为空")
+        channel_key = channel_key.strip()
+        if not channel_key:
+            raise ValueError("channel_key 不能为空")
         # 铸号自愈守卫（#81）：不只信持久化的 seq——同时从现有 session id 推出下界，
         # 取两者较大再 +1。即使 seq 因故被回退/污染（多实例踩踏、手工改 tasks.json、
         # 半截原子写），也绝不落到已存在的 id 上，守住「session_id 永不复用」不变量。
@@ -320,8 +319,8 @@ class SessionStore:
             description=description,
             status=status,
             agent_session_id=agent_session_id,
-            channel_key=conversation.channel_key(),
-            conversation_id=conversation.conversation_id,
+            channel_key=channel_key,
+            conversation_payload=dict(conversation_payload),
             workspace=workspace,
             created_at=now,
             updated_at=now,
