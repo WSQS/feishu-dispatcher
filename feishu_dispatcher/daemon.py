@@ -587,8 +587,8 @@ class _Daemon:
     )
     #: Dispatcher 的统一 Session Runtime；首次自然语言输入时惰性构造。
     _dispatcher_runtime: DispatcherSessionRuntime | None = None
-    #: Dispatcher Runtime 事件消费者尾任务；按产生顺序串行处理，关闭前等待收尾。
-    _dispatcher_event_tail: asyncio.Task[None] | None = None
+    #: Tool Loop Runtime 的每 Session 事件消费者尾任务；关闭前等待收尾。
+    _runtime_event_tails: dict[str, asyncio.Task[None]] = field(default_factory=dict)
     #: 同一 Session 的 Turn 共用一把锁；跨 Channel / runner 串行，不同 Session 可并行。
     _session_turn_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
     #: 已预留、尚未登记到 runner 的 agent 名额；覆盖 create_thread 的 await 窗口。
@@ -857,10 +857,11 @@ class _Daemon:
             )
         return record
 
-    def _queue_dispatcher_event(self, event: SessionEvent) -> None:
-        """串行桥接 Dispatcher Runtime 事件到 Daemon 与 Channel 事件管线。"""
-        previous = self._dispatcher_event_tail
-        conversations = self._conversations_for_session(event.session_id)
+    def _queue_runtime_event(self, event: SessionEvent) -> None:
+        """按 Session 串行桥接 Runtime 事件到 Daemon 与 Channel 事件管线。"""
+        session_id = event.session_id
+        previous = self._runtime_event_tails.get(session_id)
+        conversations = self._conversations_for_session(session_id)
         if isinstance(event.body, SessionInputAccepted):
             conversations = tuple(
                 conversation
@@ -892,16 +893,20 @@ class _Daemon:
                     trace_sequence=record.sequence if record is not None else None,
                 )
             finally:
-                if self._dispatcher_event_tail is task:
-                    self._dispatcher_event_tail = None
+                if self._runtime_event_tails.get(session_id) is task:
+                    self._runtime_event_tails.pop(session_id, None)
 
         task = asyncio.create_task(consume())
-        self._dispatcher_event_tail = task
+        self._runtime_event_tails[session_id] = task
 
-    async def _wait_dispatcher_events(self) -> None:
-        """等待已接收的 Dispatcher Runtime 事件完成持久化与消费。"""
-        while (tail := self._dispatcher_event_tail) is not None:
-            await tail
+    async def _wait_runtime_events(self, session_id: str | None = None) -> None:
+        """等待指定 Session 或全部 Runtime 事件完成持久化与消费。"""
+        if session_id is not None:
+            while (tail := self._runtime_event_tails.get(session_id)) is not None:
+                await tail
+            return
+        while self._runtime_event_tails:
+            await asyncio.gather(*tuple(self._runtime_event_tails.values()))
 
     async def _close_trace_store(self) -> None:
         """幂等关闭 daemon 持有的 Session Trace Store。"""
@@ -2661,7 +2666,7 @@ class _Daemon:
                 memory=self._sched_memory,
                 tools_provider=self._dispatcher_tools_for,
             )
-            runtime.subscribe(self._queue_dispatcher_event)
+            runtime.subscribe(self._queue_runtime_event)
             self._dispatcher_runtime = runtime
         return runtime
 
@@ -3444,7 +3449,7 @@ class _Daemon:
         """退出清理：停 WS 线程，取消并等待全部 agent worker 收尾。"""
         if self._dispatcher_runtime is not None:
             await self._dispatcher_runtime.close()
-            await self._wait_dispatcher_events()
+        await self._wait_runtime_events()
         if self._control is not None:
             # control.stop() 会阻塞（等 serve_forever 确认），且可能与正 run_
             # coroutine_threadsafe 回等主 loop 的 handler 线程死锁。挪到 worker
