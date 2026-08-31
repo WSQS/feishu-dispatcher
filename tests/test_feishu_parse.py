@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 import pytest
 
 from feishu_dispatcher.channel import ChannelMessage
-from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.feishu import FeishuBridge, _RateLimiter
 from feishu_dispatcher.livecard import LiveCard
 from feishu_dispatcher.session_event import (
@@ -24,6 +23,9 @@ from feishu_dispatcher.session_event import (
     ToolCallObserved,
 )
 from feishu_dispatcher.throttler import StreamThrottler
+from tests.conversation_fakes import (
+    ChannelConversationRefFactory as ConversationRef,
+)
 
 
 def _event(
@@ -448,7 +450,7 @@ def test_feishu_conversation_ref_codec_rejects_other_channel() -> None:
 def test_feishu_conversation_ref_codec_rejects_blank_serialized_id() -> None:
     bridge = make_bridge()
 
-    with pytest.raises(ValueError, match="conversation_id 不能为空"):
+    with pytest.raises(ValueError, match="ConversationRef 不能为空"):
         bridge.serialize_conversation_ref(ConversationRef("feishu", " "))
 
 
@@ -458,7 +460,7 @@ def test_feishu_conversation_ref_codec_rejects_invalid_payload(
 ) -> None:
     bridge = make_bridge()
 
-    with pytest.raises(ValueError, match="conversation_id 不能为空"):
+    with pytest.raises(ValueError, match="ConversationRef payload 无效"):
         bridge.deserialize_conversation_ref(payload)
 
 

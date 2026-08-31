@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 
 import pytest
 
-from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.session_event import (
     AgentOutputDelta,
     SessionEvent,
@@ -18,6 +17,7 @@ from feishu_dispatcher.trace_store import (
     SessionTraceStore,
     SessionTraceStoreClosed,
 )
+from tests.conversation_fakes import ConversationRefFactory as ConversationRef
 
 _OCCURRED_AT = datetime(2026, 8, 25, 12, 0, tzinfo=timezone.utc)
 

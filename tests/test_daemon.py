@@ -26,7 +26,7 @@ from feishu_dispatcher.config import (
     LLMSettings,
     Project,
 )
-from feishu_dispatcher.conversation import ConversationRef
+from feishu_dispatcher.conversation import ConversationRef as ConversationRefProtocol
 from feishu_dispatcher.daemon import (
     _DISPATCHER_SESSION_ID,
     TurnRequest,
@@ -35,7 +35,7 @@ from feishu_dispatcher.daemon import (
     _Daemon,
     _FanoutStreamingOutput,
 )
-from feishu_dispatcher.http_channel import HttpChannel
+from feishu_dispatcher.http_channel import HttpChannel, HttpConversationRef
 from feishu_dispatcher.livecard import LiveCard
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
 from feishu_dispatcher.session_event import (
@@ -53,6 +53,7 @@ from feishu_dispatcher.session_event import (
 from feishu_dispatcher.store import ProjectStore, SessionStore
 from feishu_dispatcher.throttler import StreamThrottler
 from feishu_dispatcher.trace_store import SessionTraceStore
+from tests.conversation_fakes import ConversationRefFactory as ConversationRef
 
 
 class FakeBridge:
@@ -109,7 +110,7 @@ class FakeBridge:
     ) -> ConversationRef:
         conversation_id = payload.get("conversation_id")
         if not isinstance(conversation_id, str) or not conversation_id.strip():
-            raise ValueError("Fake ConversationRef.conversation_id 不能为空")
+            raise ValueError("Fake ConversationRef 不能为空")
         return ConversationRef(self.channel_key, conversation_id.strip())
 
     def reply_in_thread(self, root_message_id: str, text: str) -> str:
@@ -1189,7 +1190,7 @@ async def test_http_create_task_conversation_creates_thread_and_binds_task():
             conversation_id = payload["conversation_id"]
             assert conversation_id.startswith("http-conversation-")
             conversation_ids.append(conversation_id)
-            task_conversation = ConversationRef("http", conversation_id)
+            task_conversation = HttpConversationRef(conversation_id)
             assert daemon._session_for_conversation(task_conversation) is task
             events = http._events_after(conversation_id, 0)["events"]
             assert events[0]["type"] == "conversation.created"
@@ -1241,7 +1242,7 @@ async def test_http_task_conversation_round_trip_routes_to_existing_runner():
         assert status == 201
         conversation_id = opened["conversation_id"]
         assert (
-            daemon._session_for_conversation(ConversationRef("http", conversation_id))
+            daemon._session_for_conversation(HttpConversationRef(conversation_id))
             is task
         )
 
@@ -1588,7 +1589,9 @@ def task_by_conversation(
     channel: str | ConversationRef = "feishu",
 ):
     channel_key = (
-        channel.channel_key() if isinstance(channel, ConversationRef) else channel
+        channel.channel_key()
+        if isinstance(channel, ConversationRefProtocol)
+        else channel
     )
     return store.by_conversation(
         channel_key,

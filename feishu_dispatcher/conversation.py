@@ -1,25 +1,18 @@
-"""Conversation 领域值对象。"""
+"""Conversation 引用的领域接口。"""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from typing import Protocol, runtime_checkable
 
 
-@dataclass(frozen=True, init=False)
-class ConversationRef:
-    """一个 Channel 内会话的稳定引用。"""
-
-    _channel_key: str
-    conversation_id: str
-
-    def __init__(self, channel_key: str, conversation_id: str) -> None:
-        object.__setattr__(self, "_channel_key", channel_key)
-        object.__setattr__(self, "conversation_id", conversation_id)
+@runtime_checkable
+class ConversationRef(Protocol):
+    """由具体 Channel 实现的、对外不透明的会话引用。"""
 
     def channel_key(self) -> str:
         """返回持有该会话的 Channel 路由键。"""
-        return self._channel_key
+        ...
 
     def to_log_string(self) -> str:
         """返回用于日志记录的稳定会话标识。"""
-        return f"{self.channel_key()}:{self.conversation_id}"
+        ...

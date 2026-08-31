@@ -10,7 +10,6 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
 from feishu_dispatcher.channel import ChannelMessage
-from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.http_channel import HttpChannel
 from feishu_dispatcher.session_event import (
     AgentOutputDelta,
@@ -20,6 +19,9 @@ from feishu_dispatcher.session_event import (
     SessionEvent,
     SessionInputAccepted,
     session_event_to_dict,
+)
+from tests.conversation_fakes import (
+    ChannelConversationRefFactory as ConversationRef,
 )
 
 pytestmark = pytest.mark.webui_e2e
