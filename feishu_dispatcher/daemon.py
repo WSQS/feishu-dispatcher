@@ -52,7 +52,12 @@ from .scheduler import (
     SchedulerMemory,
     build_scheduler_tools,
 )
-from .session import DispatcherSessionRuntime, TurnRequest
+from .session import (
+    DispatcherSessionRuntime,
+    SessionRuntime,
+    SessionRuntimeRegistry,
+    TurnRequest,
+)
 from .session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
@@ -585,8 +590,10 @@ class _Daemon:
     _sched_memory: SchedulerMemory = field(
         default_factory=lambda: SchedulerMemory(None)
     )
-    #: Dispatcher 的统一 Session Runtime；首次自然语言输入时惰性构造。
-    _dispatcher_runtime: DispatcherSessionRuntime | None = None
+    #: 当前已登记的 Session Runtime；Runtime 自身负责输入队列与执行生命周期。
+    _session_runtimes: SessionRuntimeRegistry = field(
+        default_factory=SessionRuntimeRegistry
+    )
     #: Tool Loop Runtime 的每 Session 事件消费者尾任务；关闭前等待收尾。
     _runtime_event_tails: dict[str, asyncio.Task[None]] = field(default_factory=dict)
     #: 同一 Session 的 Turn 共用一把锁；跨 Channel / runner 串行，不同 Session 可并行。
@@ -907,6 +914,11 @@ class _Daemon:
             return
         while self._runtime_event_tails:
             await asyncio.gather(*tuple(self._runtime_event_tails.values()))
+
+    def _register_session_runtime(self, runtime: SessionRuntime) -> None:
+        """登记 Runtime 并接入 daemon 的统一 SessionEvent 管线。"""
+        if self._session_runtimes.register(runtime):
+            runtime.subscribe(self._queue_runtime_event)
 
     async def _close_trace_store(self) -> None:
         """幂等关闭 daemon 持有的 Session Trace Store。"""
@@ -2658,16 +2670,18 @@ class _Daemon:
             runtime.submit(TurnRequest(text, conversation))
 
     def _get_dispatcher_runtime(self) -> DispatcherSessionRuntime:
-        runtime = self._dispatcher_runtime
-        if runtime is None:
-            runtime = DispatcherSessionRuntime(
-                session_id=_DISPATCHER_SESSION_ID,
-                llm_provider=lambda: self._llm,
-                memory=self._sched_memory,
-                tools_provider=self._dispatcher_tools_for,
-            )
-            runtime.subscribe(self._queue_runtime_event)
-            self._dispatcher_runtime = runtime
+        runtime = self._session_runtimes.get_for_session(_DISPATCHER_SESSION_ID)
+        if runtime is not None:
+            if not isinstance(runtime, DispatcherSessionRuntime):
+                raise RuntimeError("Dispatcher Session Runtime 类型不匹配")
+            return runtime
+        runtime = DispatcherSessionRuntime(
+            session_id=_DISPATCHER_SESSION_ID,
+            llm_provider=lambda: self._llm,
+            memory=self._sched_memory,
+            tools_provider=self._dispatcher_tools_for,
+        )
+        self._register_session_runtime(runtime)
         return runtime
 
     def _dispatcher_tools_for(self, conversation: ConversationRef) -> list:
@@ -3447,8 +3461,14 @@ class _Daemon:
 
     async def _shutdown(self) -> None:
         """退出清理：停 WS 线程，取消并等待全部 agent worker 收尾。"""
-        if self._dispatcher_runtime is not None:
-            await self._dispatcher_runtime.close()
+        for runtime in self._session_runtimes.values():
+            try:
+                await runtime.close()
+            except Exception:
+                logger.exception(
+                    "Session Runtime 关闭失败 session=%s",
+                    runtime.session_id,
+                )
         await self._wait_runtime_events()
         if self._control is not None:
             # control.stop() 会阻塞（等 serve_forever 确认），且可能与正 run_

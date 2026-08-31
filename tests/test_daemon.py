@@ -1634,7 +1634,7 @@ async def wait_until(cond, timeout: float = 2.0) -> None:
 
 
 async def wait_dispatcher_idle(daemon: _Daemon) -> None:
-    runtime = daemon._dispatcher_runtime
+    runtime = daemon._session_runtimes.get_for_session(_DISPATCHER_SESSION_ID)
     assert runtime is not None
     await runtime.wait_idle()
     await daemon._wait_runtime_events(_DISPATCHER_SESSION_ID)
@@ -4397,6 +4397,76 @@ async def test_runtime_events_for_different_sessions_run_in_parallel():
     await daemon._wait_runtime_events()
 
     assert consumed == ["second", "first"]
+
+
+def test_register_session_runtime_subscribes_once():
+    daemon, _, _ = make_daemon()
+
+    class FakeRuntime:
+        session_id = "session-a"
+
+        def __init__(self) -> None:
+            self.subscribe_count = 0
+
+        def subscribe(self, _listener):
+            self.subscribe_count += 1
+            return lambda: None
+
+    runtime = FakeRuntime()
+
+    daemon._register_session_runtime(runtime)
+    daemon._register_session_runtime(runtime)
+
+    assert daemon._session_runtimes.get_for_session("session-a") is runtime
+    assert runtime.subscribe_count == 1
+
+
+async def test_shutdown_closes_all_registered_session_runtimes():
+    daemon, _, _ = make_daemon()
+    closed: list[str] = []
+
+    class FakeRuntime:
+        def __init__(self, session_id: str) -> None:
+            self.session_id = session_id
+
+        def subscribe(self, _listener):
+            return lambda: None
+
+        async def close(self) -> None:
+            closed.append(self.session_id)
+
+    daemon._register_session_runtime(FakeRuntime("session-a"))
+    daemon._register_session_runtime(FakeRuntime("session-b"))
+
+    await daemon._shutdown()
+
+    assert closed == ["session-a", "session-b"]
+
+
+async def test_shutdown_continues_after_session_runtime_close_failure(caplog):
+    daemon, _, _ = make_daemon()
+    closed: list[str] = []
+
+    class FakeRuntime:
+        def __init__(self, session_id: str, *, fails: bool = False) -> None:
+            self.session_id = session_id
+            self.fails = fails
+
+        def subscribe(self, _listener):
+            return lambda: None
+
+        async def close(self) -> None:
+            closed.append(self.session_id)
+            if self.fails:
+                raise RuntimeError("close boom")
+
+    daemon._register_session_runtime(FakeRuntime("session-a", fails=True))
+    daemon._register_session_runtime(FakeRuntime("session-b"))
+
+    await daemon._shutdown()
+
+    assert closed == ["session-a", "session-b"]
+    assert "Session Runtime 关闭失败 session=session-a" in caplog.text
 
 
 async def test_scheduler_feeds_history_on_next_message():
