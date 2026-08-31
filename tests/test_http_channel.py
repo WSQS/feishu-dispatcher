@@ -17,7 +17,6 @@ import pytest
 
 from feishu_dispatcher import __version__
 from feishu_dispatcher.channel import ChannelMessage
-from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.http_channel import HttpChannel, ensure_token
 from feishu_dispatcher.session_event import (
     AgentOutputDelta,
@@ -29,6 +28,9 @@ from feishu_dispatcher.session_event import (
     SessionInputAccepted,
     ToolCallObserved,
     session_event_to_dict,
+)
+from tests.conversation_fakes import (
+    ChannelConversationRefFactory as ConversationRef,
 )
 
 
@@ -538,7 +540,7 @@ def test_http_conversation_ref_codec_rejects_blank_serialized_id() -> None:
     try:
         channel = HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
 
-        with pytest.raises(ValueError, match="conversation_id 不能为空"):
+        with pytest.raises(ValueError, match="ConversationRef 不能为空"):
             channel.serialize_conversation_ref(ConversationRef("http", " "))
     finally:
         loop.close()
@@ -552,7 +554,7 @@ def test_http_conversation_ref_codec_rejects_invalid_payload(
     try:
         channel = HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
 
-        with pytest.raises(ValueError, match="conversation_id 不能为空"):
+        with pytest.raises(ValueError, match="ConversationRef payload 无效"):
             channel.deserialize_conversation_ref(payload)
     finally:
         loop.close()
@@ -1033,7 +1035,7 @@ async def test_session_input_event_projects_to_thread_message():
 
     def serialize(conversation: ConversationRef) -> dict[str, object]:
         serialized.append(conversation)
-        return {"opaque_id": conversation.conversation_id}
+        return {"opaque_id": conversation.to_log_string()}
 
     channel = HttpChannel(
         "tok-http",
@@ -1081,7 +1083,7 @@ async def test_session_input_event_projects_to_thread_message():
         }
         assert raw_event["event"]["payload"]["source"] == {
             "channel_key": "feishu",
-            "opaque_id": "om_root",
+            "opaque_id": "feishu:om_root",
         }
         assert serialized == [
             ConversationRef("feishu", "om_root"),

@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from pathlib import Path
-from typing import Any, NewType, cast
+from typing import Any, cast
 from urllib.parse import parse_qs
 from uuid import uuid4
 
@@ -33,7 +33,19 @@ from .session_event import (
     session_event_to_dict,
 )
 
-HttpConversationRef = NewType("HttpConversationRef", ConversationRef)
+
+@dataclass(frozen=True)
+class HttpConversationRef:
+    """HTTP Channel 持有的具体会话引用。"""
+
+    conversation_id: str
+
+    def channel_key(self) -> str:
+        return "http"
+
+    def to_log_string(self) -> str:
+        return f"http:{self.conversation_id}"
+
 
 logger = logging.getLogger(__name__)
 
@@ -253,12 +265,19 @@ class HttpChannel:
         self,
         conversation: ConversationRef,
     ) -> dict[str, object]:
-        if conversation.channel_key() != "http":
-            raise ValueError("ConversationRef 不属于 HTTP Channel")
+        conversation = self._require_http_conversation(conversation)
         conversation_id = conversation.conversation_id.strip()
         if not conversation_id:
-            raise ValueError("HTTP ConversationRef.conversation_id 不能为空")
+            raise ValueError("HTTP ConversationRef 不能为空")
         return {"conversation_id": conversation_id}
+
+    @staticmethod
+    def _require_http_conversation(
+        conversation: ConversationRef,
+    ) -> HttpConversationRef:
+        if not isinstance(conversation, HttpConversationRef):
+            raise ValueError("ConversationRef 不属于 HTTP Channel")
+        return conversation
 
     def deserialize_conversation_ref(
         self,
@@ -266,12 +285,12 @@ class HttpChannel:
     ) -> HttpConversationRef:
         conversation_id = payload.get("conversation_id")
         if not isinstance(conversation_id, str) or not conversation_id.strip():
-            raise ValueError("HTTP ConversationRef.conversation_id 不能为空")
-        return HttpConversationRef(ConversationRef("http", conversation_id.strip()))
+            raise ValueError("HTTP ConversationRef payload 无效")
+        return HttpConversationRef(conversation_id.strip())
 
     def create_thread(self, initial_text: str) -> HttpConversationRef:
         conversation_id = f"http-conversation-{uuid4().hex}"
-        conversation = HttpConversationRef(ConversationRef("http", conversation_id))
+        conversation = HttpConversationRef(conversation_id)
         self._claim_targets(conversation_id, [])
         message_id = self._new_target(conversation_id, "message")
         self._append_event(
@@ -319,7 +338,8 @@ class HttpChannel:
 
     def send_text(self, conversation: ConversationRef, text: str) -> str:
         conversation_id = self._clean_identity(
-            conversation.conversation_id, "conversation_id"
+            self._require_http_conversation(conversation).conversation_id,
+            "conversation_id",
         )
         self._claim_targets(conversation_id, [])
         message_id = self._new_target(conversation_id, "message")
@@ -353,7 +373,8 @@ class HttpChannel:
         ):
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
         conversation_id = self._clean_identity(
-            conversation.conversation_id, "conversation_id"
+            self._require_http_conversation(conversation).conversation_id,
+            "conversation_id",
         )
         self._claim_targets(conversation_id, [])
         owner = conversation_id
@@ -399,7 +420,7 @@ class HttpChannel:
             return
         source = body.source.channel_key() if body.source is not None else "unknown"
         self.send_text(
-            HttpConversationRef(ConversationRef("http", conversation_id)),
+            HttpConversationRef(conversation_id),
             f"↪️ 同步自 {source}：{body.text}",
         )
 
@@ -411,7 +432,8 @@ class HttpChannel:
         footer: str = "",
     ) -> _HttpStreamingOutput:
         conversation_id = self._clean_identity(
-            conversation.conversation_id, "conversation_id"
+            self._require_http_conversation(conversation).conversation_id,
+            "conversation_id",
         )
         self._claim_targets(conversation_id, [])
         return _HttpStreamingOutput(
@@ -496,7 +518,7 @@ class HttpChannel:
         try:
             message = self._parse_message(body)
             self._claim_targets(
-                message.conversation.conversation_id,
+                self._require_http_conversation(message.conversation).conversation_id,
                 [message.message_id],
             )
 
@@ -588,7 +610,7 @@ class HttpChannel:
         text = body.get("text")
         if not isinstance(text, str):
             raise _HttpRequestError(400, "invalid_request", "text 必须是字符串")
-        conversation = HttpConversationRef(ConversationRef("http", conversation_id))
+        conversation = HttpConversationRef(conversation_id)
         return ChannelMessage(
             conversation=conversation,
             message_id=message_id,
@@ -641,7 +663,7 @@ class HttpChannel:
                 self._target_conversations[target_id] = conversation_id
 
     def _rollback_conversation(self, conversation: ConversationRef) -> None:
-        conversation_id = conversation.conversation_id
+        conversation_id = self._require_http_conversation(conversation).conversation_id
         with self._state_lock:
             state = self._conversations.pop(conversation_id, None)
             if state is not None:

@@ -24,7 +24,8 @@ import threading
 import time
 from collections import deque
 from collections.abc import Callable, Collection
-from typing import Any, NewType, cast
+from dataclasses import dataclass
+from typing import Any, cast
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -52,7 +53,19 @@ from .session_event import (
     ToolCallObserved,
 )
 
-FeishuConversationRef = NewType("FeishuConversationRef", ConversationRef)
+
+@dataclass(frozen=True)
+class FeishuConversationRef:
+    """Feishu Channel 持有的具体会话引用。"""
+
+    conversation_id: str
+
+    def channel_key(self) -> str:
+        return "feishu"
+
+    def to_log_string(self) -> str:
+        return f"feishu:{self.conversation_id}"
+
 
 # 延迟 import：event 模型属于 im.v1 namespace（单 ns，安全），但顶部 import
 # 会触发 lark_oapi/__init__；shim 必须先装好。调用方 import 顺序：
@@ -643,10 +656,7 @@ class FeishuBridge:
             or ""
         )
         conversation = FeishuConversationRef(
-            ConversationRef(
-                "feishu",
-                thread_root or msg.get("chat_id", ""),
-            )
+            thread_root or msg.get("chat_id", ""),
         )
         return ChannelMessage(
             conversation=conversation,
@@ -716,6 +726,7 @@ class FeishuBridge:
         footer: str = "",
     ) -> StreamingOutput:
         """登记一个 agent 回合的输出呈现，由 SessionEvent 驱动实际发送。"""
+        conversation = self._require_feishu_conversation(conversation)
         target_id = conversation.conversation_id
         if self._stream_mode == "card":
             from .livecard import LiveCard
@@ -771,6 +782,7 @@ class FeishuBridge:
             ),
         ):
             raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
+        conversation = self._require_feishu_conversation(conversation)
         self._run_on_main_loop(
             self._project_session_event(conversation.conversation_id, event)
         )
@@ -846,12 +858,19 @@ class FeishuBridge:
         self,
         conversation: ConversationRef,
     ) -> dict[str, object]:
-        if conversation.channel_key() != "feishu":
-            raise ValueError("ConversationRef 不属于 Feishu Channel")
+        conversation = self._require_feishu_conversation(conversation)
         conversation_id = conversation.conversation_id.strip()
         if not conversation_id:
-            raise ValueError("Feishu ConversationRef.conversation_id 不能为空")
+            raise ValueError("Feishu ConversationRef 不能为空")
         return {"conversation_id": conversation_id}
+
+    @staticmethod
+    def _require_feishu_conversation(
+        conversation: ConversationRef,
+    ) -> FeishuConversationRef:
+        if not isinstance(conversation, FeishuConversationRef):
+            raise ValueError("ConversationRef 不属于 Feishu Channel")
+        return conversation
 
     def deserialize_conversation_ref(
         self,
@@ -859,23 +878,24 @@ class FeishuBridge:
     ) -> FeishuConversationRef:
         conversation_id = payload.get("conversation_id")
         if not isinstance(conversation_id, str) or not conversation_id.strip():
-            raise ValueError("Feishu ConversationRef.conversation_id 不能为空")
-        return FeishuConversationRef(ConversationRef("feishu", conversation_id.strip()))
+            raise ValueError("Feishu ConversationRef payload 无效")
+        return FeishuConversationRef(conversation_id.strip())
 
     def create_thread(self, initial_text: str) -> FeishuConversationRef:
         """在配置的根群聊中创建话题并返回其 ConversationRef。"""
         root_message_id = self.send_root_message(self._chat_whitelist, initial_text)
-        return FeishuConversationRef(ConversationRef("feishu", root_message_id))
+        return FeishuConversationRef(root_message_id)
 
     def control_conversation(self) -> FeishuConversationRef | None:
         """返回配置的控制会话；未配置控制群聊时返回 None。"""
         chat_id = self._chat_whitelist.strip()
         if not chat_id:
             return None
-        return FeishuConversationRef(ConversationRef("feishu", chat_id))
+        return FeishuConversationRef(chat_id)
 
     def send_text(self, conversation: ConversationRef, text: str) -> str:
         """向 Conversation 发送文本。"""
+        conversation = self._require_feishu_conversation(conversation)
         conversation_id = conversation.conversation_id
         if conversation_id == self._chat_whitelist:
             return self.send_root_message(conversation_id, text)

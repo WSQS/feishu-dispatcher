@@ -6,7 +6,6 @@ import asyncio
 
 import pytest
 
-from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.scheduler import LLMResponse, SchedulerMemory
 from feishu_dispatcher.session import (
     DispatcherSessionRuntime,
@@ -20,6 +19,7 @@ from feishu_dispatcher.session_event import (
     SessionInputAccepted,
     SessionStateChanged,
 )
+from tests.conversation_fakes import ConversationRefFactory as ConversationRef
 
 
 class FakeLLM:

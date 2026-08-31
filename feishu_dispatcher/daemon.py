@@ -473,12 +473,10 @@ class _AgentSessionRunner:
 
     project_name: str
     agent_label: str
+    #: Task 的主 Thread Conversation；生命周期事件与后台输出据此寻址。
+    conversation: ConversationRef
     #: 关联的 Session id（当前值来自持久台账主键 Session.session_id）
     session_id: str = ""
-    #: Task 的主 Thread Conversation；生命周期事件与后台输出据此寻址。
-    conversation: ConversationRef = field(
-        default_factory=lambda: ConversationRef("", "")
-    )
     #: agent 工作目录（= Session.workspace）
     cwd: str = ""
     #: 是否由 load_session 恢复而来（影响启动失败时的提示文案）
