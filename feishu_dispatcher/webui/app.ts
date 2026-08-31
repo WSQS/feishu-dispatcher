@@ -1185,9 +1185,9 @@ async function connect() {
   return instanceState;
 }
 
-async function createTaskConversation(task) {
+async function createSessionConversation(task) {
   await refreshChannelInstance();
-  const payload = await api.createTaskConversation(task.task_id);
+  const payload = await api.createSessionConversation(task.task_id);
   const taskConversationId = payload.conversation_id.trim();
   taskConversations.set(task.task_id, taskConversationId);
   rememberTarget(taskConversationId, task.task_id);
@@ -1215,7 +1215,7 @@ async function selectTask(taskId) {
       !taskConversations.has(taskId)
     ) {
       setStatus(`正在打开 ${taskName(task)}…`, "busy");
-      await createTaskConversation(task);
+      await createSessionConversation(task);
     }
     selectedTaskId = taskId;
     loadActiveConversationState();

@@ -188,7 +188,7 @@ def test_webui_recovers_http_channel_instance_and_cursor():
         "async function refreshChannelInstance",
     )
     connect = section(
-        "async function connect()", "async function createTaskConversation"
+        "async function connect()", "async function createSessionConversation"
     )
     poll_once = section("async function pollOnce", "function wait")
     recovery = section("function recoverPollingError", "function startPolling")
@@ -476,9 +476,9 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
         assert "async listTasks()" in api_javascript
         assert 'request("/api/tasks")' in api_javascript
         assert "/events?${query}`" in api_javascript
-        assert "api.createTaskConversation(" in javascript
+        assert "api.createSessionConversation(" in javascript
         assert "/conversations`" not in javascript
-        assert "async createTaskConversation(" in api_javascript
+        assert "async createSessionConversation(" in api_javascript
         assert "api.sendChannelMessage(payload)" in javascript
         assert 'apiRequest("/api/channel/messages"' not in javascript
         assert "async sendChannelMessage(" in api_javascript

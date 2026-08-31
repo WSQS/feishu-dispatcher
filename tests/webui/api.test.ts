@@ -15,7 +15,7 @@ import type {
   ProjectSummary,
   SendChannelMessageRequest,
   TaskEventPage,
-  TaskConversationCreated,
+  SessionConversationCreated,
   TaskSummary,
   TreeEntry,
 } from "../../feishu_dispatcher/webui/api.ts";
@@ -122,11 +122,11 @@ describe("createApiClient 类型化方法", () => {
     expectTypeOf(api.loadChannelEvents).returns.resolves.toEqualTypeOf<
       ChannelEventPage
     >();
-    expectTypeOf(api.createTaskConversation).parameters.toEqualTypeOf<
+    expectTypeOf(api.createSessionConversation).parameters.toEqualTypeOf<
       [string]
     >();
-    expectTypeOf(api.createTaskConversation).returns.resolves.toEqualTypeOf<
-      TaskConversationCreated
+    expectTypeOf(api.createSessionConversation).returns.resolves.toEqualTypeOf<
+      SessionConversationCreated
     >();
     expectTypeOf(api.sendChannelMessage).parameters.toEqualTypeOf<
       [SendChannelMessageRequest]
@@ -425,7 +425,7 @@ describe("createApiClient 类型化方法", () => {
     ]);
   });
 
-  it("创建 Task Conversation 并校验响应身份", async () => {
+  it("创建 Session Conversation 并校验响应身份", async () => {
     const fetch = vi
       .fn()
       .mockResolvedValueOnce(
@@ -450,14 +450,14 @@ describe("createApiClient 类型化方法", () => {
     const api = createApiClient(() => "token-a");
 
     await expect(
-      api.createTaskConversation("task A"),
+      api.createSessionConversation("task A"),
     ).resolves.toEqual({
-      task_id: "task A",
+      session_id: "task A",
       conversation_id: "conversation-a",
-    } satisfies TaskConversationCreated);
+    } satisfies SessionConversationCreated);
     await expect(
-      api.createTaskConversation("task A"),
-    ).rejects.toThrow("Task Conversation响应格式无效");
+      api.createSessionConversation("task A"),
+    ).rejects.toThrow("Session Conversation响应格式无效");
 
     expect(fetch.mock.calls.map(([path]) => path)).toEqual([
       "/api/tasks/task%20A/conversations",
