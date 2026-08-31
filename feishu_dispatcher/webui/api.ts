@@ -106,8 +106,8 @@ export interface ChannelEventPage {
   oldest_cursor: number;
 }
 
-export interface TaskConversationCreated {
-  task_id: string;
+export interface SessionConversationCreated {
+  session_id: string;
   conversation_id: string;
 }
 
@@ -266,9 +266,9 @@ function isChannelEventPage(value: unknown): value is ChannelEventPage {
   );
 }
 
-function isTaskConversationCreated(
+function isSessionConversationCreatedPayload(
   value: unknown,
-): value is TaskConversationCreated {
+): value is { task_id: string; conversation_id: string } {
   return (
     isRecord(value) &&
     isNonEmptyString(value.task_id) &&
@@ -353,22 +353,25 @@ export function createApiClient(getToken: () => string) {
       return payload;
     },
 
-    async createTaskConversation(
-      taskId: string,
-    ): Promise<TaskConversationCreated> {
+    async createSessionConversation(
+      sessionId: string,
+    ): Promise<SessionConversationCreated> {
       const payload = await request<unknown>(
-        `/api/tasks/${encodeURIComponent(taskId)}/conversations`,
+        `/api/tasks/${encodeURIComponent(sessionId)}/conversations`,
         {
           method: "POST",
         },
       );
       if (
-        !isTaskConversationCreated(payload) ||
-        payload.task_id !== taskId
+        !isSessionConversationCreatedPayload(payload) ||
+        payload.task_id !== sessionId
       ) {
-        throw invalidResponse("Task Conversation");
+        throw invalidResponse("Session Conversation");
       }
-      return payload;
+      return {
+        session_id: payload.task_id,
+        conversation_id: payload.conversation_id,
+      };
     },
 
     async sendChannelMessage(
