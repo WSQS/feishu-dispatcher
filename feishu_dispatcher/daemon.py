@@ -672,6 +672,21 @@ class _Daemon:
             raise ValueError(f"Channel 未注册: {channel_key!r}") from exc
         return channel.deserialize_conversation_ref(payload)
 
+    def _conversation_for_session(self, session: Session) -> ConversationRef:
+        return self._deserialize_conversation_ref(
+            session.channel_key,
+            session.conversation_payload,
+        )
+
+    def _stored_session_for_conversation(
+        self,
+        conversation: ConversationRef,
+    ) -> Session | None:
+        return self.store.by_conversation(
+            conversation.channel_key(),
+            self._serialize_conversation_ref(conversation),
+        )
+
     def _reserve_agent_slot(self) -> bool:
         if self._runners.count() + self._pending_agent_launches >= self.cfg.max_agents:
             return False
@@ -1111,7 +1126,7 @@ class _Daemon:
 
         bound_session_id = self._session_id_for_conversation(conversation)
         persisted_session = (
-            self.store.by_conversation(conversation)
+            self._stored_session_for_conversation(conversation)
             if bound_session_id is None
             else None
         )
@@ -1552,7 +1567,10 @@ class _Daemon:
                 project_name=project_name,
                 agent_label=agent_label,
                 description=task,
-                conversation=session_conversation,
+                channel_key=session_conversation.channel_key(),
+                conversation_payload=self._serialize_conversation_ref(
+                    session_conversation
+                ),
                 workspace=str(project.path),
             )
             self._launch(
@@ -1677,7 +1695,10 @@ class _Daemon:
                 project_name=project_name,
                 agent_label=agent_label,
                 description=task_desc,
-                conversation=session_conversation,
+                channel_key=session_conversation.channel_key(),
+                conversation_payload=self._serialize_conversation_ref(
+                    session_conversation
+                ),
                 workspace=str(project.path),
                 agent_session_id=session_id,
                 origin="attach",
@@ -1772,7 +1793,7 @@ class _Daemon:
         ``attached=True`` 仅由 ``/attach`` 的**首次**拉起置位——附着摘要文案；该 Session
         事后经 ``_try_resume`` 恢复时仍走普通「已恢复」路径（attached 默认 False）。
         """
-        session_conversation = session.conversation_ref
+        session_conversation = self._conversation_for_session(session)
         self.bind_conversation(session.session_id, session_conversation)
         sess = _AgentSessionRunner(
             project_name=session.project_name,
@@ -2277,7 +2298,7 @@ class _Daemon:
             forward_raw = True
         session = self._session_for_conversation(conversation)
         if session is None:
-            session = self.store.by_conversation(conversation)
+            session = self._stored_session_for_conversation(conversation)
         if session is not None:
             self.bind_conversation(session.session_id, conversation)
         sess = (
@@ -2904,9 +2925,10 @@ class _Daemon:
         task = self.store.get(task_id)
         if task is None:
             return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
+        conversation = self._conversation_for_session(task)
         sess = self._runners.get_for_session(task.session_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
-            sess.enqueue(TurnRequest(message, task.conversation_ref))
+            sess.enqueue(TurnRequest(message, conversation))
             logger.info(
                 "send_to_task[%s] 入队（活跃 session，队列深度=%d，task.status=%s）",
                 task_id,
@@ -2925,7 +2947,7 @@ class _Daemon:
         # 非活跃且可恢复：load_session 惰性重连，把消息作为首轮。check→launch 无 await。
         ok, why = self._try_resume(
             task,
-            first_turn=TurnRequest(message, task.conversation_ref),
+            first_turn=TurnRequest(message, conversation),
         )
         logger.info(
             "send_to_task[%s] 非活跃 status=%s → 恢复%s",
@@ -3033,7 +3055,10 @@ class _Daemon:
                 project_name=project_name,
                 agent_label=agent_label,
                 description=task,
-                conversation=session_conversation,
+                channel_key=session_conversation.channel_key(),
+                conversation_payload=self._serialize_conversation_ref(
+                    session_conversation
+                ),
                 workspace=str(project.path),
                 issue_url=issue_url,
                 model=model,
@@ -3333,7 +3358,7 @@ class _Daemon:
         # 先把「结果」发到话题（可见），再驱动 agent 接续
         await self._safe_send_text(
             self._bg_result_message(job, rc),
-            conversation=task.conversation_ref,
+            conversation=self._conversation_for_session(task),
         )
         sess = self._runners.get_for_session(task.session_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
@@ -3362,7 +3387,7 @@ class _Daemon:
             task,
             first_turn=TurnRequest(
                 self._build_bg_prompt(job, rc),
-                task.conversation_ref,
+                self._conversation_for_session(task),
             ),
         )
         if ok:
