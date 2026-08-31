@@ -819,14 +819,14 @@ class FeishuBridge:
             await output.handle_event(event)
             return
         if (
-            event.session_id == "dispatcher"
-            and isinstance(event.body, AgentOutputFinished)
-            and event.body.message
+            isinstance(event.body, AgentOutputDelta)
+            and event.body.stream == "message"
+            and event.body.text
         ):
             await asyncio.to_thread(
                 self.send_text,
                 FeishuConversationRef(conversation_id),
-                event.body.message,
+                event.body.text,
             )
 
     def _output_for_event(

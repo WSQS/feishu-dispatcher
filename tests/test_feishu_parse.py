@@ -571,7 +571,7 @@ def test_channel_skips_empty_session_input_event(monkeypatch):
     assert calls == []
 
 
-def test_channel_accepts_agent_output_events_without_rendering(monkeypatch):
+def test_channel_projects_message_delta_without_open_output(monkeypatch):
     bridge = make_bridge()
     calls: list[tuple[str, str, bool]] = []
 
@@ -605,10 +605,10 @@ def test_channel_accepts_agent_output_events_without_rendering(monkeypatch):
             ),
         )
 
-    assert calls == []
+    assert calls == [("om_root", "answer", True)]
 
 
-def test_channel_projects_dispatcher_finished_without_open_output(monkeypatch):
+def test_channel_does_not_special_case_dispatcher_finished(monkeypatch):
     bridge = make_bridge()
     calls: list[tuple[str, str]] = []
 
@@ -632,7 +632,7 @@ def test_channel_projects_dispatcher_finished_without_open_output(monkeypatch):
         ),
     )
 
-    assert calls == [("om_root", "answer")]
+    assert calls == []
 
 
 def test_feishu_card_methods_delegate_to_feishu_card_methods(monkeypatch):

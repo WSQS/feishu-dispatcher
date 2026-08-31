@@ -13,6 +13,7 @@ from feishu_dispatcher.session import (
     TurnRequest,
 )
 from feishu_dispatcher.session_event import (
+    AgentOutputDelta,
     AgentOutputFinished,
     AgentOutputStarted,
     SessionErrorOccurred,
@@ -172,6 +173,7 @@ async def test_runtime_publishes_turn_lifecycle_events() -> None:
         SessionInputAccepted,
         SessionStateChanged,
         AgentOutputStarted,
+        AgentOutputDelta,
         AgentOutputFinished,
         SessionStateChanged,
     ]
@@ -181,12 +183,16 @@ async def test_runtime_publishes_turn_lifecycle_events() -> None:
         current_state="running",
     )
     assert events[2].turn_id == receipt.turn.turn_id
-    assert events[3].body == AgentOutputFinished(
+    assert events[3].body == AgentOutputDelta(
+        stream="message",
+        text="reply",
+    )
+    assert events[4].body == AgentOutputFinished(
         message="reply",
         thought="",
         outcome="completed",
     )
-    assert events[4].body == SessionStateChanged(
+    assert events[5].body == SessionStateChanged(
         previous_state="running",
         current_state="idle",
     )
