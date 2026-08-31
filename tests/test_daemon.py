@@ -1637,7 +1637,20 @@ async def wait_dispatcher_idle(daemon: _Daemon) -> None:
     runtime = daemon._dispatcher_runtime
     assert runtime is not None
     await runtime.wait_idle()
-    await daemon._wait_dispatcher_events()
+    await daemon._wait_runtime_events(_DISPATCHER_SESSION_ID)
+
+
+def runtime_state_event(session_id: str, event_id: str) -> SessionEvent:
+    return SessionEvent(
+        event_id=event_id,
+        session_id=session_id,
+        turn_id=None,
+        occurred_at=datetime.now(timezone.utc),
+        body=SessionStateChanged(
+            previous_state="idle",
+            current_state="running",
+        ),
+    )
 
 
 def current_runner(daemon: _Daemon, conversation_id: str = "om_root1"):
@@ -4329,6 +4342,61 @@ async def test_dispatcher_events_are_persisted_in_order(tmp_path):
     ]
     assert bridge.session_event_trace_sequences == [3, 4, 5]
     await daemon._shutdown()
+
+
+async def test_runtime_events_are_serialized_per_session():
+    daemon, _, _ = make_daemon()
+    consumed: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def consume(event: SessionEvent) -> None:
+        if event.event_id == "first":
+            first_started.set()
+            await release_first.wait()
+        consumed.append(event.event_id)
+
+    daemon._session_event_handler = consume
+    daemon._queue_runtime_event(runtime_state_event("session-a", "first"))
+    await first_started.wait()
+    daemon._queue_runtime_event(runtime_state_event("session-a", "second"))
+
+    await asyncio.sleep(0)
+    assert consumed == []
+
+    release_first.set()
+    await daemon._wait_runtime_events("session-a")
+
+    assert consumed == ["first", "second"]
+
+
+async def test_runtime_events_for_different_sessions_run_in_parallel():
+    daemon, _, _ = make_daemon()
+    consumed: list[str] = []
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_finished = asyncio.Event()
+
+    async def consume(event: SessionEvent) -> None:
+        if event.event_id == "first":
+            first_started.set()
+            await release_first.wait()
+        consumed.append(event.event_id)
+        if event.event_id == "second":
+            second_finished.set()
+
+    daemon._session_event_handler = consume
+    daemon._queue_runtime_event(runtime_state_event("session-a", "first"))
+    await first_started.wait()
+    daemon._queue_runtime_event(runtime_state_event("session-b", "second"))
+
+    await asyncio.wait_for(second_finished.wait(), timeout=1)
+    assert consumed == ["second"]
+
+    release_first.set()
+    await daemon._wait_runtime_events()
+
+    assert consumed == ["second", "first"]
 
 
 async def test_scheduler_feeds_history_on_next_message():
