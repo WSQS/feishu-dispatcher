@@ -1118,6 +1118,10 @@ class _Daemon:
                 report_message=message,
             )
             return message
+        await self._safe_send_text(
+            self._delegation_request_message(delegation, instruction),
+            conversation=self._conversation_for_session(worker),
+        )
         return (
             f"已创建委派 {delegation.delegation_id} 并交给 Session "
             f"{worker_session_id}；{message}"
@@ -1160,6 +1164,16 @@ class _Daemon:
                 report_message=result,
             )
             return result
+        worker = self.store.get(delegation.worker_session_id)
+        if worker is not None:
+            await self._safe_send_text(
+                self._delegation_request_message(
+                    delegation,
+                    message,
+                    continued=True,
+                ),
+                conversation=self._conversation_for_session(worker),
+            )
         return f"已让委派 {delegation_id} 继续执行；{result}"
 
     async def _project_manager_complete_delegation(
@@ -1242,6 +1256,37 @@ class _Daemon:
         self._register_session_runtime(runtime)
         return runtime
 
+    @staticmethod
+    def _delegation_request_message(
+        delegation: Delegation,
+        instruction: str,
+        *,
+        continued: bool = False,
+    ) -> str:
+        return (
+            f"📨 Project Manager {'继续委派' if continued else '委派'}\n"
+            f"委派 ID：{delegation.delegation_id}\n"
+            f"Manager Session：{delegation.manager_session_id}\n"
+            f"工作要求：\n{instruction}"
+        )
+
+    @staticmethod
+    def _delegation_result_message(
+        delegation: Delegation,
+        *,
+        outcome: OutputOutcome,
+    ) -> str:
+        return (
+            "📬 Worker 委派结果\n"
+            f"委派 ID：{delegation.delegation_id}\n"
+            f"Manager Session：{delegation.manager_session_id}\n"
+            f"Worker Session：{delegation.worker_session_id}\n"
+            f"Worker Turn：{delegation.worker_turn_id}\n"
+            f"执行结果：{outcome}\n"
+            f"Worker 声明：{delegation.report_status}\n"
+            f"报告：{delegation.report_message or '（无）'}"
+        )
+
     async def _handle_delegation_event(self, event: SessionEvent) -> None:
         if event.turn_id is None:
             return
@@ -1308,13 +1353,13 @@ class _Daemon:
             )
             return
         runtime = self._get_project_manager_runtime(delegation.project_name)
+        result_message = self._delegation_result_message(
+            delegation,
+            outcome=outcome,
+        )
+        await self._safe_send_text(result_message, conversation=conversations[0])
         text = (
-            f"系统通知：委派 {delegation.delegation_id} 的 Worker 本轮已经结束。\n"
-            f"Worker Session：{delegation.worker_session_id}\n"
-            f"Worker Turn：{delegation.worker_turn_id}\n"
-            f"执行结果：{outcome}\n"
-            f"Worker 声明：{delegation.report_status}\n"
-            f"报告：{delegation.report_message or '（无）'}\n\n"
+            f"{result_message}\n\n"
             "请判断下一步：接受结果时调用 complete_delegation；需要补充信息或继续完善时"
             "调用 continue_delegation；需要用户决策时直接向用户提问。"
         )
