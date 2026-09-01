@@ -4753,6 +4753,13 @@ async def test_manager_delegation_reports_and_notifies_after_worker_finish():
         in (created[0].prompts[0])
     )
     assert delegation.delegation_id in result
+    assert (
+        "worker-thread",
+        "📨 Project Manager 委派\n"
+        f"委派 ID：{delegation.delegation_id}\n"
+        "Manager Session：manager:demo\n"
+        "工作要求：\n修复测试",
+    ) in bridge.sent_texts
 
     status, payload = await daemon._ctl_delegation_report(
         worker.session_id,
@@ -4781,6 +4788,25 @@ async def test_manager_delegation_reports_and_notifies_after_worker_finish():
     assert stored.status == "waiting_manager"
     assert stored.report_status == "completed"
     assert stored.report_message == "测试已通过"
+    await wait_until(
+        lambda: (
+            (
+                "manager-thread",
+                "📬 Worker 委派结果\n"
+                f"委派 ID：{delegation.delegation_id}\n"
+                "Manager Session：manager:demo\n"
+                f"Worker Session：{worker.session_id}\n"
+                f"Worker Turn：{delegation.worker_turn_id}\n"
+                "执行结果：completed\n"
+                "Worker 声明：completed\n"
+                "报告：测试已通过",
+            )
+            in bridge.sent_texts
+        )
+    )
+    await wait_until(
+        lambda: ("manager-thread", "已收到 Worker 结果") in bridge.sent_texts
+    )
     assert ("manager-thread", "已收到 Worker 结果") in bridge.sent_texts
 
     previous_turn_id = stored.worker_turn_id
@@ -4795,6 +4821,13 @@ async def test_manager_delegation_reports_and_notifies_after_worker_finish():
         f"fdx delegation report --id {delegation.delegation_id}"
         in (created[0].prompts[1])
     )
+    assert (
+        "worker-thread",
+        "📨 Project Manager 继续委派\n"
+        f"委派 ID：{delegation.delegation_id}\n"
+        "Manager Session：manager:demo\n"
+        "工作要求：\n继续检查边界情况",
+    ) in bridge.sent_texts
     await wait_until(
         lambda: (
             daemon.delegation_store.get(delegation.delegation_id).status
@@ -4805,6 +4838,9 @@ async def test_manager_delegation_reports_and_notifies_after_worker_finish():
     )
     await runtime.wait_idle()
     await daemon._wait_runtime_events(runtime.session_id)
+    await wait_until(
+        lambda: ("manager-thread", "已收到 Worker 补充结果") in bridge.sent_texts
+    )
     assert ("manager-thread", "已收到 Worker 补充结果") in bridge.sent_texts
     assert (
         await daemon._project_manager_complete_delegation(
@@ -4814,6 +4850,65 @@ async def test_manager_delegation_reports_and_notifies_after_worker_finish():
         == f"委派 {delegation.delegation_id} 已确认完成。"
     )
     assert daemon.delegation_store.get(delegation.delegation_id).status == "completed"
+    await daemon._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delegation_messages_route_between_manager_and_worker_channels():
+    store = SessionStore(None)
+    worker = store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="web worker",
+        **stored_conversation_kwargs(ConversationRef("web", "worker-web")),
+        workspace="C:/tmp/demo",
+        agent_session_id="worker-acp-session",
+        status="suspended",
+    )
+    daemon, feishu, created = make_daemon(GatedAgent, store=store)
+    web = FakeBridge(channel_key="web")
+    daemon._channels["web"] = web
+    daemon._llm = ScriptedLLM([LLMResponse(content="已处理跨 Channel 结果")])
+    daemon.open_project_manager(
+        "demo",
+        ConversationRef("feishu", "manager-feishu"),
+    )
+
+    await daemon._project_manager_delegate_to_session(
+        "demo",
+        worker.session_id,
+        "检查 Web Worker",
+    )
+    delegation = daemon.delegation_store.all()[0]
+
+    assert any(
+        target == "worker-web"
+        and "📨 Project Manager 委派" in text
+        and f"委派 ID：{delegation.delegation_id}" in text
+        for target, text in web.sent_texts
+    )
+    assert not any(target == "worker-web" for target, _text in feishu.sent_texts)
+
+    await wait_until(lambda: bool(created))
+    created[0].gate.set()
+    await wait_until(
+        lambda: (
+            daemon.delegation_store.get(delegation.delegation_id).status
+            == "waiting_manager"
+        )
+    )
+    runtime = daemon._get_project_manager_runtime("demo")
+    await runtime.wait_idle()
+    await wait_until(
+        lambda: any(
+            target == "manager-feishu"
+            and "📬 Worker 委派结果" in text
+            and f"委派 ID：{delegation.delegation_id}" in text
+            for target, text in feishu.sent_texts
+        )
+    )
+
+    assert not any(target == "manager-feishu" for target, _text in web.sent_texts)
     await daemon._shutdown()
 
 
@@ -4918,6 +5013,19 @@ async def test_delegation_startup_failure_notifies_manager():
     stored = daemon.delegation_store.get(delegation.delegation_id)
     assert stored.report_status == "unreported"
     assert "失败" in stored.report_message
+    await wait_until(
+        lambda: any(
+            target == "manager-thread"
+            and "📬 Worker 委派结果" in text
+            and f"委派 ID：{delegation.delegation_id}" in text
+            and "Manager Session：manager:demo" in text
+            and "执行结果：failed" in text
+            for target, text in bridge.sent_texts
+        )
+    )
+    await wait_until(
+        lambda: ("manager-thread", "Worker 启动失败，已记录") in bridge.sent_texts
+    )
     assert ("manager-thread", "Worker 启动失败，已记录") in bridge.sent_texts
     await daemon._shutdown()
 
