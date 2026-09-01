@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import secrets
+import shutil
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
@@ -128,6 +129,116 @@ _HELP_CMDS = ("/help", "/?", "/usage")  # root 与话题内通用
 
 #: 环境变量：re-exec 重启时置位，新进程据此发「已重启」回执
 _REBOOTED_ENV = "FEISHU_DISPATCHER_REBOOTED"
+
+
+def _worktree_slug(name: str) -> str:
+    """把项目名压成适合 Windows 路径与 Git ref 的短片段。"""
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
+    return slug or "project"
+
+
+async def _git_output(
+    project_path: Path,
+    args: list[str],
+    *,
+    check: bool = True,
+) -> str:
+    """在项目目录执行 git，返回 stdout；失败时保留 stderr 诊断。"""
+    executable = _resolve_executable("git")
+    proc = await asyncio.create_subprocess_exec(
+        executable,
+        "-C",
+        str(project_path),
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await proc.communicate()
+    out = stdout.decode("utf-8", "replace").strip()
+    err = stderr.decode("utf-8", "replace").strip()
+    if check and proc.returncode:
+        detail = err or out or f"exit code {proc.returncode}"
+        raise RuntimeError(f"git {' '.join(args)} 失败：{detail}")
+    return out
+
+
+async def _create_session_worktree(project: Project, session_id: str) -> Path:
+    """为一个新 Session 创建 sibling worktree，失败时清理已生成的目录。"""
+    project_path = project.path.resolve()
+    if not project_path.is_dir():
+        raise RuntimeError(f"项目路径不是目录：{project_path}")
+    await _git_output(project_path, ["rev-parse", "--show-toplevel"])
+
+    slug = _worktree_slug(project.name)
+    root = project_path.parent / ".fdx-worktrees"
+    workspace = root / f"{slug}-{session_id}"
+    branch = f"fdx/{slug}/{session_id}"
+    if workspace.exists():
+        raise RuntimeError(f"worktree 路径已存在：{workspace}")
+
+    start_point = await _git_output(
+        project_path,
+        ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+        check=False,
+    )
+    if not start_point:
+        start_point = await _git_output(
+            project_path,
+            ["branch", "--show-current"],
+            check=False,
+        ) or "HEAD"
+    branch_exists = bool(
+        await _git_output(
+            project_path,
+            ["show-ref", "--verify", f"refs/heads/{branch}"],
+            check=False,
+        )
+    )
+    if branch_exists:
+        raise RuntimeError(f"worktree 分支已存在：{branch}")
+    root.mkdir(parents=True, exist_ok=True)
+    try:
+        await _git_output(
+            project_path,
+            ["worktree", "add", "-b", branch, str(workspace), start_point],
+        )
+    except Exception as exc:
+        try:
+            await _remove_session_worktree(
+                project,
+                session_id,
+                workspace,
+            )
+        except Exception as cleanup_exc:
+            raise RuntimeError(
+                f"{exc}；失败补偿也未完成：{cleanup_exc}"
+            ) from exc
+        raise
+    return workspace
+
+
+async def _remove_session_worktree(
+    project: Project,
+    session_id: str,
+    workspace: Path,
+) -> None:
+    """补偿删除创建流程尚未交给 Session 的 worktree 与分支。"""
+    project_path = project.path.resolve()
+    branch = f"fdx/{_worktree_slug(project.name)}/{session_id}"
+    await _git_output(
+        project_path,
+        ["worktree", "remove", "--force", str(workspace)],
+        check=False,
+    )
+    if workspace.exists():
+        shutil.rmtree(workspace)
+    await _git_output(project_path, ["worktree", "prune"])
+    if await _git_output(
+        project_path,
+        ["show-ref", "--verify", f"refs/heads/{branch}"],
+        check=False,
+    ):
+        await _git_output(project_path, ["branch", "-D", branch])
 
 #: message_id 去重窗口大小（飞书 ACK 异常时服务端会重推事件）
 _DEDUP_CAPACITY = 512
@@ -1264,7 +1375,21 @@ class _Daemon:
                 "status": "rejected",
                 "error": f"已达并发上限 {self.cfg.max_agents}，请先停止一个 Session。",
             }
+        reserved_session_id = ""
+        workspace = project.path
+        pending_worktree: Path | None = None
         try:
+            reserved_session_id = self.store.reserve_session_id()
+            try:
+                workspace = await _create_session_worktree(
+                    project, reserved_session_id
+                )
+                pending_worktree = workspace
+            except Exception as exc:
+                return {
+                    "status": "rejected",
+                    "error": f"创建 Session worktree 失败：{str(exc)[:300]}",
+                }
             channel = self._channel_for(conversation)
             session_conversation = await asyncio.to_thread(
                 channel.create_thread,
@@ -1278,8 +1403,11 @@ class _Daemon:
                 conversation_payload=self._serialize_conversation_ref(
                     session_conversation
                 ),
-                workspace=str(project.path),
+                workspace=str(workspace),
+                workspace_kind="worktree",
+                session_id=reserved_session_id,
             )
+            pending_worktree = None
             try:
                 self._launch(
                     session,
@@ -1307,6 +1435,13 @@ class _Daemon:
                     "error": f"{type(exc).__name__}: {str(exc)[:200]}",
                 }
         except Exception as exc:
+            if pending_worktree is not None:
+                try:
+                    await _remove_session_worktree(
+                        project, reserved_session_id, pending_worktree
+                    )
+                except Exception as cleanup_exc:
+                    exc = RuntimeError(f"{exc}；worktree 失败补偿未完成：{cleanup_exc}")
             logger.exception(
                 "Project Manager 创建 Worker Session 失败 project=%s",
                 project.name,

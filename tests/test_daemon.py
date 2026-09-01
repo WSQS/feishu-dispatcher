@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import json
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -31,6 +32,7 @@ from feishu_dispatcher.daemon import (
     _DISPATCHER_SESSION_ID,
     TurnRequest,
     _AgentSessionRunner,
+    _create_session_worktree,
     _CurrentRunnerRegistry,
     _Daemon,
     _FanoutStreamingOutput,
@@ -3699,6 +3701,8 @@ async def test_run_creates_task():
     assert t.agent_label == "copilot"
     assert t.agent_session_id == created[0].session_id
     assert t.description == "task"
+    assert t.workspace == str(daemon.cfg.projects["demo"].path)
+    assert t.workspace_kind == "project"
     assert daemon._conversation_for_session(t) == ConversationRef("test", "om_root1")
     await daemon._shutdown()
 
@@ -4566,8 +4570,19 @@ async def test_project_manager_callbacks_are_scoped_to_project():
     assert sent == [(demo.session_id, "继续")]
 
 
+@pytest.fixture
+def manager_worktree(monkeypatch, tmp_path: Path) -> Path:
+    async def fake_create(project, session_id):
+        return tmp_path / f"{project.name}-{session_id}"
+
+    monkeypatch.setattr(daemon_module, "_create_session_worktree", fake_create)
+    return tmp_path
+
+
 @pytest.mark.asyncio
-async def test_project_manager_can_create_worker_session_and_use_existing_tools():
+async def test_project_manager_can_create_worker_session_and_use_existing_tools(
+    manager_worktree: Path,
+):
     daemon, bridge, created = make_daemon()
     manager_conversation = ConversationRef("feishu", "manager-thread")
     runtime = daemon.open_project_manager("demo", manager_conversation)
@@ -4590,7 +4605,8 @@ async def test_project_manager_can_create_worker_session_and_use_existing_tools(
     assert session.project_name == "demo"
     assert session.agent_label == "opencode"
     assert session.description == "新 Worker"
-    assert session.workspace == str(daemon.cfg.projects["demo"].path)
+    assert session.workspace == str(manager_worktree / "demo-t1")
+    assert session.workspace_kind == "worktree"
     assert session_id in [
         item["session_id"] for item in daemon._project_manager_list_sessions("demo")
     ]
@@ -4613,7 +4629,113 @@ async def test_project_manager_can_create_worker_session_and_use_existing_tools(
 
 
 @pytest.mark.asyncio
-async def test_project_manager_create_session_rejects_invalid_agent_and_duplicate():
+async def test_project_manager_create_session_writes_worktree_workspace(
+    manager_worktree: Path,
+):
+    daemon, _, created = make_daemon()
+    manager_conversation = ConversationRef("feishu", "manager-thread")
+    daemon.open_project_manager("demo", manager_conversation)
+    result = await daemon._project_manager_create_session(
+        "demo",
+        manager_conversation,
+        "",
+        "Worker",
+        "任务",
+    )
+
+    assert result["status"] == "starting"
+    session = daemon.store.get("t1")
+    assert session is not None
+    assert session.workspace == str(manager_worktree / "demo-t1")
+    assert session.workspace_kind == "worktree"
+    await wait_until(lambda: bool(created and created[0].prompts))
+    assert created[0].spawn.cwd == str(manager_worktree / "demo-t1")
+    await daemon._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_project_manager_worktree_failure_discards_session(monkeypatch):
+    daemon, _, created = make_daemon()
+    manager_conversation = ConversationRef("feishu", "manager-thread")
+    daemon.open_project_manager("demo", manager_conversation)
+
+    async def fail_create(_project, _session_id):
+        raise RuntimeError("git worktree add failed")
+
+    monkeypatch.setattr(daemon_module, "_create_session_worktree", fail_create)
+    result = await daemon._project_manager_create_session(
+        "demo",
+        manager_conversation,
+        "",
+        "Worker",
+        "任务",
+    )
+
+    assert result["status"] == "rejected"
+    assert "git worktree add failed" in result["error"]
+    assert daemon.store.all() == []
+    assert created == []
+    await daemon._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_create_session_worktree_uses_default_branch_and_rejects_conflict(
+    tmp_path: Path,
+):
+    project_path = tmp_path / "demo"
+    subprocess.run(
+        ["git", "init", "-b", "main", str(project_path)],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(project_path), "config", "user.email", "test@example.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(project_path), "config", "user.name", "Test"],
+        check=True,
+        capture_output=True,
+    )
+    (project_path / "README.md").write_text("demo", encoding="utf-8")
+    subprocess.run(
+        ["git", "-C", str(project_path), "add", "README.md"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(project_path), "commit", "-m", "init"],
+        check=True,
+        capture_output=True,
+    )
+    project = Project(name="demo", path=project_path)
+
+    workspace = await _create_session_worktree(project, "t1")
+
+    assert workspace == tmp_path / ".fdx-worktrees" / "demo-t1"
+    branch = subprocess.run(
+        ["git", "-C", str(workspace), "branch", "--show-current"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert branch == "fdx/demo/t1"
+
+    subprocess.run(
+        ["git", "-C", str(project_path), "branch", "fdx/demo/t2"],
+        check=True,
+        capture_output=True,
+    )
+    with pytest.raises(RuntimeError, match="already exists|已存在"):
+        await _create_session_worktree(project, "t2")
+    assert not (tmp_path / ".fdx-worktrees" / "demo-t2").exists()
+
+
+@pytest.mark.asyncio
+async def test_project_manager_create_session_rejects_invalid_agent_and_duplicate(
+    manager_worktree: Path,
+):
     daemon, _, _ = make_daemon()
     manager_conversation = ConversationRef("feishu", "manager-thread")
     daemon.open_project_manager("demo", manager_conversation)
@@ -4690,7 +4812,9 @@ async def test_project_manager_create_session_rejects_other_manager_conversation
 
 
 @pytest.mark.asyncio
-async def test_project_manager_create_session_records_launch_failure(monkeypatch):
+async def test_project_manager_create_session_records_launch_failure(
+    monkeypatch, manager_worktree: Path
+):
     daemon, _, _ = make_daemon()
     manager_conversation = ConversationRef("feishu", "manager-thread")
     daemon.open_project_manager("demo", manager_conversation)
@@ -6731,6 +6855,8 @@ async def test_sched_spawn_routes_thread_and_output_to_source_channel():
 
     task = task_by_conversation(daemon.store, root, "web")
     assert task is not None
+    assert task.workspace == str(daemon.cfg.projects["demo"].path)
+    assert task.workspace_kind == "project"
     assert daemon._conversation_for_session(task) == ConversationRef("web", root)
     assert feishu.created_threads == []
     assert web.created_threads == [("oc_1", "🚀 copilot · demo\n任务: web task")]

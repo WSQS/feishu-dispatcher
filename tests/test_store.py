@@ -201,11 +201,13 @@ def test_session_identity_fields_persist_with_new_disk_keys(tmp_path: Path):
         channel_key="feishu",
         conversation_payload={"conversation_id": "om_1"},
         workspace="C:/x",
+        workspace_kind="worktree",
         agent_session_id="ses_x",
     )
 
     assert task.session_id == "t1"
     assert task.agent_session_id == "ses_x"
+    assert task.workspace_kind == "worktree"
     assert not hasattr(task, "task_id")
     record = json.loads(p.read_text(encoding="utf-8"))["tasks"]["t1"]
     assert record["session_id"] == "t1"
@@ -217,6 +219,7 @@ def test_session_identity_fields_persist_with_new_disk_keys(tmp_path: Path):
     loaded = SessionStore(p).get("t1")
     assert loaded.session_id == "t1"
     assert loaded.agent_session_id == "ses_x"
+    assert loaded.workspace_kind == "worktree"
     assert not hasattr(loaded, "task_id")
 
 
