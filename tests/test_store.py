@@ -12,11 +12,34 @@ from feishu_dispatcher.store import (
     _MAX_ACTIONS,
     DelegationStore,
     JobStore,
+    ManagerConversationStore,
     ModelStore,
     ProjectStore,
     Session,
     SessionStore,
 )
+
+
+def test_manager_conversation_store_adds_reloads_and_deduplicates(tmp_path: Path):
+    path = tmp_path / "manager-conversations.json"
+    store = ManagerConversationStore(path)
+
+    first = store.add(
+        project_name="demo",
+        channel_key="feishu",
+        conversation_payload={"conversation_id": "manager-thread"},
+    )
+    duplicate = store.add(
+        project_name="demo",
+        channel_key="feishu",
+        conversation_payload={"conversation_id": "manager-thread"},
+    )
+
+    assert duplicate is first
+    assert len(store.all()) == 1
+
+    loaded = ManagerConversationStore(path)
+    assert loaded.all() == [first]
 
 
 def test_delegation_store_creates_and_reloads(tmp_path: Path):
