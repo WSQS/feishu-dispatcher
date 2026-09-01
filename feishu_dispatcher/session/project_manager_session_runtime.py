@@ -17,6 +17,9 @@ from .tool_loop_session_runtime import (
 ProjectSessionList = Callable[[], list[dict[str, Any]]]
 ProjectSessionLookup = Callable[[str], dict[str, Any] | None]
 ProjectSessionMessenger = Callable[[str, str], Awaitable[str]]
+ProjectSessionCreator = Callable[
+    [ConversationRef, str, str, str], Awaitable[dict[str, Any]]
+]
 ProjectDelegationList = Callable[[], list[dict[str, Any]]]
 ProjectDelegationLookup = Callable[[str], dict[str, Any] | None]
 ProjectDelegationCreate = Callable[[str, str], Awaitable[str]]
@@ -27,9 +30,11 @@ ProjectDelegationComplete = Callable[[str], Awaitable[str]]
 def build_project_manager_tools(
     *,
     project_name: str,
+    conversation: ConversationRef,
     list_sessions: ProjectSessionList,
     get_session: ProjectSessionLookup,
     send_to_session: ProjectSessionMessenger,
+    create_session: ProjectSessionCreator,
     list_delegations: ProjectDelegationList,
     get_delegation: ProjectDelegationLookup,
     delegate_to_session: ProjectDelegationCreate,
@@ -65,6 +70,26 @@ def build_project_manager_tools(
         if session is None or not _belongs_to_project(session):
             return f"未找到项目 {project_name} 下的 Session {session_id}。"
         return await send_to_session(session_id, message)
+
+    async def _create_session(args: dict[str, Any]) -> str:
+        agent = str(args.get("agent", "")).strip()
+        description = str(args.get("description", "")).strip()
+        initial_task = str(args.get("initial_task", "")).strip()
+        if not description or not initial_task:
+            return "参数不足：description 和 initial_task 都必填。"
+        if len(agent) > 100:
+            return "参数无效：agent 最多 100 个字符。"
+        if len(description) > 200:
+            return "参数无效：description 最多 200 个字符。"
+        if len(initial_task) > 4000:
+            return "参数无效：initial_task 最多 4000 个字符。"
+        result = await create_session(
+            conversation,
+            agent,
+            description,
+            initial_task,
+        )
+        return json.dumps(result, ensure_ascii=False)
 
     async def _delegate_to_session(args: dict[str, Any]) -> str:
         session_id = str(args.get("session_id", "")).strip()
@@ -138,6 +163,39 @@ def build_project_manager_tools(
             description=f"查看项目 {project_name} 下指定 Session 的详细状态。",
             parameters=session_id_param,
             handler=_get_session,
+        ),
+        ToolSpec(
+            name="create_session",
+            description=(
+                f"在项目 {project_name} 内创建一个新的 Worker Session。"
+                "workspace 固定由项目配置提供，不接受路径参数；创建后可用 "
+                "list_sessions、get_session、send_to_session 和 delegate_to_session。"
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "agent": {
+                        "type": "string",
+                        "description": (
+                            "要使用的已配置 agent；留空则使用项目默认 agent"
+                        ),
+                        "maxLength": 100,
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Worker Session 的名称/描述，最多 200 个字符",
+                        "maxLength": 200,
+                    },
+                    "initial_task": {
+                        "type": "string",
+                        "description": "Worker 启动后的首轮任务说明，最多 4000 个字符",
+                        "maxLength": 4000,
+                    },
+                },
+                "required": ["description", "initial_task"],
+                "additionalProperties": False,
+            },
+            handler=_create_session,
         ),
         ToolSpec(
             name="send_to_session",
@@ -239,6 +297,7 @@ class ProjectManagerSessionRuntime(ToolLoopSessionRuntime):
         list_sessions: ProjectSessionList,
         get_session: ProjectSessionLookup,
         send_to_session: ProjectSessionMessenger,
+        create_session: ProjectSessionCreator,
         list_delegations: ProjectDelegationList,
         get_delegation: ProjectDelegationLookup,
         delegate_to_session: ProjectDelegationCreate,
@@ -249,12 +308,14 @@ class ProjectManagerSessionRuntime(ToolLoopSessionRuntime):
         if not project_name:
             raise ValueError("project_name 不能为空")
 
-        def tools_provider(_conversation: ConversationRef) -> list[ToolSpec]:
+        def tools_provider(conversation: ConversationRef) -> list[ToolSpec]:
             return build_project_manager_tools(
                 project_name=project_name,
+                conversation=conversation,
                 list_sessions=list_sessions,
                 get_session=get_session,
                 send_to_session=send_to_session,
+                create_session=create_session,
                 list_delegations=list_delegations,
                 get_delegation=get_delegation,
                 delegate_to_session=delegate_to_session,
@@ -269,13 +330,15 @@ class ProjectManagerSessionRuntime(ToolLoopSessionRuntime):
             tools_provider=tools_provider,
             system_prompt=(
                 f"你是项目 {project_name} 的 Project Manager。\n"
-                "你的职责是了解和协调该项目下已有的 Session。\n"
+                "你的职责是了解、创建和协调该项目下的 Session。\n"
                 "需要了解当前工作时先使用 list_sessions；需要细节时使用 get_session。\n"
+                "需要新建 Worker 时使用 create_session，description 填写名称/描述，"
+                "initial_task 填写首轮任务；不要传入路径或工作目录。\n"
                 "新的可追踪工作使用 delegate_to_session；普通、不追踪的补充消息才使用 "
                 "send_to_session。\n"
                 "收到委派结果通知后：接受结果用 complete_delegation；需要 Worker 继续或"
                 "回答它的问题用 continue_delegation；需要用户决定时先向用户提问。\n"
-                "你不直接修改代码、不创建 Session、不管理 worktree；信息不足时先向用户追问。"
+                "你不直接修改代码、不管理 worktree；信息不足时先向用户追问。"
             ),
             llm_unavailable_message=f"项目 {project_name} 的 Manager LLM 未配置",
             error_reply_factory=lambda exc: (

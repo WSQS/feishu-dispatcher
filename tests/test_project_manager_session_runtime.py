@@ -33,15 +33,21 @@ def tools(
     sent: list[tuple[str, str]] | None = None,
     delegations: list[dict] | None = None,
     delegation_lookup: dict[str, dict] | None = None,
+    created: list[tuple[str, str, str, str]] | None = None,
 ):
     sent = sent if sent is not None else []
     lookup = lookup if lookup is not None else {}
     delegation_lookup = delegation_lookup if delegation_lookup is not None else {}
+    created = created if created is not None else []
     return build_project_manager_tools(
         project_name="demo",
+        conversation=ConversationRef("test", "manager"),
         list_sessions=lambda: sessions or [],
         get_session=lambda session_id: lookup.get(session_id),
         send_to_session=lambda session_id, message: _send(sent, session_id, message),
+        create_session=lambda conversation, agent, description, initial_task: _create(
+            created, conversation, agent, description, initial_task
+        ),
         list_delegations=lambda: delegations or [],
         get_delegation=lambda delegation_id: delegation_lookup.get(delegation_id),
         delegate_to_session=lambda session_id, instruction: _send(
@@ -61,6 +67,22 @@ async def _send(sent: list[tuple[str, str]], session_id: str, message: str) -> s
 
 async def _complete(delegation_id: str) -> str:
     return f"已完成 {delegation_id}"
+
+
+async def _create(
+    created: list[tuple[str, str, str, str]],
+    conversation: ConversationRef,
+    agent: str,
+    description: str,
+    initial_task: str,
+) -> dict:
+    created.append((conversation.channel_key(), agent, description, initial_task))
+    return {
+        "session_id": "s-created",
+        "agent": agent or "copilot",
+        "status": "starting",
+        "description": description,
+    }
 
 
 def tool(tool_list, name: str):
@@ -162,6 +184,41 @@ async def test_project_manager_tools_validate_and_scope_missing_session():
     )
 
 
+async def test_project_manager_create_session_returns_tracking_info():
+    created: list[tuple[str, str, str, str]] = []
+    tool_list = tools(created=created)
+
+    result = json.loads(
+        await tool(tool_list, "create_session").handler(
+            {
+                "agent": "opencode",
+                "description": "新 Worker",
+                "initial_task": "检查项目状态",
+            }
+        )
+    )
+
+    assert result == {
+        "session_id": "s-created",
+        "agent": "opencode",
+        "status": "starting",
+        "description": "新 Worker",
+    }
+    assert created == [("test", "opencode", "新 Worker", "检查项目状态")]
+
+
+async def test_project_manager_create_session_validates_required_and_lengths():
+    create_tool = tool(tools(), "create_session")
+
+    assert "description 和 initial_task 都必填" in await create_tool.handler({})
+    assert "description 最多 200" in await create_tool.handler(
+        {"description": "x" * 201, "initial_task": "任务"}
+    )
+    assert "initial_task 最多 4000" in await create_tool.handler(
+        {"description": "名称", "initial_task": "x" * 4001}
+    )
+
+
 async def test_project_manager_tools_reject_other_projects():
     sent: list[tuple[str, str]] = []
     tool_list = tools(
@@ -207,6 +264,9 @@ async def test_project_manager_runtime_uses_project_policy_and_tools():
         ],
         get_session=lambda _session_id: None,
         send_to_session=lambda _session_id, _message: _send([], "", ""),
+        create_session=lambda conversation, agent, description, initial_task: _create(
+            [], conversation, agent, description, initial_task
+        ),
         list_delegations=lambda: [],
         get_delegation=lambda _delegation_id: None,
         delegate_to_session=lambda _session_id, _instruction: _send([], "", ""),
@@ -230,6 +290,7 @@ async def test_project_manager_runtime_uses_project_policy_and_tools():
     assert {item["function"]["name"] for item in llm.calls[0][1]} == {
         "list_sessions",
         "get_session",
+        "create_session",
         "send_to_session",
         "delegate_to_session",
         "list_delegations",
