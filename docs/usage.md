@@ -87,10 +87,17 @@ daemon 跑起来之后，日常怎么用。第一次配置见 [setup.md](setup.m
 | `fdx bg list` | 列出本任务起的后台 job |
 | `fdx bg logs <id> [--tail N]` | 查某 job 的输出尾部（中途看进度） |
 | `fdx bg kill <id>` | 终止一个在跑的 job |
+| `fdx delegation report --id <id> --status <状态> --message <说明>` | 向 Project Manager 报告委派结果 |
 
 - 后台 job 跑完时，daemon 会先往话题发一条**可见的完成消息**（带输出尾部），再自动唤回 agent 接着干——你在话题里看得到，不会"人间蒸发"。
 - 超时兜底：`bg_job_timeout`（配置，默认 0 = 不超时，长训练不砍），或 agent 用 `--timeout N` 单次指定。
 - **注意**：v1 不做 daemon 重启穿越——daemon 重启时正在飞的后台 job 会丢。
+
+Project Manager 委派给已有 Worker Session 的工作会附带一个委派 id。Worker 应在本轮
+结束前报告 `completed`、`input-required` 或 `blocked`。报告通过 daemon 控制面提交，
+身份来自 daemon 注入的 token；Worker 不能报告其它 Session 的委派。Worker 本轮收尾后，
+daemon 会把报告自动送回对应的 Project Manager。即使 Worker 没有调用报告命令，最终
+回复也会作为未结构化报告回送，避免委派永久悬空。
 
 ## 关机重开也能接着聊
 

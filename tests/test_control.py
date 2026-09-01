@@ -187,3 +187,60 @@ async def test_fdx_cli_bg_logs_end_to_end():
         assert seen == [("t3", {"id": "j3", "tail": 5})]  # 参数正确解析并送达
     finally:
         cs.stop()
+
+
+async def test_fdx_cli_delegation_report_end_to_end():
+    seen: list = []
+
+    async def report(task_id: str, body: dict):
+        seen.append((task_id, body))
+        return 200, {
+            "delegation_id": body["delegation_id"],
+            "status": body["status"],
+            "reported": True,
+        }
+
+    cs = await _make_server(
+        {("POST", "/v1/delegations/report"): report},
+        {"tok-worker": "t7"},
+    )
+    env = {
+        **os.environ,
+        "FEISHU_DISPATCHER_URL": cs.base_url,
+        "FEISHU_DISPATCHER_TOKEN": "tok-worker",
+    }
+    try:
+        proc = await asyncio.to_thread(
+            subprocess.run,
+            [
+                sys.executable,
+                "-m",
+                "feishu_dispatcher.agent_cli",
+                "delegation",
+                "report",
+                "--id",
+                "d3",
+                "--status",
+                "input-required",
+                "--message",
+                "需要确认",
+            ],
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert "d3" in proc.stdout
+        assert seen == [
+            (
+                "t7",
+                {
+                    "delegation_id": "d3",
+                    "status": "input-required",
+                    "message": "需要确认",
+                },
+            )
+        ]
+    finally:
+        cs.stop()

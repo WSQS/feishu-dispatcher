@@ -103,6 +103,20 @@ TERMINAL_STATES = frozenset({"done", "stopped"})
 #: 每个 Session 最多保留的动作条数（审计日志，超出丢最旧，防 tasks.json 无限涨）
 _MAX_ACTIONS = 200
 
+DELEGATION_REPORT_STATUSES = frozenset(
+    {"completed", "input_required", "blocked", "unreported"}
+)
+DELEGATION_STATUSES = frozenset(
+    {
+        "submitted",
+        "running",
+        "waiting_manager",
+        "completed",
+        "failed",
+        "cancelled",
+    }
+)
+
 _SESSION_RECORD_FIELDS = (
     "session_id",
     "project_name",
@@ -384,6 +398,174 @@ class SessionStore:
         if gone:
             self._flush()
         return len(gone)
+
+
+_DELEGATION_FIELDS = (
+    "delegation_id",
+    "project_name",
+    "manager_session_id",
+    "worker_session_id",
+    "worker_turn_id",
+    "instruction",
+    "status",
+    "report_status",
+    "report_message",
+    "created_at",
+    "updated_at",
+)
+
+
+@dataclass
+class Delegation:
+    """Project Manager 委派给 Worker 的一项可追踪工作。"""
+
+    delegation_id: str
+    project_name: str
+    manager_session_id: str
+    worker_session_id: str
+    worker_turn_id: str
+    instruction: str
+    status: str = "submitted"
+    report_status: str = ""
+    report_message: str = ""
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+class DelegationStore:
+    """delegation_id → Delegation 台账，落盘到 delegations.json。"""
+
+    def __init__(self, path: Path | None) -> None:
+        self._path = path
+        self._delegations: dict[str, Delegation] = {}
+        self._seq = 0
+        if path is not None:
+            self._load()
+
+    def _load(self) -> None:
+        assert self._path is not None
+        data = _read_json(self._path)
+        if data is None:
+            return
+        try:
+            self._seq = int(data.get("seq", 0))
+            for delegation_id, record in (data.get("delegations") or {}).items():
+                unknown_fields = set(record) - set(_DELEGATION_FIELDS)
+                if unknown_fields:
+                    raise ValueError(
+                        f"Delegation 记录包含未知字段: {sorted(unknown_fields)}"
+                    )
+                delegation = Delegation(
+                    **{key: record[key] for key in _DELEGATION_FIELDS if key in record}
+                )
+                if delegation.delegation_id != delegation_id:
+                    raise ValueError(
+                        "Delegation 记录主键不一致: "
+                        f"{delegation_id!r} != {delegation.delegation_id!r}"
+                    )
+                if delegation.status not in DELEGATION_STATUSES:
+                    raise ValueError(
+                        f"不支持的 Delegation status: {delegation.status!r}"
+                    )
+                if delegation.report_status and (
+                    delegation.report_status not in DELEGATION_REPORT_STATUSES
+                ):
+                    raise ValueError(
+                        "不支持的 Delegation report_status: "
+                        f"{delegation.report_status!r}"
+                    )
+                self._delegations[delegation_id] = delegation
+        except Exception:
+            logger.warning("委派台账解析失败，忽略: %s", self._path, exc_info=True)
+            self._delegations = {}
+            self._seq = 0
+
+    def _flush(self) -> None:
+        if self._path is None:
+            return
+        try:
+            _atomic_write_json(
+                self._path,
+                {
+                    "seq": self._seq,
+                    "delegations": {
+                        delegation_id: asdict(delegation)
+                        for delegation_id, delegation in self._delegations.items()
+                    },
+                },
+            )
+        except Exception:
+            logger.warning("委派台账写入失败: %s", self._path, exc_info=True)
+
+    def get(self, delegation_id: str) -> Delegation | None:
+        return self._delegations.get(delegation_id)
+
+    def all(self) -> list[Delegation]:
+        return list(self._delegations.values())
+
+    def by_project(self, project_name: str) -> list[Delegation]:
+        return [
+            delegation
+            for delegation in self._delegations.values()
+            if delegation.project_name == project_name
+        ]
+
+    def by_worker_turn(
+        self,
+        worker_session_id: str,
+        worker_turn_id: str,
+    ) -> Delegation | None:
+        for delegation in self._delegations.values():
+            if (
+                delegation.worker_session_id == worker_session_id
+                and delegation.worker_turn_id == worker_turn_id
+            ):
+                return delegation
+        return None
+
+    def create(
+        self,
+        *,
+        project_name: str,
+        manager_session_id: str,
+        worker_session_id: str,
+        worker_turn_id: str,
+        instruction: str,
+    ) -> Delegation:
+        self._seq += 1
+        delegation = Delegation(
+            delegation_id=f"d{self._seq}",
+            project_name=project_name,
+            manager_session_id=manager_session_id,
+            worker_session_id=worker_session_id,
+            worker_turn_id=worker_turn_id,
+            instruction=instruction,
+            created_at=time.time(),
+            updated_at=time.time(),
+        )
+        self._delegations[delegation.delegation_id] = delegation
+        self._flush()
+        return delegation
+
+    def update(self, delegation_id: str, **changes) -> Delegation | None:
+        delegation = self._delegations.get(delegation_id)
+        if delegation is None:
+            return None
+        for key, value in changes.items():
+            if key not in _DELEGATION_FIELDS:
+                raise ValueError(f"未知的 Delegation 字段: {key}")
+            setattr(delegation, key, value)
+        if delegation.status not in DELEGATION_STATUSES:
+            raise ValueError(f"不支持的 Delegation status: {delegation.status!r}")
+        if delegation.report_status and (
+            delegation.report_status not in DELEGATION_REPORT_STATUSES
+        ):
+            raise ValueError(
+                f"不支持的 Delegation report_status: {delegation.report_status!r}"
+            )
+        delegation.updated_at = time.time()
+        self._flush()
+        return delegation
 
 
 class ProjectStore:

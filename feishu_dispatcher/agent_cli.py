@@ -131,6 +131,26 @@ def _cmd_bg_kill(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_delegation_report(args: argparse.Namespace) -> int:
+    try:
+        resp = _post(
+            "/v1/delegations/report",
+            {
+                "delegation_id": args.id,
+                "status": args.status,
+                "message": args.message,
+            },
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"提交委派报告失败：{exc}", file=sys.stderr)
+        return 1
+    if resp.get("error"):
+        print(resp["error"], file=sys.stderr)
+        return 1
+    print(f"委派 {resp.get('delegation_id')} 已报告为 {resp.get('status')}。")
+    return 0
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="fdx", description="feishu-dispatcher agent 侧 CLI"
@@ -167,6 +187,32 @@ def _build_parser() -> argparse.ArgumentParser:
     kill = bg_cmds.add_parser("kill", help="终止一个在跑的后台任务")
     kill.add_argument("id", help="job id，如 j3")
     kill.set_defaults(func=_cmd_bg_kill)
+
+    delegation = groups.add_parser(
+        "delegation",
+        help="Project Manager 委派：向 dispatcher 回报结构化结果",
+    )
+    delegation_cmds = delegation.add_subparsers(
+        dest="delegation_cmd",
+        required=True,
+    )
+    report = delegation_cmds.add_parser(
+        "report",
+        help="报告当前 Worker 对某项委派的完成、待输入或阻塞状态",
+    )
+    report.add_argument("--id", required=True, help="委派 id，如 d3")
+    report.add_argument(
+        "--status",
+        required=True,
+        choices=("completed", "input-required", "blocked"),
+        help="Worker 对当前工作的判断",
+    )
+    report.add_argument(
+        "--message",
+        required=True,
+        help="结果摘要、需要的信息或阻塞原因",
+    )
+    report.set_defaults(func=_cmd_delegation_report)
     return parser
 
 

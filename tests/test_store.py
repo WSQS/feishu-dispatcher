@@ -10,12 +10,48 @@ from feishu_dispatcher import store as store_module
 from feishu_dispatcher.config import Project
 from feishu_dispatcher.store import (
     _MAX_ACTIONS,
+    DelegationStore,
     JobStore,
     ModelStore,
     ProjectStore,
     Session,
     SessionStore,
 )
+
+
+def test_delegation_store_creates_and_reloads(tmp_path: Path):
+    path = tmp_path / "delegations.json"
+    store = DelegationStore(path)
+    delegation = store.create(
+        project_name="demo",
+        manager_session_id="manager:demo",
+        worker_session_id="t1",
+        worker_turn_id="turn-1",
+        instruction="修复测试",
+    )
+    store.update(
+        delegation.delegation_id,
+        status="waiting_manager",
+        report_status="completed",
+        report_message="测试通过",
+    )
+
+    loaded = DelegationStore(path)
+    actual = loaded.get(delegation.delegation_id)
+    assert actual is not None
+    assert actual.worker_turn_id == "turn-1"
+    assert actual.status == "waiting_manager"
+    assert actual.report_status == "completed"
+    assert (
+        loaded.create(
+            project_name="demo",
+            manager_session_id="manager:demo",
+            worker_session_id="t1",
+            worker_turn_id="turn-2",
+            instruction="继续检查",
+        ).delegation_id
+        == "d2"
+    )
 
 
 def conversation_payload(conversation_id: str) -> dict[str, object]:

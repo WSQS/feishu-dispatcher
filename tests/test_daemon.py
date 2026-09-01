@@ -4580,6 +4580,263 @@ async def test_project_manager_conversation_routes_messages_to_runtime():
     assert daemon._session_runtimes.get_for_session(runtime.session_id) is runtime
 
 
+@pytest.mark.asyncio
+async def test_delegation_report_requires_own_current_worker_turn():
+    daemon, _, _ = make_daemon()
+    worker = daemon.store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="worker",
+        **stored_conversation_kwargs(ConversationRef("feishu", "worker-thread")),
+        workspace="C:/tmp/demo",
+    )
+    runner = _AgentSessionRunner(
+        "demo",
+        "copilot",
+        ConversationRef("feishu", "worker-thread"),
+        session_id=worker.session_id,
+    )
+    runner.current_turn_id = "turn-1"
+    daemon._runners.register(worker.session_id, runner)
+    delegation = daemon.delegation_store.create(
+        project_name="demo",
+        manager_session_id="manager:demo",
+        worker_session_id=worker.session_id,
+        worker_turn_id="turn-1",
+        instruction="修复测试",
+    )
+
+    status, payload = await daemon._ctl_delegation_report(
+        worker.session_id,
+        {
+            "delegation_id": delegation.delegation_id,
+            "status": "completed",
+            "message": "已完成",
+        },
+    )
+    assert status == 200
+    assert payload["reported"] is True
+    assert daemon.delegation_store.get(delegation.delegation_id).report_status == (
+        "completed"
+    )
+
+    status, payload = await daemon._ctl_delegation_report(
+        "other-worker",
+        {
+            "delegation_id": delegation.delegation_id,
+            "status": "completed",
+            "message": "冒充",
+        },
+    )
+    assert status == 403
+    assert "不属于" in payload["error"]
+
+
+@pytest.mark.asyncio
+async def test_manager_delegation_reports_and_notifies_after_worker_finish():
+    store = SessionStore(None)
+    worker = _seed_task(
+        store,
+        thread="worker-thread",
+        session_id="worker-acp-session",
+    )
+    daemon, bridge, created = make_daemon(GatedAgent, store=store)
+    daemon._llm = ScriptedLLM(
+        [
+            LLMResponse(content="已收到 Worker 结果"),
+            LLMResponse(content="已收到 Worker 补充结果"),
+        ]
+    )
+    manager_conversation = ConversationRef("feishu", "manager-thread")
+    daemon.open_project_manager("demo", manager_conversation)
+
+    result = await daemon._project_manager_delegate_to_session(
+        "demo",
+        worker.session_id,
+        "修复测试",
+    )
+    delegation = daemon.delegation_store.all()[0]
+    await wait_until(
+        lambda: (
+            created
+            and daemon._runners.get_for_session(worker.session_id).current_turn_id
+            == delegation.worker_turn_id
+        )
+    )
+    assert (
+        f"fdx delegation report --id {delegation.delegation_id}"
+        in (created[0].prompts[0])
+    )
+    assert delegation.delegation_id in result
+
+    status, payload = await daemon._ctl_delegation_report(
+        worker.session_id,
+        {
+            "delegation_id": delegation.delegation_id,
+            "status": "completed",
+            "message": "测试已通过",
+        },
+    )
+    assert status == 200
+    assert payload["reported"] is True
+    assert daemon.delegation_store.get(delegation.delegation_id).status == "running"
+
+    created[0].gate.set()
+    await wait_until(
+        lambda: (
+            daemon.delegation_store.get(delegation.delegation_id).status
+            == "waiting_manager"
+        )
+    )
+
+    runtime = daemon._get_project_manager_runtime("demo")
+    await runtime.wait_idle()
+    await daemon._wait_runtime_events(runtime.session_id)
+    stored = daemon.delegation_store.get(delegation.delegation_id)
+    assert stored.status == "waiting_manager"
+    assert stored.report_status == "completed"
+    assert stored.report_message == "测试已通过"
+    assert ("manager-thread", "已收到 Worker 结果") in bridge.sent_texts
+
+    previous_turn_id = stored.worker_turn_id
+    result = await daemon._project_manager_continue_delegation(
+        "demo",
+        delegation.delegation_id,
+        "继续检查边界情况",
+    )
+    assert delegation.delegation_id in result
+    await wait_until(lambda: len(created[0].prompts) == 2)
+    assert (
+        f"fdx delegation report --id {delegation.delegation_id}"
+        in (created[0].prompts[1])
+    )
+    await wait_until(
+        lambda: (
+            daemon.delegation_store.get(delegation.delegation_id).status
+            == "waiting_manager"
+            and daemon.delegation_store.get(delegation.delegation_id).worker_turn_id
+            != previous_turn_id
+        )
+    )
+    await runtime.wait_idle()
+    await daemon._wait_runtime_events(runtime.session_id)
+    assert ("manager-thread", "已收到 Worker 补充结果") in bridge.sent_texts
+    assert (
+        await daemon._project_manager_complete_delegation(
+            "demo",
+            delegation.delegation_id,
+        )
+        == f"委派 {delegation.delegation_id} 已确认完成。"
+    )
+    assert daemon.delegation_store.get(delegation.delegation_id).status == "completed"
+    await daemon._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_delegation_without_fdx_report_falls_back_to_final_output():
+    daemon, _, _ = make_daemon()
+    delegation = daemon.delegation_store.create(
+        project_name="demo",
+        manager_session_id="manager:demo",
+        worker_session_id="t-worker",
+        worker_turn_id="turn-1",
+        instruction="修复测试",
+    )
+
+    await daemon._handle_delegation_event(
+        SessionEvent(
+            event_id="finished-1",
+            session_id="t-worker",
+            turn_id="turn-1",
+            occurred_at=datetime.now(timezone.utc),
+            body=AgentOutputFinished(
+                message="未调用 fdx 的最终回复",
+                thought="",
+                outcome="completed",
+            ),
+        )
+    )
+
+    stored = daemon.delegation_store.get(delegation.delegation_id)
+    assert stored.status == "waiting_manager"
+    assert stored.report_status == "unreported"
+    assert stored.report_message == "未调用 fdx 的最终回复"
+
+
+@pytest.mark.asyncio
+async def test_delegation_finish_is_idempotent_and_running_cannot_continue():
+    daemon, _, _ = make_daemon()
+    delegation = daemon.delegation_store.create(
+        project_name="demo",
+        manager_session_id="manager:demo",
+        worker_session_id="t-worker",
+        worker_turn_id="turn-1",
+        instruction="修复测试",
+    )
+    assert "等待 Worker" in await daemon._project_manager_continue_delegation(
+        "demo",
+        delegation.delegation_id,
+        "继续",
+    )
+    notifications: list[str] = []
+
+    async def notify(delegation_id: str, *, outcome: str) -> None:
+        notifications.append(f"{delegation_id}:{outcome}")
+
+    daemon._notify_project_manager_delegation = notify  # type: ignore[method-assign]
+    event = SessionEvent(
+        event_id="finished-1",
+        session_id="t-worker",
+        turn_id="turn-1",
+        occurred_at=datetime.now(timezone.utc),
+        body=AgentOutputFinished(
+            message="完成",
+            thought="",
+            outcome="completed",
+        ),
+    )
+
+    await daemon._handle_delegation_event(event)
+    await daemon._handle_delegation_event(event)
+
+    assert notifications == [f"{delegation.delegation_id}:completed"]
+
+
+@pytest.mark.asyncio
+async def test_delegation_startup_failure_notifies_manager():
+    store = SessionStore(None)
+    worker = _seed_task(
+        store,
+        thread="worker-thread",
+        session_id="worker-acp-session",
+    )
+    daemon, bridge, _ = make_daemon(StartupFailAgent, store=store)
+    daemon._llm = ScriptedLLM([LLMResponse(content="Worker 启动失败，已记录")])
+    daemon.open_project_manager(
+        "demo",
+        ConversationRef("feishu", "manager-thread"),
+    )
+
+    await daemon._project_manager_delegate_to_session(
+        "demo",
+        worker.session_id,
+        "修复测试",
+    )
+    delegation = daemon.delegation_store.all()[0]
+    await wait_until(
+        lambda: daemon.delegation_store.get(delegation.delegation_id).status == "failed"
+    )
+    runtime = daemon._get_project_manager_runtime("demo")
+    await runtime.wait_idle()
+    await daemon._wait_runtime_events(runtime.session_id)
+
+    stored = daemon.delegation_store.get(delegation.delegation_id)
+    assert stored.report_status == "unreported"
+    assert "失败" in stored.report_message
+    assert ("manager-thread", "Worker 启动失败，已记录") in bridge.sent_texts
+    await daemon._shutdown()
+
+
 def test_project_manager_conversation_rejects_unknown_project():
     daemon, _, _ = make_daemon()
 
