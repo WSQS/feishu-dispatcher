@@ -127,6 +127,7 @@ _SESSION_RECORD_FIELDS = (
     "channel_key",
     "conversation_payload",
     "workspace",
+    "workspace_kind",
     "turns",
     "created_at",
     "updated_at",
@@ -150,6 +151,7 @@ class Session:
     channel_key: str = ""
     conversation_payload: dict[str, object] = field(default_factory=dict)
     workspace: str = ""
+    workspace_kind: str = "project"
     turns: int = 0
     created_at: float = 0.0
     updated_at: float = 0.0
@@ -303,18 +305,47 @@ class SessionStore:
         channel_key: str,
         conversation_payload: dict[str, object],
         workspace: str,
+        workspace_kind: str = "project",
         agent_session_id: str = "",
         status: str = "starting",
         issue_url: str = "",
         model: str = "",
         origin: str = "spawn",
+        session_id: str = "",
     ) -> Session:
         channel_key = channel_key.strip()
         if not channel_key:
             raise ValueError("channel_key 不能为空")
-        # 铸号自愈守卫（#81）：不只信持久化的 seq——同时从现有 session id 推出下界，
-        # 取两者较大再 +1。即使 seq 因故被回退/污染（多实例踩踏、手工改 tasks.json、
-        # 半截原子写），也绝不落到已存在的 id 上，守住「session_id 永不复用」不变量。
+        session_id = session_id or self._allocate_session_id()
+        if session_id in self._sessions:
+            raise ValueError(f"session_id 已存在: {session_id}")
+        if not session_id.startswith("t") or not session_id[1:].isdigit():
+            raise ValueError(f"session_id 格式无效: {session_id}")
+        self._seq = max(self._seq, int(session_id[1:]))
+        now = self._now()
+        session = Session(
+            session_id=session_id,
+            project_name=project_name,
+            agent_label=agent_label,
+            description=description,
+            status=status,
+            agent_session_id=agent_session_id,
+            channel_key=channel_key,
+            conversation_payload=dict(conversation_payload),
+            workspace=workspace,
+            workspace_kind=workspace_kind,
+            created_at=now,
+            updated_at=now,
+            issue_url=issue_url,
+            model=model,
+            origin=origin,
+        )
+        self._sessions[session.session_id] = session
+        self._flush()
+        return session
+
+    def _allocate_session_id(self) -> str:
+        """分配一个永不复用的 Session id，但不单独刷盘。"""
         floor = max(
             (
                 int(session_id[1:])
@@ -325,26 +356,13 @@ class SessionStore:
         )
         self._seq = max(self._seq, floor) + 1
         assert f"t{self._seq}" not in self._sessions, f"session_id 冲突: t{self._seq}"
-        now = self._now()
-        session = Session(
-            session_id=f"t{self._seq}",
-            project_name=project_name,
-            agent_label=agent_label,
-            description=description,
-            status=status,
-            agent_session_id=agent_session_id,
-            channel_key=channel_key,
-            conversation_payload=dict(conversation_payload),
-            workspace=workspace,
-            created_at=now,
-            updated_at=now,
-            issue_url=issue_url,
-            model=model,
-            origin=origin,
-        )
-        self._sessions[session.session_id] = session
+        return f"t{self._seq}"
+
+    def reserve_session_id(self) -> str:
+        """持久化预留 Session id，供创建外部资源时生成稳定名称。"""
+        session_id = self._allocate_session_id()
         self._flush()
-        return session
+        return session_id
 
     def update(self, session_id: str, **changes) -> Session | None:
         """就地更新 Session 字段（status/agent_session_id/turns…），刷新 updated_at 并落盘。

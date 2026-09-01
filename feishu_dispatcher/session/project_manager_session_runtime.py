@@ -168,7 +168,8 @@ def build_project_manager_tools(
             name="create_session",
             description=(
                 f"在项目 {project_name} 内创建一个新的 Worker Session。"
-                "workspace 固定由项目配置提供，不接受路径参数；创建后可用 "
+                "Manager 创建的 Session 会自动分配独立 git worktree；workspace 由 daemon 分配，"
+                "不接受路径参数；创建后可用 "
                 "list_sessions、get_session、send_to_session 和 delegate_to_session。"
             ),
             parameters={
