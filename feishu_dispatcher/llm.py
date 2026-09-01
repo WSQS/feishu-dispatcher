@@ -11,8 +11,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import secrets
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from datetime import datetime, timezone
 from typing import Any
 
 import httpx
@@ -21,6 +28,165 @@ from .config import LLMSettings
 from .scheduler import LLMResponse, ToolCall
 
 logger = logging.getLogger(__name__)
+
+_LLM_LOG_CONTEXT: ContextVar[str] = ContextVar(
+    "feishu_dispatcher_llm_log_context",
+    default="unknown",
+)
+
+
+@contextmanager
+def llm_log_context(context: str) -> Iterator[None]:
+    """为当前 LLM 调用设置 daemon 日志上下文。"""
+    token = _LLM_LOG_CONTEXT.set(context)
+    try:
+        yield
+    finally:
+        _LLM_LOG_CONTEXT.reset(token)
+
+
+def _llm_request_id() -> str:
+    return f"llm-{secrets.token_hex(16)}"
+
+
+def _http_error_details(exc: BaseException) -> tuple[int | str, str, str]:
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = exc.response
+        reason = response.reason_phrase or type(exc).__name__
+        return (
+            response.status_code,
+            f"HTTP {response.status_code} {reason}",
+            _upstream_request_id(response),
+        )
+    error_type = type(exc).__name__
+    return error_type, error_type, ""
+
+
+def _upstream_request_id(response: httpx.Response) -> str:
+    for header in (
+        "x-request-id",
+        "request-id",
+        "x-trace-id",
+        "llm_provider-x-cpa-trace-id",
+    ):
+        value = response.headers.get(header, "").strip()
+        if value:
+            return value[:200]
+    return ""
+
+
+def _log_llm_request(
+    *,
+    phase: str,
+    request_id: str,
+    model: str,
+    attempt: int,
+    started_at: str,
+    status: int | str,
+    outcome: str,
+    elapsed_ms: int,
+    error_summary: str,
+    upstream_request_id: str = "",
+    finished_at: str | None = None,
+) -> None:
+    record = {
+        "event": "llm_request",
+        "phase": phase,
+        "request_id": request_id,
+        "daemon_context": _LLM_LOG_CONTEXT.get(),
+        "model": model,
+        "attempt": attempt,
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "status": status,
+        "outcome": outcome,
+        "elapsed_ms": elapsed_ms,
+        "error_summary": error_summary,
+        "upstream_request_id": upstream_request_id,
+    }
+    logger.info("llm_request %s", json.dumps(record, ensure_ascii=False))
+
+
+async def _post_json(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    api_key: str,
+    model: str,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    request_id = _llm_request_id()
+    attempt = 1
+    started_at = datetime.now(timezone.utc).isoformat()
+    started_clock = time.monotonic()
+    _log_llm_request(
+        phase="start",
+        request_id=request_id,
+        model=model,
+        attempt=attempt,
+        started_at=started_at,
+        status="started",
+        outcome="started",
+        elapsed_ms=0,
+        error_summary="",
+    )
+    try:
+        resp = await client.post(
+            url,
+            json=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "X-Client-Request-Id": request_id,
+            },
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except asyncio.CancelledError as exc:
+        status, error_summary, upstream_request_id = _http_error_details(exc)
+        _log_llm_request(
+            phase="finish",
+            request_id=request_id,
+            model=model,
+            attempt=attempt,
+            started_at=started_at,
+            status=status,
+            outcome="failure",
+            elapsed_ms=round((time.monotonic() - started_clock) * 1000),
+            error_summary=error_summary,
+            upstream_request_id=upstream_request_id,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+        raise
+    except Exception as exc:
+        status, error_summary, upstream_request_id = _http_error_details(exc)
+        _log_llm_request(
+            phase="finish",
+            request_id=request_id,
+            model=model,
+            attempt=attempt,
+            started_at=started_at,
+            status=status,
+            outcome="failure",
+            elapsed_ms=round((time.monotonic() - started_clock) * 1000),
+            error_summary=error_summary,
+            upstream_request_id=upstream_request_id,
+            finished_at=datetime.now(timezone.utc).isoformat(),
+        )
+        raise
+    _log_llm_request(
+        phase="finish",
+        request_id=request_id,
+        model=model,
+        attempt=attempt,
+        started_at=started_at,
+        status=resp.status_code,
+        outcome="success",
+        elapsed_ms=round((time.monotonic() - started_clock) * 1000),
+        error_summary="",
+        upstream_request_id=_upstream_request_id(resp),
+        finished_at=datetime.now(timezone.utc).isoformat(),
+    )
+    return data
 
 
 class OpenAICompatClient:
@@ -40,13 +206,13 @@ class OpenAICompatClient:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(
+            data = await _post_json(
+                client,
                 self._url,
-                json=payload,
-                headers={"Authorization": f"Bearer {self._key}"},
+                api_key=self._key,
+                model=self._model,
+                payload=payload,
             )
-            resp.raise_for_status()
-            data = resp.json()
         msg = data["choices"][0]["message"]
         tool_calls: list[ToolCall] = []
         for tc in msg.get("tool_calls") or []:
@@ -195,13 +361,13 @@ class ResponsesAPIClient:
             payload["tools"] = _cc_tools_to_responses(tools)
             payload["tool_choice"] = "auto"
         async with httpx.AsyncClient(timeout=self._timeout) as client:
-            resp = await client.post(
+            data = await _post_json(
+                client,
                 self._url,
-                json=payload,
-                headers={"Authorization": f"Bearer {self._key}"},
+                api_key=self._key,
+                model=self._model,
+                payload=payload,
             )
-            resp.raise_for_status()
-            data = resp.json()
         return _parse_responses(data)
 
 

@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from ..conversation import ConversationRef
+from ..llm import llm_log_context
 from ..scheduler import LLMClient, ToolSpec, run_tool_loop
 from ..session_event import (
     AgentOutputDelta,
@@ -186,15 +187,16 @@ class ToolLoopSessionRuntime(SessionRuntime):
             llm = self._llm_provider()
             if llm is None:
                 raise RuntimeError(self._llm_unavailable_message)
-            reply, turn = await run_tool_loop(
-                llm,
-                request.text,
-                self._tools_provider(request.conversation),
-                system_prompt=self._system_prompt,
-                history=self._memory.history(),
-                max_iterations_reply=self._max_iterations_reply,
-                log_context=self._log_context,
-            )
+            with llm_log_context(f"{self._log_context} session={self.session_id}"):
+                reply, turn = await run_tool_loop(
+                    llm,
+                    request.text,
+                    self._tools_provider(request.conversation),
+                    system_prompt=self._system_prompt,
+                    history=self._memory.history(),
+                    max_iterations_reply=self._max_iterations_reply,
+                    log_context=self._log_context,
+                )
         except Exception as exc:
             outcome = "failed"
             logger.exception(

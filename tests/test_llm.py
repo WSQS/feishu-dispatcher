@@ -6,7 +6,9 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 
 import httpx
 import pytest
@@ -17,6 +19,7 @@ from feishu_dispatcher.llm import (
     OpenAICompatClient,
     ResponsesAPIClient,
     build_llm_client,
+    llm_log_context,
 )
 
 
@@ -97,6 +100,7 @@ async def test_responses_translates_request(monkeypatch):
     def handler(req: httpx.Request) -> httpx.Response:
         captured["url"] = str(req.url)
         captured["body"] = json.loads(req.content)
+        captured["headers"] = req.headers
         return httpx.Response(200, json={"output": []})
 
     _mock_httpx(monkeypatch, handler)
@@ -130,6 +134,7 @@ async def test_responses_translates_request(monkeypatch):
     await client.chat(messages, defs)
     b = captured["body"]
     assert captured["url"].endswith("/responses")
+    assert captured["headers"]["X-Client-Request-Id"].startswith("llm-")
     assert b["model"] == "m"
     assert b["instructions"] == "SYS"  # system → instructions
     # user 文本 → input_text parts（bare 字符串会 500）
@@ -219,12 +224,145 @@ async def test_responses_falls_back_to_output_text(monkeypatch):
     assert resp.content == "兜底文本"
 
 
-async def test_responses_raises_on_http_error(monkeypatch):
-    def handler(req: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"error": "boom"})
+async def test_responses_logs_structured_request(monkeypatch, caplog):
+    def handler(_req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"llm_provider-x-cpa-trace-id": "upstream-123"},
+            json={"output": []},
+        )
 
     _mock_httpx(monkeypatch, handler)
+    caplog.set_level(logging.INFO, logger="feishu_dispatcher.llm")
+
+    with llm_log_context("项目 Manager[demo]"):
+        await ResponsesAPIClient(_settings("responses")).chat(
+            [{"role": "user", "content": "不要出现在日志中"}], []
+        )
+
+    records = [
+        json.loads(record.getMessage().removeprefix("llm_request "))
+        for record in caplog.records
+        if record.name == "feishu_dispatcher.llm"
+        and record.getMessage().startswith("llm_request ")
+    ]
+    assert len(records) == 2
+    start, finish = records
+    assert start["event"] == finish["event"] == "llm_request"
+    assert start["phase"] == "start"
+    assert start["outcome"] == "started"
+    assert finish["phase"] == "finish"
+    assert start["request_id"] == finish["request_id"]
+    assert start["request_id"].startswith("llm-")
+    assert finish["daemon_context"] == "项目 Manager[demo]"
+    assert finish["model"] == "m"
+    assert finish["attempt"] == 1
+    assert finish["status"] == 200
+    assert finish["outcome"] == "success"
+    assert isinstance(finish["elapsed_ms"], int)
+    assert finish["elapsed_ms"] >= 0
+    assert finish["error_summary"] == ""
+    assert finish["upstream_request_id"] == "upstream-123"
+    assert "不要出现在日志中" not in caplog.text
+    assert "api_key" not in caplog.text
+
+
+async def test_responses_logs_http_error_without_response_body(monkeypatch, caplog):
+    def handler(req: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            500,
+            headers={"x-request-id": "upstream-error-456"},
+            json={"error": "sensitive response body"},
+        )
+
+    _mock_httpx(monkeypatch, handler)
+    caplog.set_level(logging.INFO, logger="feishu_dispatcher.llm")
     with pytest.raises(httpx.HTTPStatusError):
+        with llm_log_context("项目 Manager[demo]"):
+            await ResponsesAPIClient(_settings("responses")).chat(
+                [{"role": "user", "content": "hi"}], []
+            )
+
+    records = [
+        json.loads(record.getMessage().removeprefix("llm_request "))
+        for record in caplog.records
+        if record.name == "feishu_dispatcher.llm"
+        and record.getMessage().startswith("llm_request ")
+    ]
+    assert len(records) == 2
+    finish = records[-1]
+    assert finish["phase"] == "finish"
+    assert finish["request_id"] == records[0]["request_id"]
+    assert finish["daemon_context"] == "项目 Manager[demo]"
+    assert finish["model"] == "m"
+    assert finish["attempt"] == 1
+    assert finish["status"] == 500
+    assert finish["outcome"] == "failure"
+    assert finish["elapsed_ms"] >= 0
+    assert finish["error_summary"] == "HTTP 500 Internal Server Error"
+    assert finish["upstream_request_id"] == "upstream-error-456"
+    assert "sensitive response body" not in caplog.text
+
+
+async def test_responses_logs_transport_error_type(monkeypatch, caplog):
+    def handler(req: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("sensitive timeout detail", request=req)
+
+    _mock_httpx(monkeypatch, handler)
+    caplog.set_level(logging.INFO, logger="feishu_dispatcher.llm")
+    with pytest.raises(httpx.ReadTimeout):
         await ResponsesAPIClient(_settings("responses")).chat(
             [{"role": "user", "content": "hi"}], []
         )
+
+    records = [
+        json.loads(record.getMessage().removeprefix("llm_request "))
+        for record in caplog.records
+        if record.name == "feishu_dispatcher.llm"
+        and record.getMessage().startswith("llm_request ")
+    ]
+    finish = records[-1]
+    assert finish["status"] == "ReadTimeout"
+    assert finish["outcome"] == "failure"
+    assert finish["error_summary"] == "ReadTimeout"
+    assert finish["upstream_request_id"] == ""
+    assert "sensitive timeout detail" not in caplog.text
+
+
+async def test_responses_logs_cancelled_request(monkeypatch, caplog):
+    request_started = asyncio.Event()
+    never_finish = asyncio.Event()
+
+    async def handler(_req: httpx.Request) -> httpx.Response:
+        request_started.set()
+        await never_finish.wait()
+        return httpx.Response(200, json={"output": []})
+
+    _mock_httpx(monkeypatch, handler)
+    caplog.set_level(logging.INFO, logger="feishu_dispatcher.llm")
+    task = asyncio.create_task(
+        ResponsesAPIClient(_settings("responses")).chat(
+            [{"role": "user", "content": "不要出现在取消日志中"}], []
+        )
+    )
+    await request_started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    records = [
+        json.loads(record.getMessage().removeprefix("llm_request "))
+        for record in caplog.records
+        if record.name == "feishu_dispatcher.llm"
+        and record.getMessage().startswith("llm_request ")
+    ]
+    assert len(records) == 2
+    start, finish = records
+    assert finish["phase"] == "finish"
+    assert finish["request_id"] == start["request_id"]
+    assert finish["status"] == "CancelledError"
+    assert finish["outcome"] == "failure"
+    assert finish["error_summary"] == "CancelledError"
+    assert finish["upstream_request_id"] == ""
+    assert "不要出现在取消日志中" not in caplog.text
