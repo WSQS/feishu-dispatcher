@@ -568,6 +568,122 @@ class DelegationStore:
         return delegation
 
 
+_MANAGER_CONVERSATION_FIELDS = (
+    "project_name",
+    "channel_key",
+    "conversation_payload",
+    "created_at",
+)
+
+
+@dataclass
+class ManagerConversation:
+    """一个项目 Manager Session 已绑定的 Channel Conversation。"""
+
+    project_name: str
+    channel_key: str
+    conversation_payload: dict[str, object] = field(default_factory=dict)
+    created_at: float = 0.0
+
+
+class ManagerConversationStore:
+    """Project Manager Conversation 绑定台账。"""
+
+    def __init__(self, path: Path | None) -> None:
+        self._path = path
+        self._conversations: list[ManagerConversation] = []
+        if path is not None:
+            self._load()
+
+    def _load(self) -> None:
+        assert self._path is not None
+        data = _read_json(self._path)
+        if data is None:
+            return
+        try:
+            conversations = []
+            for record in data.get("conversations") or []:
+                unknown_fields = set(record) - set(_MANAGER_CONVERSATION_FIELDS)
+                if unknown_fields:
+                    raise ValueError(
+                        "Manager Conversation 记录包含未知字段: "
+                        f"{sorted(unknown_fields)}"
+                    )
+                conversation = ManagerConversation(
+                    **{
+                        key: record[key]
+                        for key in _MANAGER_CONVERSATION_FIELDS
+                        if key in record
+                    }
+                )
+                if (
+                    not conversation.project_name.strip()
+                    or not conversation.channel_key.strip()
+                    or not isinstance(conversation.conversation_payload, dict)
+                ):
+                    raise ValueError("Manager Conversation 记录无效")
+                conversations.append(conversation)
+            self._conversations = conversations
+        except Exception:
+            logger.warning(
+                "Manager Conversation 台账解析失败，忽略: %s",
+                self._path,
+                exc_info=True,
+            )
+            self._conversations = []
+
+    def _flush(self) -> None:
+        if self._path is None:
+            return
+        try:
+            _atomic_write_json(
+                self._path,
+                {
+                    "conversations": [
+                        asdict(conversation) for conversation in self._conversations
+                    ]
+                },
+            )
+        except Exception:
+            logger.warning(
+                "Manager Conversation 台账写入失败: %s",
+                self._path,
+                exc_info=True,
+            )
+
+    def all(self) -> list[ManagerConversation]:
+        return list(self._conversations)
+
+    def add(
+        self,
+        *,
+        project_name: str,
+        channel_key: str,
+        conversation_payload: dict[str, object],
+    ) -> ManagerConversation:
+        project_name = project_name.strip()
+        channel_key = channel_key.strip()
+        if not project_name or not channel_key:
+            raise ValueError("project_name 和 channel_key 不能为空")
+        payload = dict(conversation_payload)
+        for conversation in self._conversations:
+            if (
+                conversation.project_name == project_name
+                and conversation.channel_key == channel_key
+                and conversation.conversation_payload == payload
+            ):
+                return conversation
+        conversation = ManagerConversation(
+            project_name=project_name,
+            channel_key=channel_key,
+            conversation_payload=payload,
+            created_at=time.time(),
+        )
+        self._conversations.append(conversation)
+        self._flush()
+        return conversation
+
+
 class ProjectStore:
     """运行时注册的项目：name → Project，落盘 projects.json。
 

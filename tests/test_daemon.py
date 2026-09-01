@@ -50,7 +50,11 @@ from feishu_dispatcher.session_event import (
     ToolCallObserved,
     session_event_to_dict,
 )
-from feishu_dispatcher.store import ProjectStore, SessionStore
+from feishu_dispatcher.store import (
+    ManagerConversationStore,
+    ProjectStore,
+    SessionStore,
+)
 from feishu_dispatcher.throttler import StreamThrottler
 from feishu_dispatcher.trace_store import SessionTraceStore
 from tests.conversation_fakes import ConversationRefFactory as ConversationRef
@@ -423,6 +427,7 @@ def make_daemon(
     store: SessionStore | None = None,
     trace_store: SessionTraceStore | None = None,
     project_store: ProjectStore | None = None,
+    manager_conversation_store: ManagerConversationStore | None = None,
     idle_timeout: float = 1800.0,
     channel_key: str = "feishu",
     sender_whitelist: list[str] | None = None,
@@ -449,6 +454,9 @@ def make_daemon(
         store=store or SessionStore(None),
         trace_store=trace_store,
         project_store=project_store or ProjectStore(None),
+        manager_conversation_store=(
+            manager_conversation_store or ManagerConversationStore(None)
+        ),
         _channels={channel_key: bridge},
         _primary_channel_key=channel_key,
         _control_conversation=control_conversation,
@@ -4578,6 +4586,83 @@ async def test_project_manager_conversation_routes_messages_to_runtime():
 
     assert bridge.sent_texts == [("manager-thread", "manager reply")]
     assert daemon._session_runtimes.get_for_session(runtime.session_id) is runtime
+
+
+async def test_project_manager_conversation_restores_after_restart(tmp_path: Path):
+    path = tmp_path / "manager-conversations.json"
+    first, _, _ = make_daemon(manager_conversation_store=ManagerConversationStore(path))
+    conversation = ConversationRef("feishu", "manager-thread")
+    first.open_project_manager("demo", conversation)
+
+    restarted, bridge, _ = make_daemon(
+        manager_conversation_store=ManagerConversationStore(path)
+    )
+    restarted._llm = ScriptedLLM([LLMResponse(content="manager restored")])
+    restarted._restore_project_manager_conversations()
+
+    assert restarted._session_id_for_conversation(conversation) == "manager:demo"
+    runtime = restarted._session_runtimes.get_for_session("manager:demo")
+    assert runtime is not None
+
+    await restarted._handle_channel_message(
+        root_msg(
+            "继续管理项目",
+            mid="manager-message-after-restart",
+            conversation_id="manager-thread",
+        )
+    )
+    await runtime.wait_idle()
+    await restarted._wait_runtime_events(runtime.session_id)
+
+    assert bridge.sent_texts == [("manager-thread", "manager restored")]
+    assert len(restarted.manager_conversation_store.all()) == 1
+
+
+@pytest.mark.asyncio
+async def test_run_restores_project_manager_conversations_after_channels_start(
+    monkeypatch, tmp_path: Path
+):
+    cfg = Config(
+        app_id="a",
+        app_secret="b",
+        chat_id="oc_1",
+        projects={"demo": Project(name="demo", path=Path("C:/tmp/demo"))},
+    )
+    manager_store = ManagerConversationStore(tmp_path / "manager-conversations.json")
+    conversation = ConversationRef("feishu", "manager-thread")
+    manager_store.add(
+        project_name="demo",
+        channel_key="feishu",
+        conversation_payload={"conversation_id": conversation.conversation_id},
+    )
+    captured: list[_Daemon] = []
+
+    class FakeControlServer:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    class StartupChannel(FakeBridge):
+        def start(self, on_message) -> None:
+            super().start(on_message)
+            captured.append(on_message.__self__)
+            on_message.__self__._stop_event.set()
+
+    monkeypatch.setattr(daemon_module, "ControlServer", FakeControlServer)
+    await daemon_module.run(
+        cfg,
+        store_path=tmp_path / "sessions.json",
+        channel=StartupChannel(),
+        channel_key="feishu",
+    )
+
+    assert len(captured) == 1
+    assert captured[0]._session_id_for_conversation(conversation) == "manager:demo"
 
 
 @pytest.mark.asyncio

@@ -78,6 +78,7 @@ from .store import (
     DelegationStore,
     Job,
     JobStore,
+    ManagerConversationStore,
     ModelStore,
     ProjectStore,
     Session,
@@ -360,6 +361,9 @@ async def run(
         model_store=ModelStore(store_path.parent / "models.json"),
         job_store=JobStore(store_path.parent / "jobs.json"),
         delegation_store=DelegationStore(store_path.parent / "delegations.json"),
+        manager_conversation_store=ManagerConversationStore(
+            store_path.parent / "manager-conversations.json"
+        ),
         _bg_logs_dir=store_path.parent / "bg-logs",
         _sched_memory=SchedulerMemory(
             store_path.parent / "scheduler_memory.json",
@@ -604,6 +608,10 @@ class _Daemon:
     delegation_store: DelegationStore = field(
         default_factory=lambda: DelegationStore(None)
     )
+    #: Project Manager Conversation 绑定台账；默认纯内存，run() 注入文件版。
+    manager_conversation_store: ManagerConversationStore = field(
+        default_factory=lambda: ManagerConversationStore(None)
+    )
     #: 调度器 LLM（P2）；None = 不启用自然语言派发。run() 按 cfg.llm 构造；测试可注入
     _llm: LLMClient | None = None
     #: 当前激活的 LLM profile 名（/llm 切换时更新，不持久化）；#74
@@ -632,7 +640,7 @@ class _Daemon:
     _primary_channel_key: str = "feishu"
     #: Feishu Channel 提供的固定控制 Conversation；没有则为 None。
     _control_conversation: ConversationRef | None = None
-    #: 进程内 Conversation → Session 身份绑定；Dispatcher Session 与额外入口不持久化。
+    #: 进程内 Conversation → Session 身份绑定；Manager Conversation 另有持久化台账。
     _conversation_session_ids: dict[ConversationRef, str] = field(default_factory=dict)
     #: 每个 Session 的单活 current runner；Thread 只经 Session 路由到这里。
     _runners: _CurrentRunnerRegistry = field(default_factory=_CurrentRunnerRegistry)
@@ -1330,7 +1338,29 @@ class _Daemon:
             )
         runtime = self._get_project_manager_runtime(project.name)
         self.bind_conversation(runtime.session_id, conversation)
+        self.manager_conversation_store.add(
+            project_name=project.name,
+            channel_key=conversation.channel_key(),
+            conversation_payload=self._serialize_conversation_ref(conversation),
+        )
         return runtime
+
+    def _restore_project_manager_conversations(self) -> None:
+        """从台账恢复 Project Manager Runtime 与 Conversation 绑定。"""
+        for stored in self.manager_conversation_store.all():
+            try:
+                conversation = self._deserialize_conversation_ref(
+                    stored.channel_key,
+                    stored.conversation_payload,
+                )
+                self.open_project_manager(stored.project_name, conversation)
+            except Exception:
+                logger.warning(
+                    "恢复 Project Manager Conversation 失败 project=%s channel=%s",
+                    stored.project_name,
+                    stored.channel_key,
+                    exc_info=True,
+                )
 
     async def _close_trace_store(self) -> None:
         """幂等关闭 daemon 持有的 Session Trace Store。"""
@@ -1476,6 +1506,7 @@ class _Daemon:
         )
         self._control.start()
         self._start_channels()
+        self._restore_project_manager_conversations()
         logger.info(
             "feishu-dispatcher daemon 已启动（Channel: %d；调度器 LLM: %s），等待消息…",
             len(self._channels),
@@ -2055,12 +2086,11 @@ class _Daemon:
         header = self.session_conversation_header(manager_session_id)
         channel = self._channel_for(conversation)
         try:
-            runtime = self._get_project_manager_runtime(project.name)
             manager_conversation = await asyncio.to_thread(
                 channel.create_thread,
                 header,
             )
-            self.bind_conversation(runtime.session_id, manager_conversation)
+            self.open_project_manager(project.name, manager_conversation)
         except Exception as exc:
             logger.exception(
                 "创建项目 Manager Conversation 失败 project=%s",
