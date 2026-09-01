@@ -31,20 +31,36 @@ def tools(
     sessions: list[dict] | None = None,
     lookup: dict[str, dict] | None = None,
     sent: list[tuple[str, str]] | None = None,
+    delegations: list[dict] | None = None,
+    delegation_lookup: dict[str, dict] | None = None,
 ):
     sent = sent if sent is not None else []
     lookup = lookup if lookup is not None else {}
+    delegation_lookup = delegation_lookup if delegation_lookup is not None else {}
     return build_project_manager_tools(
         project_name="demo",
         list_sessions=lambda: sessions or [],
         get_session=lambda session_id: lookup.get(session_id),
         send_to_session=lambda session_id, message: _send(sent, session_id, message),
+        list_delegations=lambda: delegations or [],
+        get_delegation=lambda delegation_id: delegation_lookup.get(delegation_id),
+        delegate_to_session=lambda session_id, instruction: _send(
+            sent, session_id, instruction
+        ),
+        continue_delegation=lambda delegation_id, message: _send(
+            sent, delegation_id, message
+        ),
+        complete_delegation=lambda delegation_id: _complete(delegation_id),
     )
 
 
 async def _send(sent: list[tuple[str, str]], session_id: str, message: str) -> str:
     sent.append((session_id, message))
     return f"已转达 {session_id}"
+
+
+async def _complete(delegation_id: str) -> str:
+    return f"已完成 {delegation_id}"
 
 
 def tool(tool_list, name: str):
@@ -78,6 +94,60 @@ async def test_project_manager_tools_list_lookup_and_send():
         == "已转达 s1"
     )
     assert sent == [("s1", "继续")]
+
+
+async def test_project_manager_delegation_tools_create_inspect_continue_and_complete():
+    sent: list[tuple[str, str]] = []
+    tool_list = tools(
+        sessions=[{"session_id": "s1", "project": "demo"}],
+        lookup={"s1": {"session_id": "s1", "project": "demo"}},
+        delegations=[
+            {
+                "delegation_id": "d1",
+                "project": "demo",
+                "status": "waiting_manager",
+            }
+        ],
+        delegation_lookup={
+            "d1": {
+                "delegation_id": "d1",
+                "project": "demo",
+                "status": "waiting_manager",
+            }
+        },
+        sent=sent,
+    )
+
+    assert json.loads(await tool(tool_list, "list_delegations").handler({})) == [
+        {
+            "delegation_id": "d1",
+            "project": "demo",
+            "status": "waiting_manager",
+        }
+    ]
+    assert (
+        json.loads(
+            await tool(tool_list, "get_delegation").handler({"delegation_id": "d1"})
+        )["status"]
+        == "waiting_manager"
+    )
+    assert (
+        await tool(tool_list, "delegate_to_session").handler(
+            {"session_id": "s1", "instruction": "修复测试"}
+        )
+        == "已转达 s1"
+    )
+    assert (
+        await tool(tool_list, "continue_delegation").handler(
+            {"delegation_id": "d1", "message": "继续检查"}
+        )
+        == "已转达 d1"
+    )
+    assert (
+        await tool(tool_list, "complete_delegation").handler({"delegation_id": "d1"})
+        == "已完成 d1"
+    )
+    assert sent == [("s1", "修复测试"), ("d1", "继续检查")]
 
 
 async def test_project_manager_tools_validate_and_scope_missing_session():
@@ -137,6 +207,11 @@ async def test_project_manager_runtime_uses_project_policy_and_tools():
         ],
         get_session=lambda _session_id: None,
         send_to_session=lambda _session_id, _message: _send([], "", ""),
+        list_delegations=lambda: [],
+        get_delegation=lambda _delegation_id: None,
+        delegate_to_session=lambda _session_id, _instruction: _send([], "", ""),
+        continue_delegation=lambda _delegation_id, _message: _send([], "", ""),
+        complete_delegation=lambda _delegation_id: _complete(""),
     )
     events = []
     runtime.subscribe(events.append)
@@ -156,6 +231,11 @@ async def test_project_manager_runtime_uses_project_policy_and_tools():
         "list_sessions",
         "get_session",
         "send_to_session",
+        "delegate_to_session",
+        "list_delegations",
+        "get_delegation",
+        "continue_delegation",
+        "complete_delegation",
     }
     assert any(
         isinstance(event.body, AgentOutputDelta)

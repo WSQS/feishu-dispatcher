@@ -72,7 +72,17 @@ from .session_event import (
     ToolCallObserved,
     session_event_to_dict,
 )
-from .store import Job, JobStore, ModelStore, ProjectStore, Session, SessionStore
+from .store import (
+    DELEGATION_REPORT_STATUSES,
+    Delegation,
+    DelegationStore,
+    Job,
+    JobStore,
+    ModelStore,
+    ProjectStore,
+    Session,
+    SessionStore,
+)
 from .trace_store import (
     SessionTraceRecord,
     SessionTraceStore,
@@ -124,6 +134,7 @@ _DEDUP_CAPACITY = 512
 #: 关闭时等控制面停下的上限（秒）；超时即放弃继续关（serve_forever 是 daemon 线程）。#81
 _CONTROL_STOP_TIMEOUT = 5.0
 _TRACE_EVENTS_LIMIT_MAX = 500
+_DELEGATION_REPORT_MAX = 4000
 
 _USAGE = (
     "用法：\n"
@@ -348,6 +359,7 @@ async def run(
         project_store=ProjectStore(store_path.parent / "projects.json"),
         model_store=ModelStore(store_path.parent / "models.json"),
         job_store=JobStore(store_path.parent / "jobs.json"),
+        delegation_store=DelegationStore(store_path.parent / "delegations.json"),
         _bg_logs_dir=store_path.parent / "bg-logs",
         _sched_memory=SchedulerMemory(
             store_path.parent / "scheduler_memory.json",
@@ -518,7 +530,7 @@ class _AgentSessionRunner:
     current_message_chunks: list[str] = field(default_factory=list)
     current_thought_chunks: list[str] = field(default_factory=list)
     session_event_projection_tail: "asyncio.Task[None] | None" = None
-    #: 后台任务身份 token（本次启动一次性下发，注入 agent env，映射到 task_id）；#68
+    #: agent 控制面身份 token（本次启动一次性下发，注入 env，映射到 Session id）；#68
     bg_token: str = ""
     #: 单消费者 worker，持有 agent 完整生命周期
     worker: "asyncio.Task[None] | None" = None
@@ -588,6 +600,10 @@ class _Daemon:
     model_store: ModelStore = field(default_factory=lambda: ModelStore(None))
     #: 后台任务台账（默认纯内存）；run() 注入文件版（jobs.json）。#68
     job_store: JobStore = field(default_factory=lambda: JobStore(None))
+    #: Project Manager → Worker 委派台账；默认纯内存，run() 注入文件版。
+    delegation_store: DelegationStore = field(
+        default_factory=lambda: DelegationStore(None)
+    )
     #: 调度器 LLM（P2）；None = 不启用自然语言派发。run() 按 cfg.llm 构造；测试可注入
     _llm: LLMClient | None = None
     #: 当前激活的 LLM profile 名（/llm 切换时更新，不持久化）；#74
@@ -629,7 +645,7 @@ class _Daemon:
     _control: "ControlServer | None" = None
     #: workspace API 的有界扫描执行服务；run() 装配、_shutdown 关闭（线程池非 daemon）。
     _scan_executor: ScanExecutor | None = None
-    #: 后台任务身份表：token → task_id（启 agent 时登记，关 session 时清）。#68
+    #: agent 控制面身份表：token → Session id（启 agent 时登记，关 Session 时清）。#68
     _bg_tokens: dict[str, str] = field(default_factory=dict)
     #: 后台任务 watcher 的强引用（asyncio 只持弱引用，不存会被 GC）。#68
     _bg_watchers: set = field(default_factory=set)
@@ -884,13 +900,19 @@ class _Daemon:
                     "SessionEvent 持久化失败 event=%s",
                     event.event_id,
                 )
-        if self._session_event_handler is None:
-            return record
+        if self._session_event_handler is not None:
+            try:
+                await self._session_event_handler(event)
+            except Exception:
+                logger.exception(
+                    "SessionEvent 运行时消费者失败 event=%s",
+                    event.event_id,
+                )
         try:
-            await self._session_event_handler(event)
+            await self._handle_delegation_event(event)
         except Exception:
             logger.exception(
-                "SessionEvent 运行时消费者失败 event=%s",
+                "Delegation 事件消费失败 event=%s",
                 event.event_id,
             )
         return record
@@ -1000,6 +1022,156 @@ class _Daemon:
             **{key: value for key, value in details.items() if key != "task_id"},
         }
 
+    @staticmethod
+    def _delegation_payload(delegation: Delegation) -> dict[str, object]:
+        return {
+            "delegation_id": delegation.delegation_id,
+            "project": delegation.project_name,
+            "manager_session_id": delegation.manager_session_id,
+            "worker_session_id": delegation.worker_session_id,
+            "worker_turn_id": delegation.worker_turn_id,
+            "instruction": delegation.instruction,
+            "status": delegation.status,
+            "report_status": delegation.report_status,
+            "report_message": delegation.report_message,
+            "created_at": delegation.created_at,
+            "updated_at": delegation.updated_at,
+        }
+
+    def _project_manager_list_delegations(
+        self,
+        project_name: str,
+    ) -> list[dict[str, object]]:
+        return [
+            self._delegation_payload(delegation)
+            for delegation in self.delegation_store.by_project(project_name)
+        ]
+
+    def _project_manager_get_delegation(
+        self,
+        project_name: str,
+        delegation_id: str,
+    ) -> dict[str, object] | None:
+        delegation = self.delegation_store.get(delegation_id)
+        if delegation is None or delegation.project_name != project_name:
+            return None
+        return self._delegation_payload(delegation)
+
+    @staticmethod
+    def _delegation_prompt(
+        delegation_id: str,
+        instruction: str,
+    ) -> str:
+        return (
+            f"{instruction}\n\n"
+            "---\n"
+            f"这是 Project Manager 发起的委派，委派编号为 {delegation_id}。\n"
+            "完成本轮工作前，请调用以下命令报告结果：\n\n"
+            f"fdx delegation report --id {delegation_id} "
+            "--status <completed|input-required|blocked> "
+            '--message "<结果摘要、所需信息或阻塞原因>"\n\n'
+            "completed 表示你认为目标已经完成；input-required 表示需要 Manager 或用户"
+            "提供信息；blocked 表示因为环境、权限或外部条件无法继续。"
+            "fdx 报告成功后，再正常结束本轮回复。"
+        )
+
+    async def _project_manager_delegate_to_session(
+        self,
+        project_name: str,
+        worker_session_id: str,
+        instruction: str,
+    ) -> str:
+        worker = self.store.get(worker_session_id)
+        if worker is None or worker.project_name != project_name:
+            return f"未找到项目 {project_name} 下的 Session {worker_session_id}。"
+        if worker.is_terminal:
+            return (
+                f"Session {worker_session_id} 已是终止态（{worker.status}），"
+                "不能接受新委派。"
+            )
+        turn_id = secrets.token_hex(16)
+        delegation = self.delegation_store.create(
+            project_name=project_name,
+            manager_session_id=self._project_manager_session_id(project_name),
+            worker_session_id=worker_session_id,
+            worker_turn_id=turn_id,
+            instruction=instruction,
+        )
+        ok, message = await self._send_turn_to_session(
+            worker_session_id,
+            self._delegation_prompt(delegation.delegation_id, instruction),
+            turn_id=turn_id,
+        )
+        if not ok:
+            self.delegation_store.update(
+                delegation.delegation_id,
+                status="failed",
+                report_status="unreported",
+                report_message=message,
+            )
+            return message
+        return (
+            f"已创建委派 {delegation.delegation_id} 并交给 Session "
+            f"{worker_session_id}；{message}"
+        )
+
+    async def _project_manager_continue_delegation(
+        self,
+        project_name: str,
+        delegation_id: str,
+        message: str,
+    ) -> str:
+        delegation = self.delegation_store.get(delegation_id)
+        if delegation is None or delegation.project_name != project_name:
+            return f"未找到项目 {project_name} 下的委派 {delegation_id}。"
+        if delegation.status == "completed":
+            return f"委派 {delegation_id} 已完成，不能继续。"
+        if delegation.status not in {"waiting_manager", "failed", "cancelled"}:
+            return (
+                f"委派 {delegation_id} 当前为 {delegation.status}，"
+                "请等待 Worker 本轮结束后再继续。"
+            )
+        turn_id = secrets.token_hex(16)
+        self.delegation_store.update(
+            delegation_id,
+            worker_turn_id=turn_id,
+            status="submitted",
+            report_status="",
+            report_message="",
+        )
+        ok, result = await self._send_turn_to_session(
+            delegation.worker_session_id,
+            self._delegation_prompt(delegation_id, message),
+            turn_id=turn_id,
+        )
+        if not ok:
+            self.delegation_store.update(
+                delegation_id,
+                status="failed",
+                report_status="unreported",
+                report_message=result,
+            )
+            return result
+        return f"已让委派 {delegation_id} 继续执行；{result}"
+
+    async def _project_manager_complete_delegation(
+        self,
+        project_name: str,
+        delegation_id: str,
+    ) -> str:
+        delegation = self.delegation_store.get(delegation_id)
+        if delegation is None or delegation.project_name != project_name:
+            return f"未找到项目 {project_name} 下的委派 {delegation_id}。"
+        if delegation.status == "completed":
+            return f"委派 {delegation_id} 已完成。"
+        if delegation.status != "waiting_manager":
+            return (
+                f"委派 {delegation_id} 当前为 {delegation.status}，"
+                "只能在 Worker 本轮结束后确认完成。"
+            )
+        self.delegation_store.update(delegation_id, status="completed")
+        return f"委派 {delegation_id} 已确认完成。"
+
     async def _project_manager_send_to_session(
         self,
         project_name: str,
@@ -1038,9 +1210,107 @@ class _Daemon:
                 self._project_manager_send_to_session,
                 project.name,
             ),
+            list_delegations=partial(
+                self._project_manager_list_delegations,
+                project.name,
+            ),
+            get_delegation=partial(
+                self._project_manager_get_delegation,
+                project.name,
+            ),
+            delegate_to_session=partial(
+                self._project_manager_delegate_to_session,
+                project.name,
+            ),
+            continue_delegation=partial(
+                self._project_manager_continue_delegation,
+                project.name,
+            ),
+            complete_delegation=partial(
+                self._project_manager_complete_delegation,
+                project.name,
+            ),
         )
         self._register_session_runtime(runtime)
         return runtime
+
+    async def _handle_delegation_event(self, event: SessionEvent) -> None:
+        if event.turn_id is None:
+            return
+        delegation = self.delegation_store.by_worker_turn(
+            event.session_id,
+            event.turn_id,
+        )
+        if delegation is None:
+            return
+        if isinstance(event.body, AgentOutputStarted):
+            if delegation.status == "submitted":
+                self.delegation_store.update(
+                    delegation.delegation_id,
+                    status="running",
+                )
+            return
+        if not isinstance(event.body, AgentOutputFinished):
+            return
+        await self._finish_delegation_turn(
+            delegation,
+            outcome=event.body.outcome,
+            fallback_message=event.body.message,
+        )
+
+    async def _finish_delegation_turn(
+        self,
+        delegation: Delegation,
+        *,
+        outcome: OutputOutcome,
+        fallback_message: str,
+    ) -> None:
+        if delegation.status not in {"submitted", "running"}:
+            return
+
+        report_status = delegation.report_status or "unreported"
+        report_message = delegation.report_message or fallback_message
+        status = "waiting_manager" if outcome == "completed" else outcome
+        self.delegation_store.update(
+            delegation.delegation_id,
+            status=status,
+            report_status=report_status,
+            report_message=_clip(report_message, _DELEGATION_REPORT_MAX),
+        )
+        await self._notify_project_manager_delegation(
+            delegation.delegation_id,
+            outcome=outcome,
+        )
+
+    async def _notify_project_manager_delegation(
+        self,
+        delegation_id: str,
+        *,
+        outcome: OutputOutcome,
+    ) -> None:
+        delegation = self.delegation_store.get(delegation_id)
+        if delegation is None:
+            return
+        conversations = self._conversations_for_session(delegation.manager_session_id)
+        if not conversations:
+            logger.warning(
+                "委派 %s 已结束，但 Manager Session %s 没有绑定 Conversation",
+                delegation_id,
+                delegation.manager_session_id,
+            )
+            return
+        runtime = self._get_project_manager_runtime(delegation.project_name)
+        text = (
+            f"系统通知：委派 {delegation.delegation_id} 的 Worker 本轮已经结束。\n"
+            f"Worker Session：{delegation.worker_session_id}\n"
+            f"Worker Turn：{delegation.worker_turn_id}\n"
+            f"执行结果：{outcome}\n"
+            f"Worker 声明：{delegation.report_status}\n"
+            f"报告：{delegation.report_message or '（无）'}\n\n"
+            "请判断下一步：接受结果时调用 complete_delegation；需要补充信息或继续完善时"
+            "调用 continue_delegation；需要用户决策时直接向用户提问。"
+        )
+        runtime.submit(TurnRequest(text, conversations[0]))
 
     def open_project_manager(
         self,
@@ -1201,6 +1471,7 @@ class _Daemon:
                 ("POST", "/v1/bg/list"): self._ctl_bg_list,
                 ("POST", "/v1/bg/logs"): self._ctl_bg_logs,
                 ("POST", "/v1/bg/kill"): self._ctl_bg_kill,
+                ("POST", "/v1/delegations/report"): self._ctl_delegation_report,
             },
         )
         self._control.start()
@@ -2173,6 +2444,17 @@ class _Daemon:
                     message,
                     source=startup_conversation,
                 )
+                if startup_turn is not None:
+                    delegation = self.delegation_store.by_worker_turn(
+                        sess.session_id,
+                        startup_turn.turn_id,
+                    )
+                    if delegation is not None:
+                        await self._finish_delegation_turn(
+                            delegation,
+                            outcome="failed",
+                            fallback_message=message,
+                        )
             await self._close_session(sess)
             return
         if not self._runners.is_current(sess.session_id, sess):
@@ -2460,7 +2742,7 @@ class _Daemon:
     async def _close_session(self, sess: _AgentSessionRunner) -> None:
         """收尾 runner：仅按 identity 移除自身槽位，但始终关闭自身资源。"""
         self._runners.remove_if_current(sess.session_id, sess)
-        if sess.bg_token:  # 作废该 session 的后台任务 token（#68）
+        if sess.bg_token:  # 作废该 Session 的 agent 控制面 token（#68）
             self._bg_tokens.pop(sess.bg_token, None)
             sess.bg_token = ""
         output = sess.current_output
@@ -3122,34 +3404,47 @@ class _Daemon:
             "recent_actions": t.actions[-30:],  # 审计 A：agent 调过的工具
         }
 
-    async def _sched_send_to_task(self, task_id: str, message: str) -> str:
-        """send_to_task 工具：把消息路由给已有任务的 agent（在跑排队；挂起先恢复）。"""
+    async def _send_turn_to_session(
+        self,
+        task_id: str,
+        message: str,
+        *,
+        turn_id: str | None = None,
+    ) -> tuple[bool, str]:
         task = self.store.get(task_id)
         if task is None:
-            return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
+            return False, f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
         conversation = self._conversation_for_session(task)
+        request = TurnRequest(
+            message,
+            conversation,
+            **({"turn_id": turn_id} if turn_id is not None else {}),
+        )
         sess = self._runners.get_for_session(task.session_id)
         if sess is not None and sess.worker is not None and not sess.worker.done():
-            sess.enqueue(TurnRequest(message, conversation))
+            sess.enqueue(request)
             logger.info(
                 "send_to_task[%s] 入队（活跃 session，队列深度=%d，task.status=%s）",
                 task_id,
                 sess.queue.qsize(),
                 task.status,
             )
-            return f"已把消息转达给任务 [{task_id}]（{task.project_name}），排队执行。"
+            return (
+                True,
+                f"已把消息转达给任务 [{task_id}]（{task.project_name}），排队执行。",
+            )
         if task.is_terminal:
             logger.info(
                 "send_to_task[%s] 拒绝：任务已终止 status=%s", task_id, task.status
             )
-            return (
+            return False, (
                 f"任务 [{task_id}] 已是终止态（{task.status}），未自动恢复。"
                 f"如需继续，请先 resume_task({task_id})。"
             )
         # 非活跃且可恢复：load_session 惰性重连，把消息作为首轮。check→launch 无 await。
         ok, why = self._try_resume(
             task,
-            first_turn=TurnRequest(message, conversation),
+            first_turn=request,
         )
         logger.info(
             "send_to_task[%s] 非活跃 status=%s → 恢复%s",
@@ -3157,7 +3452,19 @@ class _Daemon:
             task.status,
             "成功" if ok else f"失败（{why}）",
         )
-        return f"已恢复任务 [{task_id}] 并转达消息。" if ok else why
+        return (
+            (True, f"已恢复任务 [{task_id}] 并转达消息。")
+            if ok
+            else (
+                False,
+                why,
+            )
+        )
+
+    async def _sched_send_to_task(self, task_id: str, message: str) -> str:
+        """send_to_task 工具：把消息路由给已有任务的 agent（在跑排队；挂起先恢复）。"""
+        _ok, result = await self._send_turn_to_session(task_id, message)
+        return result
 
     async def _sched_resume_task(self, task_id: str) -> str:
         """resume_task 工具：显式恢复挂起/已结束的任务（load_session），仅拉起不跑首轮。"""
@@ -3337,6 +3644,60 @@ class _Daemon:
             logger.exception("启动后台任务失败 task=%s", task_id)
             return 500, {"error": f"{type(exc).__name__}: {exc}"}
         return 200, {"job_id": job.job_id, "status": job.status}
+
+    async def _ctl_delegation_report(
+        self,
+        task_id: str,
+        body: dict,
+    ) -> tuple[int, dict]:
+        delegation_id = str(body.get("delegation_id", "")).strip()
+        report_status = str(body.get("status", "")).strip().replace("-", "_")
+        message = str(body.get("message", "")).strip()
+        if not delegation_id or not report_status or not message:
+            return 400, {
+                "error": "delegation_id、status 和 message 都必填",
+            }
+        if report_status not in DELEGATION_REPORT_STATUSES - {"unreported"}:
+            return 400, {
+                "error": "status 必须是 completed、input-required 或 blocked",
+            }
+        if len(message) > _DELEGATION_REPORT_MAX:
+            return 400, {
+                "error": f"message 最多 {_DELEGATION_REPORT_MAX} 字",
+            }
+        delegation = self.delegation_store.get(delegation_id)
+        if delegation is None:
+            return 404, {"error": f"未知委派 {delegation_id}"}
+        if delegation.worker_session_id != task_id:
+            return 403, {"error": "该委派不属于当前 Worker Session"}
+        if delegation.report_status:
+            if (
+                delegation.report_status == report_status
+                and delegation.report_message == message
+            ):
+                return 200, {
+                    "delegation_id": delegation_id,
+                    "status": report_status.replace("_", "-"),
+                    "reported": True,
+                }
+            return 409, {"error": f"委派 {delegation_id} 已提交过报告"}
+        sess = self._runners.get_for_session(task_id)
+        if sess is None or sess.current_turn_id != delegation.worker_turn_id:
+            return 409, {"error": "该委派不是当前正在执行的 Worker Turn"}
+        if delegation.status not in {"submitted", "running"}:
+            return 409, {
+                "error": f"委派 {delegation_id} 当前状态为 {delegation.status}",
+            }
+        self.delegation_store.update(
+            delegation_id,
+            report_status=report_status,
+            report_message=message,
+        )
+        return 200, {
+            "delegation_id": delegation_id,
+            "status": report_status.replace("_", "-"),
+            "reported": True,
+        }
 
     def _job_summary(self, job: Job) -> dict:
         """给 CLI 的 job 摘要（不含大输出）。"""
