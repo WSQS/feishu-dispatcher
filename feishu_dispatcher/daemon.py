@@ -1204,6 +1204,123 @@ class _Daemon:
             return f"未找到项目 {project_name} 下的 Session {session_id}。"
         return await self._sched_send_to_task(session_id, message)
 
+    async def _project_manager_create_session(
+        self,
+        project_name: str,
+        conversation: ConversationRef,
+        agent: str,
+        description: str,
+        initial_task: str,
+    ) -> dict:
+        agent = agent.strip()
+        description = description.strip()
+        initial_task = initial_task.strip()
+        project = self._resolve_project(project_name)
+        if project is None:
+            return {
+                "status": "rejected",
+                "error": f"项目不存在: {project_name}",
+            }
+        manager_session_id = self._project_manager_session_id(project.name)
+        if self._session_id_for_conversation(conversation) != manager_session_id:
+            return {
+                "status": "rejected",
+                "error": (
+                    f"Conversation 未绑定项目 {project.name} 的 Project Manager。"
+                ),
+            }
+        if not description or not initial_task:
+            return {
+                "status": "rejected",
+                "error": "description 和 initial_task 都必填。",
+            }
+        if len(agent) > 100 or len(description) > 200 or len(initial_task) > 4000:
+            return {
+                "status": "rejected",
+                "error": "create_session 参数长度超限。",
+            }
+        agent_label, agent_argv, error = self._resolve_agent(project, agent)
+        if agent_argv is None:
+            return {"status": "rejected", "error": error}
+        existing = next(
+            (
+                session
+                for session in self.store.all()
+                if session.project_name == project.name
+                and session.description == description
+            ),
+            None,
+        )
+        if existing is not None:
+            return {
+                "session_id": existing.session_id,
+                "agent": existing.agent_label,
+                "status": "conflict",
+                "description": existing.description,
+                "error": "当前项目已存在同名 Session；未重复创建。",
+            }
+        if not self._reserve_agent_slot():
+            return {
+                "status": "rejected",
+                "error": f"已达并发上限 {self.cfg.max_agents}，请先停止一个 Session。",
+            }
+        try:
+            channel = self._channel_for(conversation)
+            session_conversation = await asyncio.to_thread(
+                channel.create_thread,
+                f"🚀 {agent_label} · {project.name}\n任务: {description}",
+            )
+            session = self.store.create(
+                project_name=project.name,
+                agent_label=agent_label,
+                description=description,
+                channel_key=session_conversation.channel_key(),
+                conversation_payload=self._serialize_conversation_ref(
+                    session_conversation
+                ),
+                workspace=str(project.path),
+            )
+            try:
+                self._launch(
+                    session,
+                    agent_argv,
+                    first_turn=TurnRequest(initial_task, session_conversation),
+                )
+            except Exception as exc:
+                logger.exception(
+                    "Project Manager 创建 Worker Session 启动失败 session=%s",
+                    session.session_id,
+                )
+                self.store.update(
+                    session.session_id,
+                    status="failed",
+                    error_message=_clip(
+                        f"{type(exc).__name__}: {exc}",
+                        _ERROR_MSG_MAX,
+                    ),
+                )
+                return {
+                    "session_id": session.session_id,
+                    "agent": session.agent_label,
+                    "status": "failed",
+                    "description": session.description,
+                    "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+                }
+        except Exception as exc:
+            logger.exception(
+                "Project Manager 创建 Worker Session 失败 project=%s",
+                project.name,
+            )
+            return {
+                "status": "failed",
+                "error": f"{type(exc).__name__}: {str(exc)[:200]}",
+            }
+        finally:
+            self._release_agent_slot()
+        created = self._project_manager_get_session(project.name, session.session_id)
+        assert created is not None
+        return created
+
     def _get_project_manager_runtime(
         self,
         project_name: str,
@@ -1230,6 +1347,10 @@ class _Daemon:
             get_session=partial(self._project_manager_get_session, project.name),
             send_to_session=partial(
                 self._project_manager_send_to_session,
+                project.name,
+            ),
+            create_session=partial(
+                self._project_manager_create_session,
                 project.name,
             ),
             list_delegations=partial(

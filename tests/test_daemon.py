@@ -4566,6 +4566,156 @@ async def test_project_manager_callbacks_are_scoped_to_project():
     assert sent == [(demo.session_id, "继续")]
 
 
+@pytest.mark.asyncio
+async def test_project_manager_can_create_worker_session_and_use_existing_tools():
+    daemon, bridge, created = make_daemon()
+    manager_conversation = ConversationRef("feishu", "manager-thread")
+    runtime = daemon.open_project_manager("demo", manager_conversation)
+    tools = {tool.name: tool for tool in runtime._tools_provider(manager_conversation)}
+
+    result = json.loads(
+        await tools["create_session"].handler(
+            {
+                "agent": "opencode",
+                "description": "新 Worker",
+                "initial_task": "检查项目状态",
+            }
+        )
+    )
+
+    assert result["status"] == "starting"
+    session_id = result["session_id"]
+    session = daemon.store.get(session_id)
+    assert session is not None
+    assert session.project_name == "demo"
+    assert session.agent_label == "opencode"
+    assert session.description == "新 Worker"
+    assert session.workspace == str(daemon.cfg.projects["demo"].path)
+    assert session_id in [
+        item["session_id"] for item in daemon._project_manager_list_sessions("demo")
+    ]
+    details = daemon._project_manager_get_session("demo", session_id)
+    assert details is not None
+    assert details["session_id"] == session_id
+    assert bridge.created_threads == [("oc_1", "🚀 opencode · demo\n任务: 新 Worker")]
+
+    await wait_until(lambda: bool(created and created[0].prompts))
+    assert "排队执行" in await tools["send_to_session"].handler(
+        {"session_id": session_id, "message": "继续检查"}
+    )
+    assert "已创建委派" in await tools["delegate_to_session"].handler(
+        {"session_id": session_id, "instruction": "执行委派任务"}
+    )
+    await wait_until(lambda: len(created[0].prompts) >= 3)
+    assert created[0].prompts[1] == "继续检查"
+    assert "执行委派任务" in created[0].prompts[2]
+    await daemon._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_project_manager_create_session_rejects_invalid_agent_and_duplicate():
+    daemon, _, _ = make_daemon()
+    manager_conversation = ConversationRef("feishu", "manager-thread")
+    daemon.open_project_manager("demo", manager_conversation)
+
+    invalid = await daemon._project_manager_create_session(
+        "demo",
+        manager_conversation,
+        "missing",
+        "Worker",
+        "任务",
+    )
+    assert invalid["status"] == "rejected"
+    assert "未知 agent" in invalid["error"]
+    assert daemon.store.all() == []
+
+    first = await daemon._project_manager_create_session(
+        "demo",
+        manager_conversation,
+        "",
+        "Worker",
+        "任务",
+    )
+    duplicate = await daemon._project_manager_create_session(
+        "demo",
+        manager_conversation,
+        "",
+        "Worker",
+        "另一个任务",
+    )
+    assert first["status"] == "starting"
+    assert duplicate["status"] == "conflict"
+    assert duplicate["session_id"] == first["session_id"]
+    assert len(daemon.store.all()) == 1
+    await daemon._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_project_manager_create_session_rejects_unknown_project():
+    daemon, _, _ = make_daemon()
+
+    result = await daemon._project_manager_create_session(
+        "missing",
+        ConversationRef("feishu", "manager-thread"),
+        "",
+        "Worker",
+        "任务",
+    )
+
+    assert result == {"status": "rejected", "error": "项目不存在: missing"}
+    assert daemon.store.all() == []
+
+
+@pytest.mark.asyncio
+async def test_project_manager_create_session_rejects_other_manager_conversation():
+    daemon, _, _ = make_daemon()
+    daemon.cfg.projects["other"] = Project(
+        name="other",
+        path=Path("C:/tmp/other"),
+    )
+    other_conversation = ConversationRef("feishu", "other-manager")
+    daemon.open_project_manager("other", other_conversation)
+
+    result = await daemon._project_manager_create_session(
+        "demo",
+        other_conversation,
+        "",
+        "Worker",
+        "任务",
+    )
+
+    assert result["status"] == "rejected"
+    assert "未绑定项目 demo" in result["error"]
+    assert daemon.store.all() == []
+
+
+@pytest.mark.asyncio
+async def test_project_manager_create_session_records_launch_failure(monkeypatch):
+    daemon, _, _ = make_daemon()
+    manager_conversation = ConversationRef("feishu", "manager-thread")
+    daemon.open_project_manager("demo", manager_conversation)
+
+    def fail_launch(*_args, **_kwargs):
+        raise RuntimeError("launch boom")
+
+    monkeypatch.setattr(daemon, "_launch", fail_launch)
+    result = await daemon._project_manager_create_session(
+        "demo",
+        manager_conversation,
+        "",
+        "Worker",
+        "任务",
+    )
+
+    assert result["status"] == "failed"
+    assert result["session_id"] == "t1"
+    stored = daemon.store.get("t1")
+    assert stored is not None
+    assert stored.status == "failed"
+    assert "launch boom" in stored.error_message
+    await daemon._shutdown()
+
+
 async def test_project_manager_conversation_routes_messages_to_runtime():
     daemon, bridge, _ = make_daemon()
     daemon._llm = ScriptedLLM([LLMResponse(content="manager reply")])
