@@ -1192,6 +1192,58 @@ async def test_agent_output_events_project_as_session_events():
         channel.stop()
 
 
+async def test_output_close_unregisters_pending_and_active_outputs(monkeypatch):
+    channel = HttpChannel(
+        "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
+    )
+    unregister_calls = []
+    unregister_output = channel._unregister_output
+
+    def record_unregister(output) -> None:
+        unregister_calls.append(output)
+        unregister_output(output)
+
+    monkeypatch.setattr(channel, "_unregister_output", record_unregister)
+    try:
+        conversation = channel.create_thread("start")
+        pending = channel.open_output(conversation, "pending")
+        pending_id = pending.started_presentation()["output_id"]
+
+        assert list(channel._pending_outputs[conversation.conversation_id]) == [pending]
+        assert channel._target_conversations[pending_id] == conversation.conversation_id
+        await pending.aclose()
+        await pending.aclose()
+        assert channel._pending_outputs == {}
+        assert channel._active_outputs == {}
+        assert unregister_calls == [pending]
+
+        active = channel.open_output(conversation, "active")
+        active_id = active.started_presentation()["output_id"]
+        started = SessionEvent(
+            event_id="event-started",
+            session_id="session-1",
+            turn_id="turn-1",
+            occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+            body=AgentOutputStarted(),
+        )
+        channel.handle_session_event(conversation, started)
+
+        assert (
+            channel._active_outputs[
+                (conversation.conversation_id, "session-1", "turn-1")
+            ]
+            is active
+        )
+        assert channel._target_conversations[active_id] == conversation.conversation_id
+        await active.aclose()
+        await active.aclose()
+        assert channel._pending_outputs == {}
+        assert channel._active_outputs == {}
+        assert unregister_calls == [pending, active]
+    finally:
+        channel.stop()
+
+
 async def test_session_event_presentation_is_the_only_live_output_path():
     channel = HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0

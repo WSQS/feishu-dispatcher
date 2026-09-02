@@ -436,12 +436,15 @@ class HttpChannel:
             "conversation_id",
         )
         self._claim_targets(conversation_id, [])
-        return _HttpStreamingOutput(
-            self,
+        output = _HttpStreamingOutput(
+            self._new_target(conversation_id, "output"),
             conversation_id,
             title,
             footer=footer,
+            on_close=self._unregister_output,
         )
+        self._register_output(output)
+        return output
 
     def _register_output(self, output: _HttpStreamingOutput) -> None:
         with self._state_lock:
@@ -748,21 +751,21 @@ class _HttpStreamingOutput:
 
     def __init__(
         self,
-        channel: HttpChannel,
+        output_id: str,
         conversation_id: str,
         title: str,
         *,
         footer: str,
+        on_close: Callable[["_HttpStreamingOutput"], None],
     ) -> None:
-        self._channel = channel
-        self._output_id = channel._new_target(conversation_id, "output")
+        self._output_id = output_id
         self.conversation_id = conversation_id
         self._footer = footer
+        self._on_close = on_close
         self._closed = False
         self._title = title
         self._message_text = ""
         self._last_stream: str | None = None
-        self._channel._register_output(self)
 
     def feed(self, text: str) -> None:
         return None
@@ -782,7 +785,7 @@ class _HttpStreamingOutput:
         if self._closed:
             return
         self._closed = True
-        self._channel._unregister_output(self)
+        self._on_close(self)
 
     def started_presentation(self) -> dict[str, object]:
         return {
