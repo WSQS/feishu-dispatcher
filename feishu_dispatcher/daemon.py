@@ -408,6 +408,13 @@ def _parse_agent_flag(text: str) -> tuple[str, str]:
     return task, m.group(1)
 
 
+@dataclass(frozen=True)
+class DaemonRunResult:
+    """daemon 运行循环结束后交给启动 facade 的结果。"""
+
+    reboot_requested: bool = False
+
+
 async def run(
     cfg: Config,
     *,
@@ -521,16 +528,16 @@ async def run(
             )
         except BaseException:
             await scan_executor.aclose()
-            await daemon._close_trace_store()
+            await daemon.aclose()
             raise
         daemon._scan_executor = scan_executor
         daemon._channels["http"] = http_channel
         logger.info("HTTP Channel token 已存: %s", http_token_path)
     try:
-        await daemon.run(rebooted=rebooted)
+        result = await daemon.run(rebooted=rebooted)
     finally:
-        await daemon._close_trace_store()
-    return daemon._reboot_requested
+        await daemon.aclose()
+    return result.reboot_requested
 
 
 #: 唤回 agent 处理后台任务完成的引导语（单条；合并批次时也只出现一次）。
@@ -1664,8 +1671,8 @@ class _Daemon:
                     exc_info=True,
                 )
 
-    async def _close_trace_store(self) -> None:
-        """幂等关闭 daemon 持有的 Session Trace Store。"""
+    async def aclose(self) -> None:
+        """幂等关闭由启动 facade 直接装配的 Session Trace Store。"""
         trace_store = self.trace_store
         self.trace_store = None
         if trace_store is None:
@@ -1786,7 +1793,7 @@ class _Daemon:
             except Exception:
                 logger.warning("Channel %s 关闭失败，忽略", channel_key, exc_info=True)
 
-    async def run(self, *, rebooted: bool = False) -> None:
+    async def run(self, *, rebooted: bool = False) -> DaemonRunResult:
         loop = asyncio.get_running_loop()
         self._validate_channel_registry()
         if self._llm is None:
@@ -1832,6 +1839,7 @@ class _Daemon:
             logger.info("收到退出信号，清理 agent…")
         finally:
             await self._shutdown()
+        return DaemonRunResult(reboot_requested=self._reboot_requested)
 
     # ------------------------------------------------------------------ #
     # 消息分发
@@ -4412,4 +4420,4 @@ class _Daemon:
             except Exception:
                 logger.warning("扫描执行服务关闭失败，忽略", exc_info=True)
             self._scan_executor = None
-        await self._close_trace_store()
+        await self.aclose()

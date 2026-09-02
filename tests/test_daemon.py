@@ -31,6 +31,7 @@ from feishu_dispatcher.config import (
 from feishu_dispatcher.conversation import ConversationRef as ConversationRefProtocol
 from feishu_dispatcher.daemon import (
     _DISPATCHER_SESSION_ID,
+    DaemonRunResult,
     TurnRequest,
     _AgentSessionRunner,
     _create_session_worktree,
@@ -509,6 +510,62 @@ def http_channel_request(
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
+class _CountingTraceStore:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+@pytest.mark.asyncio
+async def test_run_returns_reboot_result_and_closes_trace_store(
+    monkeypatch,
+    tmp_path,
+):
+    trace_store = _CountingTraceStore()
+
+    async def fake_daemon_run(
+        _self,
+        *,
+        rebooted: bool = False,
+    ) -> DaemonRunResult:
+        assert rebooted is False
+        return DaemonRunResult(reboot_requested=True)
+
+    monkeypatch.setattr(
+        daemon_module,
+        "SessionTraceStore",
+        lambda _path: trace_store,
+    )
+    monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
+
+    reboot = await daemon_module.run(
+        Config(app_id="a", app_secret="b", chat_id="oc-main"),
+        store_path=tmp_path / "sessions.json",
+        channel=FakeBridge(channel_key="test"),
+        channel_key="test",
+    )
+
+    assert reboot is True
+    assert trace_store.close_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_daemon_aclose_is_idempotent():
+    trace_store = _CountingTraceStore()
+    daemon = _Daemon(
+        Config(app_id="a", app_secret="b", chat_id="oc-main"),
+        trace_store=trace_store,
+    )
+
+    await asyncio.gather(daemon.aclose(), daemon.aclose())
+    await daemon.aclose()
+
+    assert trace_store.close_calls == 1
+    assert daemon.trace_store is None
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("discover", "expected_sender_whitelist"),
@@ -558,11 +615,12 @@ async def test_run_builds_default_feishu_channel_and_injects_it(
         def control_conversation(self) -> ConversationRef:
             return self._control_conversation
 
-    async def fake_daemon_run(self, *, rebooted: bool = False) -> None:
+    async def fake_daemon_run(self, *, rebooted: bool = False) -> DaemonRunResult:
         constructed["channels"] = dict(self._channels)
         constructed["primary_channel_key"] = self._primary_channel_key
         constructed["control_conversation"] = self._control_conversation
         constructed["rebooted"] = rebooted
+        return DaemonRunResult()
 
     monkeypatch.setattr(daemon_module, "FeishuBridge", FakeFeishuChannel)
     monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
@@ -639,10 +697,11 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
                 throttle_window=throttle_window,
             )
 
-    async def fake_daemon_run(self, *, rebooted: bool = False) -> None:
+    async def fake_daemon_run(self, *, rebooted: bool = False) -> DaemonRunResult:
         constructed["channels"] = dict(self._channels)
         constructed["primary_channel_key"] = self._primary_channel_key
         constructed["rebooted"] = rebooted
+        return DaemonRunResult()
 
     def fake_token(path: Path) -> str:
         constructed["token_path"] = path
@@ -698,9 +757,10 @@ async def test_run_does_not_auto_register_http_for_injected_channel(
     )
     constructed: dict[str, object] = {}
 
-    async def fake_daemon_run(self, *, rebooted: bool = False) -> None:
+    async def fake_daemon_run(self, *, rebooted: bool = False) -> DaemonRunResult:
         constructed["channels"] = dict(self._channels)
         constructed["rebooted"] = rebooted
+        return DaemonRunResult()
 
     def unexpected_http(*_args, **_kwargs):
         raise AssertionError("injected Channel path must not auto-register HTTP")
@@ -738,12 +798,19 @@ async def test_enabled_http_channel_bind_failure_is_explicit(monkeypatch, tmp_pa
         def __init__(self, **_kwargs) -> None:
             super().__init__()
 
+    trace_store = _CountingTraceStore()
     monkeypatch.setattr(daemon_module, "FeishuBridge", FakeFeishuChannel)
+    monkeypatch.setattr(
+        daemon_module,
+        "SessionTraceStore",
+        lambda _path: trace_store,
+    )
     try:
         with pytest.raises(OSError):
             await daemon_module.run(cfg, store_path=tmp_path / "sessions.json")
     finally:
         holder.close()
+    assert trace_store.close_calls == 1
 
 
 @pytest.mark.asyncio
@@ -1054,7 +1121,7 @@ async def test_http_task_events_route_returns_unavailable_when_shutdown_wins_rea
     )
     assert await asyncio.to_thread(trace_store.read_started.wait, 1)
 
-    await daemon._close_trace_store()
+    await daemon.aclose()
     trace_store.resume_read.set()
 
     status, payload = await request_task
@@ -1106,7 +1173,7 @@ async def test_http_task_events_route_completes_when_read_wins_shutdown_race(tmp
     )
     assert await asyncio.to_thread(trace_store.read_started.wait, 1)
 
-    close_task = asyncio.create_task(daemon._close_trace_store())
+    close_task = asyncio.create_task(daemon.aclose())
     await asyncio.sleep(0)
     trace_store.resume_read.set()
 
@@ -5811,6 +5878,7 @@ async def test_daemon_run_uses_explicit_rebooted_flag_without_environment_access
 
     def start_channels() -> None:
         assert daemon._stop_event is not None
+        daemon._reboot_requested = True
         daemon._stop_event.set()
 
     class FakeControlServer:
@@ -5826,9 +5894,10 @@ async def test_daemon_run_uses_explicit_rebooted_flag_without_environment_access
     monkeypatch.setattr(daemon, "_start_channels", start_channels)
     monkeypatch.setenv("FEISHU_DISPATCHER_REBOOTED", "1")
 
-    await daemon.run(rebooted=True)
+    result = await daemon.run(rebooted=True)
 
     assert notifications == ["✅ daemon 已重启完成。"]
+    assert result == DaemonRunResult(reboot_requested=True)
     assert os.environ["FEISHU_DISPATCHER_REBOOTED"] == "1"
     assert not hasattr(daemon_module, "_REBOOTED_ENV")
 
