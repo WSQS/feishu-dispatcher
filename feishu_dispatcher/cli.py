@@ -11,6 +11,8 @@ from acp.exceptions import RequestError
 
 logger = logging.getLogger(__name__)
 
+_REBOOTED_ENV = "FEISHU_DISPATCHER_REBOOTED"
+
 
 class _AcpMethodNotFoundFilter(logging.Filter):
     """丢掉 ACP task supervisor 对「已回过 -32601 的 client 请求」记的裸
@@ -85,6 +87,7 @@ def main() -> None:
 
     if args.command == "start":
         import asyncio
+        import os
 
         from feishu_dispatcher.config import DEFAULT_CONFIG_PATH, Config
         from feishu_dispatcher.daemon import run
@@ -110,8 +113,14 @@ def main() -> None:
         try:
             cfg = Config.load(cfg_path, allow_empty_chat_id=args.discover)
             store_path = cfg_path.parent / "sessions.json"
+            rebooted = bool(os.environ.pop(_REBOOTED_ENV, None))
             reboot = asyncio.run(
-                run(cfg, discover=args.discover, store_path=store_path)
+                run(
+                    cfg,
+                    discover=args.discover,
+                    store_path=store_path,
+                    rebooted=rebooted,
+                )
             )
         finally:
             # re-exec 前显式放锁，让重启起来的新进程能立刻重新获取。
@@ -129,8 +138,6 @@ def _reexec() -> None:
     """
     import os
     import sys
-
-    from feishu_dispatcher.daemon import _REBOOTED_ENV
 
     os.environ[_REBOOTED_ENV] = "1"  # 新进程据此发「已重启」回执
     logger.info(

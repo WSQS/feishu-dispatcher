@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -514,8 +515,9 @@ def http_channel_request(
     [(False, ["ou-owner"]), (True, [])],
 )
 @pytest.mark.parametrize("http_channel", [None, HttpChannelConfig()])
+@pytest.mark.parametrize("rebooted", [False, True])
 async def test_run_builds_default_feishu_channel_and_injects_it(
-    monkeypatch, tmp_path, discover, expected_sender_whitelist, http_channel
+    monkeypatch, tmp_path, discover, expected_sender_whitelist, http_channel, rebooted
 ):
     cfg = Config(
         app_id="app-id",
@@ -556,10 +558,11 @@ async def test_run_builds_default_feishu_channel_and_injects_it(
         def control_conversation(self) -> ConversationRef:
             return self._control_conversation
 
-    async def fake_daemon_run(self) -> None:
+    async def fake_daemon_run(self, *, rebooted: bool = False) -> None:
         constructed["channels"] = dict(self._channels)
         constructed["primary_channel_key"] = self._primary_channel_key
         constructed["control_conversation"] = self._control_conversation
+        constructed["rebooted"] = rebooted
 
     monkeypatch.setattr(daemon_module, "FeishuBridge", FakeFeishuChannel)
     monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
@@ -568,6 +571,7 @@ async def test_run_builds_default_feishu_channel_and_injects_it(
         cfg,
         discover=discover,
         store_path=tmp_path / "sessions.json",
+        rebooted=rebooted,
     )
 
     assert reboot is False
@@ -579,6 +583,7 @@ async def test_run_builds_default_feishu_channel_and_injects_it(
     assert constructed["qps"] == 3.5
     assert constructed["stream_mode"] == "card"
     assert constructed["throttle_window"] == 0.5
+    assert constructed["rebooted"] is rebooted
     channels = constructed["channels"]
     assert isinstance(channels, dict)
     assert set(channels) == {"feishu"}
@@ -634,9 +639,10 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
                 throttle_window=throttle_window,
             )
 
-    async def fake_daemon_run(self) -> None:
+    async def fake_daemon_run(self, *, rebooted: bool = False) -> None:
         constructed["channels"] = dict(self._channels)
         constructed["primary_channel_key"] = self._primary_channel_key
+        constructed["rebooted"] = rebooted
 
     def fake_token(path: Path) -> str:
         constructed["token_path"] = path
@@ -692,8 +698,9 @@ async def test_run_does_not_auto_register_http_for_injected_channel(
     )
     constructed: dict[str, object] = {}
 
-    async def fake_daemon_run(self) -> None:
+    async def fake_daemon_run(self, *, rebooted: bool = False) -> None:
         constructed["channels"] = dict(self._channels)
+        constructed["rebooted"] = rebooted
 
     def unexpected_http(*_args, **_kwargs):
         raise AssertionError("injected Channel path must not auto-register HTTP")
@@ -5787,6 +5794,43 @@ async def test_reboot_command_requests_restart_and_replies():
     assert daemon._reboot_requested is True
     assert daemon._stop_event.is_set()
     assert any("重启" in t for t in bridge.texts("oc_1"))
+
+
+@pytest.mark.asyncio
+async def test_daemon_run_uses_explicit_rebooted_flag_without_environment_access(
+    monkeypatch,
+):
+    daemon, _, _ = make_daemon()
+    notifications: list[str] = []
+
+    async def notify_main(text: str) -> None:
+        notifications.append(text)
+
+    async def shutdown() -> None:
+        return None
+
+    def start_channels() -> None:
+        assert daemon._stop_event is not None
+        daemon._stop_event.set()
+
+    class FakeControlServer:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(daemon_module, "ControlServer", FakeControlServer)
+    monkeypatch.setattr(daemon, "_notify_main", notify_main)
+    monkeypatch.setattr(daemon, "_shutdown", shutdown)
+    monkeypatch.setattr(daemon, "_start_channels", start_channels)
+    monkeypatch.setenv("FEISHU_DISPATCHER_REBOOTED", "1")
+
+    await daemon.run(rebooted=True)
+
+    assert notifications == ["✅ daemon 已重启完成。"]
+    assert os.environ["FEISHU_DISPATCHER_REBOOTED"] == "1"
+    assert not hasattr(daemon_module, "_REBOOTED_ENV")
 
 
 async def test_get_task_returns_detail():

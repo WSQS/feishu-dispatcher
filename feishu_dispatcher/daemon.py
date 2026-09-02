@@ -127,10 +127,6 @@ _ATTACH_CMD = "/attach"  # root：附着 daemon 外部的 agent 会话为新 Tas
 _MANAGER_CMD = "/manager"  # root：创建项目 Manager Conversation
 _HELP_CMDS = ("/help", "/?", "/usage")  # root 与话题内通用
 
-#: 环境变量：re-exec 重启时置位，新进程据此发「已重启」回执
-_REBOOTED_ENV = "FEISHU_DISPATCHER_REBOOTED"
-
-
 def _worktree_slug(name: str) -> str:
     """把项目名压成适合 Windows 路径与 Git ref 的短片段。"""
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
@@ -416,6 +412,7 @@ async def run(
     store_path: Path | None = None,
     channel: Channel | None = None,
     channel_key: str | None = None,
+    rebooted: bool = False,
 ) -> bool:
     """启动 daemon：飞书 WS 长连接 + agent 调度。阻塞直到收到退出信号。
 
@@ -425,6 +422,9 @@ async def run(
     Channel；配置启用 ``[http_channel]`` 时与 Feishu 并行注册。注入其它实现时必须
     用 ``channel_key`` 指定稳定身份，且不自动装配其它 Channel。未注入 Channel 时
     ``channel_key`` 默认取 ``feishu``。
+
+    ``rebooted=True`` 表示本次启动由 CLI 的重启 handoff 触发；
+    daemon 就绪时据此发送「已重启完成」回执。
 
     返回是否收到 ``/reboot``——cli.py 据此 re-exec 重启进程。
     """
@@ -524,7 +524,7 @@ async def run(
         daemon._channels["http"] = http_channel
         logger.info("HTTP Channel token 已存: %s", http_token_path)
     try:
-        await daemon.run()
+        await daemon.run(rebooted=rebooted)
     finally:
         await daemon._close_trace_store()
     return daemon._reboot_requested
@@ -1785,7 +1785,7 @@ class _Daemon:
             except Exception:
                 logger.warning("Channel %s 关闭失败，忽略", channel_key, exc_info=True)
 
-    async def run(self) -> None:
+    async def run(self, *, rebooted: bool = False) -> None:
         loop = asyncio.get_running_loop()
         self._validate_channel_registry()
         if self._llm is None:
@@ -1814,7 +1814,7 @@ class _Daemon:
             "on" if self._llm else "off",
         )
         # re-exec 重启起来的进程：给控制台发一条「已重启」回执（HTTP，不依赖 WS）
-        if os.environ.pop(_REBOOTED_ENV, None):
+        if rebooted:
             await self._notify_main("✅ daemon 已重启完成。")
         try:
             # R13：看门狗——最多等 30s 或直到 _stop_event 被 set（/reboot / 退出）；
