@@ -17,7 +17,7 @@ import pytest
 
 from feishu_dispatcher import __version__
 from feishu_dispatcher.channel import ChannelMessage
-from feishu_dispatcher.http_channel import HttpChannel, ensure_token
+from feishu_dispatcher.http_channel import HttpChannel, HttpRequest, ensure_token
 from feishu_dispatcher.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
@@ -590,6 +590,29 @@ async def test_health_requires_token_and_returns_channel_version():
         }
     finally:
         channel.stop()
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["/api/channel/messages", "/api/tasks/t1/conversations"],
+)
+def test_http_request_dispatch_authenticates_before_reading_body(path: str) -> None:
+    loop = asyncio.new_event_loop()
+    try:
+        channel = HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
+
+        def unexpected_read() -> object | None:
+            raise AssertionError("未授权请求不应读取 body")
+
+        response = channel.dispatch_http_request(
+            HttpRequest("POST", path, "", "bad", read_body=unexpected_read)
+        )
+
+        assert response.status == 401
+        assert json.loads(response.body) == {"error": "invalid_token"}
+    finally:
+        channel.stop()
+        loop.close()
 
 
 async def test_application_post_route_requires_token_and_marshals_body():
