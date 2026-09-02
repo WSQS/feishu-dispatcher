@@ -182,16 +182,16 @@ class _FeishuSessionEventOutput:
 
     def __init__(
         self,
-        bridge: FeishuBridge,
         conversation_id: str,
         output: StreamingOutput,
         *,
         footer: str,
+        on_close: Callable[["_FeishuSessionEventOutput"], None],
     ) -> None:
-        self._bridge = bridge
         self.conversation_id = conversation_id
         self._output = output
         self._footer = footer
+        self._on_close = on_close
         self._closed = False
         self._message_text = ""
         self._last_stream: str | None = None
@@ -213,7 +213,7 @@ class _FeishuSessionEventOutput:
         if self._closed:
             return
         self._closed = True
-        self._bridge._unregister_output(self)
+        self._on_close(self)
         await self._output.aclose()
 
     async def handle_event(self, event: SessionEvent) -> None:
@@ -746,10 +746,10 @@ class FeishuBridge:
 
             output = StreamThrottler(send_piece, window=self._throttle_window)
         session_output = _FeishuSessionEventOutput(
-            self,
             target_id,
             output,
             footer=footer,
+            on_close=self._unregister_output,
         )
         with self._output_lock:
             self._pending_outputs.setdefault(target_id, deque()).append(session_output)

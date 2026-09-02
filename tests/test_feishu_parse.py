@@ -714,6 +714,31 @@ async def test_channel_open_output_uses_text_mode(monkeypatch):
     assert calls == [("om_root", "hello", True)]
 
 
+async def test_output_close_unregisters_pending_and_active_outputs():
+    bridge = make_bridge(stream_mode="text", throttle_window=60.0)
+    pending = bridge.open_output(ConversationRef("feishu", "om_root"), "pending")
+
+    assert list(bridge._pending_outputs["om_root"]) == [pending]
+    await pending.aclose()
+    assert bridge._pending_outputs == {}
+    assert bridge._active_outputs == {}
+
+    active = bridge.open_output(ConversationRef("feishu", "om_root"), "active")
+    event = SessionEvent(
+        event_id="event-started",
+        session_id="session-1",
+        turn_id="turn-1",
+        occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+        body=AgentOutputStarted(),
+    )
+    assert bridge._output_for_event("om_root", event) is active
+    assert bridge._active_outputs[("om_root", "session-1", "turn-1")] is active
+
+    await active.aclose()
+    assert bridge._pending_outputs == {}
+    assert bridge._active_outputs == {}
+
+
 async def test_text_output_is_driven_by_session_events(monkeypatch):
     bridge = FeishuBridge(
         app_id="a",
