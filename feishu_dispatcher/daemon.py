@@ -127,6 +127,7 @@ _ATTACH_CMD = "/attach"  # root：附着 daemon 外部的 agent 会话为新 Tas
 _MANAGER_CMD = "/manager"  # root：创建项目 Manager Conversation
 _HELP_CMDS = ("/help", "/?", "/usage")  # root 与话题内通用
 
+
 def _worktree_slug(name: str) -> str:
     """把项目名压成适合 Windows 路径与 Git ref 的短片段。"""
     slug = re.sub(r"[^A-Za-z0-9._-]+", "-", name).strip(".-")
@@ -178,11 +179,14 @@ async def _create_session_worktree(project: Project, session_id: str) -> Path:
         check=False,
     )
     if not start_point:
-        start_point = await _git_output(
-            project_path,
-            ["branch", "--show-current"],
-            check=False,
-        ) or "HEAD"
+        start_point = (
+            await _git_output(
+                project_path,
+                ["branch", "--show-current"],
+                check=False,
+            )
+            or "HEAD"
+        )
     branch_exists = bool(
         await _git_output(
             project_path,
@@ -206,9 +210,7 @@ async def _create_session_worktree(project: Project, session_id: str) -> Path:
                 workspace,
             )
         except Exception as cleanup_exc:
-            raise RuntimeError(
-                f"{exc}；失败补偿也未完成：{cleanup_exc}"
-            ) from exc
+            raise RuntimeError(f"{exc}；失败补偿也未完成：{cleanup_exc}") from exc
         raise
     return workspace
 
@@ -235,6 +237,7 @@ async def _remove_session_worktree(
         check=False,
     ):
         await _git_output(project_path, ["branch", "-D", branch])
+
 
 #: message_id 去重窗口大小（飞书 ACK 异常时服务端会重推事件）
 _DEDUP_CAPACITY = 512
@@ -1381,9 +1384,7 @@ class _Daemon:
         try:
             reserved_session_id = self.store.reserve_session_id()
             try:
-                workspace = await _create_session_worktree(
-                    project, reserved_session_id
-                )
+                workspace = await _create_session_worktree(project, reserved_session_id)
                 pending_worktree = workspace
             except Exception as exc:
                 return {
