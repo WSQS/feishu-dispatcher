@@ -58,6 +58,7 @@ _DISPATCH_TIMEOUT = 30.0
 RouteHandler = Callable[[dict, dict], Coroutine[Any, Any, tuple[int, dict]]]
 SessionConversationHeaderProvider = Callable[[str], str]
 SessionConversationOpener = Callable[[str, ConversationRef], str | None]
+HttpBodyReader = Callable[[], object | None]
 
 _CREATE_TASK_CONVERSATION_ROUTE = (
     "POST",
@@ -92,6 +93,27 @@ class _ConversationState:
 class _WebAsset:
     body: bytes
     content_type: str
+
+
+@dataclass(frozen=True)
+class HttpResponse:
+    """HTTP Channel 对请求适配层返回的完整响应。"""
+
+    status: int
+    body: bytes
+    content_type: str
+    headers: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class HttpRequest:
+    """请求适配层传给 HTTP Channel 的规范化请求。"""
+
+    method: str
+    path: str
+    query: str
+    token: str
+    read_body: HttpBodyReader | None = None
 
 
 def _load_webui_assets() -> dict[str, _WebAsset]:
@@ -498,6 +520,71 @@ class HttpChannel:
 
     def _build_server(self) -> _HttpServer:
         return _HttpServer((self._host, self._port), _make_handler(self))
+
+    def dispatch_http_request(self, request: HttpRequest) -> HttpResponse:
+        """处理一个 HTTP 请求，供每请求 Handler 使用。"""
+        if request.method == "GET":
+            asset = self._webui_assets.get(request.path)
+            if asset is not None:
+                logger.info("http-channel GET %s → 200", request.path)
+                return HttpResponse(
+                    200,
+                    asset.body,
+                    asset.content_type,
+                    {
+                        "Cache-Control": "no-store",
+                        "Content-Security-Policy": (
+                            "default-src 'self'; base-uri 'none'; connect-src 'self'; "
+                            "form-action 'self'; frame-ancestors 'none'; object-src 'none'; "
+                            "script-src 'self'; style-src 'self'"
+                        ),
+                        "Referrer-Policy": "no-referrer",
+                        "X-Content-Type-Options": "nosniff",
+                    },
+                )
+            if request.path == "/api/channel/health":
+                status, payload = self._dispatch_health(request.token)
+            elif request.path == "/api/channel/events":
+                status, payload = self._dispatch_events(request.token, request.query)
+            elif request.path.startswith("/api/"):
+                status, payload = self._dispatch_route(
+                    request.token, "GET", request.path, request.query
+                )
+            else:
+                status, payload = 404, {"error": "not_found"}
+            logger.info("http-channel GET %s → %d", request.path, status)
+            return self._json_response(status, payload)
+
+        if request.method == "POST":
+            if request.path != "/api/channel/messages":
+                if not request.path.startswith("/api/"):
+                    return self._json_response(404, {"error": "not_found"})
+                if not self._authorized(request.token):
+                    return self._json_response(401, {"error": "invalid_token"})
+                body = request.read_body() if request.read_body is not None else None
+                status, payload = self._dispatch_route(
+                    request.token, "POST", request.path, request.query, body
+                )
+                logger.info("http-channel POST %s → %d", request.path, status)
+                return self._json_response(status, payload)
+            if not self._authorized(request.token):
+                return self._json_response(401, {"error": "invalid_token"})
+            body = request.read_body() if request.read_body is not None else None
+            if body is None:
+                return self._json_response(400, {"error": "invalid_request"})
+            status, payload = self._dispatch_message(request.token, body)
+            logger.info("http-channel POST %s → %d", request.path, status)
+            return self._json_response(status, payload)
+
+        return self._json_response(404, {"error": "not_found"})
+
+    @staticmethod
+    def _json_response(status: int, payload: dict) -> HttpResponse:
+        return HttpResponse(
+            status,
+            json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            "application/json; charset=utf-8",
+        )
 
     def _authorized(self, token: str) -> bool:
         return bool(token) and secrets.compare_digest(token, self._token)
@@ -906,10 +993,12 @@ def _make_handler(channel: HttpChannel):
             auth = self.headers.get("Authorization", "") or ""
             return auth[len("Bearer ") :].strip() if auth.startswith("Bearer ") else ""
 
-        def _respond(self, status: int, payload: dict) -> None:
-            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        def _respond(self, response: HttpResponse) -> None:
             self._respond_bytes(
-                status, data, content_type="application/json; charset=utf-8"
+                response.status,
+                response.body,
+                content_type=response.content_type,
+                headers=response.headers,
             )
 
         def _respond_bytes(
@@ -927,23 +1016,6 @@ def _make_handler(channel: HttpChannel):
                 self.send_header(name, value)
             self.end_headers()
             self.wfile.write(data)
-
-        def _respond_asset(self, asset: _WebAsset) -> None:
-            self._respond_bytes(
-                200,
-                asset.body,
-                content_type=asset.content_type,
-                headers={
-                    "Cache-Control": "no-store",
-                    "Content-Security-Policy": (
-                        "default-src 'self'; base-uri 'none'; connect-src 'self'; "
-                        "form-action 'self'; frame-ancestors 'none'; object-src 'none'; "
-                        "script-src 'self'; style-src 'self'"
-                    ),
-                    "Referrer-Policy": "no-referrer",
-                    "X-Content-Type-Options": "nosniff",
-                },
-            )
 
         def _split(self) -> tuple[str, str]:
             path, _, query = self.path.partition("?")
@@ -963,53 +1035,22 @@ def _make_handler(channel: HttpChannel):
 
         def do_GET(self) -> None:  # noqa: N802
             path, query = self._split()
-            asset = channel._webui_assets.get(path)
-            if asset is not None:
-                logger.info("http-channel GET %s → 200", path)
-                self._respond_asset(asset)
-                return
-            if path == "/api/channel/health":
-                status, payload = channel._dispatch_health(self._token())
-            elif path == "/api/channel/events":
-                status, payload = channel._dispatch_events(self._token(), query)
-            elif path.startswith("/api/"):
-                status, payload = channel._dispatch_route(
-                    self._token(), "GET", path, query
-                )
-            else:
-                status, payload = 404, {"error": "not_found"}
-            logger.info("http-channel GET %s → %d", path, status)
-            self._respond(status, payload)
+            response = channel.dispatch_http_request(
+                HttpRequest("GET", path, query, self._token())
+            )
+            self._respond(response)
 
         def do_POST(self) -> None:  # noqa: N802
             path, query = self._split()
-            if path != "/api/channel/messages":
-                if not path.startswith("/api/"):
-                    self._respond(404, {"error": "not_found"})
-                    return
-                token = self._token()
-                if not channel._authorized(token):
-                    self._respond(401, {"error": "invalid_token"})
-                    return
-                status, payload = channel._dispatch_route(
-                    token,
+            response = channel.dispatch_http_request(
+                HttpRequest(
                     "POST",
                     path,
                     query,
-                    self._read_body(),
+                    self._token(),
+                    read_body=self._read_body,
                 )
-                logger.info("http-channel POST %s → %d", path, status)
-                self._respond(status, payload)
-                return
-            if not channel._authorized(self._token()):
-                self._respond(401, {"error": "invalid_token"})
-                return
-            body = self._read_body()
-            if body is None:
-                self._respond(400, {"error": "invalid_request"})
-                return
-            status, payload = channel._dispatch_message(self._token(), body)
-            logger.info("http-channel POST %s → %d", path, status)
-            self._respond(status, payload)
+            )
+            self._respond(response)
 
     return _Handler
