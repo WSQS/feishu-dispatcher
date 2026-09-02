@@ -700,6 +700,7 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
     async def fake_daemon_run(self, *, rebooted: bool = False) -> DaemonRunResult:
         constructed["channels"] = dict(self._channels)
         constructed["primary_channel_key"] = self._primary_channel_key
+        constructed["scan_executor"] = self._scan_executor
         constructed["rebooted"] = rebooted
         return DaemonRunResult()
 
@@ -736,13 +737,92 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
         ("GET", "/api/projects/{name}/tree/children"),
         ("GET", "/api/projects/{name}/file"),
     }
+    status, payload = await routes[("GET", "/api/tasks")]({}, {})
+    assert status == 200
+    assert payload["tasks"][0]["task_id"] == _DISPATCHER_SESSION_ID
+    status, payload = await routes[("GET", "/api/tasks/{task_id}/events")](
+        {},
+        {"segments": {"task_id": "missing"}},
+    )
+    assert status == 404
+    assert payload == {"error": "task_not_found", "task_id": "missing"}
     route_context = constructed["route_context"]
     assert isinstance(route_context, dict)
-    assert callable(route_context["all_projects"])
+    assert route_context["all_projects"]() == {}
     assert isinstance(route_context["scan_executor"], daemon_module.ScanExecutor)
+    assert constructed["scan_executor"] is route_context["scan_executor"]
     assert callable(constructed["session_conversation_header"])
     assert callable(constructed["open_session_conversation"])
+    assert constructed["conversation_ref_serializer"](
+        ConversationRef("feishu", "oc-main")
+    ) == {"conversation_id": "oc-main"}
     await route_context["scan_executor"].aclose()
+
+
+@pytest.mark.asyncio
+async def test_configure_http_channel_failure_does_not_take_ownership(monkeypatch):
+    daemon, feishu, _ = make_daemon()
+    scan_executor = object()
+
+    def fail_http_channel(*_args, **_kwargs):
+        raise OSError("bind failed")
+
+    monkeypatch.setattr(daemon_module, "HttpChannel", fail_http_channel)
+
+    with pytest.raises(OSError, match="bind failed"):
+        daemon.configure_http_channel(
+            token="tok-http",
+            loop=asyncio.get_running_loop(),
+            host="127.0.0.1",
+            port=7322,
+            throttle_window=0.25,
+            scan_executor=scan_executor,
+        )
+
+    assert daemon._channels == {"feishu": feishu}
+    assert daemon._scan_executor is None
+
+
+@pytest.mark.asyncio
+async def test_configure_http_channel_transfers_shutdown_ownership(monkeypatch):
+    daemon, _, _ = make_daemon()
+
+    class FakeHttpChannel(FakeBridge):
+        def __init__(self, *_args, **_kwargs) -> None:
+            super().__init__(channel_key="http")
+
+    class FakeScanExecutor:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
+    monkeypatch.setattr(daemon_module, "HttpChannel", FakeHttpChannel)
+    scan_executor = FakeScanExecutor()
+
+    daemon.configure_http_channel(
+        token="tok-http",
+        loop=asyncio.get_running_loop(),
+        host="127.0.0.1",
+        port=7322,
+        throttle_window=0.25,
+        scan_executor=scan_executor,
+    )
+    with pytest.raises(RuntimeError, match="HTTP Channel 已注册"):
+        daemon.configure_http_channel(
+            token="tok-http",
+            loop=asyncio.get_running_loop(),
+            host="127.0.0.1",
+            port=7322,
+            throttle_window=0.25,
+            scan_executor=FakeScanExecutor(),
+        )
+
+    await daemon._shutdown()
+
+    assert scan_executor.close_calls == 1
+    assert daemon._scan_executor is None
 
 
 @pytest.mark.asyncio
@@ -798,8 +878,17 @@ async def test_enabled_http_channel_bind_failure_is_explicit(monkeypatch, tmp_pa
         def __init__(self, **_kwargs) -> None:
             super().__init__()
 
+    class FakeScanExecutor:
+        def __init__(self) -> None:
+            self.close_calls = 0
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+
     trace_store = _CountingTraceStore()
+    scan_executor = FakeScanExecutor()
     monkeypatch.setattr(daemon_module, "FeishuBridge", FakeFeishuChannel)
+    monkeypatch.setattr(daemon_module, "ScanExecutor", lambda: scan_executor)
     monkeypatch.setattr(
         daemon_module,
         "SessionTraceStore",
@@ -810,6 +899,7 @@ async def test_enabled_http_channel_bind_failure_is_explicit(monkeypatch, tmp_pa
             await daemon_module.run(cfg, store_path=tmp_path / "sessions.json")
     finally:
         holder.close()
+    assert scan_executor.close_calls == 1
     assert trace_store.close_calls == 1
 
 

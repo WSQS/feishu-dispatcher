@@ -501,37 +501,18 @@ async def run(
         http_channel_config = cfg.http_channel
         scan_executor = ScanExecutor()
         try:
-            http_channel = HttpChannel(
-                ensure_http_channel_token(http_token_path),
-                loop,
+            daemon.configure_http_channel(
+                token=ensure_http_channel_token(http_token_path),
+                loop=loop,
                 host=http_channel_config.bind,
                 port=http_channel_config.port,
-                routes={
-                    ("GET", "/api/health"): workspace_health,
-                    ("GET", "/api/tasks"): daemon._http_list_tasks,
-                    ("GET", "/api/tasks/{task_id}/events"): daemon._http_task_events,
-                    ("GET", "/api/projects"): workspace_list_projects,
-                    (
-                        "GET",
-                        "/api/projects/{name}/tree/children",
-                    ): workspace_tree_children,
-                    ("GET", "/api/projects/{name}/file"): workspace_file,
-                },
-                route_context={
-                    "all_projects": daemon._all_projects,
-                    "scan_executor": scan_executor,
-                },
-                session_conversation_header=daemon.session_conversation_header,
-                open_session_conversation=daemon.open_session_conversation,
-                conversation_ref_serializer=daemon._serialize_conversation_ref,
                 throttle_window=cfg.throttle_window,
+                scan_executor=scan_executor,
             )
         except BaseException:
             await scan_executor.aclose()
             await daemon.aclose()
             raise
-        daemon._scan_executor = scan_executor
-        daemon._channels["http"] = http_channel
         logger.info("HTTP Channel token 已存: %s", http_token_path)
     try:
         result = await daemon.run(rebooted=rebooted)
@@ -1681,6 +1662,49 @@ class _Daemon:
             await asyncio.to_thread(trace_store.close)
         except Exception:
             logger.warning("Session Trace 存储关闭失败，忽略", exc_info=True)
+
+    def configure_http_channel(
+        self,
+        *,
+        token: str,
+        loop: asyncio.AbstractEventLoop,
+        host: str,
+        port: int,
+        throttle_window: float,
+        scan_executor: ScanExecutor,
+    ) -> None:
+        """装配 HTTP Channel，并在构造成功后接管其运行时资源。"""
+        if "http" in self._channels:
+            raise RuntimeError("HTTP Channel 已注册")
+        if self._scan_executor is not None:
+            raise RuntimeError("扫描执行服务已注册")
+        http_channel = HttpChannel(
+            token,
+            loop,
+            host=host,
+            port=port,
+            routes={
+                ("GET", "/api/health"): workspace_health,
+                ("GET", "/api/tasks"): self._http_list_tasks,
+                ("GET", "/api/tasks/{task_id}/events"): self._http_task_events,
+                ("GET", "/api/projects"): workspace_list_projects,
+                (
+                    "GET",
+                    "/api/projects/{name}/tree/children",
+                ): workspace_tree_children,
+                ("GET", "/api/projects/{name}/file"): workspace_file,
+            },
+            route_context={
+                "all_projects": self._all_projects,
+                "scan_executor": scan_executor,
+            },
+            session_conversation_header=self.session_conversation_header,
+            open_session_conversation=self.open_session_conversation,
+            conversation_ref_serializer=self._serialize_conversation_ref,
+            throttle_window=throttle_window,
+        )
+        self._scan_executor = scan_executor
+        self._channels["http"] = http_channel
 
     def _queue_session_event_projection(
         self,
