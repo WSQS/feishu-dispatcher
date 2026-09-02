@@ -31,6 +31,7 @@ from feishu_dispatcher.acp_client import (
     _MethodNotFoundTap,
     _proc_tree_pids,
     _StreamFormatter,
+    resolve_executable,
 )
 
 
@@ -50,6 +51,44 @@ def _agent(start_timeout=5.0, resume=None) -> AcpAgent:
 def fmt(update) -> str:
     """单条 update 用全新格式化器（等价于旧的无状态 _extract_text）。"""
     return _StreamFormatter().format(update)
+
+
+# --- 可执行文件解析 (resolve_executable) ------------------------------- #
+
+
+def test_resolve_executable_non_windows_returns_command(monkeypatch):
+    import feishu_dispatcher.acp_client as mod
+
+    monkeypatch.setattr(mod.sys, "platform", "linux")
+    assert resolve_executable("copilot") == "copilot"
+
+
+def test_resolve_executable_windows_prefers_cmd(monkeypatch):
+    import feishu_dispatcher.acp_client as mod
+
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(
+        mod,
+        "_which",
+        lambda name: r"C:\npm\copilot.cmd" if name == "copilot.cmd" else None,
+    )
+    assert resolve_executable("copilot") == r"C:\npm\copilot.cmd"
+
+
+def test_resolve_executable_windows_path_adds_existing_cmd(monkeypatch):
+    import feishu_dispatcher.acp_client as mod
+
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(mod.os.path, "exists", lambda path: path.endswith(".cmd"))
+    assert resolve_executable(r"C:\npm\copilot") == r"C:\npm\copilot.cmd"
+
+
+def test_resolve_executable_windows_returns_original_when_unresolved(monkeypatch):
+    import feishu_dispatcher.acp_client as mod
+
+    monkeypatch.setattr(mod.sys, "platform", "win32")
+    monkeypatch.setattr(mod, "_which", lambda _name: None)
+    assert resolve_executable("copilot") == "copilot"
 
 
 # --- 审计动作抽取 (_extract_action) ------------------------------------- #

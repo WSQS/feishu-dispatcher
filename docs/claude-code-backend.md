@@ -12,7 +12,7 @@ Claude Code **无原生 ACP**，经 Zed 官方适配器接入；daemon 侧零代
 ## 安装与前置
 
 1. 装适配器：`npm i -g @agentclientprotocol/claude-agent-acp`
-   （Windows 上 daemon 的 `_resolve_executable` 会自动补 `.cmd` shim。）
+   （Windows 上 daemon 的 `resolve_executable` 会自动补 `.cmd` shim。）
 2. 鉴权二选一（SDK 读取顺序：环境变量 > `~/.claude` 登录态）：
    - **claude.ai 订阅登录**：`claude auth login`（`claude auth status` 应显示 `loggedIn: true`）。Pro/Max 订阅额度即可，无需 API key。
    - **API key**：`ANTHROPIC_API_KEY` 写进 `AgentSpawn.env` / 配置——daemon 只透传白名单 env + `AgentSpawn.env`，不会自动带上 shell 里的变量。

@@ -788,7 +788,7 @@ class AcpAgent:
         command = list(self._spawn.command)
         if not command:
             raise ValueError("agent 启动命令为空")
-        executable = _resolve_executable(command[0])
+        executable = resolve_executable(command[0])
         args = command[1:]
 
         # R9：只传配置里显式给的 env，让 SDK 的 default_environment() 白名单
@@ -1013,7 +1013,7 @@ def _redact_argv(args: list[str]) -> list[str]:
     return redacted
 
 
-def _resolve_executable(cmd: str) -> str:
+def resolve_executable(cmd: str) -> str:
     """Windows 上 ``asyncio.create_subprocess_exec`` 不会查 PATHEXT，
     所以 npm 装的 ``copilot`` / ``opencode`` 必须用 ``.cmd`` shim 启动。
     其他平台原样返回。
