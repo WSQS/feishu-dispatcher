@@ -39,7 +39,7 @@ from .acp_client import (
     OnAction,
     OnOutput,
     OnToolCall,
-    _resolve_executable,
+    resolve_executable,
 )
 from .channel import Channel, ChannelMessage, OutputStatus, StreamingOutput
 from .config import DEFAULT_CONFIG_PATH, Config, Project
@@ -141,7 +141,7 @@ async def _git_output(
     check: bool = True,
 ) -> str:
     """在项目目录执行 git，返回 stdout；失败时保留 stderr 诊断。"""
-    executable = _resolve_executable("git")
+    executable = resolve_executable("git")
     proc = await asyncio.create_subprocess_exec(
         executable,
         "-C",
@@ -4115,7 +4115,7 @@ class _Daemon:
         self.job_store.update(job.job_id, output_file=str(out_path))
         out_file = open(out_path, "wb")  # noqa: SIM115 —— 交给 watcher 在进程退出后关
         try:
-            argv = [_resolve_executable(command[0]), *command[1:]]
+            argv = [resolve_executable(command[0]), *command[1:]]
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 cwd=cwd,

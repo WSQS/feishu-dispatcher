@@ -36,7 +36,7 @@ def resolve_pi_bin() -> str:
 
     Windows 上 npm 全局装的 pi 是 ``pi.cmd`` shim。真正原因是 pi-acpinator（Rust
     std spawn）spawn ``pi`` 时不查 PATHEXT（只补 ``.exe``）、解析不到 npm shim；
-    daemon 自己的 ``_resolve_executable`` 会给 ACP argv 首词补 ``.cmd``，但管不到
+    daemon 自己的 ``resolve_executable`` 会给 ACP argv 首词补 ``.cmd``，但管不到
     适配器内部再 spawn 的 ``pi``。故这里显式解析出 ``pi.cmd`` 交给它
     （``PI_ACPINATOR_PI_BIN``）。POSIX 用 ``pi``。
     """

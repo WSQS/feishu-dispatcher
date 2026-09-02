@@ -27,7 +27,7 @@ from feishu_dispatcher.acp_client import (
     _ClientImpl,
     _extract_model,
     _extract_usage_tokens,
-    _resolve_executable,
+    resolve_executable,
 )
 
 _AGENTS = {
@@ -62,7 +62,7 @@ async def main() -> int:
     name = sys.argv[1] if len(sys.argv) > 1 else "opencode"
     cwd = sys.argv[2] if len(sys.argv) > 2 else _REPO_ROOT
     argv = _AGENTS[name]
-    executable = _resolve_executable(argv[0])
+    executable = resolve_executable(argv[0])
 
     async def _noop(_output: AgentOutputChunk) -> None:
         pass
