@@ -1,8 +1,18 @@
 import pytest
 
+from feishu_dispatcher.channel.feishu import (
+    FeishuBridge as PackagedFeishuBridge,
+)
+from feishu_dispatcher.channel.feishu import (
+    FeishuConversationRef as PackagedFeishuConversationRef,
+)
+from feishu_dispatcher.channel.http import HttpChannel as PackagedHttpChannel
+from feishu_dispatcher.channel.http import (
+    HttpConversationRef as PackagedHttpConversationRef,
+)
 from feishu_dispatcher.conversation import ConversationRef
-from feishu_dispatcher.feishu import FeishuConversationRef
-from feishu_dispatcher.http_channel import HttpConversationRef
+from feishu_dispatcher.feishu import FeishuBridge, FeishuConversationRef
+from feishu_dispatcher.http_channel import HttpChannel, HttpConversationRef
 
 
 def test_conversation_ref_scopes_conversation_id_by_channel() -> None:
@@ -28,3 +38,10 @@ def test_channels_have_distinct_conversation_ref_types() -> None:
 def test_conversation_ref_is_an_interface() -> None:
     with pytest.raises(TypeError):
         ConversationRef()
+
+
+def test_legacy_channel_imports_reexport_packaged_implementations() -> None:
+    assert FeishuBridge is PackagedFeishuBridge
+    assert FeishuConversationRef is PackagedFeishuConversationRef
+    assert HttpChannel is PackagedHttpChannel
+    assert HttpConversationRef is PackagedHttpConversationRef

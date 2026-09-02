@@ -1365,7 +1365,7 @@ async def test_start_failure_releases_listener(monkeypatch):
 
     with monkeypatch.context() as patch:
         patch.setattr(
-            "feishu_dispatcher.http_channel.threading.Thread.start", fail_start
+            "feishu_dispatcher.channel.http.threading.Thread.start", fail_start
         )
         with pytest.raises(RuntimeError, match="thread start boom"):
             channel.start(ignore)

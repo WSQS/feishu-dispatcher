@@ -10,7 +10,8 @@ from datetime import datetime, timezone
 import pytest
 
 from feishu_dispatcher.channel import ChannelMessage
-from feishu_dispatcher.feishu import FeishuBridge, _RateLimiter
+from feishu_dispatcher.channel.feishu import _RateLimiter
+from feishu_dispatcher.feishu import FeishuBridge
 from feishu_dispatcher.livecard import LiveCard
 from feishu_dispatcher.session_event import (
     AgentOutputDelta,
