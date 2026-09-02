@@ -10,8 +10,8 @@ import urllib.request
 from feishu_dispatcher import __version__
 from feishu_dispatcher._scan_executor import ScanExecutor
 from feishu_dispatcher.channel import ChannelMessage
+from feishu_dispatcher.channel.http import HttpChannel
 from feishu_dispatcher.config import Project
-from feishu_dispatcher.http_channel import HttpChannel
 from feishu_dispatcher.workspace_api import (
     _MAX_FILE_BYTES,
     health,

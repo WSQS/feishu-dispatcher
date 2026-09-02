@@ -41,9 +41,8 @@ from lark_oapi.ws.pb import pbbp2_pb2
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .channel import ChannelMessage, MessageHandler, OutputStatus, StreamingOutput
-from .conversation import ConversationRef
-from .session_event import (
+from ..conversation import ConversationRef
+from ..session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
     AgentOutputStarted,
@@ -52,6 +51,7 @@ from .session_event import (
     SessionInputAccepted,
     ToolCallObserved,
 )
+from . import ChannelMessage, MessageHandler, OutputStatus, StreamingOutput
 
 
 @dataclass(frozen=True)
@@ -70,9 +70,9 @@ class FeishuConversationRef:
 # 延迟 import：event 模型属于 im.v1 namespace（单 ns，安全），但顶部 import
 # 会触发 lark_oapi/__init__；shim 必须先装好。调用方 import 顺序：
 #   import feishu_dispatcher._lark_compat  # noqa: F401
-#   from feishu_dispatcher.feishu import ...
+#   from feishu_dispatcher.channel.feishu import ...
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("feishu_dispatcher.feishu")
 
 _FEISHU_DOMAIN = "https://open.feishu.cn"
 _ENDPOINT_URI = "/callback/ws/endpoint"
@@ -729,7 +729,7 @@ class FeishuBridge:
         conversation = self._require_feishu_conversation(conversation)
         target_id = conversation.conversation_id
         if self._stream_mode == "card":
-            from .livecard import LiveCard
+            from ..livecard import LiveCard
 
             output: StreamingOutput = LiveCard(
                 self,
@@ -739,7 +739,7 @@ class FeishuBridge:
                 window=self._throttle_window,
             )
         else:
-            from .throttler import StreamThrottler
+            from ..throttler import StreamThrottler
 
             async def send_piece(piece: str) -> None:
                 await asyncio.to_thread(self.send_text, conversation, piece)

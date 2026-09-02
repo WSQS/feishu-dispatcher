@@ -6,8 +6,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from .conversation import ConversationRef
-from .session_event import SessionEvent
+from ..conversation import ConversationRef
+from ..session_event import SessionEvent
 
 
 @dataclass(frozen=True)

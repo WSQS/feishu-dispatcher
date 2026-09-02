@@ -42,12 +42,12 @@ from .acp_client import (
     resolve_executable,
 )
 from .channel import Channel, ChannelMessage, OutputStatus, StreamingOutput
+from .channel.feishu import FeishuBridge
+from .channel.http import HttpChannel
+from .channel.http import ensure_token as ensure_http_channel_token
 from .config import DEFAULT_CONFIG_PATH, Config, Project
 from .control import ControlServer
 from .conversation import ConversationRef
-from .feishu import FeishuBridge
-from .http_channel import HttpChannel
-from .http_channel import ensure_token as ensure_http_channel_token
 from .llm import build_llm_client
 from .scheduler import (
     LLMClient,
