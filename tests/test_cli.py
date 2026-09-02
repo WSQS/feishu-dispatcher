@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from pathlib import Path
 
 from acp.exceptions import RequestError
 
+import feishu_dispatcher.cli as cli_module
+import feishu_dispatcher.config as config_module
+import feishu_dispatcher.daemon as daemon_module
+import feishu_dispatcher.singleinstance as singleinstance_module
 from feishu_dispatcher.cli import _AcpMethodNotFoundFilter, _setup_logging
 
 
@@ -81,3 +87,70 @@ def test_acp_filter_keeps_other_background_task_errors():
     assert (
         f.filter(_record("其它错误", RequestError(-32601, "Method not found"))) is True
     )
+
+
+def test_reexec_sets_reboot_handoff_and_preserves_arguments(monkeypatch):
+    exec_calls: list[tuple[str, list[str]]] = []
+
+    def fake_execv(executable: str, argv: list[str]) -> None:
+        exec_calls.append((executable, argv))
+
+    monkeypatch.setattr(sys, "executable", "python-test")
+    monkeypatch.setattr(sys, "argv", ["feishu-dispatcher", "start", "--discover"])
+    monkeypatch.setattr(os, "execv", fake_execv)
+
+    cli_module._reexec()
+
+    assert os.environ[cli_module._REBOOTED_ENV] == "1"
+    assert exec_calls == [
+        (
+            "python-test",
+            ["python-test", "-m", "feishu_dispatcher.cli", "start", "--discover"],
+        )
+    ]
+
+
+def test_main_consumes_reboot_handoff_and_passes_it_to_daemon(
+    monkeypatch, tmp_path: Path
+):
+    calls: dict[str, object] = {}
+    config_path = tmp_path / "config.toml"
+
+    class FakeLock:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def acquire(self) -> None:
+            return None
+
+        def release(self) -> None:
+            calls["released"] = True
+
+    async def fake_run(cfg, **kwargs):
+        calls["cfg"] = cfg
+        calls["kwargs"] = kwargs
+        return False
+
+    monkeypatch.setattr(cli_module, "_setup_logging", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        config_module.Config,
+        "load",
+        staticmethod(lambda *_args, **_kwargs: object()),
+    )
+    monkeypatch.setattr(daemon_module, "run", fake_run)
+    monkeypatch.setattr(singleinstance_module, "SingleInstanceLock", FakeLock)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["feishu-dispatcher", "start", "--config", str(config_path)],
+    )
+    monkeypatch.setenv(cli_module._REBOOTED_ENV, "1")
+
+    cli_module.main()
+
+    assert calls["kwargs"] == {
+        "discover": False,
+        "store_path": config_path.parent / "sessions.json",
+        "rebooted": True,
+    }
+    assert cli_module._REBOOTED_ENV not in os.environ
