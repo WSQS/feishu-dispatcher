@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from feishu_dispatcher.channel.feishu import FeishuConversationRef
+from feishu_dispatcher.channel.http import HttpConversationRef
 from feishu_dispatcher.conversation import ConversationRef
-from feishu_dispatcher.feishu import FeishuConversationRef
-from feishu_dispatcher.http_channel import HttpConversationRef
 
 
 @dataclass(frozen=True)

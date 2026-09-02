@@ -10,7 +10,7 @@ from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
 from feishu_dispatcher.channel import ChannelMessage
-from feishu_dispatcher.http_channel import HttpChannel
+from feishu_dispatcher.channel.http import HttpChannel
 from feishu_dispatcher.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,

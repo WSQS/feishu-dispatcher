@@ -11,7 +11,7 @@
 两个包对象换成「空壳」（只设 ``__path__``，不执行它们的 ``__init__``），
 从而跳过那 57 个 namespace 的 eager import。实际只会加载
 ``lark_oapi.ws.pb``（WebSocket frame protobuf）与 ``lark_oapi.ws.const``
-——事件 JSON 由 :mod:`feishu_dispatcher.feishu` 手写 dict 解析，
+——事件 JSON 由 :mod:`feishu_dispatcher.channel.feishu` 手写 dict 解析，
 不依赖任何 lark API model。
 
 调用约定：任何要 ``import lark_oapi`` 的模块，必须在最顶部先 ``import

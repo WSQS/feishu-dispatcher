@@ -17,7 +17,7 @@ import pytest
 
 from feishu_dispatcher import __version__
 from feishu_dispatcher.channel import ChannelMessage
-from feishu_dispatcher.http_channel import HttpChannel, HttpRequest, ensure_token
+from feishu_dispatcher.channel.http import HttpChannel, HttpRequest, ensure_token
 from feishu_dispatcher.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
@@ -1365,7 +1365,7 @@ async def test_start_failure_releases_listener(monkeypatch):
 
     with monkeypatch.context() as patch:
         patch.setattr(
-            "feishu_dispatcher.http_channel.threading.Thread.start", fail_start
+            "feishu_dispatcher.channel.http.threading.Thread.start", fail_start
         )
         with pytest.raises(RuntimeError, match="thread start boom"):
             channel.start(ignore)

@@ -1,8 +1,8 @@
 import pytest
 
+from feishu_dispatcher.channel.feishu import FeishuConversationRef
+from feishu_dispatcher.channel.http import HttpConversationRef
 from feishu_dispatcher.conversation import ConversationRef
-from feishu_dispatcher.feishu import FeishuConversationRef
-from feishu_dispatcher.http_channel import HttpConversationRef
 
 
 def test_conversation_ref_scopes_conversation_id_by_channel() -> None:

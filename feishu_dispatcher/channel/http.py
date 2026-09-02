@@ -17,11 +17,10 @@ from typing import Any, cast
 from urllib.parse import parse_qs
 from uuid import uuid4
 
-from . import __version__
-from ._atomic import atomic_write
-from .channel import ChannelMessage, MessageHandler, OutputStatus
-from .conversation import ConversationRef
-from .session_event import (
+from .. import __version__
+from .._atomic import atomic_write
+from ..conversation import ConversationRef
+from ..session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
     AgentOutputStarted,
@@ -32,6 +31,7 @@ from .session_event import (
     ToolCallObserved,
     session_event_to_dict,
 )
+from . import ChannelMessage, MessageHandler, OutputStatus
 
 
 @dataclass(frozen=True)
@@ -47,7 +47,7 @@ class HttpConversationRef:
         return f"http:{self.conversation_id}"
 
 
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("feishu_dispatcher.http_channel")
 
 _MAX_BODY = 1_000_000
 _DEFAULT_MAX_CONVERSATIONS = 128
