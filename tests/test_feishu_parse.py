@@ -11,7 +11,7 @@ import pytest
 
 from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.channel.feishu import FeishuBridge, _RateLimiter
-from feishu_dispatcher.livecard import LiveCard
+from feishu_dispatcher.channel.feishu_livecard import LiveCard
 from feishu_dispatcher.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,

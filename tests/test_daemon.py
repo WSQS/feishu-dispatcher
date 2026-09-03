@@ -21,6 +21,7 @@ import pytest
 import feishu_dispatcher.daemon as daemon_module
 from feishu_dispatcher.acp_client import AgentOutputChunk, AgentToolCallUpdate
 from feishu_dispatcher.channel import ChannelMessage, StreamingOutput
+from feishu_dispatcher.channel.feishu_livecard import LiveCard
 from feishu_dispatcher.channel.http import HttpChannel, HttpConversationRef
 from feishu_dispatcher.config import (
     Config,
@@ -39,7 +40,6 @@ from feishu_dispatcher.daemon import (
     _Daemon,
     _FanoutStreamingOutput,
 )
-from feishu_dispatcher.livecard import LiveCard
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
 from feishu_dispatcher.session_event import (
     AgentOutputDelta,

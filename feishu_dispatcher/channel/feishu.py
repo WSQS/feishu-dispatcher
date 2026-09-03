@@ -729,7 +729,7 @@ class FeishuBridge:
         conversation = self._require_feishu_conversation(conversation)
         target_id = conversation.conversation_id
         if self._stream_mode == "card":
-            from ..livecard import LiveCard
+            from .feishu_livecard import LiveCard
 
             output: StreamingOutput = LiveCard(
                 self,

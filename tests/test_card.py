@@ -1,6 +1,6 @@
 """build_card 单元测试（卡片 JSON 2.0）。"""
 
-from feishu_dispatcher.card import build_card
+from feishu_dispatcher.channel.feishu_card import build_card
 
 
 def _body(card):
