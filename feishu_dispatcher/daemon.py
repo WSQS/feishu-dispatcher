@@ -20,7 +20,6 @@ import logging
 import os
 import re
 import secrets
-import shutil
 import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
@@ -90,6 +89,7 @@ from .trace_store import (
     SessionTraceStore,
     SessionTraceStoreClosed,
 )
+from .util.git import create_worktree, delete_branch, remove_worktree
 from .workspace_api import (
     file as workspace_file,
 )
@@ -134,84 +134,18 @@ def _worktree_slug(name: str) -> str:
     return slug or "project"
 
 
-async def _git_output(
-    project_path: Path,
-    args: list[str],
-    *,
-    check: bool = True,
-) -> str:
-    """在项目目录执行 git，返回 stdout；失败时保留 stderr 诊断。"""
-    executable = resolve_executable("git")
-    proc = await asyncio.create_subprocess_exec(
-        executable,
-        "-C",
-        str(project_path),
-        *args,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    stdout, stderr = await proc.communicate()
-    out = stdout.decode("utf-8", "replace").strip()
-    err = stderr.decode("utf-8", "replace").strip()
-    if check and proc.returncode:
-        detail = err or out or f"exit code {proc.returncode}"
-        raise RuntimeError(f"git {' '.join(args)} 失败：{detail}")
-    return out
-
-
 async def _create_session_worktree(project: Project, session_id: str) -> Path:
-    """为一个新 Session 创建 sibling worktree，失败时清理已生成的目录。"""
-    project_path = project.path.resolve()
-    if not project_path.is_dir():
-        raise RuntimeError(f"项目路径不是目录：{project_path}")
-    await _git_output(project_path, ["rev-parse", "--show-toplevel"])
-
+    """按 Session workspace 约定创建 sibling worktree。"""
+    repository = project.path.resolve()
+    if not repository.is_dir():
+        raise RuntimeError(f"项目路径不是目录：{repository}")
     slug = _worktree_slug(project.name)
-    root = project_path.parent / ".fdx-worktrees"
-    workspace = root / f"{slug}-{session_id}"
-    branch = f"fdx/{slug}/{session_id}"
-    if workspace.exists():
-        raise RuntimeError(f"worktree 路径已存在：{workspace}")
-
-    start_point = await _git_output(
-        project_path,
-        ["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
-        check=False,
+    workspace = repository.parent / ".fdx-worktrees" / f"{slug}-{session_id}"
+    await create_worktree(
+        repository=repository,
+        workspace=workspace,
+        branch=f"fdx/{slug}/{session_id}",
     )
-    if not start_point:
-        start_point = (
-            await _git_output(
-                project_path,
-                ["branch", "--show-current"],
-                check=False,
-            )
-            or "HEAD"
-        )
-    branch_exists = bool(
-        await _git_output(
-            project_path,
-            ["show-ref", "--verify", f"refs/heads/{branch}"],
-            check=False,
-        )
-    )
-    if branch_exists:
-        raise RuntimeError(f"worktree 分支已存在：{branch}")
-    root.mkdir(parents=True, exist_ok=True)
-    try:
-        await _git_output(
-            project_path,
-            ["worktree", "add", "-b", branch, str(workspace), start_point],
-        )
-    except Exception as exc:
-        try:
-            await _remove_session_worktree(
-                project,
-                session_id,
-                workspace,
-            )
-        except Exception as cleanup_exc:
-            raise RuntimeError(f"{exc}；失败补偿也未完成：{cleanup_exc}") from exc
-        raise
     return workspace
 
 
@@ -220,23 +154,17 @@ async def _remove_session_worktree(
     session_id: str,
     workspace: Path,
 ) -> None:
-    """补偿删除创建流程尚未交给 Session 的 worktree 与分支。"""
-    project_path = project.path.resolve()
-    branch = f"fdx/{_worktree_slug(project.name)}/{session_id}"
-    await _git_output(
-        project_path,
-        ["worktree", "remove", "--force", str(workspace)],
-        check=False,
+    """按 Session workspace 约定删除 worktree 与分支。"""
+    slug = _worktree_slug(project.name)
+    repository = project.path.resolve()
+    await remove_worktree(
+        repository=repository,
+        workspace=workspace,
     )
-    if workspace.exists():
-        shutil.rmtree(workspace)
-    await _git_output(project_path, ["worktree", "prune"])
-    if await _git_output(
-        project_path,
-        ["show-ref", "--verify", f"refs/heads/{branch}"],
-        check=False,
-    ):
-        await _git_output(project_path, ["branch", "-D", branch])
+    await delete_branch(
+        repository=repository,
+        branch=f"fdx/{slug}/{session_id}",
+    )
 
 
 #: message_id 去重窗口大小（飞书 ACK 异常时服务端会重推事件）
@@ -1427,7 +1355,9 @@ class _Daemon:
             if pending_worktree is not None:
                 try:
                     await _remove_session_worktree(
-                        project, reserved_session_id, pending_worktree
+                        project,
+                        reserved_session_id,
+                        pending_worktree,
                     )
                 except Exception as cleanup_exc:
                     exc = RuntimeError(f"{exc}；worktree 失败补偿未完成：{cleanup_exc}")

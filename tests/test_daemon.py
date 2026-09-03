@@ -7,7 +7,6 @@ import inspect
 import json
 import os
 import socket
-import subprocess
 import sys
 import threading
 import time
@@ -4734,6 +4733,63 @@ async def test_project_manager_callbacks_are_scoped_to_project():
     assert sent == [(demo.session_id, "继续")]
 
 
+@pytest.mark.asyncio
+async def test_create_session_worktree_maps_project_to_git_worktree(
+    monkeypatch,
+    tmp_path: Path,
+):
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    project = Project(name="Demo Project", path=project_path)
+    captured = {}
+
+    async def fake_create_worktree(*, repository, workspace, branch):
+        captured.update(
+            repository=repository,
+            workspace=workspace,
+            branch=branch,
+        )
+
+    monkeypatch.setattr(daemon_module, "create_worktree", fake_create_worktree)
+
+    workspace = await _create_session_worktree(project, "t1")
+
+    assert workspace == tmp_path / ".fdx-worktrees" / "Demo-Project-t1"
+    assert captured == {
+        "repository": project_path.resolve(),
+        "workspace": workspace,
+        "branch": "fdx/Demo-Project/t1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_remove_session_worktree_explicitly_removes_workspace_and_branch(
+    monkeypatch,
+    tmp_path: Path,
+):
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    project = Project(name="Demo Project", path=project_path)
+    workspace = tmp_path / ".fdx-worktrees" / "Demo-Project-t1"
+    calls = []
+
+    async def fake_remove_worktree(*, repository, workspace):
+        calls.append(("remove_worktree", repository, workspace))
+
+    async def fake_delete_branch(*, repository, branch):
+        calls.append(("delete_branch", repository, branch))
+
+    monkeypatch.setattr(daemon_module, "remove_worktree", fake_remove_worktree)
+    monkeypatch.setattr(daemon_module, "delete_branch", fake_delete_branch)
+
+    await daemon_module._remove_session_worktree(project, "t1", workspace)
+
+    assert calls == [
+        ("remove_worktree", project_path.resolve(), workspace),
+        ("delete_branch", project_path.resolve(), "fdx/Demo-Project/t1"),
+    ]
+
+
 @pytest.fixture
 def manager_worktree(monkeypatch, tmp_path: Path) -> Path:
     async def fake_create(project, session_id):
@@ -4840,60 +4896,6 @@ async def test_project_manager_worktree_failure_discards_session(monkeypatch):
     assert daemon.store.all() == []
     assert created == []
     await daemon._shutdown()
-
-
-@pytest.mark.asyncio
-async def test_create_session_worktree_uses_default_branch_and_rejects_conflict(
-    tmp_path: Path,
-):
-    project_path = tmp_path / "demo"
-    subprocess.run(
-        ["git", "init", "-b", "main", str(project_path)],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(project_path), "config", "user.email", "test@example.com"],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(project_path), "config", "user.name", "Test"],
-        check=True,
-        capture_output=True,
-    )
-    (project_path / "README.md").write_text("demo", encoding="utf-8")
-    subprocess.run(
-        ["git", "-C", str(project_path), "add", "README.md"],
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(project_path), "commit", "-m", "init"],
-        check=True,
-        capture_output=True,
-    )
-    project = Project(name="demo", path=project_path)
-
-    workspace = await _create_session_worktree(project, "t1")
-
-    assert workspace == tmp_path / ".fdx-worktrees" / "demo-t1"
-    branch = subprocess.run(
-        ["git", "-C", str(workspace), "branch", "--show-current"],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout.strip()
-    assert branch == "fdx/demo/t1"
-
-    subprocess.run(
-        ["git", "-C", str(project_path), "branch", "fdx/demo/t2"],
-        check=True,
-        capture_output=True,
-    )
-    with pytest.raises(RuntimeError, match="already exists|已存在"):
-        await _create_session_worktree(project, "t2")
-    assert not (tmp_path / ".fdx-worktrees" / "demo-t2").exists()
 
 
 @pytest.mark.asyncio
