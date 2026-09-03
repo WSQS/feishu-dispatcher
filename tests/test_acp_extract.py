@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
 from types import SimpleNamespace as NS
 
 import pytest
@@ -68,8 +69,8 @@ def test_resolve_executable_windows_prefers_cmd(monkeypatch):
 
     monkeypatch.setattr(mod.sys, "platform", "win32")
     monkeypatch.setattr(
-        mod,
-        "_which",
+        shutil,
+        "which",
         lambda name: r"C:\npm\copilot.cmd" if name == "copilot.cmd" else None,
     )
     assert resolve_executable("copilot") == r"C:\npm\copilot.cmd"
@@ -87,7 +88,7 @@ def test_resolve_executable_windows_returns_original_when_unresolved(monkeypatch
     import feishu_dispatcher.acp_client as mod
 
     monkeypatch.setattr(mod.sys, "platform", "win32")
-    monkeypatch.setattr(mod, "_which", lambda _name: None)
+    monkeypatch.setattr(shutil, "which", lambda _name: None)
     assert resolve_executable("copilot") == "copilot"
 
 

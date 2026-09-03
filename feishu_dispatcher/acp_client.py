@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import shutil
 import signal
 import sys
 from collections.abc import Awaitable, Callable, Iterable
@@ -1029,13 +1030,7 @@ def resolve_executable(cmd: str) -> str:
         return cmd
     # 裸命令名：在 PATH 里找 .cmd / .bat
     for ext in (".cmd", ".bat", ".exe"):
-        found = _which(cmd + ext)
+        found = shutil.which(cmd + ext)
         if found:
             return found
     return cmd
-
-
-def _which(name: str) -> str | None:
-    from shutil import which
-
-    return which(name)
