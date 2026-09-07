@@ -21,6 +21,7 @@ from feishu_dispatcher.channel.http import HttpChannel, HttpRequest, ensure_toke
 from feishu_dispatcher.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
+    AgentOutputMetadata,
     AgentOutputStarted,
     AgentPlanEntry,
     AgentPlanUpdated,
@@ -957,7 +958,6 @@ async def test_thread_reply_session_event_output_and_restart():
             conversation,
             "reply",
         )
-        output = channel.open_output(conversation, "demo", footer="model:a")
         channel.handle_session_event(
             conversation,
             SessionEvent(
@@ -965,7 +965,9 @@ async def test_thread_reply_session_event_output_and_restart():
                 session_id="t1",
                 turn_id="turn-1",
                 occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
-                body=AgentOutputStarted(),
+                body=AgentOutputStarted(
+                    metadata=AgentOutputMetadata("demo", "copilot", "model:a")
+                ),
             ),
         )
         channel.handle_session_event(
@@ -978,8 +980,6 @@ async def test_thread_reply_session_event_output_and_restart():
                 body=AgentOutputDelta(stream="message", text="hello world"),
             ),
         )
-        output.set_footer("model:b")
-        await output.set_status("done")
         channel.handle_session_event(
             conversation,
             SessionEvent(
@@ -991,10 +991,10 @@ async def test_thread_reply_session_event_output_and_restart():
                     message="hello world",
                     thought="",
                     outcome="completed",
+                    usage_tokens=2_000,
                 ),
             ),
         )
-        await output.aclose()
         events = await _wait_for_events(
             channel, conversation.conversation_id, minimum=5
         )
@@ -1011,8 +1011,8 @@ async def test_thread_reply_session_event_output_and_restart():
         output_id = events["events"][2]["presentation"]["output_id"]
         assert events["events"][2]["presentation"] == {
             "output_id": output_id,
-            "title": "demo",
-            "footer": "model:a",
+            "title": "demo · copilot",
+            "footer": "demo · 模型：model:a",
             "status": "running",
         }
         assert events["events"][3]["presentation"] == {
@@ -1022,7 +1022,7 @@ async def test_thread_reply_session_event_output_and_restart():
         assert events["events"][4]["presentation"] == {
             "output_id": output_id,
             "text": "",
-            "footer": "model:b",
+            "footer": "demo · 模型：model:a · ~2k tok",
             "status": "done",
         }
 
@@ -1229,19 +1229,6 @@ async def test_output_close_unregisters_pending_and_active_outputs(monkeypatch):
     monkeypatch.setattr(channel, "_unregister_output", record_unregister)
     try:
         conversation = channel.create_thread("start")
-        pending = channel.open_output(conversation, "pending")
-        pending_id = pending.started_presentation()["output_id"]
-
-        assert list(channel._pending_outputs[conversation.conversation_id]) == [pending]
-        assert channel._target_conversations[pending_id] == conversation.conversation_id
-        await pending.aclose()
-        await pending.aclose()
-        assert channel._pending_outputs == {}
-        assert channel._active_outputs == {}
-        assert unregister_calls == [pending]
-
-        active = channel.open_output(conversation, "active")
-        active_id = active.started_presentation()["output_id"]
         started = SessionEvent(
             event_id="event-started",
             session_id="session-1",
@@ -1251,18 +1238,78 @@ async def test_output_close_unregisters_pending_and_active_outputs(monkeypatch):
         )
         channel.handle_session_event(conversation, started)
 
-        assert (
-            channel._active_outputs[
-                (conversation.conversation_id, "session-1", "turn-1")
-            ]
-            is active
-        )
+        key = (conversation.conversation_id, "session-1", "turn-1")
+        active = channel._active_outputs[key]
+        active_id = active.started_presentation()["output_id"]
         assert channel._target_conversations[active_id] == conversation.conversation_id
-        await active.aclose()
-        await active.aclose()
-        assert channel._pending_outputs == {}
+        channel.handle_session_event(
+            conversation,
+            SessionEvent(
+                event_id="event-finished",
+                session_id="session-1",
+                turn_id="turn-1",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=AgentOutputFinished(
+                    message="",
+                    thought="",
+                    outcome="completed",
+                ),
+            ),
+        )
         assert channel._active_outputs == {}
-        assert unregister_calls == [pending, active]
+        assert unregister_calls == [active]
+
+        channel.handle_session_event(
+            conversation,
+            SessionEvent(
+                event_id="event-started-2",
+                session_id="session-1",
+                turn_id="turn-2",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=AgentOutputStarted(),
+            ),
+        )
+        remaining = channel._active_outputs[
+            (conversation.conversation_id, "session-1", "turn-2")
+        ]
+        channel.stop()
+        assert remaining._closed
+        assert channel._active_outputs == {}
+    finally:
+        channel.stop()
+
+
+async def test_interrupted_output_projects_stopped_status():
+    channel = HttpChannel(
+        "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
+    )
+    try:
+        conversation = channel.create_thread("start")
+        for event_id, body in [
+            ("started", AgentOutputStarted()),
+            (
+                "finished",
+                AgentOutputFinished(
+                    message="partial",
+                    thought="",
+                    outcome="interrupted",
+                ),
+            ),
+        ]:
+            channel.handle_session_event(
+                conversation,
+                SessionEvent(
+                    event_id=event_id,
+                    session_id="t1",
+                    turn_id="turn-1",
+                    occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                    body=body,
+                ),
+            )
+
+        events = channel._events_after(conversation.conversation_id, 0)["events"]
+        assert events[-1]["presentation"]["status"] == "stopped"
+        assert channel._active_outputs == {}
     finally:
         channel.stop()
 
@@ -1278,9 +1325,7 @@ async def test_session_event_presentation_is_the_only_live_output_path():
     channel.start(ignore)
     try:
         conversation = channel.create_thread("start")
-        output = channel.open_output(conversation, "demo", footer="model:a")
-        output.feed("legacy text must not be emitted")
-        await output.flush()
+        assert not hasattr(channel, "open_output")
         channel.handle_session_event(
             conversation,
             SessionEvent(

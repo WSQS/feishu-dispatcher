@@ -23,6 +23,7 @@ from ..conversation import ConversationRef
 from ..session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
+    AgentOutputMetadata,
     AgentOutputStarted,
     AgentPlanUpdated,
     ConversationRefSerializer,
@@ -32,6 +33,7 @@ from ..session_event import (
     session_event_to_dict,
 )
 from . import ChannelMessage, MessageHandler, OutputStatus
+from .presentation import format_agent_output_footer, format_agent_output_title
 
 
 @dataclass(frozen=True)
@@ -206,8 +208,7 @@ class HttpChannel:
         self._lifecycle_lock = threading.Lock()
         self._conversations: dict[str, _ConversationState] = {}
         self._target_conversations: dict[str, str] = {}
-        self._pending_outputs: dict[str, deque[_HttpStreamingOutput]] = {}
-        self._active_outputs: dict[tuple[str, str, str], _HttpStreamingOutput] = {}
+        self._active_outputs: dict[tuple[str, str, str], _HttpSessionEventOutput] = {}
         self._on_message: MessageHandler | None = None
         self._webui_assets = _load_webui_assets()
         self._server: _HttpServer | None = self._build_server()
@@ -251,6 +252,7 @@ class HttpChannel:
 
     def stop(self) -> None:
         """停止监听并释放端口；可重复调用。"""
+        self._close_active_outputs()
         with self._lifecycle_lock:
             server = self._server
             thread = self._thread
@@ -431,11 +433,15 @@ class HttpChannel:
             payload["trace_sequence"] = trace_sequence
         if presentation is not None:
             payload["presentation"] = presentation
-        self._append_event(
-            owner,
-            "session.event",
-            **payload,
-        )
+        try:
+            self._append_event(
+                owner,
+                "session.event",
+                **payload,
+            )
+        finally:
+            if isinstance(body, AgentOutputFinished) and output is not None:
+                output.close()
         if not isinstance(body, SessionInputAccepted):
             return
         if not body.text:
@@ -446,43 +452,8 @@ class HttpChannel:
             f"↪️ 同步自 {source}：{body.text}",
         )
 
-    def open_output(
-        self,
-        conversation: ConversationRef,
-        title: str,
-        *,
-        footer: str = "",
-    ) -> _HttpStreamingOutput:
-        conversation_id = self._clean_identity(
-            self._require_http_conversation(conversation).conversation_id,
-            "conversation_id",
-        )
-        self._claim_targets(conversation_id, [])
-        output = _HttpStreamingOutput(
-            self._new_target(conversation_id, "output"),
-            conversation_id,
-            title,
-            footer=footer,
-            on_close=self._unregister_output,
-        )
-        self._register_output(output)
-        return output
-
-    def _register_output(self, output: _HttpStreamingOutput) -> None:
+    def _unregister_output(self, output: _HttpSessionEventOutput) -> None:
         with self._state_lock:
-            self._pending_outputs.setdefault(output.conversation_id, deque()).append(
-                output
-            )
-
-    def _unregister_output(self, output: _HttpStreamingOutput) -> None:
-        with self._state_lock:
-            pending = self._pending_outputs.get(output.conversation_id)
-            if pending is not None:
-                self._pending_outputs[output.conversation_id] = deque(
-                    item for item in pending if item is not output
-                )
-                if not self._pending_outputs[output.conversation_id]:
-                    del self._pending_outputs[output.conversation_id]
             for key, active in list(self._active_outputs.items()):
                 if active is output:
                     del self._active_outputs[key]
@@ -491,26 +462,38 @@ class HttpChannel:
         self,
         conversation_id: str,
         event: SessionEvent,
-    ) -> _HttpStreamingOutput | None:
+    ) -> _HttpSessionEventOutput | None:
         if event.turn_id is None:
             return None
+        key = (conversation_id, event.session_id, event.turn_id)
         with self._state_lock:
-            pending = self._pending_outputs.get(conversation_id)
-            if not pending:
-                return None
-            output = pending.popleft()
-            if not pending:
-                del self._pending_outputs[conversation_id]
-            self._active_outputs[(conversation_id, event.session_id, event.turn_id)] = (
-                output
-            )
-            return output
+            current = self._active_outputs.get(key)
+        if current is not None:
+            return current
+        if not isinstance(event.body, AgentOutputStarted):
+            return None
+        output = _HttpSessionEventOutput(
+            self._new_target(conversation_id, "output"),
+            conversation_id,
+            event.body.metadata,
+            on_close=self._unregister_output,
+        )
+        with self._state_lock:
+            self._active_outputs[key] = output
+        return output
+
+    def _close_active_outputs(self) -> None:
+        with self._state_lock:
+            outputs = tuple(dict.fromkeys(self._active_outputs.values()))
+            self._active_outputs.clear()
+        for output in outputs:
+            output.close()
 
     def _active_output(
         self,
         conversation_id: str,
         event: SessionEvent,
-    ) -> _HttpStreamingOutput | None:
+    ) -> _HttpSessionEventOutput | None:
         if event.turn_id is None:
             return None
         with self._state_lock:
@@ -760,7 +743,6 @@ class HttpChannel:
                 for target_id in state.targets:
                     if self._target_conversations.get(target_id) == conversation_id:
                         del self._target_conversations[target_id]
-            self._pending_outputs.pop(conversation_id, None)
             for key in [
                 key for key in self._active_outputs if key[0] == conversation_id
             ]:
@@ -833,42 +815,26 @@ class HttpChannel:
             logger.exception("HTTP Channel 入站消息处理失败")
 
 
-class _HttpStreamingOutput:
-    """登记一个回合的 HTTP 展示元数据，由 SessionEvent 驱动实际事件。"""
+class _HttpSessionEventOutput:
+    """维护一个由 SessionEvent 驱动的 HTTP 回合展示。"""
 
     def __init__(
         self,
         output_id: str,
         conversation_id: str,
-        title: str,
+        metadata: AgentOutputMetadata | None,
         *,
-        footer: str,
-        on_close: Callable[["_HttpStreamingOutput"], None],
+        on_close: Callable[["_HttpSessionEventOutput"], None],
     ) -> None:
         self._output_id = output_id
         self.conversation_id = conversation_id
-        self._footer = footer
+        self._metadata = metadata
         self._on_close = on_close
         self._closed = False
-        self._title = title
         self._message_text = ""
         self._last_stream: str | None = None
 
-    def feed(self, text: str) -> None:
-        return None
-
-    def set_footer(self, footer: str) -> None:
-        if self._closed:
-            return
-        self._footer = footer
-
-    async def flush(self) -> None:
-        return None
-
-    async def set_status(self, status: OutputStatus) -> None:
-        return None
-
-    async def aclose(self) -> None:
+    def close(self) -> None:
         if self._closed:
             return
         self._closed = True
@@ -877,8 +843,8 @@ class _HttpStreamingOutput:
     def started_presentation(self) -> dict[str, object]:
         return {
             "output_id": self._output_id,
-            "title": self._title,
-            "footer": self._footer,
+            "title": format_agent_output_title(self._metadata),
+            "footer": format_agent_output_footer(self._metadata),
             "status": "running",
         }
 
@@ -918,18 +884,23 @@ class _HttpStreamingOutput:
             self._message_text = event.message
         else:
             suffix = ""
+        footer = format_agent_output_footer(
+            self._metadata,
+            usage_tokens=event.usage_tokens,
+        )
         status = cast(
             OutputStatus,
             {
                 "completed": "done",
                 "cancelled": "stopped",
                 "failed": "error",
+                "interrupted": "stopped",
             }[event.outcome],
         )
         return {
             "output_id": self._output_id,
             "text": suffix,
-            "footer": self._footer,
+            "footer": footer,
             "status": status,
         }
 

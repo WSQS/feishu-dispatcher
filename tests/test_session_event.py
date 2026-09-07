@@ -6,6 +6,7 @@ import pytest
 from feishu_dispatcher.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
+    AgentOutputMetadata,
     AgentOutputStarted,
     AgentPlanEntry,
     AgentPlanUpdated,
@@ -80,6 +81,14 @@ def _deserialize_conversation_ref(
                 outcome="failed",
             ),
             "turn-3",
+        ),
+        (
+            AgentOutputFinished(
+                message="读取日志时退出",
+                thought="daemon 正在关闭",
+                outcome="interrupted",
+            ),
+            "turn-4",
         ),
         (
             ToolCallObserved(
@@ -190,6 +199,55 @@ def test_session_event_uses_conversation_ref_codec_callbacks() -> None:
     assert deserialized == [
         ("feishu", {"opaque_id": "om_thread"}),
     ]
+
+
+def test_session_event_round_trips_output_metadata_and_usage_tokens() -> None:
+    started = SessionEvent(
+        event_id="event-output-context",
+        session_id="t1",
+        turn_id="turn-1",
+        occurred_at=_OCCURRED_AT,
+        body=AgentOutputStarted(
+            metadata=AgentOutputMetadata(
+                project_name="demo",
+                agent_label="copilot",
+                model="model-a",
+                issue_url="https://github.com/o/r/issues/7",
+            )
+        ),
+    )
+    finished = SessionEvent(
+        event_id="event-output-finished",
+        session_id="t1",
+        turn_id="turn-1",
+        occurred_at=_OCCURRED_AT,
+        body=AgentOutputFinished(
+            message="done",
+            thought="",
+            outcome="completed",
+            usage_tokens=321,
+        ),
+    )
+
+    started_record = session_event_to_dict(started)
+    finished_record = session_event_to_dict(finished)
+
+    assert started_record["payload"] == {
+        "metadata": {
+            "project_name": "demo",
+            "agent_label": "copilot",
+            "model": "model-a",
+            "issue_url": "https://github.com/o/r/issues/7",
+        }
+    }
+    assert finished_record["payload"] == {
+        "message": "done",
+        "thought": "",
+        "outcome": "completed",
+        "usage_tokens": 321,
+    }
+    assert session_event_from_dict(started_record) == started
+    assert session_event_from_dict(finished_record) == finished
 
 
 def test_session_event_rejects_codec_payload_channel_key_override() -> None:
@@ -304,6 +362,20 @@ def test_session_event_source_requires_conversation_ref_deserializer() -> None:
                 "message": "检查完成",
                 "thought": "日志状态正常",
                 "outcome": "completed",
+            },
+        ),
+        (
+            AgentOutputFinished(
+                message="检查中断",
+                thought="daemon 正在关闭",
+                outcome="interrupted",
+            ),
+            "turn-2",
+            "agent.output.finished",
+            {
+                "message": "检查中断",
+                "thought": "daemon 正在关闭",
+                "outcome": "interrupted",
             },
         ),
         (

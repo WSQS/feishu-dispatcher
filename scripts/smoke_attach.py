@@ -19,13 +19,12 @@ import sys
 from pathlib import Path
 
 from feishu_dispatcher.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
-from feishu_dispatcher.channel import ChannelMessage, StreamingOutput
+from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.config import Config, Project
 from feishu_dispatcher.conversation import ConversationRef
 from feishu_dispatcher.daemon import _Daemon
-from feishu_dispatcher.session_event import SessionEvent
+from feishu_dispatcher.session_event import AgentOutputDelta, SessionEvent
 from feishu_dispatcher.store import ProjectStore, SessionStore
-from feishu_dispatcher.throttler import StreamThrottler
 
 REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 SECRET = "4287"
@@ -75,24 +74,13 @@ class Bridge:
 
     def handle_session_event(
         self,
-        conversation_id: str,
+        conversation: ConversationRef,
         event: SessionEvent,
         *,
         trace_sequence: int | None = None,
     ) -> None:
-        return None
-
-    def open_output(
-        self,
-        conversation: ConversationRef,
-        title: str,
-        *,
-        footer: str = "",
-    ) -> StreamingOutput:
-        async def send_piece(piece: str) -> None:
-            await asyncio.to_thread(self.send_text, conversation, piece)
-
-        return StreamThrottler(send_piece, window=0.01)
+        if isinstance(event.body, AgentOutputDelta) and event.body.text:
+            self.send_text(conversation, event.body.text)
 
     def reply(self, message_id: str, text: str) -> str:
         self.plains.append(text)

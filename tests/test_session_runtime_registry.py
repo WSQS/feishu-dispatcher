@@ -38,3 +38,17 @@ def test_registry_rejects_conflicting_runtime() -> None:
 
     with pytest.raises(RuntimeError, match="Session Runtime 已注册: session-a"):
         registry.register(runtime("session-a"))
+
+
+def test_registry_removes_only_the_current_runtime_generation() -> None:
+    registry = SessionRuntimeRegistry()
+    first = runtime("session-a")
+    replacement = runtime("session-a")
+    registry.register(first)
+
+    assert registry.is_current(first)
+    assert not registry.is_current(replacement)
+    assert not registry.remove_if_current(replacement)
+    assert registry.remove_if_current(first)
+    assert not registry.remove_if_current(first)
+    assert registry.count() == 0
