@@ -5,7 +5,7 @@ P0 原型范围（设计文档）：
 - 根消息 `/run` 触发 spawn，话题回复排队追加给同一 agent
 
 生命周期模型（review R2/R3 修复后的设计）：
-- 一个 `/run` = 一个 `_AgentSessionRunner`：agent 进程与 ACP session **跨 turn 存活**，
+- 一个 `/run` = 一个 `AcpSessionRuntime`：agent 进程与 ACP session **跨 turn 存活**，
   上下文保留在 session 里
 - 每个 session 一个 Turn 队列 + 单消费者 worker task，turn 串行执行
 - 话题回复只入队；`/stop`（入队 None 哨兵）、执行出错或 daemon 退出才关闭 agent
@@ -24,9 +24,9 @@ import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
+from typing import Literal
 
 from . import forge
 from ._scan_executor import ScanExecutor
@@ -40,8 +40,7 @@ from .acp_client import (
     OnToolCall,
     resolve_executable,
 )
-from .channel import Channel, ChannelMessage, StreamingOutput
-from .channel.fanout import FanoutStreamingOutput
+from .channel import Channel, ChannelMessage
 from .channel.feishu import FeishuBridge
 from .channel.http import HttpChannel
 from .channel.http import ensure_token as ensure_http_channel_token
@@ -55,6 +54,9 @@ from .scheduler import (
     build_scheduler_tools,
 )
 from .session import (
+    AcpSessionRuntime,
+    AcpSessionRuntimeHooks,
+    AcpTurnResult,
     DispatcherSessionRuntime,
     ProjectManagerSessionRuntime,
     SessionRuntime,
@@ -65,7 +67,6 @@ from .session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
     AgentOutputStarted,
-    AgentPlanEntry,
     AgentPlanUpdated,
     OutputOutcome,
     SessionEvent,
@@ -256,21 +257,6 @@ def _attach_probe_error(exc: Exception) -> str:
     )
 
 
-def _fmt_tokens(n: int) -> str:
-    """token 数压成人读的小字（`~850 tok` / `~3.2k tok` / `~1.2M tok`）。"""
-    for unit, div in (("M", 1_000_000), ("k", 1000)):
-        if n >= div:
-            s = f"{n / div:.1f}".rstrip("0").rstrip(".")
-            return f"~{s}{unit} tok"
-    return f"~{n} tok"
-
-
-def _with_tokens(footer: str, tokens: int) -> str:
-    """把 token 用量拼到既有 footer 尾部（`项目 · 模型：X · ~3.2k tok`）。"""
-    tok = _fmt_tokens(tokens)
-    return f"{footer} · {tok}" if footer else tok
-
-
 def _fmt_ts(ts: float) -> str:
     """epoch 秒 → 本地 `MM-DD HH:MM`；0/无 → 「未知」。"""
     if not ts:
@@ -312,17 +298,6 @@ def _read_tail_lines(path: str, lines: int, *, max_bytes: int = 200_000) -> str:
     except Exception:
         logger.debug("读后台任务输出行失败 %s", path, exc_info=True)
     return ""
-
-
-def _issue_tag(issue_url: str) -> str:
-    """从 issue URL 提末段编号拼成 `#N`（GitHub `/issues/3`、GitLab `/-/issues/3`）。
-
-    只用于展示。取不到数字则返回空串（不显示，不猜）。
-    """
-    if not issue_url:
-        return ""
-    last = issue_url.rstrip("/").rsplit("/", 1)[-1]
-    return f"#{last}" if last.isdigit() else ""
 
 
 def _parse_agent_flag(text: str) -> tuple[str, str]:
@@ -458,116 +433,6 @@ _BG_GUIDANCE = (
 
 
 @dataclass
-class _BgBatch:
-    """待唤回 agent 的后台任务完成批次（#79）。作为**可变**队列项入队；同一 task 相邻
-    完成的多个 job 把各自的 ``<bg_job_done>`` 块 append 进来，只唤回一轮。渲染时把所有块
-    拼起来 + 一条引导语——多个 job 合并成一轮 prompt，避免各自冷启动/打断。"""
-
-    blocks: list[str] = field(default_factory=list)
-
-    def add(self, block: str) -> None:
-        self.blocks.append(block)
-
-    def render(self) -> str:
-        return "\n\n".join(self.blocks) + "\n\n" + _BG_GUIDANCE
-
-
-@dataclass
-class _AgentSessionRunner:
-    """一个活跃 agent 的运行时状态。"""
-
-    project_name: str
-    agent_label: str
-    #: Task 的主 Thread Conversation；生命周期事件与后台输出据此寻址。
-    conversation: ConversationRef
-    #: 关联的 Session id（当前值来自持久台账主键 Session.session_id）
-    session_id: str = ""
-    #: agent 工作目录（= Session.workspace）
-    cwd: str = ""
-    #: 是否由 load_session 恢复而来（影响启动失败时的提示文案）
-    resumed: bool = False
-    #: 是否由 /attach 附着外部会话而来（= Session.origin == "attach"）；
-    #: 影响启动成功/失败的提示文案（区别于普通恢复的「已恢复」）。
-    attached: bool = False
-    #: 关联的 forge issue URL（= Session.issue_url，#63）；供 footer/展示标归属，空 = 未绑定
-    issue_url: str = ""
-    #: agent 实例（先建 session、再建 agent，故允许 None）
-    agent: "AcpAgent | None" = None
-    #: 当前回合的流式输出呈现；回合间为 None
-    current_output: StreamingOutput | None = None
-    #: Turn 队列；None 是关闭哨兵（/stop / /done / mark_done），_BgBatch 是后台完成批次
-    queue: "asyncio.Queue[TurnRequest | _BgBatch | None]" = field(
-        default_factory=asyncio.Queue
-    )
-    #: 队尾未消费的后台任务批次（#79）；非 None ⟺ 队尾是可继续合并的 _BgBatch。
-    #: 入任何非 bg 项（enqueue）或被 worker 消费即清空——据此判「队尾能否再合并」。
-    pending_bg: "_BgBatch | None" = None
-    #: 收到 None 哨兵时置入的终止态：stopped（/stop，默认）或 done（/done / mark_done）
-    terminate_status: str = "stopped"
-    #: 本轮是否正在跑（worker 卡在 agent.prompt() 里）；/stop 据此决定要不要发 cancel
-    turn_in_flight: bool = False
-    #: 当前 Turn 的运行事实聚合，供 SessionEvent sink 生成完整收尾事件。
-    current_turn_id: str | None = None
-    current_conversations: tuple[ConversationRef, ...] = ()
-    current_message_chunks: list[str] = field(default_factory=list)
-    current_thought_chunks: list[str] = field(default_factory=list)
-    session_event_projection_tail: "asyncio.Task[None] | None" = None
-    #: agent 控制面身份 token（本次启动一次性下发，注入 env，映射到 Session id）；#68
-    bg_token: str = ""
-    #: 单消费者 worker，持有 agent 完整生命周期
-    worker: "asyncio.Task[None] | None" = None
-
-    def enqueue(self, request: TurnRequest) -> None:
-        """入队一个普通 Turn（话题回复 / 首轮 / 新指令 / send_to_task），**断开** bg
-        合并邻接（清 pending_bg）——之后完成的 bg 不会跨这个普通项去合并，保 FIFO。"""
-        self.pending_bg = None
-        self.queue.put_nowait(request)
-
-    def terminate(self) -> None:
-        """入队终止哨兵 None，并**丢弃**队列里所有未处理的后台批次（/stop、/done 立即
-        停、不排空后台结果，#79）。单线程、无 await，原子——排空后再放 None。"""
-        kept: list = []
-        while not self.queue.empty():
-            it = self.queue.get_nowait()
-            if not isinstance(it, _BgBatch):
-                kept.append(it)
-        for it in kept:
-            self.queue.put_nowait(it)
-        self.pending_bg = None
-        self.queue.put_nowait(None)
-
-
-class _CurrentRunnerRegistry:
-    """Session 的单活 current-runner 槽位；session_id 只是 lookup key。"""
-
-    def __init__(self) -> None:
-        self._by_session: dict[str, _AgentSessionRunner] = {}
-
-    def get_for_session(self, session_id: str) -> _AgentSessionRunner | None:
-        return self._by_session.get(session_id)
-
-    def register(self, session_id: str, runner: _AgentSessionRunner) -> None:
-        if session_id in self._by_session:
-            raise RuntimeError(f"session {session_id} 已有 current runner")
-        self._by_session[session_id] = runner
-
-    def is_current(self, session_id: str, runner: _AgentSessionRunner) -> bool:
-        return self._by_session.get(session_id) is runner
-
-    def remove_if_current(self, session_id: str, runner: _AgentSessionRunner) -> bool:
-        if not self.is_current(session_id, runner):
-            return False
-        del self._by_session[session_id]
-        return True
-
-    def values(self) -> list[_AgentSessionRunner]:
-        return list(self._by_session.values())
-
-    def count(self) -> int:
-        return len(self._by_session)
-
-
-@dataclass
 class _Daemon:
     cfg: Config
     discover: bool = False
@@ -598,19 +463,23 @@ class _Daemon:
     _sched_memory: SchedulerMemory = field(
         default_factory=lambda: SchedulerMemory(None)
     )
-    #: 当前已登记的 Session Runtime；Runtime 自身负责输入队列与执行生命周期。
+    #: 当前已登记的 Session Runtime；ACP、Dispatcher 与 Manager 共用同一身份表。
     _session_runtimes: SessionRuntimeRegistry = field(
         default_factory=SessionRuntimeRegistry
     )
+    #: ACP Turn 开始时确定的 Channel 投影目标快照。
+    _turn_audiences: dict[
+        tuple[AcpSessionRuntime, str], tuple[ConversationRef, ...]
+    ] = field(default_factory=dict)
     #: 每个项目 Manager 的独立对话记忆；首次使用时惰性构造。
     _project_manager_memories: dict[str, SchedulerMemory] = field(default_factory=dict)
     #: Project Manager 记忆目录；测试默认 None，不写盘。
     _project_manager_memory_dir: "Path | None" = None
     #: Tool Loop Runtime 的每 Session 事件消费者尾任务；关闭前等待收尾。
     _runtime_event_tails: dict[str, asyncio.Task[None]] = field(default_factory=dict)
-    #: 同一 Session 的 Turn 共用一把锁；跨 Channel / runner 串行，不同 Session 可并行。
+    #: 同一 Session 的 Turn 共用一把锁；跨 Channel / Runtime 串行，不同 Session 可并行。
     _session_turn_locks: dict[str, asyncio.Lock] = field(default_factory=dict)
-    #: 已预留、尚未登记到 runner 的 agent 名额；覆盖 create_thread 的 await 窗口。
+    #: 已预留、尚未登记到 Runtime 的 agent 名额；覆盖 create_thread 的 await 窗口。
     _pending_agent_launches: int = 0
     #: 由启动装配层注入；稳定 key → Channel 实例。
     _channels: dict[str, Channel] = field(default_factory=dict)
@@ -620,8 +489,6 @@ class _Daemon:
     _control_conversation: ConversationRef | None = None
     #: 进程内 Conversation → Session 身份绑定；Manager Conversation 另有持久化台账。
     _conversation_session_ids: dict[ConversationRef, str] = field(default_factory=dict)
-    #: 每个 Session 的单活 current runner；Thread 只经 Session 路由到这里。
-    _runners: _CurrentRunnerRegistry = field(default_factory=_CurrentRunnerRegistry)
     #: 可选的运行时事件消费者；不参与 Channel 投影或持久化。
     _session_event_handler: SessionEventHandler | None = None
     _seen_message_keys: OrderedDict[tuple[ConversationRef, str], None] = field(
@@ -633,6 +500,8 @@ class _Daemon:
     _scan_executor: ScanExecutor | None = None
     #: agent 控制面身份表：token → Session id（启 agent 时登记，关 Session 时清）。#68
     _bg_tokens: dict[str, str] = field(default_factory=dict)
+    #: 每代 ACP Runtime 拥有的控制面 token；按实例清理，避免旧代误撤销新代 token。
+    _runtime_bg_tokens: dict[AcpSessionRuntime, str] = field(default_factory=dict)
     #: 后台任务 watcher 的强引用（asyncio 只持弱引用，不存会被 GC）。#68
     _bg_watchers: set = field(default_factory=set)
     #: 在跑的后台进程：job_id → proc（launch 登记、watcher 退出清），供 bg kill。#70
@@ -705,10 +574,29 @@ class _Daemon:
         )
 
     def _reserve_agent_slot(self) -> bool:
-        if self._runners.count() + self._pending_agent_launches >= self.cfg.max_agents:
+        if (
+            sum(
+                isinstance(runtime, AcpSessionRuntime)
+                for runtime in self._session_runtimes.values()
+            )
+            + self._pending_agent_launches
+            >= self.cfg.max_agents
+        ):
             return False
         self._pending_agent_launches += 1
         return True
+
+    def _acp_runtime(self, session_id: str) -> AcpSessionRuntime | None:
+        """返回当前持久 Worker 的 ACP Runtime。"""
+        runtime = self._session_runtimes.get_for_session(session_id)
+        return runtime if isinstance(runtime, AcpSessionRuntime) else None
+
+    def _active_acp_runtimes(self) -> list[AcpSessionRuntime]:
+        return [
+            runtime
+            for runtime in self._session_runtimes.values()
+            if isinstance(runtime, AcpSessionRuntime)
+        ]
 
     def _release_agent_slot(self) -> None:
         if self._pending_agent_launches <= 0:
@@ -868,6 +756,36 @@ class _Daemon:
             )
         )
 
+    async def _publish_acp_event(
+        self,
+        sess: AcpSessionRuntime,
+        event: SessionEvent,
+    ) -> None:
+        """接收 ACP Runtime 事件，并保留既有 trace/Channel 投影顺序。"""
+        record = await self._emit_session_event(event)
+        if isinstance(event.body, SessionInputAccepted):
+            conversations = tuple(
+                conversation
+                for conversation in self._conversations_for_session(sess.session_id)
+                if conversation != event.body.source
+            )
+            await self._publish_session_event(
+                event,
+                conversations,
+                trace_sequence=record.sequence if record is not None else None,
+            )
+            return
+        conversations = (
+            self._turn_audiences.get((sess, event.turn_id), ())
+            if event.turn_id is not None
+            else ()
+        )
+        self._queue_session_event_projection(
+            event,
+            conversations,
+            record.sequence if record is not None else None,
+        )
+
     async def _emit_session_event(
         self, event: SessionEvent
     ) -> SessionTraceRecord | None:
@@ -949,15 +867,18 @@ class _Daemon:
         """等待指定 Session 或全部 Runtime 事件完成持久化与消费。"""
         if session_id is not None:
             while (tail := self._runtime_event_tails.get(session_id)) is not None:
-                await tail
+                await asyncio.shield(tail)
             return
         while self._runtime_event_tails:
-            await asyncio.gather(*tuple(self._runtime_event_tails.values()))
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in self._runtime_event_tails.values())
+            )
 
     def _register_session_runtime(self, runtime: SessionRuntime) -> None:
         """登记 Runtime 并接入 daemon 的统一 SessionEvent 管线。"""
         if self._session_runtimes.register(runtime):
-            runtime.subscribe(self._queue_runtime_event)
+            if not isinstance(runtime, AcpSessionRuntime):
+                runtime.subscribe(self._queue_runtime_event)
 
     def _project_manager_session_id(self, project_name: str) -> str:
         return f"{_PROJECT_MANAGER_SESSION_PREFIX}{project_name}"
@@ -986,7 +907,7 @@ class _Daemon:
                 "description": session.description,
                 "status": session.status,
                 "turns": session.turns,
-                "active": self._runners.get_for_session(session.session_id) is not None,
+                "active": self._acp_runtime(session.session_id) is not None,
             }
             for session in self.store.all()
             if session.project_name == project_name
@@ -1586,73 +1507,29 @@ class _Daemon:
 
     def _queue_session_event_projection(
         self,
-        sess: _AgentSessionRunner,
         event: SessionEvent,
+        conversations: tuple[ConversationRef, ...],
         trace_sequence: int | None,
     ) -> None:
         """按 Turn 顺序异步投影事件，避免 Channel 延迟阻塞 ACP 输出。"""
-        previous = sess.session_event_projection_tail
-        conversations = sess.current_conversations
+        previous = self._runtime_event_tails.get(event.session_id)
+        task: asyncio.Task[None]
 
         async def project() -> None:
-            if previous is not None:
-                await previous
-            await self._publish_session_event(
-                event,
-                conversations,
-                trace_sequence=trace_sequence,
-            )
-
-        sess.session_event_projection_tail = asyncio.create_task(project())
-
-    async def _finish_agent_output(
-        self,
-        sess: _AgentSessionRunner,
-        outcome: OutputOutcome,
-    ) -> None:
-        if sess.current_turn_id is None:
-            return
-        event = SessionEvent(
-            event_id=secrets.token_hex(16),
-            session_id=sess.session_id,
-            turn_id=sess.current_turn_id,
-            occurred_at=datetime.now(timezone.utc),
-            body=AgentOutputFinished(
-                message="".join(sess.current_message_chunks),
-                thought="".join(sess.current_thought_chunks),
-                outcome=outcome,
-            ),
-        )
-        record = await self._emit_session_event(event)
-        self._queue_session_event_projection(
-            sess,
-            event,
-            record.sequence if record is not None else None,
-        )
-
-    def _open_session_output(
-        self,
-        conversations: tuple[ConversationRef, ...],
-        title: str,
-        *,
-        footer: str,
-    ) -> StreamingOutput:
-        outputs: list[tuple[ConversationRef, StreamingOutput]] = []
-        for conversation in conversations:
             try:
-                output = self._channel_for(conversation).open_output(
-                    conversation,
-                    title,
-                    footer=footer,
+                if previous is not None:
+                    await previous
+                await self._publish_session_event(
+                    event,
+                    conversations,
+                    trace_sequence=trace_sequence,
                 )
-            except Exception:
-                logger.exception(
-                    "Session 输出创建失败 conversation=%s",
-                    conversation.to_log_string(),
-                )
-                continue
-            outputs.append((conversation, output))
-        return FanoutStreamingOutput(outputs)
+            finally:
+                if self._runtime_event_tails.get(event.session_id) is task:
+                    self._runtime_event_tails.pop(event.session_id, None)
+
+        task = asyncio.create_task(project())
+        self._runtime_event_tails[event.session_id] = task
 
     def _start_channels(self) -> None:
         self._validate_channel_registry()
@@ -1803,7 +1680,7 @@ class _Daemon:
         )
         if bound_session_id is not None and bound_session_id != _DISPATCHER_SESSION_ID:
             runtime = self._session_runtimes.get_for_session(bound_session_id)
-            if runtime is not None:
+            if runtime is not None and self.store.get(bound_session_id) is None:
                 if msg.text.strip():
                     runtime.submit(TurnRequest(msg.text.strip(), conversation))
                 return
@@ -2138,7 +2015,7 @@ class _Daemon:
     async def _refresh_models(self, backend: str) -> tuple[bool, str]:
         """临时起一个该 backend 的一次性 agent、读 available_models 后关掉，刷新缓存。
 
-        不进 current-runner registry——不占 max_agents。返回 (是否成功, 人读结果串)。
+        不进 ACP Runtime registry——不占 max_agents。返回 (是否成功, 人读结果串)。
         """
         argv = self.cfg.agents.get(backend)
         if not argv:
@@ -2514,8 +2391,8 @@ class _Daemon:
         *,
         resume_session_id: str | None = None,
         attached: bool = False,
-    ) -> _AgentSessionRunner:
-        """按 Session 创建 ``_AgentSessionRunner``、接线输出、入队首个 Turn、启动 worker。
+    ) -> AcpSessionRuntime:
+        """按 Session 创建 ``AcpSessionRuntime``、接线输出、入队首个 Turn、启动 worker。
 
         ``resume_session_id`` 非 None 时 agent 用 load_session 恢复（惰性重连）。
         ``first_turn=None`` 时只把 agent 拉起来在线（不跑首轮），用于 resume_task。
@@ -2524,7 +2401,53 @@ class _Daemon:
         """
         session_conversation = self._conversation_for_session(session)
         self.bind_conversation(session.session_id, session_conversation)
-        sess = _AgentSessionRunner(
+        sess: AcpSessionRuntime
+
+        async def on_output(output: AgentOutputChunk) -> None:
+            if not self._session_runtimes.is_current(sess):
+                return
+            await sess.handle_output(output)
+
+        async def on_action(action: dict) -> None:
+            # 审计（A）：只有 current Runtime 能把 tool_call 记进 Task；旧代 Runtime
+            # 的迟到 callback 仍可收尾自身资源，但不能再代表 Task 写当前运行态。
+            if not self._session_runtimes.is_current(sess):
+                return
+            cur = self.store.get(sess.session_id)
+            turn = (cur.turns if cur else 0) + 1
+            self.store.add_action(sess.session_id, {"turn": turn, **action})
+
+        async def on_tool_call(update: AgentToolCallUpdate) -> None:
+            if not self._session_runtimes.is_current(sess):
+                return
+            await sess.handle_tool_call(update)
+
+        # 配置里给该后端声明的追加 env（[agents.<名>].env，如 codex 的 CODEX_PATH）打底。
+        env: dict[str, str] = dict(self.cfg.agent_env.get(session.agent_label, {}))
+        # 身份注入（#68）：给 agent 子进程一份一次性 token + 控制面 URL（经 env 逐层
+        # 透传到 agent 跑的 shell → fdx）。有控制面才注入（测试无控制面时不注入）。
+        token: str | None = None
+        if self._control is not None:
+            token = secrets.token_urlsafe(16)
+            env.update(
+                {
+                    "FEISHU_DISPATCHER_URL": self._control.base_url,
+                    "FEISHU_DISPATCHER_TOKEN": token,
+                    "FEISHU_DISPATCHER_TASK_ID": session.session_id,
+                }
+            )
+        agent = self._make_agent(
+            AgentSpawn(command=list(agent_argv), cwd=session.workspace, env=env),
+            on_output,
+            on_action,
+            on_tool_call=on_tool_call,
+            resume_session_id=resume_session_id,
+        )
+
+        async def publish_event(event: SessionEvent) -> None:
+            await self._publish_acp_event(sess, event)
+
+        sess = AcpSessionRuntime(
             project_name=session.project_name,
             agent_label=session.agent_label,
             session_id=session.session_id,
@@ -2533,198 +2456,99 @@ class _Daemon:
             resumed=resume_session_id is not None,
             attached=attached,
             issue_url=session.issue_url,
+            agent=agent,
+            event_sink=publish_event,
         )
-
-        async def on_output(output: AgentOutputChunk) -> None:
-            if not self._runners.is_current(sess.session_id, sess):
-                return
-            if sess.current_output is not None:
-                sess.current_output.feed(output.display_text)
-            if sess.current_turn_id is None:
-                return
-            if output.raw_text is None:
-                if not output.plan_entries:
-                    return
-                event = SessionEvent(
-                    event_id=secrets.token_hex(16),
-                    session_id=sess.session_id,
-                    turn_id=sess.current_turn_id,
-                    occurred_at=datetime.now(timezone.utc),
-                    body=AgentPlanUpdated(
-                        entries=tuple(
-                            AgentPlanEntry(
-                                content=entry.content,
-                                status=entry.status,
-                            )
-                            for entry in output.plan_entries
-                        )
-                    ),
-                )
-                record = await self._emit_session_event(event)
-                self._queue_session_event_projection(
-                    sess,
-                    event,
-                    record.sequence if record is not None else None,
-                )
-                return
-            if output.kind == "message":
-                sess.current_message_chunks.append(output.raw_text)
-                stream = "message"
-            elif output.kind == "thought":
-                sess.current_thought_chunks.append(output.raw_text)
-                stream = "thought"
-            else:
-                return
-            event = SessionEvent(
-                event_id=secrets.token_hex(16),
-                session_id=sess.session_id,
-                turn_id=sess.current_turn_id,
-                occurred_at=datetime.now(timezone.utc),
-                body=AgentOutputDelta(stream=stream, text=output.raw_text),
-            )
-            record = await self._emit_session_event(event)
-            self._queue_session_event_projection(
-                sess,
-                event,
-                record.sequence if record is not None else None,
-            )
-
-        async def on_action(action: dict) -> None:
-            # 审计（A）：只有 current runner 能把 tool_call 记进 Task；旧代 runner
-            # 的迟到 callback 仍可收尾自身资源，但不能再代表 Task 写当前运行态。
-            if not self._runners.is_current(sess.session_id, sess):
-                return
-            cur = self.store.get(sess.session_id)
-            turn = (cur.turns if cur else 0) + 1
-            self.store.add_action(sess.session_id, {"turn": turn, **action})
-
-        async def on_tool_call(update: AgentToolCallUpdate) -> None:
-            if (
-                not self._runners.is_current(sess.session_id, sess)
-                or sess.current_turn_id is None
-            ):
-                return
-            event = SessionEvent(
-                event_id=secrets.token_hex(16),
-                session_id=sess.session_id,
-                turn_id=sess.current_turn_id,
-                occurred_at=datetime.now(timezone.utc),
-                body=ToolCallObserved(
-                    tool_call_id=update.tool_call_id,
-                    kind=update.kind,
-                    title=update.title,
-                    status=update.status,
-                    detail=update.detail,
-                ),
-            )
-            record = await self._emit_session_event(event)
-            self._queue_session_event_projection(
-                sess,
-                event,
-                record.sequence if record is not None else None,
-            )
-
-        # 配置里给该后端声明的追加 env（[agents.<名>].env，如 codex 的 CODEX_PATH）打底。
-        env: dict[str, str] = dict(self.cfg.agent_env.get(session.agent_label, {}))
-        # 身份注入（#68）：给 agent 子进程一份一次性 token + 控制面 URL（经 env 逐层
-        # 透传到 agent 跑的 shell → fdx）。有控制面才注入（测试无控制面时不注入）。
-        if self._control is not None:
-            token = secrets.token_urlsafe(16)
+        if token is not None:
             self._bg_tokens[token] = session.session_id
-            sess.bg_token = token
-            env.update(
-                {
-                    "FEISHU_DISPATCHER_URL": self._control.base_url,
-                    "FEISHU_DISPATCHER_TOKEN": token,
-                    "FEISHU_DISPATCHER_TASK_ID": session.session_id,
-                }
-            )
-        sess.agent = self._make_agent(
-            AgentSpawn(command=list(agent_argv), cwd=session.workspace, env=env),
-            on_output,
-            on_action,
-            on_tool_call=on_tool_call,
-            resume_session_id=resume_session_id,
-        )
+            self._runtime_bg_tokens[sess] = token
         if first_turn is not None:
-            sess.enqueue(first_turn)
-        self._runners.register(session.session_id, sess)
-        sess.worker = asyncio.create_task(
-            self._agent_worker(sess, first_turn), name=f"agent-{session.session_id}"
+            sess.submit(first_turn)
+        self._register_session_runtime(sess)
+        sess.start_worker(
+            AcpSessionRuntimeHooks(
+                is_current=lambda: self._session_runtimes.is_current(sess),
+                on_start_failed=lambda exc: self._handle_agent_start_failure(
+                    sess,
+                    first_turn,
+                    exc,
+                ),
+                on_started=lambda: self._handle_agent_started(sess, first_turn),
+                turn_context=lambda: self._session_turn_lock(sess.session_id),
+                prepare_turn=lambda request: self._prepare_agent_turn(sess, request),
+                execute_turn=lambda request: self._execute_agent_turn(sess, request),
+                on_turn_finished=lambda request: self._finish_agent_turn_projection(
+                    sess,
+                    request.turn_id,
+                ),
+                on_idle_timeout=lambda: self._handle_agent_idle_timeout(sess),
+                on_terminate=lambda status: self._handle_agent_terminate(sess, status),
+                on_finished=lambda: self._close_session(sess),
+            ),
+            idle_timeout=(self.cfg.idle_timeout if self.cfg.idle_timeout > 0 else None),
         )
         return sess
 
-    async def _agent_worker(
-        self, sess: _AgentSessionRunner, startup_turn: TurnRequest | None
+    async def _handle_agent_start_failure(
+        self,
+        sess: AcpSessionRuntime,
+        startup_turn: TurnRequest | None,
+        exc: Exception,
     ) -> None:
-        """一个 agent 的完整生命周期：启动 → 串行消费 Turn 队列 → 关闭。"""
-        agent = sess.agent
-        assert agent is not None
-        startup_conversation = (
-            startup_turn.conversation if startup_turn is not None else sess.conversation
+        logger.exception("agent 启动失败")
+        if not self._session_runtimes.is_current(sess):
+            return
+        err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
+        self.store.update(sess.session_id, status="failed", error_message=err)
+        if sess.attached:
+            message = "❌ 附着失败（session 无法恢复或已过期）。请确认后重试，或发送 `/run` 新开。"
+        elif sess.resumed:
+            message = "❌ 会话恢复失败（可能已在 agent 侧过期）。发送 `/run` 重开。"
+        else:
+            message = f"❌ agent 启动失败: {str(exc)[:200]}"
+        await self._send_to_session(
+            sess.session_id,
+            message,
+            source=startup_turn.conversation if startup_turn else sess.conversation,
         )
-        try:
-            await agent.start()
-        except Exception as exc:
-            logger.exception("agent 启动失败")
-            if self._runners.is_current(sess.session_id, sess):
-                err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
-                self.store.update(sess.session_id, status="failed", error_message=err)
-                if sess.attached:
-                    message = (
-                        "❌ 附着失败（session 无法恢复或已过期）。"
-                        "请确认后重试，或发送 `/run` 新开。"
-                    )
-                elif sess.resumed:
-                    message = (
-                        "❌ 会话恢复失败（可能已在 agent 侧过期）。发送 `/run` 重开。"
-                    )
-                else:
-                    message = f"❌ agent 启动失败: {str(exc)[:200]}"
-                await self._send_to_session(
-                    sess.session_id,
-                    message,
-                    source=startup_conversation,
+        if startup_turn is not None:
+            delegation = self.delegation_store.by_worker_turn(
+                sess.session_id,
+                startup_turn.turn_id,
+            )
+            if delegation is not None:
+                await self._finish_delegation_turn(
+                    delegation,
+                    outcome="failed",
+                    fallback_message=message,
                 )
-                if startup_turn is not None:
-                    delegation = self.delegation_store.by_worker_turn(
-                        sess.session_id,
-                        startup_turn.turn_id,
-                    )
-                    if delegation is not None:
-                        await self._finish_delegation_turn(
-                            delegation,
-                            outcome="failed",
-                            fallback_message=message,
-                        )
-            await self._close_session(sess)
-            return
-        if not self._runners.is_current(sess.session_id, sess):
-            await self._close_session(sess)
-            return
-        # 启动成功：把 agent_session_id + 模型落进 Task 并置 idle（供重启后恢复）
-        reported = getattr(agent, "model", "") or ""
+
+    async def _handle_agent_started(
+        self,
+        sess: AcpSessionRuntime,
+        startup_turn: TurnRequest | None,
+    ) -> bool:
+        if not self._session_runtimes.is_current(sess):
+            return False
+        agent_session_id = sess.agent_session_id or ""
+        reported = sess.model
         model = reported
-        # 模型黏住（恢复后）：agent 后端重载会话（load_session）时可能把模型重置回默认，
-        # 报回的 current_value 即是默认——若直接采信就会把用户此前 /model 切过的模型覆盖掉
-        # （台账 + 实际都还原）。故：Session 若记着用户切过的模型且后端仍支持，就重新下发一次，
-        # 保证「切模型 → 挂起 → 恢复」后仍用用户选的模型。后端已持久化（reported==pinned）时跳过。
         task = self.store.get(sess.session_id)
         pinned = (task.model if task else "") or ""
-        available = getattr(agent, "available_models", None) or []
-        # 被动刷新模型缓存：真实 agent 一启动就把它报的 available_models 存下来，
-        # 供 spawn 前 /models、list_models 列出/校验（copilot 报空也如实存）。
+        available = sess.available_models
         self.model_store.update(sess.agent_label, list(available))
         if pinned and pinned != reported and pinned in available:
             try:
-                await agent.set_model(pinned)
+                await sess.set_model(pinned)
                 model = pinned
                 logger.info("恢复后重新应用模型 task=%s → %s", sess.session_id, pinned)
             except Exception:
                 logger.exception(
-                    "恢复后重新应用模型失败 task=%s → %s", sess.session_id, pinned
+                    "恢复后重新应用模型失败 task=%s → %s",
+                    sess.session_id,
+                    pinned,
                 )
-                model = reported  # 应用失败：如实保留后端报回的模型，不谎报
+                model = reported
         elif pinned and pinned != reported and pinned not in available:
             logger.warning(
                 "恢复后无法保持模型 task=%s：后端已不提供 %s（回退 %s）",
@@ -2732,286 +2556,187 @@ class _Daemon:
                 pinned,
                 reported or "默认",
             )
-        if not self._runners.is_current(sess.session_id, sess):
-            await self._close_session(sess)
-            return
+        if not self._session_runtimes.is_current(sess):
+            return False
         self.store.update(
             sess.session_id,
-            agent_session_id=agent.session_id or "",
+            agent_session_id=agent_session_id,
             status="idle",
             model=model,
         )
         if sess.attached:
-            # 附着摘要（区别于普通「已就绪」/「已恢复」文案）：说明来源 + 后续回复续接上下文
-            sid = _short_sid(agent.session_id or "")
+            sid = _short_sid(agent_session_id)
             model_tail = f"，模型：{model}" if model else ""
-            base = (
+            message = (
                 f"🔗 已附着外部会话（agent={sess.agent_label}，session={sid}{model_tail}）。\n"
                 "后续回复将继续原上下文；可 `/stop` 结束、`/done` 归档。"
             )
         elif sess.resumed:
-            base = "♻️ 已恢复会话，继续执行…"
+            message = "♻️ 已恢复会话，继续执行…"
             if model:
-                base += f"（模型：{model}）"
+                message += f"（模型：{model}）"
         else:
-            base = "▶️ agent 已就绪，开始执行…"
+            message = "▶️ agent 已就绪，开始执行…"
             if model:
-                base += f"（模型：{model}）"
+                message += f"（模型：{model}）"
         await self._send_to_session(
             sess.session_id,
-            base,
-            source=startup_conversation,
+            message,
+            source=startup_turn.conversation if startup_turn else sess.conversation,
         )
-        try:
-            while True:
-                # 空闲挂起（坑 1）：超时无新回复就关掉 agent 腾出 max_agents 名额，
-                # 但**保留** sessions.json 记录（区别于 /stop 的删除）——之后在本
-                # 话题回复即走 load_session 恢复。<=0 表示不自动挂起。
-                timeout = self.cfg.idle_timeout if self.cfg.idle_timeout > 0 else None
-                try:
-                    queued = await asyncio.wait_for(sess.queue.get(), timeout=timeout)
-                except asyncio.TimeoutError:
-                    if not self._runners.is_current(sess.session_id, sess):
-                        break
-                    self.store.update(sess.session_id, status="suspended")
-                    await self._send_to_session(
-                        sess.session_id,
-                        "💤 空闲超时，已挂起该 agent（在本话题回复即自动恢复）。",
-                        source=sess.conversation,
-                    )
-                    if self._runners.is_current(sess.session_id, sess):
-                        await self._notify_main(
-                            f"💤 {sess.project_name} 已空闲挂起（在其话题回复即自动恢复）。"
-                        )
-                    break
-                if not self._runners.is_current(sess.session_id, sess):
-                    break
-                if queued is None:
-                    status = sess.terminate_status  # stopped(/stop) 或 done(/done)
-                    self.store.update(sess.session_id, status=status)  # 保留历史
-                    await self._send_to_session(
-                        sess.session_id,
-                        "✅ 任务已完成并归档。"
-                        if status == "done"
-                        else "🛑 agent 已停止。",
-                        source=sess.conversation,
-                    )
-                    break
-                async with self._session_turn_lock(sess.session_id):
-                    if not self._runners.is_current(sess.session_id, sess):
-                        break
-                    if isinstance(queued, _BgBatch):
-                        # 后台完成批次（#79）：清 pending_bg（队尾不再有可合并批次），
-                        # 渲染成本轮 prompt（可能含多个 job 块）。清空须紧接 get、无 await。
-                        sess.pending_bg = None
-                        request = TurnRequest(queued.render(), sess.conversation)
-                        mirror_input = False
-                    else:
-                        request = queued
-                        mirror_input = True
-                    prompt = request.text
-                    turn_conversation = request.conversation
-                    turn_conversations = self._conversations_for_session(
-                        sess.session_id,
-                        source=turn_conversation,
-                    )
-                    if mirror_input:
-                        event = SessionEvent(
-                            event_id=secrets.token_hex(16),
-                            session_id=sess.session_id,
-                            turn_id=request.turn_id,
-                            occurred_at=datetime.now(timezone.utc),
-                            body=SessionInputAccepted(
-                                text=request.text,
-                                source=request.conversation,
-                            ),
-                        )
-                        record = await self._emit_session_event(event)
-                        await self._publish_session_event(
-                            event,
-                            tuple(
-                                conversation
-                                for conversation in turn_conversations
-                                if conversation != request.conversation
-                            ),
-                            trace_sequence=(
-                                record.sequence if record is not None else None
-                            ),
-                        )
-                    title = f"{sess.project_name} · {sess.agent_label}"
-                    model = getattr(agent, "model", "") or ""
-                    # footer 与模型同一行显示项目名（#44）：在任意输出单元都可辨归属
-                    footer = sess.project_name
-                    if model:
-                        footer += f" · 模型：{model}"
-                    issue_tag = _issue_tag(
-                        sess.issue_url
-                    )  # 绑定了 issue 则标 · #N（#63）
-                    if issue_tag:
-                        footer += f" · {issue_tag}"
-                    output = self._open_session_output(
-                        turn_conversations,
-                        title,
-                        footer=footer,
-                    )
-                    sess.current_output = output
-                    sess.current_turn_id = request.turn_id
-                    sess.current_conversations = turn_conversations
-                    sess.current_message_chunks.clear()
-                    sess.current_thought_chunks.clear()
-                    self.store.update(sess.session_id, status="running")
-                    logger.info(
-                        "任务 %s 开始一轮（%s）: %.80s",
-                        sess.session_id,
-                        sess.agent_label,
-                        prompt,
-                    )
-                    sess.turn_in_flight = True
-                    event = SessionEvent(
-                        event_id=secrets.token_hex(16),
-                        session_id=sess.session_id,
-                        turn_id=request.turn_id,
-                        occurred_at=datetime.now(timezone.utc),
-                        body=AgentOutputStarted(),
-                    )
-                    record = await self._emit_session_event(event)
-                    self._queue_session_event_projection(
-                        sess,
-                        event,
-                        record.sequence if record is not None else None,
-                    )
-                    outcome: OutputOutcome | None = None
-                    try:
-                        stop_reason = await agent.prompt(prompt)
-                        await output.flush()
-                        if not self._runners.is_current(sess.session_id, sess):
-                            break
-                        if stop_reason == "cancelled":
-                            # 本轮被 /stop 中途取消：不当作正常完成（不 ✅、不计 turn、
-                            # 不发完成通知）。输出置停止态；随后循环取到 None 哨兵即终止。
-                            await output.set_status("stopped")
-                            if not self._runners.is_current(sess.session_id, sess):
-                                break
-                            self.store.update(sess.session_id, status="idle")
-                            logger.info("任务 %s 本轮被取消", sess.session_id)
-                            outcome = "cancelled"
-                            continue
-                        # footer 追加本轮 token 用量（#53）：取不到就不显示、不报错。
-                        # 只标脏，紧随的 set_status("done") 会把新 footer 一起 emit。
-                        tokens = getattr(agent, "last_usage_tokens", None)
-                        if tokens is not None:
-                            output.set_footer(_with_tokens(footer, tokens))
-                        await output.set_status("done")
-                        if not self._runners.is_current(sess.session_id, sess):
-                            break
-                        # 落 last_output：本轮 agent 的收尾回复（截断），供 get_task/通知摘要
-                        last_output = _clip(agent.last_message, _LAST_OUTPUT_MAX)
-                        cur = self.store.get(sess.session_id)
-                        turns = (cur.turns if cur else 0) + 1
-                        logger.info(
-                            "任务 %s 完成第 %d 轮，回复 %d 字",
-                            sess.session_id,
-                            turns,
-                            len(last_output),
-                        )
-                        self.store.update(
-                            sess.session_id,
-                            status="idle",
-                            turns=turns,
-                            last_output=last_output,
-                            error_message="",  # 一轮成功即清掉上次异常诊断（恢复成功）
-                        )
-                        await self._send_to_conversations(
-                            turn_conversations,
-                            "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）",
-                        )
-                        # 完成且已闲下来（无排队）→ 推一条主线通知（带收尾摘要），免得挨个点话题
-                        if (
-                            self._runners.is_current(sess.session_id, sess)
-                            and sess.queue.empty()
-                        ):
-                            note = f"🔔 {sess.project_name} 完成第 {turns} 轮"
-                            snippet = _one_line(last_output, 80)
-                            if snippet:
-                                note += f"：{snippet}"
-                            note += "，在其话题里查看/继续。"
-                            await self._notify_main(note)
-                        outcome = "completed"
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:
-                        logger.exception("agent 执行异常")
-                        err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
-                        outcome = "failed"
-                        try:
-                            await output.set_status("error")
-                        except Exception:
-                            logger.debug("set_status error 失败（忽略）", exc_info=True)
-                        if self._runners.is_current(sess.session_id, sess):
-                            # failed 不再是终止态：本轮失败但 session 已建，多半能 load_session
-                            # 接回——标 failed（可恢复），话题回复即尝试恢复，而非逼用户重开丢上下文。
-                            self.store.update(
-                                sess.session_id, status="failed", error_message=err
-                            )
-                            await self._send_to_conversations(
-                                turn_conversations,
-                                f"❌ 本轮异常，已暂停：{err}\n"
-                                "在话题回复即尝试恢复（load_session 接回上下文），或 `/stop` 结束。",
-                            )
-                            await self._notify_main(
-                                f"❌ {sess.project_name} 本轮异常，已暂停（在其话题回复即尝试恢复）。"
-                            )
-                        break
-                    finally:
-                        sess.turn_in_flight = False
-                        if outcome is not None:
-                            await self._finish_agent_output(sess, outcome)
-                        projection_tail = sess.session_event_projection_tail
-                        if projection_tail is not None:
-                            await projection_tail
-                            sess.session_event_projection_tail = None
-                        await output.aclose()
-                        sess.current_output = None
-                        sess.current_turn_id = None
-                        sess.current_conversations = ()
-                        sess.current_message_chunks.clear()
-                        sess.current_thought_chunks.clear()
-        except asyncio.CancelledError:
-            logger.debug("agent worker 被取消 session=%s", sess.session_id)
-        finally:
-            await self._close_session(sess)
+        return True
 
-    async def _close_session(self, sess: _AgentSessionRunner) -> None:
-        """收尾 runner：仅按 identity 移除自身槽位，但始终关闭自身资源。"""
-        self._runners.remove_if_current(sess.session_id, sess)
-        if sess.bg_token:  # 作废该 Session 的 agent 控制面 token（#68）
-            self._bg_tokens.pop(sess.bg_token, None)
-            sess.bg_token = ""
-        output = sess.current_output
-        sess.current_output = None
-        if output is not None:
-            try:
-                await output.aclose()
-            except Exception:
-                logger.debug("output aclose 异常（忽略）", exc_info=True)
-        agent = sess.agent
-        sess.agent = None
-        if agent is not None:
-            try:
-                await agent.aclose()
-            except Exception:
-                logger.debug("agent aclose 异常（忽略）", exc_info=True)
-
-    async def _cancel_turn(self, sess: _AgentSessionRunner) -> None:
-        """协作式取消 session 当前在途的 turn（ACP session/cancel）。失败不致命。"""
-        agent = sess.agent
-        if agent is None:
+    async def _handle_agent_idle_timeout(self, sess: AcpSessionRuntime) -> None:
+        if not self._session_runtimes.is_current(sess):
             return
+        self.store.update(sess.session_id, status="suspended")
+        await self._send_to_session(
+            sess.session_id,
+            "💤 空闲超时，已挂起该 agent（在本话题回复即自动恢复）。",
+            source=sess.conversation,
+        )
+        if self._session_runtimes.is_current(sess):
+            await self._notify_main(
+                f"💤 {sess.project_name} 已空闲挂起（在其话题回复即自动恢复）。"
+            )
+
+    async def _handle_agent_terminate(
+        self,
+        sess: AcpSessionRuntime,
+        status: Literal["stopped", "done"],
+    ) -> None:
+        self.store.update(sess.session_id, status=status)
+        await self._send_to_session(
+            sess.session_id,
+            "✅ 任务已完成并归档。" if status == "done" else "🛑 agent 已停止。",
+            source=sess.conversation,
+        )
+
+    async def _prepare_agent_turn(
+        self,
+        sess: AcpSessionRuntime,
+        request: TurnRequest,
+    ) -> None:
+        turn_conversations = self._conversations_for_session(
+            sess.session_id,
+            source=request.conversation,
+        )
+        self._turn_audiences[(sess, request.turn_id)] = turn_conversations
+        self.store.update(sess.session_id, status="running")
+        logger.info(
+            "任务 %s 开始一轮（%s）: %.80s",
+            sess.session_id,
+            sess.agent_label,
+            request.text,
+        )
+
+    async def _execute_agent_turn(
+        self,
+        sess: AcpSessionRuntime,
+        request: TurnRequest,
+    ) -> AcpTurnResult:
         try:
-            await agent.cancel()
+            prompt_result = await sess.prompt(request.text)
+            if not self._session_runtimes.is_current(sess):
+                return AcpTurnResult(outcome=None, keep_running=False)
+            if prompt_result.stop_reason == "cancelled":
+                self.store.update(sess.session_id, status="idle")
+                logger.info("任务 %s 本轮被取消", sess.session_id)
+                return AcpTurnResult(outcome="cancelled", keep_running=True)
+            if not self._session_runtimes.is_current(sess):
+                return AcpTurnResult(outcome=None, keep_running=False)
+            last_output = _clip(
+                prompt_result.message,
+                _LAST_OUTPUT_MAX,
+            )
+            cur = self.store.get(sess.session_id)
+            turns = (cur.turns if cur else 0) + 1
+            logger.info(
+                "任务 %s 完成第 %d 轮，回复 %d 字",
+                sess.session_id,
+                turns,
+                len(last_output),
+            )
+            self.store.update(
+                sess.session_id,
+                status="idle",
+                turns=turns,
+                last_output=last_output,
+                error_message="",
+            )
+            await self._send_to_conversations(
+                self._turn_audiences.get((sess, request.turn_id), ()),
+                "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）",
+            )
+            if self._session_runtimes.is_current(sess) and not sess.has_pending_turns():
+                note = f"🔔 {sess.project_name} 完成第 {turns} 轮"
+                snippet = _one_line(last_output, 80)
+                if snippet:
+                    note += f"：{snippet}"
+                await self._notify_main(note + "，在其话题里查看/继续。")
+            return AcpTurnResult(
+                outcome="completed",
+                keep_running=True,
+                usage_tokens=prompt_result.usage_tokens,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("agent 执行异常")
+            err = _clip(f"{type(exc).__name__}: {exc}", _ERROR_MSG_MAX)
+            if self._session_runtimes.is_current(sess):
+                self.store.update(
+                    sess.session_id,
+                    status="failed",
+                    error_message=err,
+                )
+                await self._send_to_conversations(
+                    self._turn_audiences.get((sess, request.turn_id), ()),
+                    f"❌ 本轮异常，已暂停：{err}\n"
+                    "在话题回复即尝试恢复（load_session 接回上下文），或 `/stop` 结束。",
+                )
+                await self._notify_main(
+                    f"❌ {sess.project_name} 本轮异常，已暂停（在其话题回复即尝试恢复）。"
+                )
+            return AcpTurnResult(outcome="failed", keep_running=False)
+
+    async def _finish_agent_turn_projection(
+        self,
+        sess: AcpSessionRuntime,
+        turn_id: str,
+    ) -> None:
+        await self._wait_runtime_events(sess.session_id)
+        self._turn_audiences.pop((sess, turn_id), None)
+
+    async def _close_session(self, sess: AcpSessionRuntime) -> None:
+        """收尾 Runtime：仅按 identity 移除自身槽位，但始终关闭自身资源。"""
+        self._session_runtimes.remove_if_current(sess)
+        token = self._runtime_bg_tokens.pop(sess, None)
+        if token is not None:
+            self._bg_tokens.pop(token, None)
+        await self._wait_runtime_events(sess.session_id)
+        for key in [key for key in self._turn_audiences if key[0] is sess]:
+            self._turn_audiences.pop(key, None)
+        await sess.close()
+
+    async def _cancel_turn(
+        self,
+        sess: AcpSessionRuntime,
+        *,
+        replacement: TurnRequest | None = None,
+    ) -> bool:
+        """协作式取消 Worker 当前在途的 Turn；失败不致命。"""
+        try:
+            cancelled = await sess.cancel_current_turn(replacement)
+            if not cancelled:
+                return False
             logger.info("已请求取消任务 %s 的当前轮", sess.session_id)
+            return True
         except Exception:
             logger.exception("取消当前轮失败 task=%s", sess.session_id)
+            # Runtime 已确认存在在途 Turn（替代输入也已在 cancel 前入队）；
+            # 保持原有优雅退化语义，避免把替代输入再次提交。
+            return True
 
     async def _forward_to_agent(
         self, msg: ChannelMessage, *, conversation: ConversationRef
@@ -3041,13 +2766,9 @@ class _Daemon:
             session = self._stored_session_for_conversation(conversation)
         if session is not None:
             self.bind_conversation(session.session_id, conversation)
-        sess = (
-            self._runners.get_for_session(session.session_id)
-            if session is not None
-            else None
-        )
+        sess = self._acp_runtime(session.session_id) if session is not None else None
         if sess is None:
-            # Conversation 只负责路由到 Session；无 current runner 时再尝试恢复或明确提示。
+            # Conversation 只负责路由到 Session；无 current Runtime 时再尝试恢复或明确提示。
             await self._recover_or_notify(
                 text,
                 conversation=conversation,
@@ -3057,34 +2778,33 @@ class _Daemon:
             return
         if not text:
             return
-        if sess.worker is None or sess.worker.done():
-            await self._send_to_session(
-                sess.session_id,
-                "⚠️ 该 agent 已结束。发送 `/run ...` 新建任务。",
-                source=conversation,
-            )
-            return
         if forward_raw:
-            sess.enqueue(TurnRequest(text, conversation))  # 逐字直传，跳过保留命令解释
+            if sess.try_submit(TurnRequest(text, conversation)) is None:
+                await self._send_to_session(
+                    sess.session_id,
+                    "⚠️ 该 agent 已结束。发送 `/run ...` 新建任务。",
+                    source=conversation,
+                )
             return
         if text == _STOP_CMD:
             # 终止信号：丢弃未处理 bg 批次 + 入队 None（#79 立即停、不排空后台结果）。
-            sess.terminate()
+            if not sess.request_termination():
+                await self._send_to_session(
+                    sess.session_id,
+                    "⚠️ 该 agent 已结束。发送 `/run ...` 新建任务。",
+                    source=conversation,
+                )
+                return
             # 有在途 turn 时协作式取消它，否则 None 要等整轮跑完才生效（跑偏时干瞪眼）。
-            # terminate() 在 cancel 之前：cancel 让在途 prompt() 返回后，队列里已有 None。
-            if sess.turn_in_flight:
-                await self._cancel_turn(sess)
+            # 终止请求在 cancel 之前：cancel 让在途 prompt() 返回后，队列里已有 None。
+            await self._cancel_turn(sess)
             return
         if text == _CANCEL_CMD or text.startswith(_CANCEL_CMD + " "):
             # /cancel = 停当前轮但**保留 agent**（区别于 /stop 的结束）；
             # /cancel <新输入> = 停当前轮 + 把新输入作为下一轮排队（FIFO）。
             new_input = text[len(_CANCEL_CMD) :].strip()
-            if sess.turn_in_flight:
-                if new_input:
-                    # 排在 cancel 之前：取消让在途 prompt() 返回后，队列里已有新输入 →
-                    # worker 的 cancelled 分支 continue 后即取到它，作为新一轮跑。
-                    sess.enqueue(TurnRequest(new_input, conversation))
-                await self._cancel_turn(sess)
+            replacement = TurnRequest(new_input, conversation) if new_input else None
+            if await self._cancel_turn(sess, replacement=replacement):
                 await self._send_to_session(
                     sess.session_id,
                     "🛑 已取消当前轮，改执行新指令…"
@@ -3094,7 +2814,13 @@ class _Daemon:
                 )
             elif new_input:
                 # 无在途轮：没什么可取消，新输入当普通消息执行
-                sess.enqueue(TurnRequest(new_input, conversation))
+                assert replacement is not None
+                if sess.try_submit(replacement) is None:
+                    await self._send_to_session(
+                        sess.session_id,
+                        "⚠️ 该 agent 已结束。发送 `/run ...` 新建任务。",
+                        source=conversation,
+                    )
             else:
                 await self._safe_send_text(
                     "当前没有在跑的轮，无需取消。",
@@ -3107,11 +2833,16 @@ class _Daemon:
         if text == _MODEL_CMD or text.startswith(_MODEL_CMD + " "):
             await self._handle_model_cmd(sess, text, conversation=conversation)
             return
-        sess.enqueue(TurnRequest(text, conversation))
+        if sess.try_submit(TurnRequest(text, conversation)) is None:
+            await self._send_to_session(
+                sess.session_id,
+                "⚠️ 该 agent 已结束。发送 `/run ...` 新建任务。",
+                source=conversation,
+            )
 
     async def _handle_model_cmd(
         self,
-        sess: _AgentSessionRunner,
+        sess: AcpSessionRuntime,
         text: str,
         *,
         conversation: ConversationRef,
@@ -3120,15 +2851,8 @@ class _Daemon:
 
         对下一轮生效。agent 不暴露模型选项（如 copilot）则提示不支持。
         """
-        agent = sess.agent
-        if agent is None:
-            await self._safe_send_text(
-                "⚠️ agent 尚未就绪，无法切换模型。",
-                conversation=conversation,
-            )
-            return
-        models = list(getattr(agent, "available_models", []) or [])
-        current = getattr(agent, "model", "") or ""
+        models = sess.available_models
+        current = sess.model
         if not models:
             await self._safe_send_text(
                 "⚠️ 该 agent 不支持切换模型（未通过 ACP 暴露模型选项）。",
@@ -3151,16 +2875,16 @@ class _Daemon:
             )
             return
         try:
-            await agent.set_model(arg)
+            await sess.set_model(arg)
         except Exception as exc:
             logger.exception("切换模型失败 task=%s model=%s", sess.session_id, arg)
-            if self._runners.is_current(sess.session_id, sess):
+            if self._session_runtimes.is_current(sess):
                 await self._safe_send_text(
                     f"❌ 切换模型失败：{str(exc)[:200]}",
                     conversation=conversation,
                 )
             return
-        if not self._runners.is_current(sess.session_id, sess):
+        if not self._session_runtimes.is_current(sess):
             return
         self.store.update(sess.session_id, model=arg)
         logger.info("任务 %s 切换模型 → %s", sess.session_id, arg)
@@ -3234,7 +2958,7 @@ class _Daemon:
         用统一的预留计数覆盖 ``create_thread`` 等其它入口的 await 窗口，保证并发下
         不突破 max_agents。
         """
-        if self._runners.get_for_session(task.session_id) is not None:
+        if self._acp_runtime(task.session_id) is not None:
             return False, f"任务 [{task.session_id}] 已在运行，无需恢复。"
         agent_argv = self.cfg.agents.get(task.agent_label)
         if not agent_argv or not task.agent_session_id:
@@ -3259,7 +2983,11 @@ class _Daemon:
             self._release_agent_slot()
         return True, ""
 
-    def _finish_task(self, task_id: str, status: str) -> bool:
+    def _finish_task(
+        self,
+        task_id: str,
+        status: Literal["stopped", "done"],
+    ) -> bool:
         """把任务置为终止态 ``status``；有活跃 worker 则经哨兵优雅收尾，否则直接改台账。
 
         返回是否找到该任务。活跃时把 ``terminate_status`` 交给 worker、入队 None——
@@ -3268,11 +2996,13 @@ class _Daemon:
         task = self.store.get(task_id)
         if task is None:
             return False
-        sess = self._runners.get_for_session(task.session_id)
-        if sess is not None and sess.worker is not None and not sess.worker.done():
-            sess.terminate_status = status
-            sess.terminate()  # 丢弃未处理 bg 批次 + 入队 None（#79，与 /stop 同机制）
-        else:
+        if status not in {"stopped", "done"}:
+            raise ValueError(f"不支持的终止状态: {status}")
+        sess = self._acp_runtime(task.session_id)
+        termination_requested = sess is not None and sess.request_termination(
+            status=status
+        )
+        if not termination_requested:
             self.store.update(task_id, status=status)
         return True
 
@@ -3522,7 +3252,7 @@ class _Daemon:
             summary.update(
                 kind="agent",
                 issue_url=task.issue_url or None,
-                active=self._runners.get_for_session(task.session_id) is not None,
+                active=self._acp_runtime(task.session_id) is not None,
             )
             tasks.append(summary)
         return 200, {"tasks": tasks}
@@ -3635,7 +3365,7 @@ class _Daemon:
             "turns": t.turns,
             "has_session": bool(t.agent_session_id),
             "origin": t.origin,  # 会话来源 spawn/attach
-            "active": self._runners.get_for_session(t.session_id) is not None,
+            "active": self._acp_runtime(t.session_id) is not None,
             "model": t.model,  # agent 当前模型（copilot 不暴露则为空）
             "issue_url": t.issue_url,  # 关联的 issue（#63）；空 = 未绑定
             "created_at": t.created_at,
@@ -3662,13 +3392,13 @@ class _Daemon:
             conversation,
             **({"turn_id": turn_id} if turn_id is not None else {}),
         )
-        sess = self._runners.get_for_session(task.session_id)
-        if sess is not None and sess.worker is not None and not sess.worker.done():
-            sess.enqueue(request)
+        sess = self._acp_runtime(task.session_id)
+        receipt = sess.try_submit(request) if sess is not None else None
+        if receipt is not None:
             logger.info(
-                "send_to_task[%s] 入队（活跃 session，队列深度=%d，task.status=%s）",
+                "send_to_task[%s] 入队（placement=%s，task.status=%s）",
                 task_id,
-                sess.queue.qsize(),
+                receipt.placement,
                 task.status,
             )
             return (
@@ -3713,8 +3443,8 @@ class _Daemon:
         task = self.store.get(task_id)
         if task is None:
             return f"未找到任务 {task_id}（用 list_tasks 查看现有任务）。"
-        sess = self._runners.get_for_session(task.session_id)
-        if sess is not None and sess.worker is not None and not sess.worker.done():
+        sess = self._acp_runtime(task.session_id)
+        if sess is not None:
             return f"任务 [{task_id}] 已在运行，无需恢复。"
         ok, why = self._try_resume(task, first_turn=None)
         if not ok:
@@ -3785,7 +3515,7 @@ class _Daemon:
             cached = self.model_store.get(agent_label)
             if cached and model not in cached:
                 model_note = f"（注意：{model} 不在 {agent_label} 已知模型 {cached} 里，将尝试下发）"
-        # issue fetch 放在并发上限检查之前：它只读 forge、不碰 current-runner registry，避免加宽
+        # issue fetch 放在并发上限检查之前：它只读 forge、不碰 ACP Runtime registry，避免加宽
         # 「检查 → _launch 登记」之间的 TOCTOU 窗口。
         brief, issue_url, note = task, "", ""
         if issue and issue > 0:
@@ -3923,8 +3653,8 @@ class _Daemon:
                     "reported": True,
                 }
             return 409, {"error": f"委派 {delegation_id} 已提交过报告"}
-        sess = self._runners.get_for_session(task_id)
-        if sess is None or sess.current_turn_id != delegation.worker_turn_id:
+        sess = self._acp_runtime(task_id)
+        if sess is None or not sess.owns_turn(delegation.worker_turn_id):
             return 409, {"error": "该委派不是当前正在执行的 Worker Turn"}
         if delegation.status not in {"submitted", "running"}:
             return 409, {
@@ -4104,7 +3834,7 @@ class _Daemon:
 
     def _build_bg_block(self, job: Job, rc: int) -> str:
         """单个后台任务完成的 `<bg_job_done>` 块（id/命令/exit/耗时/超时/输出尾部）。
-        多个 job 合并唤回时各出一块（见 _BgBatch），引导语由 render() 单独补一条。"""
+        多个 job 合并唤回时各出一块，引导语由 Runtime 在生成 Turn 时补一条。"""
         tail = _read_tail(job.output_file)
         dur = (
             _fmt_duration(job.finished_at - job.created_at) if job.finished_at else "?"
@@ -4125,7 +3855,7 @@ class _Daemon:
 
     def _build_bg_prompt(self, job: Job, rc: int) -> str:
         """单个后台任务的完整唤回 prompt（块 + 引导语）——用于挂起恢复的首轮（不合并）。
-        与单块 _BgBatch.render() 等价。"""
+        与 Runtime 收到单个后台结果时生成的 Turn 等价。"""
         return f"{self._build_bg_block(job, rc)}\n\n{_BG_GUIDANCE}"
 
     def _bg_result_message(self, job: Job, rc: int) -> str:
@@ -4149,8 +3879,8 @@ class _Daemon:
         无论哪种去向，只要 task 还在，都先往它的话题发一条**可见**完成消息（带输出尾部），
         让用户直接看到结果，再驱动 agent 接续（主线 🔔 保留作「快去看」提醒）。
 
-        活跃分支按 #79 合并：队尾已有未消费批次（``pending_bg``）时只把本 job 的块追加进
-        去、不再入队，让相邻完成的多个 job 只唤回一轮。挂起 task 不合并（各自恢复）。
+        活跃分支由 Runtime 合并队尾尚未消费的后台批次，让相邻完成的多个 job 只唤回
+        一轮。挂起 task 不合并（各自恢复）。
         """
         verb = "成功" if rc == 0 else f"失败(exit {rc})"
         tag = f"[{job.task_id}]"
@@ -4165,19 +3895,21 @@ class _Daemon:
             self._bg_result_message(job, rc),
             conversation=self._conversation_for_session(task),
         )
-        sess = self._runners.get_for_session(task.session_id)
-        if sess is not None and sess.worker is not None and not sess.worker.done():
-            # check-set 之间无 await：单线程原子，并发完成的 job 不会漏合并/重复入队。
-            if sess.pending_bg is not None:
-                sess.pending_bg.add(self._build_bg_block(job, rc))  # 合并进队尾批次
+        sess = self._acp_runtime(task.session_id)
+        placement = (
+            sess.submit_background_turn(
+                self._build_bg_block(job, rc),
+                guidance=_BG_GUIDANCE,
+            )
+            if sess is not None
+            else None
+        )
+        if placement is not None:
+            if placement == "merged":
                 await self._notify_main(
                     f"🔔 {tag} 后台任务 {job.job_id} {verb}，已并入待处理批次。"
                 )
             else:
-                batch = _BgBatch()
-                batch.add(self._build_bg_block(job, rc))
-                sess.pending_bg = batch
-                sess.queue.put_nowait(batch)  # 首个：入队一次
                 await self._notify_main(
                     f"🔔 {tag} 后台任务 {job.job_id} {verb}，已让 agent 继续。"
                 )
@@ -4264,8 +3996,10 @@ class _Daemon:
         await self._safe_send_text(text, conversation=conversation)
 
     async def _shutdown(self) -> None:
-        """退出清理：停 WS 线程，取消并等待全部 agent worker 收尾。"""
+        """退出清理：先阻止新请求，再让 Runtime 发布收尾事件，最后停 Channel。"""
         for runtime in self._session_runtimes.values():
+            if isinstance(runtime, AcpSessionRuntime):
+                continue
             try:
                 await runtime.close()
             except Exception:
@@ -4273,7 +4007,6 @@ class _Daemon:
                     "Session Runtime 关闭失败 session=%s",
                     runtime.session_id,
                 )
-        await self._wait_runtime_events()
         if self._control is not None:
             # control.stop() 会阻塞（等 serve_forever 确认），且可能与正 run_
             # coroutine_threadsafe 回等主 loop 的 handler 线程死锁。挪到 worker
@@ -4289,33 +4022,22 @@ class _Daemon:
                 )
             except Exception:
                 logger.warning("控制面关闭失败，忽略", exc_info=True)
-        self._stop_channels()
         # 把仍活跃的任务标记为 suspended，让重启后台账状态准确（且可 load_session 恢复）
-        for sess in self._runners.values():
+        for sess in self._active_acp_runtimes():
             task = self.store.get(sess.session_id)
             if task is not None and not task.is_terminal:
                 self.store.update(sess.session_id, status="suspended")
-        workers = [
-            s.worker
-            for s in self._runners.values()
-            if s.worker is not None and not s.worker.done()
-        ]
-        for w in workers:
-            w.cancel()
-        for w in workers:
-            try:
-                await w
-            except asyncio.CancelledError:
-                pass
-            except Exception:
-                logger.exception("agent worker 退出异常")
-        # 兜底：worker 的 finally(_close_session) 只包住主循环；启动段（agent.start /
-        # set_model / 就绪回复）被 cancel 时 CancelledError 直接冒出、不走 finally，
-        # registry 槽位悬空。这里把仍残留的 runner 逐个走同一关闭路径清掉——
-        # _close_session 幂等（remove_if_current 按 identity、agent 只 aclose 一次），
-        # 不会与已正常收尾的 worker 重复关闭。
-        for sess in self._runners.values():
+        active_runtimes = self._active_acp_runtimes()
+        for sess in active_runtimes:
+            sess.request_worker_stop()
+        await asyncio.gather(*(sess.wait_worker_stopped() for sess in active_runtimes))
+        await self._wait_runtime_events()
+        # 正常 worker 会在 AcpSessionRuntime._run 的 finally 中调用 _close_session。
+        # 这里兜底清理没有 worker 或异常收尾后仍残留的 Runtime；_close_session 幂等，
+        # 不会移除替代它的新 generation，也不会重复关闭已释放的 agent。
+        for sess in self._active_acp_runtimes():
             await self._close_session(sess)
+        self._stop_channels()
         if self._scan_executor is not None:
             try:
                 await self._scan_executor.aclose()

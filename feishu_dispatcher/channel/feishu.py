@@ -22,10 +22,9 @@ import logging
 import re
 import threading
 import time
-from collections import deque
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any, Protocol, cast
 from urllib.parse import parse_qs, urlparse
 
 import requests
@@ -45,13 +44,15 @@ from ..conversation import ConversationRef
 from ..session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
+    AgentOutputMetadata,
     AgentOutputStarted,
     AgentPlanUpdated,
     SessionEvent,
     SessionInputAccepted,
     ToolCallObserved,
 )
-from . import ChannelMessage, MessageHandler, OutputStatus, StreamingOutput
+from . import ChannelMessage, MessageHandler, OutputStatus
+from .presentation import format_agent_output_footer, format_agent_output_title
 
 
 @dataclass(frozen=True)
@@ -177,43 +178,32 @@ class _RateLimiter:
                 self._tokens -= 1.0
 
 
+class _FeishuOutputPresenter(Protocol):
+    def feed(self, text: str) -> None: ...
+
+    def set_footer(self, footer: str) -> None: ...
+
+    async def flush(self) -> None: ...
+
+    async def set_status(self, status: OutputStatus) -> None: ...
+
+    async def aclose(self) -> None: ...
+
+
 class _FeishuSessionEventOutput:
     """把 SessionEvent 转换为现有 Feishu 流式呈现。"""
 
     def __init__(
         self,
-        conversation_id: str,
-        output: StreamingOutput,
-        *,
-        footer: str,
-        on_close: Callable[["_FeishuSessionEventOutput"], None],
+        output: _FeishuOutputPresenter,
+        metadata: AgentOutputMetadata | None,
     ) -> None:
-        self.conversation_id = conversation_id
         self._output = output
-        self._footer = footer
-        self._on_close = on_close
-        self._closed = False
+        self._metadata = metadata
         self._message_text = ""
         self._last_stream: str | None = None
 
-    def feed(self, text: str) -> None:
-        return None
-
-    def set_footer(self, footer: str) -> None:
-        if not self._closed:
-            self._footer = footer
-
-    async def flush(self) -> None:
-        return None
-
-    async def set_status(self, status: OutputStatus) -> None:
-        return None
-
     async def aclose(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        self._on_close(self)
         await self._output.aclose()
 
     async def handle_event(self, event: SessionEvent) -> None:
@@ -266,13 +256,19 @@ class _FeishuSessionEventOutput:
             if suffix:
                 self._output.feed(suffix)
             self._message_text = body.message
-        self._output.set_footer(self._footer)
+        self._output.set_footer(
+            format_agent_output_footer(
+                self._metadata,
+                usage_tokens=body.usage_tokens,
+            )
+        )
         status = cast(
             OutputStatus,
             {
                 "completed": "done",
                 "cancelled": "stopped",
                 "failed": "error",
+                "interrupted": "stopped",
             }[body.outcome],
         )
         await self._output.set_status(status)
@@ -284,7 +280,7 @@ class FeishuBridge:
 
     - :meth:`start_background` 在后台线程启动 WebSocket 长连接
     - :meth:`create_thread` / :meth:`reply_in_thread` 同步操作话题（HTTP）
-    - :meth:`open_output` 为 agent 回合创建流式输出呈现
+    - :meth:`handle_session_event` 将 SessionEvent 投影为流式输出
     """
 
     def __init__(
@@ -321,7 +317,6 @@ class FeishuBridge:
         self._ws_task: asyncio.Task[None] | None = None
         self._stopping = threading.Event()
         self._output_lock = threading.Lock()
-        self._pending_outputs: dict[str, deque[_FeishuSessionEventOutput]] = {}
         self._active_outputs: dict[tuple[str, str, str], _FeishuSessionEventOutput] = {}
         #: ping 间隔（秒），服务端可通过 endpoint 发现响应 / pong payload 下发
         self._ping_interval: float = 120.0
@@ -394,6 +389,8 @@ class FeishuBridge:
     def stop(self) -> None:
         """请求停止 WS 线程。跨线程调用安全（cancel 经 call_soon_threadsafe）。"""
         self._stopping.set()
+        for output in self._take_active_outputs():
+            self._run_on_main_loop(output.aclose())
         loop, task = self._ws_loop, self._ws_task
         if loop is not None and task is not None:
             loop.call_soon_threadsafe(task.cancel)
@@ -718,43 +715,6 @@ class FeishuBridge:
         )
         return result["data"]["message_id"]
 
-    def open_output(
-        self,
-        conversation: ConversationRef,
-        title: str,
-        *,
-        footer: str = "",
-    ) -> StreamingOutput:
-        """登记一个 agent 回合的输出呈现，由 SessionEvent 驱动实际发送。"""
-        conversation = self._require_feishu_conversation(conversation)
-        target_id = conversation.conversation_id
-        if self._stream_mode == "card":
-            from .feishu_livecard import LiveCard
-
-            output: StreamingOutput = LiveCard(
-                self,
-                target_id,
-                title,
-                footer=footer,
-                window=self._throttle_window,
-            )
-        else:
-            from ..throttler import StreamThrottler
-
-            async def send_piece(piece: str) -> None:
-                await asyncio.to_thread(self.send_text, conversation, piece)
-
-            output = StreamThrottler(send_piece, window=self._throttle_window)
-        session_output = _FeishuSessionEventOutput(
-            target_id,
-            output,
-            footer=footer,
-            on_close=self._unregister_output,
-        )
-        with self._output_lock:
-            self._pending_outputs.setdefault(target_id, deque()).append(session_output)
-        return session_output
-
     def handle_session_event(
         self,
         conversation: ConversationRef,
@@ -816,7 +776,12 @@ class FeishuBridge:
     ) -> None:
         output = self._output_for_event(conversation_id, event)
         if output is not None:
-            await output.handle_event(event)
+            try:
+                await output.handle_event(event)
+            finally:
+                if isinstance(event.body, AgentOutputFinished):
+                    self._remove_active_output(conversation_id, event, output)
+                    await output.aclose()
             return
         if (
             isinstance(event.body, AgentOutputDelta)
@@ -834,36 +799,66 @@ class FeishuBridge:
         conversation_id: str,
         event: SessionEvent,
     ) -> _FeishuSessionEventOutput | None:
+        if event.turn_id is None:
+            return None
+        key = (conversation_id, event.session_id, event.turn_id)
         with self._output_lock:
             if isinstance(event.body, AgentOutputStarted):
-                pending = self._pending_outputs.get(conversation_id)
-                if not pending or event.turn_id is None:
-                    return None
-                output = pending.popleft()
-                if not pending:
-                    del self._pending_outputs[conversation_id]
-                self._active_outputs[
-                    (conversation_id, event.session_id, event.turn_id)
-                ] = output
+                output = self._active_outputs.get(key)
+                if output is None:
+                    output = self._create_session_output(
+                        conversation_id,
+                        event.body.metadata,
+                    )
+                    self._active_outputs[key] = output
                 return output
-            if event.turn_id is None:
-                return None
-            return self._active_outputs.get(
-                (conversation_id, event.session_id, event.turn_id)
-            )
+            return self._active_outputs.get(key)
 
-    def _unregister_output(self, output: _FeishuSessionEventOutput) -> None:
+    def _create_session_output(
+        self,
+        conversation_id: str,
+        metadata: AgentOutputMetadata | None,
+    ) -> _FeishuSessionEventOutput:
+        conversation = FeishuConversationRef(conversation_id)
+        title = format_agent_output_title(metadata)
+        footer = format_agent_output_footer(metadata)
+        if self._stream_mode == "card":
+            from .feishu_livecard import LiveCard
+
+            output = LiveCard(
+                self,
+                conversation_id,
+                title,
+                footer=footer,
+                window=self._throttle_window,
+            )
+        else:
+            from ..throttler import StreamThrottler
+
+            async def send_piece(piece: str) -> None:
+                await asyncio.to_thread(self.send_text, conversation, piece)
+
+            output = StreamThrottler(send_piece, window=self._throttle_window)
+        return _FeishuSessionEventOutput(output, metadata)
+
+    def _remove_active_output(
+        self,
+        conversation_id: str,
+        event: SessionEvent,
+        output: _FeishuSessionEventOutput,
+    ) -> None:
+        if event.turn_id is None:
+            return
+        key = (conversation_id, event.session_id, event.turn_id)
         with self._output_lock:
-            pending = self._pending_outputs.get(output.conversation_id)
-            if pending is not None:
-                self._pending_outputs[output.conversation_id] = deque(
-                    item for item in pending if item is not output
-                )
-                if not self._pending_outputs[output.conversation_id]:
-                    del self._pending_outputs[output.conversation_id]
-            for key, active in list(self._active_outputs.items()):
-                if active is output:
-                    del self._active_outputs[key]
+            if self._active_outputs.get(key) is output:
+                del self._active_outputs[key]
+
+    def _take_active_outputs(self) -> tuple[_FeishuSessionEventOutput, ...]:
+        with self._output_lock:
+            outputs = tuple(dict.fromkeys(self._active_outputs.values()))
+            self._active_outputs.clear()
+        return outputs
 
     def serialize_conversation_ref(
         self,

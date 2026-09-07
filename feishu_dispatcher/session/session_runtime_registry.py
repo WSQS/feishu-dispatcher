@@ -25,5 +25,19 @@ class SessionRuntimeRegistry:
     def get_for_session(self, session_id: str) -> SessionRuntime | None:
         return self._by_session.get(session_id)
 
+    def is_current(self, runtime: SessionRuntime) -> bool:
+        """Runtime 是否仍是其 Session 当前登记的实例。"""
+        return self._by_session.get(runtime.session_id) is runtime
+
+    def remove_if_current(self, runtime: SessionRuntime) -> bool:
+        """仅当实例仍是 current generation 时移除。"""
+        if not self.is_current(runtime):
+            return False
+        del self._by_session[runtime.session_id]
+        return True
+
     def values(self) -> list[SessionRuntime]:
         return list(self._by_session.values())
+
+    def count(self) -> int:
+        return len(self._by_session)

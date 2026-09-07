@@ -11,10 +11,10 @@ import pytest
 
 from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.channel.feishu import FeishuBridge, _RateLimiter
-from feishu_dispatcher.channel.feishu_livecard import LiveCard
 from feishu_dispatcher.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
+    AgentOutputMetadata,
     AgentOutputStarted,
     AgentPlanEntry,
     AgentPlanUpdated,
@@ -22,7 +22,6 @@ from feishu_dispatcher.session_event import (
     SessionInputAccepted,
     ToolCallObserved,
 )
-from feishu_dispatcher.throttler import StreamThrottler
 from tests.conversation_fakes import (
     ChannelConversationRefFactory as ConversationRef,
 )
@@ -571,8 +570,13 @@ def test_channel_skips_empty_session_input_event(monkeypatch):
     assert calls == []
 
 
-def test_channel_projects_message_delta_without_open_output(monkeypatch):
-    bridge = make_bridge()
+async def test_channel_projects_message_delta_through_session_events(monkeypatch):
+    bridge = FeishuBridge(
+        app_id="a",
+        app_secret="b",
+        main_loop=asyncio.get_running_loop(),
+        stream_mode="text",
+    )
     calls: list[tuple[str, str, bool]] = []
 
     def send_text(conversation: ConversationRef, text: str) -> str:
@@ -594,8 +598,8 @@ def test_channel_projects_message_delta_without_open_output(monkeypatch):
     ]
 
     for index, body in enumerate(bodies, start=1):
-        bridge.handle_session_event(
-            ConversationRef("feishu", "om_root"),
+        await bridge._project_session_event(
+            "om_root",
             SessionEvent(
                 event_id=f"event-{index}",
                 session_id="t1",
@@ -658,87 +662,6 @@ def test_feishu_card_methods_delegate_to_feishu_card_methods(monkeypatch):
     ]
 
 
-def test_channel_open_output_uses_card_mode():
-    bridge = make_bridge(stream_mode="card")
-
-    output = bridge.open_output(
-        ConversationRef("feishu", "om_root"), "demo", footer="project"
-    )
-
-    assert isinstance(output._output, LiveCard)
-
-
-async def test_channel_open_output_uses_text_mode(monkeypatch):
-    bridge = make_bridge(stream_mode="text", throttle_window=60.0)
-    calls: list[tuple[str, str, bool]] = []
-
-    def send_text(conversation: ConversationRef, text: str) -> str:
-        calls.append((conversation.conversation_id, text, True))
-        return "om_text"
-
-    monkeypatch.setattr(bridge, "send_text", send_text)
-    output = bridge.open_output(ConversationRef("feishu", "om_root"), "demo")
-
-    assert isinstance(output._output, StreamThrottler)
-    output.feed("legacy")
-    await output.flush()
-    await output.handle_event(
-        SessionEvent(
-            event_id="event-started",
-            session_id="t1",
-            turn_id="turn-1",
-            occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
-            body=AgentOutputStarted(),
-        )
-    )
-    await output.handle_event(
-        SessionEvent(
-            event_id="event-delta",
-            session_id="t1",
-            turn_id="turn-1",
-            occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
-            body=AgentOutputDelta(stream="message", text="hello"),
-        )
-    )
-    await output.handle_event(
-        SessionEvent(
-            event_id="event-finished",
-            session_id="t1",
-            turn_id="turn-1",
-            occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
-            body=AgentOutputFinished(message="hello", thought="", outcome="completed"),
-        )
-    )
-    await output.aclose()
-
-    assert calls == [("om_root", "hello", True)]
-
-
-async def test_output_close_unregisters_pending_and_active_outputs():
-    bridge = make_bridge(stream_mode="text", throttle_window=60.0)
-    pending = bridge.open_output(ConversationRef("feishu", "om_root"), "pending")
-
-    assert list(bridge._pending_outputs["om_root"]) == [pending]
-    await pending.aclose()
-    assert bridge._pending_outputs == {}
-    assert bridge._active_outputs == {}
-
-    active = bridge.open_output(ConversationRef("feishu", "om_root"), "active")
-    event = SessionEvent(
-        event_id="event-started",
-        session_id="session-1",
-        turn_id="turn-1",
-        occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
-        body=AgentOutputStarted(),
-    )
-    assert bridge._output_for_event("om_root", event) is active
-    assert bridge._active_outputs[("om_root", "session-1", "turn-1")] is active
-
-    await active.aclose()
-    assert bridge._pending_outputs == {}
-    assert bridge._active_outputs == {}
-
-
 async def test_text_output_is_driven_by_session_events(monkeypatch):
     bridge = FeishuBridge(
         app_id="a",
@@ -754,11 +677,8 @@ async def test_text_output_is_driven_by_session_events(monkeypatch):
         return "om_text"
 
     monkeypatch.setattr(bridge, "send_text", send_text)
-    output = bridge.open_output(ConversationRef("feishu", "om_root"), "demo")
-    output.feed("legacy")
-
     events = [
-        AgentOutputStarted(),
+        AgentOutputStarted(metadata=AgentOutputMetadata("demo", "copilot", "model-a")),
         AgentOutputDelta(stream="thought", text="thinking"),
         AgentOutputDelta(stream="message", text="answer"),
         AgentPlanUpdated(
@@ -795,8 +715,6 @@ async def test_text_output_is_driven_by_session_events(monkeypatch):
             ),
         )
 
-    await output.aclose()
-
     assert calls == [
         (
             "om_root",
@@ -825,9 +743,6 @@ async def test_card_output_is_driven_by_session_events(monkeypatch):
 
     monkeypatch.setattr(bridge, "reply_card", reply_card)
     monkeypatch.setattr(bridge, "patch_card", patch_card)
-    output = bridge.open_output(ConversationRef("feishu", "om_root"), "demo")
-    output.feed("legacy")
-
     await asyncio.to_thread(
         bridge.handle_session_event,
         ConversationRef("feishu", "om_root"),
@@ -836,7 +751,7 @@ async def test_card_output_is_driven_by_session_events(monkeypatch):
             session_id="t1",
             turn_id="turn-1",
             occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
-            body=AgentOutputStarted(),
+            body=AgentOutputStarted(metadata=AgentOutputMetadata("demo", "copilot")),
         ),
     )
     await asyncio.to_thread(
@@ -878,8 +793,6 @@ async def test_card_output_is_driven_by_session_events(monkeypatch):
             ),
         ),
     )
-    await output.aclose()
-
     assert len(replies) == 1
     assert "answer" in replies[0][1]["body"]["elements"][0]["content"]
     assert "📋 计划:\n🔄 run tests" in replies[0][1]["body"]["elements"][0]["content"]
@@ -893,6 +806,7 @@ async def test_card_output_is_driven_by_session_events(monkeypatch):
         ("completed", "green"),
         ("cancelled", "grey"),
         ("failed", "red"),
+        ("interrupted", "grey"),
     ],
 )
 async def test_card_output_maps_session_outcome(monkeypatch, outcome, template):
@@ -909,10 +823,9 @@ async def test_card_output_maps_session_outcome(monkeypatch, outcome, template):
         return "om_card"
 
     monkeypatch.setattr(bridge, "reply_card", reply_card)
-    output = bridge.open_output(ConversationRef("feishu", "om_root"), "demo")
     for index, body in enumerate(
         [
-            AgentOutputStarted(),
+            AgentOutputStarted(metadata=AgentOutputMetadata("demo", "copilot")),
             AgentOutputFinished(message="answer", thought="", outcome=outcome),
         ],
         start=1,
@@ -928,9 +841,33 @@ async def test_card_output_maps_session_outcome(monkeypatch, outcome, template):
                 body=body,
             ),
         )
-    await output.aclose()
-
     assert cards[-1]["header"]["template"] == template
+
+
+async def test_channel_stop_closes_active_session_outputs():
+    bridge = FeishuBridge(
+        app_id="a",
+        app_secret="b",
+        main_loop=asyncio.get_running_loop(),
+        stream_mode="text",
+    )
+    await bridge._project_session_event(
+        "om_root",
+        SessionEvent(
+            event_id="event-started",
+            session_id="t1",
+            turn_id="turn-1",
+            occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+            body=AgentOutputStarted(),
+        ),
+    )
+    output = bridge._active_outputs[("om_root", "t1", "turn-1")]
+
+    bridge.stop()
+    await asyncio.sleep(0)
+
+    assert bridge._active_outputs == {}
+    assert output._output._closed
 
 
 # ---------------------------------------------------------------------- #

@@ -21,7 +21,7 @@ ConversationRefDeserializer: TypeAlias = Callable[
 ]
 
 OutputStream = Literal["message", "thought"]
-OutputOutcome = Literal["completed", "cancelled", "failed"]
+OutputOutcome = Literal["completed", "cancelled", "failed", "interrupted"]
 PlanEntryStatus = Literal["pending", "in_progress", "completed"]
 ToolCallStatus = Literal["started", "completed", "failed"]
 SessionState = Literal[
@@ -35,7 +35,7 @@ SessionState = Literal[
 ]
 
 _OUTPUT_STREAMS = frozenset({"message", "thought"})
-_OUTPUT_OUTCOMES = frozenset({"completed", "cancelled", "failed"})
+_OUTPUT_OUTCOMES = frozenset({"completed", "cancelled", "failed", "interrupted"})
 _PLAN_ENTRY_STATUSES = frozenset({"pending", "in_progress", "completed"})
 _TOOL_CALL_STATUSES = frozenset({"started", "completed", "failed"})
 _SESSION_STATES = frozenset(
@@ -52,8 +52,20 @@ class SessionInputAccepted:
 
 
 @dataclass(frozen=True)
+class AgentOutputMetadata:
+    """Agent 当前 Turn 的业务上下文，不包含具体 Channel 文案。"""
+
+    project_name: str
+    agent_label: str
+    model: str = ""
+    issue_url: str = ""
+
+
+@dataclass(frozen=True)
 class AgentOutputStarted:
     """Agent 已开始为当前 Turn 产生输出。"""
+
+    metadata: AgentOutputMetadata | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +98,7 @@ class AgentOutputFinished:
     message: str
     thought: str
     outcome: OutputOutcome
+    usage_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -203,6 +216,13 @@ def session_event_to_dict(
             }
     elif isinstance(body, AgentOutputStarted):
         payload = {}
+        if body.metadata is not None:
+            payload["metadata"] = {
+                "project_name": body.metadata.project_name,
+                "agent_label": body.metadata.agent_label,
+                "model": body.metadata.model,
+                "issue_url": body.metadata.issue_url,
+            }
     elif isinstance(body, AgentOutputDelta):
         _require_enum("stream", body.stream, _OUTPUT_STREAMS)
         payload = {"stream": body.stream, "text": body.text}
@@ -220,6 +240,8 @@ def session_event_to_dict(
             "thought": body.thought,
             "outcome": body.outcome,
         }
+        if body.usage_tokens is not None:
+            payload["usage_tokens"] = body.usage_tokens
     elif isinstance(body, ToolCallObserved):
         _require_enum("status", body.status, _TOOL_CALL_STATUSES)
         payload = {
@@ -319,7 +341,18 @@ def _decode_body(
             source=source,
         )
     if event_type == "agent.output.started":
-        return AgentOutputStarted()
+        metadata_value = payload.get("metadata")
+        metadata = None
+        if metadata_value is not None:
+            if not isinstance(metadata_value, dict):
+                raise ValueError("metadata 必须是对象或 null")
+            metadata = AgentOutputMetadata(
+                project_name=_require_string(metadata_value, "project_name"),
+                agent_label=_require_string(metadata_value, "agent_label"),
+                model=_require_string(metadata_value, "model"),
+                issue_url=_require_string(metadata_value, "issue_url"),
+            )
+        return AgentOutputStarted(metadata=metadata)
     if event_type == "agent.output.delta":
         stream = _require_enum(
             "stream", _require_string(payload, "stream"), _OUTPUT_STREAMS
@@ -352,10 +385,16 @@ def _decode_body(
         outcome = _require_enum(
             "outcome", _require_string(payload, "outcome"), _OUTPUT_OUTCOMES
         )
+        usage_tokens = payload.get("usage_tokens")
+        if usage_tokens is not None and (
+            type(usage_tokens) is not int or usage_tokens < 0
+        ):
+            raise ValueError("usage_tokens 必须是非负整数或 null")
         return AgentOutputFinished(
             message=_require_string(payload, "message"),
             thought=_require_string(payload, "thought"),
             outcome=cast(OutputOutcome, outcome),
+            usage_tokens=usage_tokens,
         )
     if event_type == "tool.call.observed":
         status = _require_enum(
@@ -395,13 +434,24 @@ def _decode_body(
 
 
 def _validate_body(body: SessionEventBody) -> None:
-    if isinstance(body, AgentOutputDelta):
+    if isinstance(body, AgentOutputStarted):
+        metadata = body.metadata
+        if metadata is not None:
+            if not metadata.project_name.strip():
+                raise ValueError("metadata.project_name 不能为空")
+            if not metadata.agent_label.strip():
+                raise ValueError("metadata.agent_label 不能为空")
+    elif isinstance(body, AgentOutputDelta):
         _require_enum("stream", body.stream, _OUTPUT_STREAMS)
     elif isinstance(body, AgentPlanUpdated):
         for entry in body.entries:
             _require_enum("status", entry.status, _PLAN_ENTRY_STATUSES)
     elif isinstance(body, AgentOutputFinished):
         _require_enum("outcome", body.outcome, _OUTPUT_OUTCOMES)
+        if body.usage_tokens is not None and (
+            type(body.usage_tokens) is not int or body.usage_tokens < 0
+        ):
+            raise ValueError("usage_tokens 必须是非负整数或 null")
     elif isinstance(body, ToolCallObserved):
         _require_enum("status", body.status, _TOOL_CALL_STATUSES)
     elif isinstance(body, SessionStateChanged):

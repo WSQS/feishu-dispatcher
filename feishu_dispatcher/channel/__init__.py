@@ -24,20 +24,6 @@ MessageHandler = Callable[[ChannelMessage], Awaitable[None]]
 OutputStatus = Literal["running", "done", "error", "stopped"]
 
 
-class StreamingOutput(Protocol):
-    """一个 agent 回合的流式输出呈现。"""
-
-    def feed(self, text: str) -> None: ...
-
-    def set_footer(self, footer: str) -> None: ...
-
-    async def flush(self) -> None: ...
-
-    async def set_status(self, status: OutputStatus) -> None: ...
-
-    async def aclose(self) -> None: ...
-
-
 class Channel(Protocol):
     """一个交互通道实例的最小能力。"""
 
@@ -72,11 +58,3 @@ class Channel(Protocol):
         *,
         trace_sequence: int | None = None,
     ) -> None: ...
-
-    def open_output(
-        self,
-        conversation: ConversationRef,
-        title: str,
-        *,
-        footer: str = "",
-    ) -> StreamingOutput: ...

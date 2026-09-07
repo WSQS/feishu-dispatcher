@@ -1,5 +1,12 @@
 """Session 运行时公共接口。"""
 
+from .acp_session_runtime import (
+    AcpPromptResult,
+    AcpSessionRuntime,
+    AcpSessionRuntimeHooks,
+    AcpTurnResult,
+    BackgroundTurnPlacement,
+)
 from .dispatcher_session_runtime import DispatcherSessionRuntime
 from .project_manager_session_runtime import (
     ProjectManagerSessionRuntime,
@@ -18,6 +25,11 @@ from .tool_loop_session_runtime import SessionMemory, ToolLoopSessionRuntime
 
 __all__ = [
     "DispatcherSessionRuntime",
+    "AcpPromptResult",
+    "AcpSessionRuntime",
+    "AcpSessionRuntimeHooks",
+    "AcpTurnResult",
+    "BackgroundTurnPlacement",
     "ProjectManagerSessionRuntime",
     "SessionRuntime",
     "SessionRuntimeRegistry",

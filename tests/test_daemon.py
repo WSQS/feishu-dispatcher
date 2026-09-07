@@ -20,9 +20,14 @@ import pytest
 
 import feishu_dispatcher.daemon as daemon_module
 from feishu_dispatcher.acp_client import AgentOutputChunk, AgentToolCallUpdate
-from feishu_dispatcher.channel import ChannelMessage, StreamingOutput
-from feishu_dispatcher.channel.feishu_livecard import LiveCard
+from feishu_dispatcher.channel import ChannelMessage
+from feishu_dispatcher.channel.feishu_card import build_card
 from feishu_dispatcher.channel.http import HttpChannel, HttpConversationRef
+from feishu_dispatcher.channel.presentation import (
+    format_agent_output_footer,
+    format_agent_output_title,
+    format_usage_tokens,
+)
 from feishu_dispatcher.config import (
     Config,
     HttpChannelConfig,
@@ -34,15 +39,18 @@ from feishu_dispatcher.daemon import (
     _DISPATCHER_SESSION_ID,
     DaemonRunResult,
     TurnRequest,
-    _AgentSessionRunner,
     _create_session_worktree,
-    _CurrentRunnerRegistry,
     _Daemon,
 )
 from feishu_dispatcher.scheduler import LLMResponse, ToolCall
+from feishu_dispatcher.session import (
+    AcpSessionRuntime,
+    SessionRuntimeRegistry,
+)
 from feishu_dispatcher.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
+    AgentOutputMetadata,
     AgentOutputStarted,
     AgentPlanEntry,
     AgentPlanUpdated,
@@ -57,7 +65,6 @@ from feishu_dispatcher.store import (
     ProjectStore,
     SessionStore,
 )
-from feishu_dispatcher.throttler import StreamThrottler
 from feishu_dispatcher.trace_store import SessionTraceStore
 from tests.conversation_fakes import ConversationRefFactory as ConversationRef
 
@@ -90,8 +97,11 @@ class FakeBridge:
         self.plain = self.sent_texts
         self.session_events: list[tuple[ConversationRef, SessionEvent]] = []
         self.session_event_trace_sequences: list[int | None] = []
-        self.pending_output_counts: dict[ConversationRef, int] = {}
         self.active_output_turns: set[tuple[ConversationRef, str, str]] = set()
+        self.event_outputs: dict[
+            tuple[ConversationRef, str, str],
+            dict[str, object],
+        ] = {}
 
     def start(self, on_message) -> None:
         self.start_count += 1
@@ -156,59 +166,141 @@ class FakeBridge:
             else None
         )
         if isinstance(body, AgentOutputStarted):
-            pending = self.pending_output_counts.get(conversation, 0)
-            if pending and turn_key is not None:
-                if pending == 1:
-                    self.pending_output_counts.pop(conversation)
-                else:
-                    self.pending_output_counts[conversation] = pending - 1
+            if turn_key is not None:
                 self.active_output_turns.add(turn_key)
+                self.event_outputs[turn_key] = {
+                    "metadata": body.metadata,
+                    "text": "",
+                    "message": "",
+                    "last_stream": None,
+                }
             return
         if isinstance(body, AgentOutputDelta):
-            if (
-                turn_key not in self.active_output_turns
-                and body.stream == "message"
-                and body.text
+            output = self.event_outputs.get(turn_key) if turn_key is not None else None
+            if output is None:
+                if body.stream == "message" and body.text:
+                    self.send_text(conversation, body.text)
+                return
+            last_stream = output["last_stream"]
+            display = body.text
+            if body.stream == "thought" and last_stream != "thought":
+                display = f"💭 {body.text}"
+            elif body.stream == "message" and last_stream == "thought":
+                display = f"\n{body.text}"
+            output["last_stream"] = body.stream
+            output["text"] = str(output["text"]) + display
+            if body.stream == "message":
+                output["message"] = str(output["message"]) + body.text
+            if self.stream_mode == "text" and display:
+                self.send_text(conversation, display)
+            return
+        if isinstance(body, AgentPlanUpdated):
+            output = self.event_outputs.get(turn_key) if turn_key is not None else None
+            if output is not None:
+                marks = {"pending": "⬜", "in_progress": "🔄", "completed": "☑️"}
+                output["text"] = (
+                    str(output["text"])
+                    + "\n📋 计划:\n"
+                    + "\n".join(
+                        f"{marks[entry.status]} {entry.content}"
+                        for entry in body.entries
+                    )
+                    + "\n"
+                )
+                output["last_stream"] = "activity"
+                if self.stream_mode == "text":
+                    self.send_text(
+                        conversation,
+                        "\n📋 计划:\n"
+                        + "\n".join(
+                            f"{marks[entry.status]} {entry.content}"
+                            for entry in body.entries
+                        )
+                        + "\n",
+                    )
+            return
+        if isinstance(body, ToolCallObserved):
+            output = self.event_outputs.get(turn_key) if turn_key is not None else None
+            if output is not None and not (
+                body.status == "started"
+                and body.kind in {"execute", "other"}
+                and not body.detail
             ):
-                self.send_text(conversation, body.text)
+                icon = {"started": "🔧", "completed": "✅", "failed": "❌"}[body.status]
+                detail = (
+                    f": {body.detail}"
+                    if body.detail and body.detail != body.title
+                    else ""
+                )
+                prefix = "\n" if body.status == "started" else ""
+                output["text"] = (
+                    str(output["text"]) + f"{prefix}{icon} {body.title}{detail}\n"
+                )
+                output["last_stream"] = "activity"
+                if self.stream_mode == "text":
+                    self.send_text(
+                        conversation,
+                        f"{prefix}{icon} {body.title}{detail}\n",
+                    )
             return
         if isinstance(body, AgentOutputFinished):
+            output = (
+                self.event_outputs.pop(turn_key, None) if turn_key is not None else None
+            )
+            if output is not None:
+                message = str(output["message"])
+                if body.message != message:
+                    suffix = (
+                        body.message[len(message) :]
+                        if body.message.startswith(message)
+                        else body.message
+                    )
+                    output["text"] = str(output["text"]) + suffix
+                metadata = output["metadata"]
+                assert metadata is None or isinstance(metadata, AgentOutputMetadata)
+                if self.stream_mode == "card":
+                    status = {
+                        "completed": "done",
+                        "cancelled": "stopped",
+                        "failed": "error",
+                        "interrupted": "stopped",
+                    }[body.outcome]
+                    self.reply_card(
+                        conversation.conversation_id,
+                        build_card(
+                            format_agent_output_title(metadata),
+                            status,
+                            str(output["text"]),
+                            format_agent_output_footer(
+                                metadata,
+                                usage_tokens=body.usage_tokens,
+                            ),
+                        ),
+                    )
+                else:
+                    message = str(output["message"])
+                    if body.message != message:
+                        suffix = (
+                            body.message[len(message) :]
+                            if body.message.startswith(message)
+                            else body.message
+                        )
+                        if suffix:
+                            self.send_text(conversation, suffix)
             if turn_key is not None:
                 self.active_output_turns.discard(turn_key)
             return
-        if not isinstance(body, SessionInputAccepted):
-            if isinstance(
-                body,
-                (AgentPlanUpdated,),
-            ):
-                return
-            if isinstance(body, ToolCallObserved):
-                return
-            raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
-        source = body.source.channel_key() if body.source is not None else "unknown"
-        self.send_text(
-            conversation,
-            f"↪️ 同步自 {source}：{body.text}",
-        )
-
-    def open_output(
-        self, conversation: ConversationRef, title: str, *, footer: str = ""
-    ) -> StreamingOutput:
-        self.pending_output_counts[conversation] = (
-            self.pending_output_counts.get(conversation, 0) + 1
-        )
-        target_id = conversation.conversation_id
-        if self.stream_mode == "card":
-            return LiveCard(self, target_id, title, footer=footer)
-
-        async def send_piece(piece: str) -> None:
-            await asyncio.to_thread(
-                self.send_text,
-                conversation,
-                piece,
-            )
-
-        return StreamThrottler(send_piece, window=self.throttle_window)
+        if isinstance(body, SessionInputAccepted):
+            source = body.source.channel_key() if body.source is not None else "unknown"
+            if body.text:
+                text = (
+                    body.text
+                    if source == "unknown"
+                    else f"↪️ 同步自 {source}：{body.text}"
+                )
+                self.send_text(conversation, text)
+            return
+        raise ValueError(f"暂不支持的 SessionEvent body: {type(body).__name__}")
 
     def send_root_message(self, chat_id: str, text: str) -> str:
         self.roots.append((chat_id, text))
@@ -404,7 +496,7 @@ class UsageAgent(ModelAgent):
 
 
 class GatedAgent(FakeAgent):
-    """首轮 prompt() 阻塞在 gate 事件上（保持 turn_in_flight），之后各轮立即完成——
+    """首轮 prompt() 阻塞在 gate 事件上（保持 Turn 在途），之后各轮立即完成——
     用于确定性地在「turn 在途」窗口内投递 bg 结果、观察合并（#79）。"""
 
     def __init__(self, *a, **k) -> None:
@@ -1468,7 +1560,7 @@ async def test_http_create_manager_conversation_uses_session_identity_prefix():
 
 
 @pytest.mark.asyncio
-async def test_http_task_conversation_round_trip_routes_to_existing_runner():
+async def test_http_task_conversation_round_trip_routes_to_existing_runtime():
     daemon, feishu, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo first"))
     await wait_until(
@@ -1890,10 +1982,12 @@ def runtime_state_event(session_id: str, event_id: str) -> SessionEvent:
     )
 
 
-def current_runner(daemon: _Daemon, conversation_id: str = "om_root1"):
+def current_runtime(daemon: _Daemon, conversation_id: str = "om_root1"):
     task = task_by_conversation(daemon.store, conversation_id)
     return (
-        daemon._runners.get_for_session(task.session_id) if task is not None else None
+        daemon._session_runtimes.get_for_session(task.session_id)
+        if task is not None
+        else None
     )
 
 
@@ -1904,55 +1998,55 @@ def test_launch_uses_session_parameter_name():
     assert "task" not in parameters
 
 
-def test_current_runner_registry_rejects_occupied_slot():
-    registry = _CurrentRunnerRegistry()
+def test_current_runtime_registry_rejects_occupied_slot():
+    registry = SessionRuntimeRegistry()
     assert not hasattr(registry, "get_for_task")
     assert not hasattr(registry, "_by_task")
-    runner_a = _AgentSessionRunner(
+    runtime_a = AcpSessionRuntime(
         "demo",
         "copilot",
         session_id="t1",
         conversation=ConversationRef("feishu", "thread-a"),
     )
-    runner_b = _AgentSessionRunner(
+    runtime_b = AcpSessionRuntime(
         "demo",
         "copilot",
         session_id="t1",
         conversation=ConversationRef("feishu", "thread-b"),
     )
 
-    assert runner_a.session_id == "t1"
-    assert not hasattr(runner_a, "task_id")
-    registry.register("t1", runner_a)
+    assert runtime_a.session_id == "t1"
+    assert not hasattr(runtime_a, "task_id")
+    registry.register(runtime_a)
 
-    assert registry.get_for_session("t1") is runner_a
-    assert registry.is_current("t1", runner_a)
+    assert registry.get_for_session("t1") is runtime_a
+    assert registry.is_current(runtime_a)
     assert registry.count() == 1
-    assert registry.values() == [runner_a]
-    with pytest.raises(RuntimeError, match="已有 current runner"):
-        registry.register("t1", runner_b)
+    assert registry.values() == [runtime_a]
+    with pytest.raises(RuntimeError, match="Session Runtime 已注册"):
+        registry.register(runtime_b)
 
 
-def test_current_runner_registry_remove_is_expected_current_and_repeatable():
-    registry = _CurrentRunnerRegistry()
-    runner_a = _AgentSessionRunner(
+def test_current_runtime_registry_remove_is_expected_current_and_repeatable():
+    registry = SessionRuntimeRegistry()
+    runtime_a = AcpSessionRuntime(
         "demo",
         "copilot",
         session_id="t1",
         conversation=ConversationRef("feishu", "thread-a"),
     )
-    runner_b = _AgentSessionRunner(
+    runtime_b = AcpSessionRuntime(
         "demo",
         "copilot",
         session_id="t1",
         conversation=ConversationRef("feishu", "thread-b"),
     )
-    registry.register("t1", runner_a)
+    registry.register(runtime_a)
 
-    assert not registry.remove_if_current("t1", runner_b)
-    assert registry.get_for_session("t1") is runner_a
-    assert registry.remove_if_current("t1", runner_a)
-    assert not registry.remove_if_current("t1", runner_a)
+    assert not registry.remove_if_current(runtime_b)
+    assert registry.get_for_session("t1") is runtime_a
+    assert registry.remove_if_current(runtime_a)
+    assert not registry.remove_if_current(runtime_a)
     assert registry.get_for_session("t1") is None
 
 
@@ -2068,20 +2162,22 @@ def test_session_turn_lock_is_stable_per_session_identity():
 
 
 def test_fmt_tokens_scales_units():
-    from feishu_dispatcher.daemon import _fmt_tokens
-
-    assert _fmt_tokens(0) == "~0 tok"
-    assert _fmt_tokens(850) == "~850 tok"
-    assert _fmt_tokens(3210) == "~3.2k tok"
-    assert _fmt_tokens(32000) == "~32k tok"  # 整千不留 .0
-    assert _fmt_tokens(1_200_000) == "~1.2M tok"
+    assert format_usage_tokens(0) == "~0 tok"
+    assert format_usage_tokens(850) == "~850 tok"
+    assert format_usage_tokens(3210) == "~3.2k tok"
+    assert format_usage_tokens(32000) == "~32k tok"  # 整千不留 .0
+    assert format_usage_tokens(1_200_000) == "~1.2M tok"
 
 
 def test_with_tokens_appends_to_footer():
-    from feishu_dispatcher.daemon import _with_tokens
-
-    assert _with_tokens("demo · 模型：X", 3210) == "demo · 模型：X · ~3.2k tok"
-    assert _with_tokens("", 3210) == "~3.2k tok"  # 空 footer 不带前导分隔
+    assert (
+        format_agent_output_footer(
+            AgentOutputMetadata("demo", "copilot", "X"),
+            usage_tokens=3210,
+        )
+        == "demo · 模型：X · ~3.2k tok"
+    )
+    assert format_usage_tokens(3210) == "~3.2k tok"
 
 
 async def test_run_dispatches_and_streams_output():
@@ -2119,9 +2215,7 @@ async def test_daemon_streams_structured_output_display_text():
 
     daemon, bridge, _ = make_daemon(agent_cls=StructuredOutputAgent)
     await daemon._handle_message(root_msg("/run demo do stuff"))
-    await wait_until(
-        lambda: any("💭 thinking\nanswer" in text for text in bridge.texts("om_root1"))
-    )
+    await wait_until(lambda: "💭 thinking\nanswer" in "".join(bridge.texts("om_root1")))
 
     assert not any(text == "thinkinganswer" for text in bridge.texts("om_root1"))
     await daemon._shutdown()
@@ -2276,7 +2370,7 @@ async def test_daemon_persists_session_events_once_across_conversation_fanout(
 
     web_conversation = ConversationRef("web", "web-thread")
     daemon.bind_conversation(task.session_id, web_conversation)
-    current_runner(daemon).enqueue(TurnRequest("second", web_conversation))
+    current_runtime(daemon).enqueue(TurnRequest("second", web_conversation))
     await wait_until(
         lambda: (
             created[0].prompts == ["first", "second"]
@@ -2432,7 +2526,9 @@ async def test_daemon_emits_and_projects_tool_call_session_events():
         )
     )
     assert created[0].prompts == ["first", "second"]
-    assert any("echo:second" in text for text in feishu.texts("om_root1"))
+    await wait_until(
+        lambda: any("echo:second" in text for text in feishu.texts("om_root1"))
+    )
     await daemon._shutdown()
 
 
@@ -2454,8 +2550,7 @@ async def test_tool_call_without_current_turn_is_ignored():
     await wait_until(lambda: created and created[0].prompts == ["first"])
     await wait_until(
         lambda: (
-            (runner := current_runner(daemon)) is not None
-            and runner.current_turn_id is None
+            (runtime := current_runtime(daemon)) is not None and runtime.state == "idle"
         )
     )
 
@@ -2699,7 +2794,7 @@ async def test_session_event_handler_failure_does_not_abort_agent_turn(caplog):
             )
         )
 
-    assert "echo:task" in "".join(bridge.texts("om_root1"))
+    await wait_until(lambda: "echo:task" in "".join(bridge.texts("om_root1")))
     assert "SessionEvent 运行时消费者失败" in caplog.text
     assert task_by_conversation(daemon.store, "om_root1").status == "idle"
     await daemon._shutdown()
@@ -2707,7 +2802,13 @@ async def test_session_event_handler_failure_does_not_abort_agent_turn(caplog):
 
 async def test_trace_store_failure_does_not_abort_agent_turn(tmp_path, caplog):
     class BrokenTraceStore(SessionTraceStore):
-        def append(self, event: SessionEvent):
+        def append(
+            self,
+            event: SessionEvent,
+            *,
+            conversation_ref_serializer=None,
+            conversation_ref_deserializer=None,
+        ):
             raise RuntimeError("trace boom")
 
     trace_store = BrokenTraceStore(tmp_path / "session-trace.sqlite")
@@ -2768,7 +2869,7 @@ async def test_run_uses_text_only_channel_output_lifecycle():
         async def flush(self) -> None:
             self.flush_count += 1
 
-        async def set_status(self, status: str) -> None:
+        def set_status(self, status: str) -> None:
             self.statuses.append(status)
 
         async def aclose(self) -> None:
@@ -2779,6 +2880,7 @@ async def test_run_uses_text_only_channel_output_lifecycle():
             self.replies: list[tuple[str, str, bool]] = []
             self.outputs: list[RecordingOutput] = []
             self.opened: list[tuple[ConversationRef, str, str]] = []
+            self._active: dict[tuple[str, str, str], RecordingOutput] = {}
             self.stopped = False
 
         def start(self, on_message) -> None:
@@ -2822,19 +2924,37 @@ async def test_run_uses_text_only_channel_output_lifecycle():
             *,
             trace_sequence: int | None = None,
         ) -> None:
-            return None
-
-        def open_output(
-            self,
-            conversation: ConversationRef,
-            title: str,
-            *,
-            footer: str = "",
-        ) -> StreamingOutput:
-            output = RecordingOutput()
-            self.outputs.append(output)
-            self.opened.append((conversation, title, footer))
-            return output
+            key = (conversation.conversation_id, event.session_id, event.turn_id or "")
+            body = event.body
+            if isinstance(body, AgentOutputStarted):
+                metadata = body.metadata
+                title = (
+                    f"{metadata.project_name} · {metadata.agent_label}"
+                    if metadata is not None
+                    else "Agent"
+                )
+                footer = metadata.project_name if metadata is not None else ""
+                output = RecordingOutput()
+                self.outputs.append(output)
+                self.opened.append((conversation, title, footer))
+                self._active[key] = output
+            elif isinstance(body, AgentOutputDelta):
+                output = self._active.get(key)
+                if output is not None:
+                    output.feed(body.text)
+            elif isinstance(body, AgentOutputFinished):
+                output = self._active.pop(key, None)
+                if output is not None:
+                    output.set_status(
+                        {
+                            "completed": "done",
+                            "cancelled": "stopped",
+                            "failed": "error",
+                            "interrupted": "stopped",
+                        }[body.outcome]
+                    )
+                    output.flush_count += 1
+                    output.closed = True
 
     daemon, _, created = make_daemon()
     channel = TextOnlyChannel()
@@ -2884,45 +3004,44 @@ async def test_run_unknown_agent_errors_no_spawn():
     assert task_by_conversation(daemon.store, "om_root1") is None
 
 
-async def test_old_runner_repeated_cleanup_does_not_remove_replacement():
+async def test_old_runtime_repeated_cleanup_does_not_remove_replacement():
     daemon, _, _ = make_daemon()
-    runner_a = _AgentSessionRunner(
+    agent_a = FakeAgent(None, lambda text: None)
+    runtime_a = AcpSessionRuntime(
         "demo",
         "copilot",
         session_id="t1",
         conversation=ConversationRef("feishu", "thread-a"),
+        agent=agent_a,
     )
-    runner_b = _AgentSessionRunner(
+    runtime_b = AcpSessionRuntime(
         "demo",
         "copilot",
         session_id="t1",
         conversation=ConversationRef("feishu", "thread-b"),
     )
-    agent_a = FakeAgent(None, lambda text: None)
-    runner_a.agent = agent_a
-    daemon._runners.register("t1", runner_a)
-    assert daemon._runners.remove_if_current("t1", runner_a)
-    daemon._runners.register("t1", runner_b)
+    daemon._session_runtimes.register(runtime_a)
+    assert daemon._session_runtimes.remove_if_current(runtime_a)
+    daemon._session_runtimes.register(runtime_b)
 
-    await daemon._close_session(runner_a)
-    await daemon._close_session(runner_a)
+    await daemon._close_session(runtime_a)
+    await daemon._close_session(runtime_a)
 
-    assert daemon._runners.get_for_session("t1") is runner_b
+    assert daemon._session_runtimes.get_for_session("t1") is runtime_b
     assert agent_a.closed
-    assert runner_a.agent is None
 
 
-async def test_thread_reply_routes_through_task_id_to_current_runner():
+async def test_thread_reply_routes_through_task_id_to_current_runtime():
     daemon, _, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo first task"))
     await wait_until(lambda: created and created[0].prompts == ["first task"])
-    runner = current_runner(daemon)
-    runner.conversation = ConversationRef("feishu", "not-the-route-key")
+    runtime = current_runtime(daemon)
+    runtime.conversation = ConversationRef("feishu", "not-the-route-key")
 
     await daemon._handle_message(thread_msg("second task"))
 
     await wait_until(lambda: created[0].prompts == ["first task", "second task"])
-    assert current_runner(daemon) is runner
+    assert current_runtime(daemon) is runtime
     await daemon._shutdown()
 
 
@@ -2949,7 +3068,7 @@ async def test_stop_command_closes_agent_and_removes_session():
 
     await daemon._handle_message(thread_msg("/stop"))
     await wait_until(lambda: created[0].closed)
-    await wait_until(lambda: current_runner(daemon) is None)
+    await wait_until(lambda: current_runtime(daemon) is None)
     assert any("🛑" in t for t in bridge.texts("om_root1"))
 
 
@@ -2963,7 +3082,7 @@ async def test_stop_cancels_in_flight_turn():
     await wait_until(lambda: created[0].cancel_calls == 1)
     # 取消后 agent 收尾关闭、session 移除、任务标 stopped
     await wait_until(lambda: created[0].closed)
-    await wait_until(lambda: current_runner(daemon) is None)
+    await wait_until(lambda: current_runtime(daemon) is None)
     assert any("🛑" in t for t in bridge.texts("om_root1"))
     assert task_by_conversation(daemon.store, "om_root1").status == "stopped"
 
@@ -2973,7 +3092,7 @@ async def test_stop_when_idle_does_not_cancel():
     daemon, bridge, created = make_daemon()
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
-    await wait_until(lambda: not current_runner(daemon).turn_in_flight)
+    await wait_until(lambda: current_runtime(daemon).state == "idle")
     await daemon._handle_message(thread_msg("/stop"))
     await wait_until(lambda: created[0].closed)
     assert created[0].cancel_calls == 0
@@ -2985,10 +3104,10 @@ async def test_cancel_stops_turn_but_keeps_agent():
     await wait_until(lambda: created and created[0].in_prompt.is_set())
     await daemon._handle_message(thread_msg("/cancel"))
     await wait_until(lambda: created[0].cancel_calls == 1)
-    await wait_until(lambda: not current_runner(daemon).turn_in_flight)
+    await wait_until(lambda: current_runtime(daemon).state == "idle")
     # agent 保留：未关闭、session 还在、任务回 idle（非 stopped）
     assert not created[0].closed
-    assert current_runner(daemon) is not None
+    assert current_runtime(daemon) is not None
     await wait_until(
         lambda: task_by_conversation(daemon.store, "om_root1").status == "idle"
     )
@@ -3005,7 +3124,7 @@ async def test_cancel_with_input_runs_new_turn():
     # 取消后新输入作为下一轮被拾起执行（FIFO），agent 仍存活
     await wait_until(lambda: created[0].prompts == ["task", "do this instead"])
     assert not created[0].closed
-    assert current_runner(daemon) is not None
+    assert current_runtime(daemon) is not None
     await daemon._shutdown()
 
 
@@ -3013,7 +3132,7 @@ async def test_cancel_when_idle_reports_nothing_to_cancel():
     daemon, bridge, created = make_daemon()  # FakeAgent（回合秒完）
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
-    await wait_until(lambda: not current_runner(daemon).turn_in_flight)
+    await wait_until(lambda: current_runtime(daemon).state == "idle")
     await daemon._handle_message(thread_msg("/cancel"))
     assert created[0].cancel_calls == 0
     assert any("没有在跑的轮" in t for t in bridge.texts("om_root1"))
@@ -3077,7 +3196,7 @@ async def test_raw_forwards_stop_literally_keeps_agent():
     await daemon._handle_message(thread_msg("/raw /stop", mid="om_raw2"))
     await wait_until(lambda: created[0].prompts == ["task", "/stop"])
     assert not created[0].closed
-    assert current_runner(daemon) is not None
+    assert current_runtime(daemon) is not None
     await daemon._shutdown()
 
 
@@ -3224,7 +3343,7 @@ async def test_same_inbound_ids_are_isolated_by_channel():
     await daemon._shutdown()
 
 
-async def test_runner_fans_out_turns_to_bound_conversations():
+async def test_runtime_fans_out_turns_to_bound_conversations():
     daemon, feishu, created = make_daemon()
     web = FakeBridge()
     daemon._channels["web"] = web
@@ -3237,7 +3356,7 @@ async def test_runner_fans_out_turns_to_bound_conversations():
         )
     )
     task = task_by_conversation(daemon.store, "om_root1")
-    runner = current_runner(daemon)
+    runtime = current_runtime(daemon)
     main_conversation = ConversationRef("feishu", "om_root1")
     web_conversation = ConversationRef("web", "web-thread")
     await wait_until(
@@ -3248,7 +3367,7 @@ async def test_runner_fans_out_turns_to_bound_conversations():
     )
     daemon.bind_conversation(task.session_id, web_conversation)
 
-    runner.enqueue(TurnRequest("web turn", web_conversation))
+    runtime.enqueue(TurnRequest("web turn", web_conversation))
     await wait_until(
         lambda: (
             created[0].prompts == ["first", "web turn"]
@@ -3259,7 +3378,7 @@ async def test_runner_fans_out_turns_to_bound_conversations():
         )
     )
 
-    assert runner.conversation == main_conversation
+    assert runtime.conversation == main_conversation
     assert "↪️ 同步自 web：web turn" in feishu.texts("om_root1")
     assert "↪️ 同步自 web：web turn" not in web.texts("web-thread")
     projected_event = next(
@@ -3340,7 +3459,7 @@ async def test_session_input_event_projection_failure_does_not_abort_turn(caplog
     await daemon._handle_message(root_msg("/run demo first"))
     await wait_until(lambda: created and created[0].prompts == ["first"])
     task = task_by_conversation(daemon.store, "om_root1")
-    runner = current_runner(daemon)
+    runtime = current_runtime(daemon)
     source = ConversationRef("feishu", "om_root1")
     daemon.bind_conversation(
         task.session_id,
@@ -3352,7 +3471,7 @@ async def test_session_input_event_projection_failure_does_not_abort_turn(caplog
     )
 
     with caplog.at_level("ERROR"):
-        runner.enqueue(TurnRequest("continue", source))
+        runtime.enqueue(TurnRequest("continue", source))
         await wait_until(
             lambda: (
                 created[0].prompts == ["first", "continue"]
@@ -3376,7 +3495,7 @@ async def test_session_input_event_projection_failure_does_not_abort_turn(caplog
     await daemon._shutdown()
 
 
-async def test_bound_cross_channel_thread_routes_to_existing_runner():
+async def test_bound_cross_channel_thread_routes_to_existing_runtime():
     daemon, feishu, created = make_daemon()
     web = FakeBridge()
     daemon._channels["web"] = web
@@ -3389,7 +3508,7 @@ async def test_bound_cross_channel_thread_routes_to_existing_runner():
         )
     )
     task = task_by_conversation(daemon.store, "om_root1")
-    runner = current_runner(daemon)
+    runtime = current_runtime(daemon)
     main_conversation = ConversationRef("feishu", "om_root1")
     web_conversation = ConversationRef("web", "web-thread")
 
@@ -3414,8 +3533,8 @@ async def test_bound_cross_channel_thread_routes_to_existing_runner():
         )
     )
 
-    assert daemon._runners.get_for_session(task.session_id) is runner
-    assert runner.conversation == main_conversation
+    assert daemon._session_runtimes.get_for_session(task.session_id) is runtime
+    assert runtime.conversation == main_conversation
     assert "↪️ 同步自 web：web follow up" in feishu.texts("om_root1")
     assert "↪️ 同步自 web：web follow up" not in web.texts("web-thread")
 
@@ -3442,10 +3561,20 @@ async def test_session_output_creation_failure_keeps_other_conversation_running(
     caplog,
 ):
     class BrokenOutputBridge(FakeBridge):
-        def open_output(
-            self, conversation: ConversationRef, title: str, *, footer: str = ""
-        ) -> StreamingOutput:
-            raise RuntimeError("open output boom")
+        def handle_session_event(
+            self,
+            conversation: ConversationRef,
+            event: SessionEvent,
+            *,
+            trace_sequence: int | None = None,
+        ) -> None:
+            if isinstance(event.body, AgentOutputStarted):
+                raise RuntimeError("start output boom")
+            super().handle_session_event(
+                conversation,
+                event,
+                trace_sequence=trace_sequence,
+            )
 
     daemon, feishu, created = make_daemon()
     broken = BrokenOutputBridge()
@@ -3482,23 +3611,23 @@ async def test_session_output_creation_failure_keeps_other_conversation_running(
         await wait_until(lambda: daemon.store.get(task.session_id).status == "idle")
 
     assert daemon.store.get(task.session_id).status == "idle"
-    assert "Session 输出创建失败 conversation=broken:broken-thread" in caplog.text
+    assert "Channel SessionEvent 投影失败" in caplog.text
     await daemon._shutdown()
 
 
-async def test_replaced_runner_late_completion_does_not_overwrite_current_state():
+async def test_replaced_runtime_late_completion_does_not_overwrite_current_state():
     daemon, _, created = make_daemon(agent_cls=GatedAgent)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
-    runner_a = current_runner(daemon)
-    runner_b = _AgentSessionRunner(
+    runtime_a = current_runtime(daemon)
+    runtime_b = AcpSessionRuntime(
         "demo",
         "copilot",
         session_id="t1",
         conversation=ConversationRef("feishu", "thread-b"),
     )
-    assert daemon._runners.remove_if_current("t1", runner_a)
-    daemon._runners.register("t1", runner_b)
+    assert daemon._session_runtimes.remove_if_current(runtime_a)
+    daemon._session_runtimes.register(runtime_b)
     daemon.store.update("t1", status="starting")
 
     created[0].gate.set()
@@ -3507,15 +3636,15 @@ async def test_replaced_runner_late_completion_does_not_overwrite_current_state(
     task = daemon.store.get("t1")
     assert task.status == "starting"
     assert task.turns == 0
-    assert daemon._runners.get_for_session("t1") is runner_b
-    await daemon._close_session(runner_b)
+    assert daemon._session_runtimes.get_for_session("t1") is runtime_b
+    await daemon._close_session(runtime_b)
 
 
 async def test_agent_error_reports_and_closes_session():
     daemon, bridge, created = make_daemon(agent_cls=FailingAgent)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: any("❌" in t for t in bridge.texts("om_root1")))
-    await wait_until(lambda: current_runner(daemon) is None)
+    await wait_until(lambda: current_runtime(daemon) is None)
     assert created[0].closed
 
 
@@ -3532,28 +3661,46 @@ async def test_plain_root_message_replies_usage():
 
 
 async def test_shutdown_cancels_workers_and_stops_bridge():
-    daemon, bridge, created = make_daemon()
+    daemon, bridge, created = make_daemon(agent_cls=CancelableAgent)
+    events_at_channel_stop: list[SessionEvent] = []
+    stop = bridge.stop
+
+    def record_stop() -> None:
+        events_at_channel_stop.extend(event for _, event in bridge.session_events)
+        stop()
+
+    bridge.stop = record_stop  # type: ignore[method-assign]
     await daemon._handle_message(root_msg("/run demo task"))
-    await wait_until(lambda: created and created[0].prompts == ["task"])
+    await wait_until(lambda: created and created[0].in_prompt.is_set())
 
     await daemon._shutdown()
     assert bridge.stopped
-    assert daemon._runners.count() == 0
+    assert daemon._session_runtimes.count() == 0
     assert created[0].closed
+    finished = [
+        event.body
+        for event in events_at_channel_stop
+        if isinstance(event.body, AgentOutputFinished)
+    ]
+    assert finished == [
+        AgentOutputFinished(
+            message="",
+            thought="",
+            outcome="interrupted",
+        )
+    ]
 
 
-async def test_shutdown_reaps_runner_cancelled_during_startup():
-    """minor-1：worker 卡在启动段（start() 未返回）时被 _shutdown cancel，CancelledError
-    不经过主循环的 finally(_close_session)，registry 槽位会悬空；_shutdown 兜底清理把它
-    收掉（槽位清空 + agent 关闭），不泄漏进程/名额。"""
+async def test_shutdown_closes_runtime_cancelled_during_startup():
+    """worker 卡在 start() 时被 shutdown 取消，也会经 Runtime 外层 finally 收尾。"""
     daemon, bridge, created = make_daemon(agent_cls=BlockingStartAgent)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].started.is_set())
-    assert daemon._runners.count() == 1  # worker 已登记、停在 start()
+    assert daemon._session_runtimes.count() == 1  # worker 已登记、停在 start()
 
     await daemon._shutdown()
 
-    assert daemon._runners.count() == 0
+    assert daemon._session_runtimes.count() == 0
     assert created[0].closed
 
 
@@ -3636,7 +3783,7 @@ def make_daemon_with_limit(
 
 async def test_max_agents_limit_blocks_excess_spawns():
     # 用一个「不会自己结束」的 agent 占住 session 槽位：
-    # FakeAgent.prompt 返回即可，但 session 仍存活在 current-runner registry 里
+    # FakeAgent.prompt 返回即可，但 session 仍存活在 Runtime Registry 里
     daemon, bridge, created = make_daemon_with_limit(max_agents=1)
     await daemon._handle_message(root_msg("/run demo task1", mid="om_r1"))
     await wait_until(lambda: created and created[0].prompts == ["task1"])
@@ -3718,7 +3865,7 @@ async def test_card_mode_run_echo_in_card_and_done_status():
 async def test_card_mode_footer_shows_token_usage():
     daemon, bridge, created = make_daemon(agent_cls=UsageAgent, stream_mode="card")
     await daemon._handle_message(root_msg("/run demo do stuff"))
-    await wait_until(lambda: any("✅" in t for t in bridge.texts("om_root1")))
+    await wait_until(lambda: bool(bridge.card_replies or bridge.card_patches))
     all_cards = bridge.card_replies + bridge.card_patches
     last_card = all_cards[-1][1]
     foot = last_card["body"]["elements"][-1]["content"]
@@ -3746,7 +3893,7 @@ async def test_card_mode_agent_error_sets_error_status():
     daemon, bridge, created = make_daemon(agent_cls=FailingAgent, stream_mode="card")
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: any("❌" in t for t in bridge.texts("om_root1")))
-    await wait_until(lambda: current_runner(daemon) is None)
+    await wait_until(lambda: current_runtime(daemon) is None)
     assert created[0].closed
 
 
@@ -3757,7 +3904,7 @@ async def test_card_mode_stop_command_closes_agent():
 
     await daemon._handle_message(thread_msg("/stop"))
     await wait_until(lambda: created[0].closed)
-    await wait_until(lambda: current_runner(daemon) is None)
+    await wait_until(lambda: current_runtime(daemon) is None)
     assert any("🛑" in t for t in bridge.texts("om_root1"))
 
 
@@ -3820,12 +3967,12 @@ async def test_recovery_after_restart_uses_file_session_store(tmp_path: Path):
 
     store2 = SessionStore(store_path)
     d2, b2, c2 = make_daemon(store=store2)
-    assert d2._runners.count() == 0
+    assert d2._session_runtimes.count() == 0
     await d2._handle_message(thread_msg("follow up", root="om_root1", mid="om_t2"))
     await wait_until(lambda: c2 and c2[0].prompts == ["follow up"])
     assert c2[0].resume_session_id == saved_sid
     assert (
-        current_runner(d2).session_id
+        current_runtime(d2).session_id
         == task_by_conversation(store2, "om_root1").session_id
     )
     assert c2[0].start_count == 1
@@ -3852,13 +3999,14 @@ async def test_recovery_turn_fans_out_start_and_output():
             and created[0].prompts == ["continue"]
             and any("已恢复会话" in text for text in web.texts("web-thread"))
             and any("echo:continue" in text for text in web.texts("web-thread"))
+            and any("echo:continue" in text for text in feishu.texts("om_main"))
             and any("本轮结束" in text for text in web.texts("web-thread"))
             and any("本轮结束" in text for text in feishu.texts("om_main"))
         )
     )
 
-    runner = daemon._runners.get_for_session(task.session_id)
-    assert runner.conversation == daemon._conversation_for_session(task)
+    runtime = daemon._session_runtimes.get_for_session(task.session_id)
+    assert runtime.conversation == daemon._conversation_for_session(task)
     assert any("正在恢复任务" in text for text in feishu.texts("om_main"))
     assert any("已恢复会话" in text for text in feishu.texts("om_main"))
     assert "↪️ 同步自 web：continue" in feishu.texts("om_main")
@@ -3893,8 +4041,10 @@ async def test_cross_channel_recovery_start_failure_fans_out():
 
     assert len(created) == 1
     assert store.get(task.session_id).status == "failed"
-    await wait_until(lambda: daemon._runners.get_for_session(task.session_id) is None)
-    assert daemon._runners.get_for_session(task.session_id) is None
+    await wait_until(
+        lambda: daemon._session_runtimes.get_for_session(task.session_id) is None
+    )
+    assert daemon._session_runtimes.get_for_session(task.session_id) is None
 
 
 async def test_cross_channel_turn_error_fans_out():
@@ -3935,8 +4085,10 @@ async def test_cross_channel_turn_error_fans_out():
 
     assert created[0].prompts == ["fail"]
     assert store.get(task.session_id).status == "failed"
-    await wait_until(lambda: daemon._runners.get_for_session(task.session_id) is None)
-    assert daemon._runners.get_for_session(task.session_id) is None
+    await wait_until(
+        lambda: daemon._session_runtimes.get_for_session(task.session_id) is None
+    )
+    assert daemon._session_runtimes.get_for_session(task.session_id) is None
 
 
 async def test_unbound_conversation_uses_dispatcher_fallback():
@@ -4016,7 +4168,7 @@ async def test_idle_timeout_suspends_but_keeps_record_recoverable():
     saved_sid = created[0].session_id
     # 空闲超时 → 挂起：关进程、腾名额、但任务留存为 suspended
     await wait_until(lambda: any("💤" in t for t in bridge.texts("om_root1")))
-    await wait_until(lambda: current_runner(daemon) is None)  # 名额已释放
+    await wait_until(lambda: current_runtime(daemon) is None)  # 名额已释放
     assert created[0].closed
     await wait_until(
         lambda: task_by_conversation(store, "om_root1").status == "suspended"
@@ -4035,7 +4187,7 @@ async def test_idle_timeout_zero_disables_suspend():
     await wait_until(lambda: any("✅" in t for t in bridge.texts("om_root1")))
     # 关闭自动挂起：跑完后 session 仍存活
     await asyncio.sleep(0.15)
-    assert current_runner(daemon) is not None
+    assert current_runtime(daemon) is not None
     assert not created[0].closed
     await daemon._shutdown()
 
@@ -5048,14 +5200,14 @@ async def test_delegation_report_requires_own_current_worker_turn():
         **stored_conversation_kwargs(ConversationRef("feishu", "worker-thread")),
         workspace="C:/tmp/demo",
     )
-    runner = _AgentSessionRunner(
+    runtime = AcpSessionRuntime(
         "demo",
         "copilot",
         ConversationRef("feishu", "worker-thread"),
         session_id=worker.session_id,
     )
-    runner.current_turn_id = "turn-1"
-    daemon._runners.register(worker.session_id, runner)
+    runtime._current_turn_id = "turn-1"
+    daemon._session_runtimes.register(runtime)
     delegation = daemon.delegation_store.create(
         project_name="demo",
         manager_session_id="manager:demo",
@@ -5117,8 +5269,9 @@ async def test_manager_delegation_reports_and_notifies_after_worker_finish():
     await wait_until(
         lambda: (
             created
-            and daemon._runners.get_for_session(worker.session_id).current_turn_id
-            == delegation.worker_turn_id
+            and daemon._session_runtimes.get_for_session(worker.session_id).owns_turn(
+                delegation.worker_turn_id
+            )
         )
     )
     assert (
@@ -5586,7 +5739,7 @@ async def test_agent_error_pauses_recoverable_notifies_main_line():
     await daemon._handle_message(root_msg("/run demo task"))
     # turn 异常 → 主线通知「已暂停」，session 关闭腾名额
     await wait_until(lambda: any("❌" in t and "暂停" in t for _, t in bridge.roots))
-    await wait_until(lambda: current_runner(daemon) is None)
+    await wait_until(lambda: current_runtime(daemon) is None)
     # 关键：failed 是可恢复态（非终止），且记下诊断
     task = task_by_conversation(daemon.store, "om_root1")
     assert task.status == "failed"
@@ -5601,7 +5754,7 @@ async def test_failed_task_resumes_on_thread_reply():
     await wait_until(
         lambda: task_by_conversation(daemon.store, "om_root1").status == "failed"
     )
-    await wait_until(lambda: current_runner(daemon) is None)
+    await wait_until(lambda: current_runtime(daemon) is None)
     assert task_by_conversation(
         daemon.store, "om_root1"
     ).agent_session_id  # turn 失败时 session 已建
@@ -5626,7 +5779,7 @@ async def test_startup_failure_stays_unresumable_guides_to_run():
     await wait_until(
         lambda: task_by_conversation(daemon.store, "om_root1").status == "failed"
     )
-    await wait_until(lambda: current_runner(daemon) is None)
+    await wait_until(lambda: current_runtime(daemon) is None)
     task = task_by_conversation(daemon.store, "om_root1")
     assert not task.agent_session_id  # startup 失败没建会话
     # 话题回复 → 尝试恢复但无 session → 挡回 /run（不丢人，只是没得恢复）
@@ -5675,9 +5828,8 @@ async def test_http_list_tasks_reports_dispatcher_and_agent_runtime_state():
         status="done",
     )
     daemon.store.update(historical.session_id, turns=1)
-    daemon._runners.register(
-        active.session_id,
-        _AgentSessionRunner(
+    daemon._session_runtimes.register(
+        AcpSessionRuntime(
             "demo",
             "copilot",
             session_id=active.session_id,
@@ -5826,7 +5978,7 @@ async def test_mark_done_active_archives_and_closes_agent():
     out = await daemon._sched_mark_done("t1")
     assert "done" in out
     await wait_until(lambda: store.get("t1").status == "done")
-    await wait_until(lambda: current_runner(daemon) is None)
+    await wait_until(lambda: current_runtime(daemon) is None)
     assert created[0].closed
     assert any("归档" in t for t in bridge.texts("om_root1"))
     await daemon._shutdown()
@@ -6088,6 +6240,7 @@ async def test_model_pinned_as_card_footer():
     )
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    await wait_until(lambda: bool(bridge.card_replies or bridge.card_patches))
     # 卡片最下方固定显示模型（footer：小字号 markdown 元素）
     all_cards = bridge.card_replies + bridge.card_patches
     assert any(
@@ -6122,6 +6275,7 @@ async def test_card_footer_shows_project_and_model():
     )
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    await wait_until(lambda: bool(bridge.card_replies or bridge.card_patches))
     all_cards = bridge.card_replies + bridge.card_patches
     # footer（notation 小字 markdown 元素）里项目名与模型同行
     assert any(
@@ -6143,6 +6297,7 @@ async def test_card_footer_project_only_when_no_model():
     daemon, bridge, created = make_daemon(store=store, stream_mode="card")
     await daemon._handle_message(root_msg("/run demo build"))
     await wait_until(lambda: store.get("t1") and store.get("t1").turns == 1)
+    await wait_until(lambda: bool(bridge.card_replies or bridge.card_patches))
     all_cards = bridge.card_replies + bridge.card_patches
     assert any(
         any(
@@ -6966,12 +7121,34 @@ async def test_sched_list_forge_all_skipped_is_explicit(monkeypatch):
 
 
 def test_issue_tag_extracts_number():
-    from feishu_dispatcher.daemon import _issue_tag
-
-    assert _issue_tag("https://github.com/o/r/issues/3") == "#3"
-    assert _issue_tag("https://gitlab.com/g/p/-/issues/42") == "#42"
-    assert _issue_tag("") == ""
-    assert _issue_tag("https://x/no/number/here") == ""  # 末段非数字 → 不显示
+    base = {"project_name": "demo", "agent_label": "copilot"}
+    assert (
+        format_agent_output_footer(
+            AgentOutputMetadata(**base, issue_url="https://github.com/o/r/issues/3")
+        )
+        == "demo · #3"
+    )
+    assert (
+        format_agent_output_footer(
+            AgentOutputMetadata(
+                **base,
+                issue_url="https://gitlab.com/g/p/-/issues/42",
+            )
+        )
+        == "demo · #42"
+    )
+    assert (
+        format_agent_output_footer(AgentOutputMetadata(**base, issue_url="")) == "demo"
+    )
+    assert (
+        format_agent_output_footer(
+            AgentOutputMetadata(
+                **base,
+                issue_url="https://x/no/number/here",
+            )
+        )
+        == "demo"
+    )
 
 
 async def test_sched_spawn_routes_thread_and_output_to_source_channel():
@@ -7125,7 +7302,7 @@ async def test_models_refresh_command_boots_throwaway_agent():
     await daemon._handle_message(root_msg("/models refresh copilot"))
     assert "zhipuai/glm-5" in daemon.model_store.get("copilot")
     assert created and created[-1].closed  # 一次性 agent 已关闭
-    assert daemon._runners.count() == 0  # 没占用 session 名额
+    assert daemon._session_runtimes.count() == 0  # 没占用 session 名额
 
 
 # ---------------------------------------------------------------------- #
@@ -7275,11 +7452,11 @@ async def test_bg_job_completion_fans_out_to_bound_conversations():
     daemon._channels["web"] = web
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
-    runner = current_runner(daemon)
+    runtime = current_runtime(daemon)
     web_conversation = ConversationRef("web", "web-thread")
     daemon.bind_conversation("t1", web_conversation)
 
-    runner.enqueue(TurnRequest("web turn", web_conversation))
+    runtime.enqueue(TurnRequest("web turn", web_conversation))
     await wait_until(
         lambda: (
             created[0].prompts == ["task", "web turn"]
@@ -7381,24 +7558,20 @@ async def test_bg_completions_merge_into_single_batch_and_one_turn():
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
     agent = created[0]
-    sess = current_runner(daemon)
-    assert sess.turn_in_flight  # 首轮卡在 gate 上
+    sess = current_runtime(daemon)
+    assert sess.state == "running"  # 首轮卡在 gate 上
     j1 = daemon.job_store.create(task_id="t1", command=["a"], cwd="c")
     daemon.job_store.update(j1.job_id, exit_code=0, finished_at=time.time())
     await daemon._deliver_bg_result(daemon.job_store.get(j1.job_id), 0)
     j2 = daemon.job_store.create(task_id="t1", command=["b"], cwd="c")
     daemon.job_store.update(j2.job_id, exit_code=0, finished_at=time.time())
     await daemon._deliver_bg_result(daemon.job_store.get(j2.job_id), 0)
-    # 两个 job 合并进队尾同一批次，只入队一次
-    assert sess.pending_bg is not None and len(sess.pending_bg.blocks) == 2
-    assert sess.queue.qsize() == 1
     # 放行首轮 → worker 取走批次 → 一轮 prompt 同时含 j1 与 j2
     agent.gate.set()
     await wait_until(
         lambda: any("Job: j1" in p and "Job: j2" in p for p in agent.prompts)
     )
     assert sum(p.startswith("<bg_job_done>") for p in agent.prompts) == 1  # 只一轮
-    assert sess.pending_bg is None  # 消费后清空
     await daemon._shutdown()
 
 
@@ -7408,19 +7581,22 @@ async def test_normal_reply_between_bg_completions_prevents_merge():
     daemon, bridge, created = make_daemon(GatedAgent, store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await wait_until(lambda: created and created[0].prompts == ["task"])
-    sess = current_runner(daemon)
     j1 = daemon.job_store.create(task_id="t1", command=["a"], cwd="c")
     await daemon._deliver_bg_result(daemon.job_store.get(j1.job_id), 0)
-    batch1 = sess.pending_bg
-    assert batch1 is not None
     await daemon._handle_message(thread_msg("hi there"))  # 用户回复夹在中间
-    assert sess.pending_bg is None  # enqueue 清了合并邻接
     j2 = daemon.job_store.create(task_id="t1", command=["b"], cwd="c")
     await daemon._deliver_bg_result(daemon.job_store.get(j2.job_id), 0)
-    # j2 另起批次、不并入 batch1（保 FIFO：j2 晚于 "hi there"）
-    assert sess.pending_bg is not None and sess.pending_bg is not batch1
-    assert len(batch1.blocks) == 1 and len(sess.pending_bg.blocks) == 1
-    assert sess.queue.qsize() == 3  # [batch1, "hi there", batch2]
+    # j2 另起一轮、不并入 j1（保 FIFO：j2 晚于 "hi there"）。
+    sess_agent = created[0]
+    sess_agent.gate.set()
+    await wait_until(
+        lambda: (
+            len(sess_agent.prompts) >= 4
+            and "<bg_job_done>" in sess_agent.prompts[1]
+            and sess_agent.prompts[2] == "hi there"
+            and "<bg_job_done>" in sess_agent.prompts[3]
+        )
+    )
     await daemon._shutdown()
 
 
@@ -7430,16 +7606,13 @@ async def test_stop_drops_pending_bg_batch():
     daemon, bridge, created = make_daemon(CancelableAgent, store=store)
     await daemon._handle_message(root_msg("/run demo task"))
     await created[0].in_prompt.wait()  # 首轮在途
-    sess = current_runner(daemon)
     j1 = daemon.job_store.create(task_id="t1", command=["a"], cwd="c")
     daemon.job_store.update(j1.job_id, exit_code=0, finished_at=time.time())
     await daemon._deliver_bg_result(daemon.job_store.get(j1.job_id), 0)
-    assert sess.pending_bg is not None and sess.queue.qsize() == 1  # 批次已入队
     await daemon._handle_message(thread_msg("/stop"))
     await wait_until(lambda: daemon.store.get("t1").status == "stopped")
     # agent 只收到过首轮，从未收到被丢弃的 bg 批次
     assert created[0].prompts == ["task"]
-    assert sess.pending_bg is None
     await daemon._shutdown()
 
 
