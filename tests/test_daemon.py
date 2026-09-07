@@ -21,6 +21,7 @@ import pytest
 import feishu_dispatcher.daemon as daemon_module
 from feishu_dispatcher.acp_client import AgentOutputChunk, AgentToolCallUpdate
 from feishu_dispatcher.channel import ChannelMessage
+from feishu_dispatcher.channel.feishu import FeishuBridge, FeishuConversationRef
 from feishu_dispatcher.channel.feishu_card import build_card
 from feishu_dispatcher.channel.http import HttpChannel, HttpConversationRef
 from feishu_dispatcher.channel.presentation import (
@@ -2190,6 +2191,106 @@ async def test_run_dispatches_and_streams_output():
     assert len(created) == 1
     assert created[0].prompts == ["do stuff"]
     assert created[0].start_count == 1
+
+
+async def test_completion_notice_waits_for_finished_projection():
+    daemon, bridge, _ = make_daemon()
+    finish_started = asyncio.Event()
+    release_finish = threading.Event()
+    loop = asyncio.get_running_loop()
+    original = bridge.handle_session_event
+
+    def slow_finish(conversation, event, *, trace_sequence=None):
+        if isinstance(event.body, AgentOutputFinished):
+            loop.call_soon_threadsafe(finish_started.set)
+            if not release_finish.wait(5):
+                raise TimeoutError("test did not release output finish")
+        original(conversation, event, trace_sequence=trace_sequence)
+
+    bridge.handle_session_event = slow_finish
+    try:
+        await daemon._handle_message(root_msg("/run demo task"))
+        await asyncio.wait_for(finish_started.wait(), 3)
+        assert not any("本轮结束" in text for text in bridge.texts())
+        assert not any("🔔" in text for text in bridge.texts())
+    finally:
+        release_finish.set()
+        await wait_until(lambda: any("本轮结束" in text for text in bridge.texts()))
+        await daemon._shutdown()
+
+
+@pytest.mark.parametrize("stream_mode", ["text", "card"])
+async def test_feishu_two_turns_flush_before_completion_notice(
+    monkeypatch, stream_mode
+):
+    class CharacterAgent(FakeAgent):
+        async def prompt(self, text):
+            self.prompts.append(text)
+            self.last_message = text
+            for char in text:
+                await self._emit_message(char)
+            return "end_turn"
+
+    daemon, _, created = make_daemon(
+        agent_cls=CharacterAgent, control_conversation=None
+    )
+    bridge = FeishuBridge(
+        app_id="a",
+        app_secret="b",
+        main_loop=asyncio.get_running_loop(),
+        stream_mode=stream_mode,
+        throttle_window=60,
+        qps=0,
+    )
+    deliveries: list[tuple[str, str]] = []
+
+    def send_text(conversation, text):
+        deliveries.append(("text", text))
+        return "text-id"
+
+    def send_card(conversation_id, card):
+        deliveries.append(("card", json.dumps(card, ensure_ascii=False)))
+        return f"card-{len(deliveries)}"
+
+    monkeypatch.setattr(bridge, "send_text", send_text)
+    monkeypatch.setattr(bridge, "send_card", send_card)
+    monkeypatch.setattr(bridge, "update_card", send_card)
+    daemon._channels["feishu"] = bridge
+    conversation = FeishuConversationRef("om_root1")
+    task = daemon.store.create(
+        project_name="demo",
+        agent_label="copilot",
+        description="output ordering",
+        channel_key="feishu",
+        conversation_payload={"conversation_id": "om_root1"},
+        workspace=".",
+    )
+    runtime = daemon._launch(
+        task, ["fake"], TurnRequest("第一轮完整回复", conversation)
+    )
+    runtime.submit(TurnRequest("第二轮继续回复", conversation))
+    try:
+        await asyncio.wait_for(runtime.wait_idle(), 5)
+        notice_indexes = [
+            index for index, (_, text) in enumerate(deliveries) if "✅ 本轮结束" in text
+        ]
+        assert len(notice_indexes) == 2
+        start = 0
+        for answer, end in zip(created[0].prompts, notice_indexes, strict=True):
+            output = [
+                text
+                for kind, text in deliveries[start:end]
+                if kind == ("text" if stream_mode == "text" else "card")
+                and answer in text
+            ]
+            assert output, f"{answer!r} must be delivered before completion"
+            start = end + 1
+        assert not any(
+            kind == "text" and len(text) == 1 for kind, text in deliveries
+        ), "character deltas must not fall back to individual Feishu messages"
+        assert bridge._active_outputs == {}
+    finally:
+        await daemon._shutdown()
 
 
 async def test_daemon_streams_structured_output_display_text():

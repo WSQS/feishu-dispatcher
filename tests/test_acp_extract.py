@@ -14,6 +14,7 @@ from acp import (
     update_agent_thought_text,
     update_tool_call,
 )
+from acp.client.connection import ClientSideConnection
 from acp.connection import StreamDirection
 from acp.schema import ToolCallLocation
 
@@ -299,6 +300,99 @@ async def test_client_serialization_does_not_block_another_client():
 
     release_first.set()
     await blocked
+
+
+@pytest.mark.parametrize("stop_reason", ["end_turn", "cancelled"])
+async def test_prompt_waits_for_received_update_callbacks(stop_reason):
+    """response 可先被读取，但 prompt 必须等到此前收到的文字/usage 处理完毕。"""
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    response_read = asyncio.Event()
+    outputs: list[str] = []
+
+    async def collect(output):
+        if output.raw_text == "first":
+            first_started.set()
+            await release_first.wait()
+        outputs.append(output.raw_text)
+
+    class Transport:
+        def __init__(self):
+            self.incoming = asyncio.Queue()
+
+        async def send(self, message):
+            assert message["method"] == "session/prompt"
+            for update in (
+                update_agent_message_text("first"),
+                update_agent_message_text("second"),
+            ):
+                self.incoming.put_nowait(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/update",
+                        "params": {
+                            "sessionId": "s",
+                            "update": update.model_dump(
+                                by_alias=True, exclude_none=True
+                            ),
+                        },
+                    }
+                )
+            self.incoming.put_nowait(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "session/update",
+                    "params": {
+                        "sessionId": "s",
+                        "update": {
+                            "sessionUpdate": "usage_update",
+                            "used": 321,
+                            "size": 1000,
+                        },
+                    },
+                }
+            )
+            self.incoming.put_nowait(
+                {
+                    "jsonrpc": "2.0",
+                    "id": message["id"],
+                    "result": {"stopReason": stop_reason},
+                }
+            )
+
+        async def receive(self):
+            message = await self.incoming.get()
+            if message is not None and "result" in message:
+                response_read.set()
+            return message
+
+        async def close(self):
+            self.incoming.put_nowait(None)
+
+    impl = _ClientImpl(_Callbacks(on_output=collect))
+    conn = ClientSideConnection(impl, Transport())
+    agent = _agent()
+    agent._conn = conn
+    agent._client_impl = impl
+    agent._session_id = "s"
+    task = asyncio.create_task(agent.prompt("hello"))
+    try:
+        await asyncio.wait_for(response_read.wait(), 3)
+        await asyncio.wait_for(first_started.wait(), 3)
+        # 让已收到 response 的 prompt continuation 有机会继续执行。
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert outputs == []
+        release_first.set()
+        assert await asyncio.wait_for(task, 3) == stop_reason
+        assert outputs == ["first", "second"]
+        assert agent.last_message == "firstsecond"
+        assert agent.last_usage_tokens == 321
+    finally:
+        release_first.set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await conn.close()
 
 
 async def test_client_emits_structured_message_thought_and_activity_output():

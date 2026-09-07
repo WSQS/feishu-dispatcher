@@ -785,6 +785,15 @@ class _Daemon:
             conversations,
             record.sequence if record is not None else None,
         )
+        if (
+            isinstance(event.body, AgentOutputFinished)
+            and event.body.outcome == "completed"
+        ):
+            # Finished 投影会刷新并关闭 Channel 展示对象；独立文本通知不能越过它，
+            # 否则用户会先看到“本轮结束”，后收到仍滞留在节流器中的输出。
+            await self._wait_runtime_events(sess.session_id)
+            if self._session_runtimes.is_current(sess):
+                await self._notify_agent_turn_completed(sess, conversations)
 
     async def _emit_session_event(
         self, event: SessionEvent
@@ -2664,16 +2673,6 @@ class _Daemon:
                 last_output=last_output,
                 error_message="",
             )
-            await self._send_to_conversations(
-                self._turn_audiences.get((sess, request.turn_id), ()),
-                "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）",
-            )
-            if self._session_runtimes.is_current(sess) and not sess.has_pending_turns():
-                note = f"🔔 {sess.project_name} 完成第 {turns} 轮"
-                snippet = _one_line(last_output, 80)
-                if snippet:
-                    note += f"：{snippet}"
-                await self._notify_main(note + "，在其话题里查看/继续。")
             return AcpTurnResult(
                 outcome="completed",
                 keep_running=True,
@@ -2699,6 +2698,27 @@ class _Daemon:
                     f"❌ {sess.project_name} 本轮异常，已暂停（在其话题回复即尝试恢复）。"
                 )
             return AcpTurnResult(outcome="failed", keep_running=False)
+
+    async def _notify_agent_turn_completed(
+        self,
+        sess: AcpSessionRuntime,
+        conversations: tuple[ConversationRef, ...],
+    ) -> None:
+        """在本轮输出完成投影后发送话题回执和空闲通知。"""
+        await self._send_to_conversations(
+            conversations,
+            "✅ 本轮结束（可继续回复；发送 `/stop` 结束该 agent）",
+        )
+        if not self._session_runtimes.is_current(sess) or sess.has_pending_turns():
+            return
+        task = self.store.get(sess.session_id)
+        if task is None:
+            return
+        note = f"🔔 {sess.project_name} 完成第 {task.turns} 轮"
+        snippet = _one_line(task.last_output, 80)
+        if snippet:
+            note += f"：{snippet}"
+        await self._notify_main(note + "，在其话题里查看/继续。")
 
     async def _finish_agent_turn_projection(
         self,
