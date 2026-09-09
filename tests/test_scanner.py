@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from feishu_dispatcher._scanner import scan_children
+from feishu_dispatcher.agent._scanner import scan_children
 
 
 def test_lists_direct_children_root(tmp_path: Path):

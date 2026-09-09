@@ -20,7 +20,7 @@ import acp
 from acp import text_block
 from acp.transports import spawn_stdio_transport
 
-from feishu_dispatcher.acp_client import (
+from feishu_dispatcher.agent.acp_client import (
     _PROTOCOL_VERSION,
     AgentOutputChunk,
     _Callbacks,

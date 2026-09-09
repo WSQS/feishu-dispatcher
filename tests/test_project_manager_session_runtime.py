@@ -6,13 +6,13 @@ import json
 
 import pytest
 
-from feishu_dispatcher.scheduler import LLMResponse, SchedulerMemory, ToolCall
-from feishu_dispatcher.session import (
+from feishu_dispatcher.agent.scheduler import LLMResponse, SchedulerMemory, ToolCall
+from feishu_dispatcher.agent.session import (
     ProjectManagerSessionRuntime,
     TurnRequest,
     build_project_manager_tools,
 )
-from feishu_dispatcher.session_event import AgentOutputDelta
+from feishu_dispatcher.agent.session_event import AgentOutputDelta
 from tests.conversation_fakes import ConversationRefFactory as ConversationRef
 
 

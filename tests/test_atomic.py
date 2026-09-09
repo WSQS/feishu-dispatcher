@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from feishu_dispatcher._atomic import atomic_write
+from feishu_dispatcher.agent._atomic import atomic_write
 
 
 def test_atomic_write_writes_content_and_leaves_no_tmp(tmp_path: Path):
@@ -46,7 +46,7 @@ def test_atomic_write_fsyncs_data(tmp_path: Path, monkeypatch):
         calls.append(fd)
         return real_fsync(fd)
 
-    import feishu_dispatcher._atomic as atomic_mod
+    import feishu_dispatcher.agent._atomic as atomic_mod
 
     monkeypatch.setattr(atomic_mod.os, "fsync", spy)
     atomic_write(tmp_path / "f.txt", "x", keep_bak=False)

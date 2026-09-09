@@ -16,7 +16,7 @@ import os
 import sys
 from pathlib import Path
 
-from feishu_dispatcher.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
+from feishu_dispatcher.agent.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 CWD = str(Path(__file__).resolve().parent.parent)

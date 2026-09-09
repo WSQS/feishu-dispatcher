@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from feishu_dispatcher.scheduler import SchedulerMemory
-from feishu_dispatcher.session import (
+from feishu_dispatcher.agent.scheduler import SchedulerMemory
+from feishu_dispatcher.agent.session import (
     DispatcherSessionRuntime,
     SessionRuntimeRegistry,
 )

@@ -8,7 +8,7 @@ import {
   storedChannelInstanceId,
   storedConversationId,
   storedCursor,
-} from "../../feishu_dispatcher/webui/storage.ts";
+} from "../../feishu_dispatcher/agent/webui/storage.ts";
 
 function stubStorage(overrides: Partial<Storage> = {}): Storage {
   const storage = {

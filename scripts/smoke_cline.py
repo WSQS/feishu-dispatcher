@@ -16,7 +16,7 @@ import logging
 import sys
 from pathlib import Path
 
-from feishu_dispatcher.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
+from feishu_dispatcher.agent.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
 
 REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 

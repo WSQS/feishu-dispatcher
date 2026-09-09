@@ -7,7 +7,11 @@ from pathlib import Path
 
 import pytest
 
-from feishu_dispatcher.util.git import create_worktree, delete_branch, remove_worktree
+from feishu_dispatcher.agent.util.git import (
+    create_worktree,
+    delete_branch,
+    remove_worktree,
+)
 
 
 @pytest.mark.asyncio

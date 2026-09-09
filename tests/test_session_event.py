@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from feishu_dispatcher.session_event import (
+from feishu_dispatcher.agent.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
     AgentOutputMetadata,

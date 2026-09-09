@@ -4,7 +4,7 @@ import {
   ApiError,
   createApiClient,
   createApiRequest,
-} from "../../feishu_dispatcher/webui/api.ts";
+} from "../../feishu_dispatcher/agent/webui/api.ts";
 import type {
   AgentTaskSummary,
   ChannelEventPage,
@@ -18,7 +18,7 @@ import type {
   SessionConversationCreated,
   TaskSummary,
   TreeEntry,
-} from "../../feishu_dispatcher/webui/api.ts";
+} from "../../feishu_dispatcher/agent/webui/api.ts";
 
 afterEach(() => {
   vi.unstubAllGlobals();

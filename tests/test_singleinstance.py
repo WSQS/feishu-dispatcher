@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from feishu_dispatcher.singleinstance import SingleInstanceLock
+from feishu_dispatcher.agent.singleinstance import SingleInstanceLock
 
 
 def test_acquire_creates_lock_and_writes_pid(tmp_path: Path):

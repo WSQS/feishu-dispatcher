@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from feishu_dispatcher.scheduler import (
+from feishu_dispatcher.agent.scheduler import (
     SYSTEM_PROMPT,
     LLMResponse,
     SchedulerMemory,
@@ -357,7 +357,7 @@ async def test_resume_and_mark_done_validate_and_dispatch():
 async def test_tool_calls_are_logged_for_diagnostics(caplog):
     import logging
 
-    caplog.set_level(logging.INFO, logger="feishu_dispatcher.scheduler")
+    caplog.set_level(logging.INFO, logger="feishu_dispatcher.agent.scheduler")
     sent = []
 
     async def send(tid, m):
@@ -385,7 +385,7 @@ async def test_tool_calls_are_logged_for_diagnostics(caplog):
 async def test_finish_without_tool_call_is_logged(caplog):
     import logging
 
-    caplog.set_level(logging.INFO, logger="feishu_dispatcher.scheduler")
+    caplog.set_level(logging.INFO, logger="feishu_dispatcher.agent.scheduler")
     llm = FakeLLM([LLMResponse(content="好的，我已经发送了")])  # 只说不做
     await run_tool_loop(llm, "让 t3 跑测试", _tools())
     # 关键诊断信号：LLM 没调任何工具就收尾（「说了没做」）

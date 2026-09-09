@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from feishu_dispatcher.config import Config, HttpChannelConfig, Project
+from feishu_dispatcher.agent.config import Config, HttpChannelConfig, Project
 
 SAMPLE = """
 app_id = "cli_abc"

@@ -5,12 +5,12 @@ import {
   indexTasks,
   taskIsTerminal,
   taskName,
-} from "../../feishu_dispatcher/webui/tasks.ts";
+} from "../../feishu_dispatcher/agent/webui/tasks.ts";
 import type {
   AgentTaskSummary,
   DispatcherTaskSummary,
   TaskSummary,
-} from "../../feishu_dispatcher/webui/api.ts";
+} from "../../feishu_dispatcher/agent/webui/api.ts";
 
 const dispatcher: DispatcherTaskSummary = {
   task_id: DISPATCHER_TASK_ID,

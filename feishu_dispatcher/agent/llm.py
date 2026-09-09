@@ -5,7 +5,7 @@
 - :class:`ResponsesAPIClient` —— OpenAI Responses API（``/responses``），对接只走该接口的
   端点/模型（如公司网关上的 gpt-5.4；``[llm] api = "responses"``）。
 
-两者都实现 :class:`feishu_dispatcher.scheduler.LLMClient` 协议、返回统一的 ``LLMResponse``，
+两者都实现 :class:`feishu_dispatcher.agent.scheduler.LLMClient` 协议、返回统一的 ``LLMResponse``，
 故 ``scheduler.py`` 的工具循环/记忆不感知具体后端。配置见 config 的 ``[llm]`` 段。
 """
 

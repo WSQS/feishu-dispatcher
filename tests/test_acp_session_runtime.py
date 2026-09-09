@@ -9,20 +9,20 @@ from typing import cast
 
 import pytest
 
-from feishu_dispatcher.acp_client import (
+from feishu_dispatcher.agent.acp_client import (
     AcpAgent,
     AgentOutputChunk,
     AgentPlanEntryUpdate,
     AgentToolCallUpdate,
 )
-from feishu_dispatcher.session import (
+from feishu_dispatcher.agent.session import (
     AcpSessionRuntime,
     AcpSessionRuntimeHooks,
     AcpTurnResult,
     SessionRuntime,
     TurnRequest,
 )
-from feishu_dispatcher.session_event import (
+from feishu_dispatcher.agent.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
     AgentOutputMetadata,

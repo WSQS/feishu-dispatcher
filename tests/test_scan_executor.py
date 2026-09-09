@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from feishu_dispatcher._scan_executor import ScanExecutor
+from feishu_dispatcher.agent._scan_executor import ScanExecutor
 
 
 async def test_run_delegates_and_returns_result():

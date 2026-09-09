@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from feishu_dispatcher import __version__
-from feishu_dispatcher._paths import (
+from feishu_dispatcher.agent import __version__
+from feishu_dispatcher.agent._paths import (
     PathTraversalError,
     resolve_tree_path,
     resolve_under_root,

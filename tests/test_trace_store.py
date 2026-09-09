@@ -8,12 +8,12 @@ from datetime import datetime, timezone
 
 import pytest
 
-from feishu_dispatcher.session_event import (
+from feishu_dispatcher.agent.session_event import (
     AgentOutputDelta,
     SessionEvent,
     SessionInputAccepted,
 )
-from feishu_dispatcher.trace_store import (
+from feishu_dispatcher.agent.trace_store import (
     SessionTraceStore,
     SessionTraceStoreClosed,
 )

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from feishu_dispatcher._paths import (
+from feishu_dispatcher.agent._paths import (
     PathTraversalError,
     resolve_tree_path,
     resolve_under_root,

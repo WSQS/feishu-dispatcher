@@ -9,7 +9,7 @@
 - WebSocket 收消息用 ``websockets`` 库 + 官方 protobuf Frame（``pbbp2``）。
   绕开 ``lark.ws.Client``：它依赖 ``EventDispatcherHandler``，后者 eager import
   全部 57 个 API namespace，在 Windows + Defender 下会 access violation 崩溃
-  （详见 :mod:`feishu_dispatcher._lark_compat`）。事件 JSON 全部手写 dict 解析，
+  （详见 :mod:`feishu_dispatcher.agent._lark_compat`）。事件 JSON 全部手写 dict 解析，
   不依赖任何 lark API model；只 import ``ws.pb``（protobuf Frame）与 ``ws.const``。
   frame/ACK/ping 语义对照官方参考实现 ``lark_oapi/ws/client.py``。
 """
@@ -70,10 +70,10 @@ class FeishuConversationRef:
 
 # 延迟 import：event 模型属于 im.v1 namespace（单 ns，安全），但顶部 import
 # 会触发 lark_oapi/__init__；shim 必须先装好。调用方 import 顺序：
-#   import feishu_dispatcher._lark_compat  # noqa: F401
-#   from feishu_dispatcher.channel.feishu import ...
+#   import feishu_dispatcher.agent._lark_compat  # noqa: F401
+#   from feishu_dispatcher.agent.channel.feishu import ...
 
-logger = logging.getLogger("feishu_dispatcher.feishu")
+logger = logging.getLogger("feishu_dispatcher.agent.feishu")
 
 _FEISHU_DOMAIN = "https://open.feishu.cn"
 _ENDPOINT_URI = "/callback/ws/endpoint"

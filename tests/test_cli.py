@@ -9,11 +9,11 @@ from pathlib import Path
 
 from acp.exceptions import RequestError
 
-import feishu_dispatcher.cli as cli_module
-import feishu_dispatcher.config as config_module
-import feishu_dispatcher.daemon as daemon_module
-import feishu_dispatcher.singleinstance as singleinstance_module
-from feishu_dispatcher.cli import _AcpMethodNotFoundFilter, _setup_logging
+import feishu_dispatcher.agent.cli as cli_module
+import feishu_dispatcher.agent.config as config_module
+import feishu_dispatcher.agent.daemon as daemon_module
+import feishu_dispatcher.agent.singleinstance as singleinstance_module
+from feishu_dispatcher.agent.cli import _AcpMethodNotFoundFilter, _setup_logging
 
 
 def _with_restored_root(fn):
@@ -35,7 +35,7 @@ def _with_restored_root(fn):
 def test_setup_logging_writes_to_daemon_log(tmp_path: Path):
     def body():
         _setup_logging(verbose=False, log_dir=tmp_path)
-        logging.getLogger("feishu_dispatcher.diag").info("hello-diag-123")
+        logging.getLogger("feishu_dispatcher.agent.diag").info("hello-diag-123")
         for h in logging.getLogger().handlers:
             h.flush()
         log = tmp_path / "daemon.log"
@@ -105,7 +105,7 @@ def test_reexec_sets_reboot_handoff_and_preserves_arguments(monkeypatch):
     assert exec_calls == [
         (
             "python-test",
-            ["python-test", "-m", "feishu_dispatcher.cli", "start", "--discover"],
+            ["python-test", "-m", "feishu_dispatcher.agent.cli", "start", "--discover"],
         )
     ]
 

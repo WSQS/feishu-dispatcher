@@ -9,7 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from feishu_dispatcher import forge
+from feishu_dispatcher.agent import forge
 
 
 def _proj(repo="", path="/tmp/x"):

@@ -18,7 +18,7 @@ from acp.client.connection import ClientSideConnection
 from acp.connection import StreamDirection
 from acp.schema import ToolCallLocation
 
-from feishu_dispatcher.acp_client import (
+from feishu_dispatcher.agent.acp_client import (
     AcpAgent,
     AgentOutputChunk,
     AgentSpawn,
@@ -59,14 +59,14 @@ def fmt(update) -> str:
 
 
 def test_resolve_executable_non_windows_returns_command(monkeypatch):
-    import feishu_dispatcher.acp_client as mod
+    import feishu_dispatcher.agent.acp_client as mod
 
     monkeypatch.setattr(mod.sys, "platform", "linux")
     assert resolve_executable("copilot") == "copilot"
 
 
 def test_resolve_executable_windows_prefers_cmd(monkeypatch):
-    import feishu_dispatcher.acp_client as mod
+    import feishu_dispatcher.agent.acp_client as mod
 
     monkeypatch.setattr(mod.sys, "platform", "win32")
     monkeypatch.setattr(
@@ -78,7 +78,7 @@ def test_resolve_executable_windows_prefers_cmd(monkeypatch):
 
 
 def test_resolve_executable_windows_path_adds_existing_cmd(monkeypatch):
-    import feishu_dispatcher.acp_client as mod
+    import feishu_dispatcher.agent.acp_client as mod
 
     monkeypatch.setattr(mod.sys, "platform", "win32")
     monkeypatch.setattr(mod.os.path, "exists", lambda path: path.endswith(".cmd"))
@@ -86,7 +86,7 @@ def test_resolve_executable_windows_path_adds_existing_cmd(monkeypatch):
 
 
 def test_resolve_executable_windows_returns_original_when_unresolved(monkeypatch):
-    import feishu_dispatcher.acp_client as mod
+    import feishu_dispatcher.agent.acp_client as mod
 
     monkeypatch.setattr(mod.sys, "platform", "win32")
     monkeypatch.setattr(shutil, "which", lambda _name: None)
@@ -883,7 +883,7 @@ async def test_await_start_raises_timeout_on_hang():
 
 async def test_start_raises_timeout_when_load_session_hangs(monkeypatch):
     # 复刻真机：initialize 成功但 load_session 永不返回 → start() 抛 TimeoutError 而非挂起
-    import feishu_dispatcher.acp_client as mod
+    import feishu_dispatcher.agent.acp_client as mod
 
     class _FakeTransport:
         async def __aenter__(self):

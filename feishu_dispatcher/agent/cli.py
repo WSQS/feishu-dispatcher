@@ -89,9 +89,9 @@ def main() -> None:
         import asyncio
         import os
 
-        from feishu_dispatcher.config import DEFAULT_CONFIG_PATH, Config
-        from feishu_dispatcher.daemon import run
-        from feishu_dispatcher.singleinstance import SingleInstanceLock
+        from feishu_dispatcher.agent.config import DEFAULT_CONFIG_PATH, Config
+        from feishu_dispatcher.agent.daemon import run
+        from feishu_dispatcher.agent.singleinstance import SingleInstanceLock
 
         cfg_path = args.config or DEFAULT_CONFIG_PATH
         # 日志文件与会话/任务台账同放 config 目录
@@ -133,7 +133,7 @@ def _reexec() -> None:
     """/reboot：清理已在 run() 的 finally 里跑完，这里用同一 venv python + 同参数
     re-exec 一个全新进程替换自己（PID 不变，无需外部看护）。
 
-    经 ``python -m feishu_dispatcher.cli <原参数>`` 起，绕过 uv 包装但继承其 env
+    经 ``python -m feishu_dispatcher.agent.cli <原参数>`` 起，绕过 uv 包装但继承其 env
     （VIRTUAL_ENV/PATH 都在），等价于原来的 `uv run feishu-dispatcher start ...`。
     """
     import os
@@ -141,12 +141,13 @@ def _reexec() -> None:
 
     os.environ[_REBOOTED_ENV] = "1"  # 新进程据此发「已重启」回执
     logger.info(
-        "re-exec 重启 daemon：%s -m feishu_dispatcher.cli %s",
+        "re-exec 重启 daemon：%s -m feishu_dispatcher.agent.cli %s",
         sys.executable,
         sys.argv[1:],
     )
     os.execv(
-        sys.executable, [sys.executable, "-m", "feishu_dispatcher.cli", *sys.argv[1:]]
+        sys.executable,
+        [sys.executable, "-m", "feishu_dispatcher.agent.cli", *sys.argv[1:]],
     )
 
 

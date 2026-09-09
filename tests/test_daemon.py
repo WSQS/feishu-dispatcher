@@ -18,37 +18,39 @@ from pathlib import Path
 
 import pytest
 
-import feishu_dispatcher.daemon as daemon_module
-from feishu_dispatcher.acp_client import AgentOutputChunk, AgentToolCallUpdate
-from feishu_dispatcher.channel import ChannelMessage
-from feishu_dispatcher.channel.feishu import FeishuBridge, FeishuConversationRef
-from feishu_dispatcher.channel.feishu_card import build_card
-from feishu_dispatcher.channel.http import HttpChannel, HttpConversationRef
-from feishu_dispatcher.channel.presentation import (
+import feishu_dispatcher.agent.daemon as daemon_module
+from feishu_dispatcher.agent.acp_client import AgentOutputChunk, AgentToolCallUpdate
+from feishu_dispatcher.agent.channel import ChannelMessage
+from feishu_dispatcher.agent.channel.feishu import FeishuBridge, FeishuConversationRef
+from feishu_dispatcher.agent.channel.feishu_card import build_card
+from feishu_dispatcher.agent.channel.http import HttpChannel, HttpConversationRef
+from feishu_dispatcher.agent.channel.presentation import (
     format_agent_output_footer,
     format_agent_output_title,
     format_usage_tokens,
 )
-from feishu_dispatcher.config import (
+from feishu_dispatcher.agent.config import (
     Config,
     HttpChannelConfig,
     LLMSettings,
     Project,
 )
-from feishu_dispatcher.conversation import ConversationRef as ConversationRefProtocol
-from feishu_dispatcher.daemon import (
+from feishu_dispatcher.agent.conversation import (
+    ConversationRef as ConversationRefProtocol,
+)
+from feishu_dispatcher.agent.daemon import (
     _DISPATCHER_SESSION_ID,
     DaemonRunResult,
     TurnRequest,
     _create_session_worktree,
     _Daemon,
 )
-from feishu_dispatcher.scheduler import LLMResponse, ToolCall
-from feishu_dispatcher.session import (
+from feishu_dispatcher.agent.scheduler import LLMResponse, ToolCall
+from feishu_dispatcher.agent.session import (
     AcpSessionRuntime,
     SessionRuntimeRegistry,
 )
-from feishu_dispatcher.session_event import (
+from feishu_dispatcher.agent.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
     AgentOutputMetadata,
@@ -61,12 +63,12 @@ from feishu_dispatcher.session_event import (
     ToolCallObserved,
     session_event_to_dict,
 )
-from feishu_dispatcher.store import (
+from feishu_dispatcher.agent.store import (
     ManagerConversationStore,
     ProjectStore,
     SessionStore,
 )
-from feishu_dispatcher.trace_store import SessionTraceStore
+from feishu_dispatcher.agent.trace_store import SessionTraceStore
 from tests.conversation_fakes import ConversationRefFactory as ConversationRef
 
 
@@ -3813,7 +3815,7 @@ async def test_shutdown_survives_hung_control_stop():
     """
     import threading
 
-    import feishu_dispatcher.daemon as daemon_mod
+    import feishu_dispatcher.agent.daemon as daemon_mod
 
     daemon, bridge, created = make_daemon()
     unblock = threading.Event()
@@ -6502,7 +6504,7 @@ async def test_load_session_replay_does_not_log_actions():
     # 这里直接验证：suppress=True 时 session_update 不触发 on_action。
     from acp import start_tool_call
 
-    from feishu_dispatcher.acp_client import _Callbacks, _ClientImpl
+    from feishu_dispatcher.agent.acp_client import _Callbacks, _ClientImpl
 
     logged: list[dict] = []
 
@@ -6527,7 +6529,7 @@ async def test_load_session_replay_does_not_log_actions():
 
 
 def test_short_sid_truncates():
-    from feishu_dispatcher.daemon import _short_sid
+    from feishu_dispatcher.agent.daemon import _short_sid
 
     assert _short_sid("abc") == "abc"
     assert _short_sid("a" * 20) == "a" * 16 + "…"
@@ -6537,7 +6539,7 @@ def test_short_sid_truncates():
 def test_attach_probe_error_distinguishes_causes():
     from acp.exceptions import RequestError
 
-    from feishu_dispatcher.daemon import _attach_probe_error
+    from feishu_dispatcher.agent.daemon import _attach_probe_error
 
     unsupported = _attach_probe_error(RequestError.method_not_found("load_session"))
     assert "不支持 load_session" in unsupported
@@ -7118,7 +7120,7 @@ async def test_sched_get_forge_unknown_project():
 
 
 async def test_sched_get_forge_no_binding(monkeypatch):
-    from feishu_dispatcher import forge
+    from feishu_dispatcher.agent import forge
 
     async def no_ref(project):
         return None
@@ -7130,7 +7132,7 @@ async def test_sched_get_forge_no_binding(monkeypatch):
 
 
 async def test_sched_get_forge_happy(monkeypatch):
-    from feishu_dispatcher import forge
+    from feishu_dispatcher.agent import forge
 
     async def fake_ref(project):
         return forge.ForgeRef("github", "o/r", "github.com", "u")
@@ -7146,7 +7148,7 @@ async def test_sched_get_forge_happy(monkeypatch):
 
 
 async def test_sched_get_forge_error_is_readable(monkeypatch):
-    from feishu_dispatcher import forge
+    from feishu_dispatcher.agent import forge
 
     async def fake_ref(project):
         return forge.ForgeRef("github", "o/r", "github.com", "u")
@@ -7162,7 +7164,7 @@ async def test_sched_get_forge_error_is_readable(monkeypatch):
 
 
 async def test_sched_list_forge_single_project(monkeypatch):
-    from feishu_dispatcher import forge
+    from feishu_dispatcher.agent import forge
 
     async def fake_ref(project):
         return forge.ForgeRef("github", "o/r", "github.com", "u")
@@ -7180,7 +7182,7 @@ async def test_sched_list_forge_single_project(monkeypatch):
 
 
 async def test_sched_list_forge_fans_out_and_reports_skipped(monkeypatch):
-    from feishu_dispatcher import forge
+    from feishu_dispatcher.agent import forge
 
     # demo 有绑定；extra 无绑定（resolve 返回 None）
     daemon, _, _ = make_daemon()
@@ -7207,7 +7209,7 @@ async def test_sched_list_forge_fans_out_and_reports_skipped(monkeypatch):
 
 
 async def test_sched_list_forge_all_skipped_is_explicit(monkeypatch):
-    from feishu_dispatcher import forge
+    from feishu_dispatcher.agent import forge
 
     async def no_ref(project):
         return None
@@ -7282,7 +7284,7 @@ async def test_sched_spawn_routes_thread_and_output_to_source_channel():
 
 
 async def test_sched_spawn_with_issue_uses_body_as_brief(monkeypatch):
-    from feishu_dispatcher import forge
+    from feishu_dispatcher.agent import forge
 
     async def fake_ref(project):
         return forge.ForgeRef("github", "o/r", "github.com", "u")
@@ -7317,7 +7319,7 @@ async def test_sched_spawn_with_issue_uses_body_as_brief(monkeypatch):
 
 
 async def test_sched_spawn_with_issue_no_binding_degrades(monkeypatch):
-    from feishu_dispatcher import forge
+    from feishu_dispatcher.agent import forge
 
     async def no_ref(project):
         return None
@@ -7440,7 +7442,7 @@ async def test_llm_command_lists_profiles_marks_active():
 
 
 async def test_llm_command_switches_and_rebuilds_client():
-    from feishu_dispatcher.llm import ResponsesAPIClient
+    from feishu_dispatcher.agent.llm import ResponsesAPIClient
 
     daemon, bridge = _daemon_with_llm_profiles()
     await daemon._handle_message(root_msg("/llm gpt5", mid="om_l2"))

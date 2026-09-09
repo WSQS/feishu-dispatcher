@@ -7,20 +7,20 @@ import json
 import urllib.error
 import urllib.request
 
-from feishu_dispatcher import __version__
-from feishu_dispatcher._scan_executor import ScanExecutor
-from feishu_dispatcher.channel import ChannelMessage
-from feishu_dispatcher.channel.http import HttpChannel
-from feishu_dispatcher.config import Project
-from feishu_dispatcher.workspace_api import (
+from feishu_dispatcher.agent import __version__
+from feishu_dispatcher.agent._scan_executor import ScanExecutor
+from feishu_dispatcher.agent.channel import ChannelMessage
+from feishu_dispatcher.agent.channel.http import HttpChannel
+from feishu_dispatcher.agent.config import Project
+from feishu_dispatcher.agent.workspace_api import (
     _MAX_FILE_BYTES,
     health,
     list_projects,
 )
-from feishu_dispatcher.workspace_api import (
+from feishu_dispatcher.agent.workspace_api import (
     file as workspace_file,
 )
-from feishu_dispatcher.workspace_api import (
+from feishu_dispatcher.agent.workspace_api import (
     tree_children as workspace_tree_children,
 )
 
@@ -171,7 +171,7 @@ def test_route_returns_503_when_main_loop_is_unavailable():
 
 async def test_list_projects_returns_items():
     # ctx 注入假的 all_projects：返回一个 project dict
-    from feishu_dispatcher.config import Project
+    from feishu_dispatcher.agent.config import Project
 
     fake = {
         "demo": Project(name="demo", path="/tmp/demo"),
