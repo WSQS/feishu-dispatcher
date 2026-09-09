@@ -5,9 +5,9 @@
     "noEmit": true
   },
   "include": [
-    "feishu_dispatcher/webui/api.ts",
-    "feishu_dispatcher/webui/storage.ts",
-    "feishu_dispatcher/webui/tasks.ts",
+    "feishu_dispatcher/agent/webui/api.ts",
+    "feishu_dispatcher/agent/webui/storage.ts",
+    "feishu_dispatcher/agent/webui/tasks.ts",
     "tests/webui/**/*.test.ts",
     "vitest.config.mts"
   ]

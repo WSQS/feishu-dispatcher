@@ -9,9 +9,9 @@ from datetime import datetime, timezone
 
 import pytest
 
-from feishu_dispatcher.channel import ChannelMessage
-from feishu_dispatcher.channel.feishu import FeishuBridge, _RateLimiter
-from feishu_dispatcher.session_event import (
+from feishu_dispatcher.agent.channel import ChannelMessage
+from feishu_dispatcher.agent.channel.feishu import FeishuBridge, _RateLimiter
+from feishu_dispatcher.agent.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
     AgentOutputMetadata,
@@ -95,7 +95,7 @@ def test_parse_message_where_root_id_equals_message_id_is_root():
 def test_parse_non_text_message_returns_none_and_logs(caplog):
     import logging
 
-    with caplog.at_level(logging.INFO, logger="feishu_dispatcher.feishu"):
+    with caplog.at_level(logging.INFO, logger="feishu_dispatcher.agent.feishu"):
         msg = FeishuBridge._parse_event_message(
             _event(
                 message_id="om_img",
@@ -113,7 +113,7 @@ def test_parse_non_text_message_returns_none_and_logs(caplog):
 def test_parse_p2p_message_returns_none_and_logs(caplog):
     import logging
 
-    with caplog.at_level(logging.INFO, logger="feishu_dispatcher.feishu"):
+    with caplog.at_level(logging.INFO, logger="feishu_dispatcher.agent.feishu"):
         msg = FeishuBridge._parse_event_message(
             _event(
                 message_id="om_p2p",

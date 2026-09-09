@@ -13,7 +13,7 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from feishu_dispatcher.acp_client import (
+from feishu_dispatcher.agent.acp_client import (
     _proc_tree_pids,
     _win_reap_pids,
     _win_snapshot_ppids,

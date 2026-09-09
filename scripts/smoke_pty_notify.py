@@ -19,8 +19,8 @@ import logging
 import sys
 import time
 
-from feishu_dispatcher import acp_client
-from feishu_dispatcher.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
+from feishu_dispatcher.agent import acp_client
+from feishu_dispatcher.agent.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
 
 WORKDIR = r"C:\Users\wsqsy\AppData\Local\Temp\pty-smoke"
 EXIT_MARKER = "DONE_MARKER_XYZ"

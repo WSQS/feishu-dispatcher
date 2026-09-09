@@ -2,7 +2,7 @@
 
 import asyncio
 
-from feishu_dispatcher.channel.feishu_livecard import LiveCard
+from feishu_dispatcher.agent.channel.feishu_livecard import LiveCard
 
 
 class FakeBridge:

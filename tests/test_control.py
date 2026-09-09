@@ -15,7 +15,7 @@ import sys
 import urllib.error
 import urllib.request
 
-from feishu_dispatcher.control import ControlServer
+from feishu_dispatcher.agent.control import ControlServer
 
 
 def _post(url: str, payload: dict, token: str | None) -> tuple[int, dict]:
@@ -124,7 +124,7 @@ async def test_fdx_cli_bg_run_end_to_end():
             [
                 sys.executable,
                 "-m",
-                "feishu_dispatcher.agent_cli",
+                "feishu_dispatcher.agent.agent_cli",
                 "bg",
                 "run",
                 "--",
@@ -170,7 +170,7 @@ async def test_fdx_cli_bg_logs_end_to_end():
             [
                 sys.executable,
                 "-m",
-                "feishu_dispatcher.agent_cli",
+                "feishu_dispatcher.agent.agent_cli",
                 "bg",
                 "logs",
                 "j3",
@@ -215,7 +215,7 @@ async def test_fdx_cli_delegation_report_end_to_end():
             [
                 sys.executable,
                 "-m",
-                "feishu_dispatcher.agent_cli",
+                "feishu_dispatcher.agent.agent_cli",
                 "delegation",
                 "report",
                 "--id",

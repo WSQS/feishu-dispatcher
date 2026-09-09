@@ -1,6 +1,6 @@
 import asyncio
 
-from feishu_dispatcher.throttler import StreamThrottler
+from feishu_dispatcher.agent.throttler import StreamThrottler
 
 
 class Recorder:

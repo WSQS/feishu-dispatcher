@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from feishu_dispatcher import store as store_module
-from feishu_dispatcher.config import Project
-from feishu_dispatcher.store import (
+from feishu_dispatcher.agent import store as store_module
+from feishu_dispatcher.agent.config import Project
+from feishu_dispatcher.agent.store import (
     _MAX_ACTIONS,
     DelegationStore,
     JobStore,
@@ -339,7 +339,7 @@ def test_flush_fsyncs_data(tmp_path: Path, monkeypatch):
     """落盘时对临时文件 fsync（把数据真正刷到盘，防掉电后原子改名指向未写入的块）。"""
     import os
 
-    import feishu_dispatcher._atomic as atomic_mod
+    import feishu_dispatcher.agent._atomic as atomic_mod
 
     calls = []
     real_fsync = os.fsync

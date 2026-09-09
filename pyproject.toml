@@ -21,15 +21,15 @@ dev = [
 ]
 
 [project.scripts]
-feishu-dispatcher = "feishu_dispatcher.cli:main"
-fdx = "feishu_dispatcher.agent_cli:main"
+feishu-dispatcher = "feishu_dispatcher.agent.cli:main"
+fdx = "feishu_dispatcher.agent.agent_cli:main"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build]
-artifacts = ["feishu_dispatcher/webui/*.js"]
+artifacts = ["feishu_dispatcher/agent/webui/*.js"]
 
 [tool.hatch.build.hooks.custom]
 path = "hatch_build.py"
@@ -42,7 +42,7 @@ extend-select = ["I", "UP035"]
 
 [tool.pyright]
 include = ["feishu_dispatcher"]
-exclude = ["build", "scripts", "tests", "feishu_dispatcher/webui"]
+exclude = ["build", "scripts", "tests", "feishu_dispatcher/agent/webui"]
 pythonVersion = "3.11"
 typeCheckingMode = "basic"
 reportPrivateUsage = "error"

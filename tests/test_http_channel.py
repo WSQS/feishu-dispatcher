@@ -15,10 +15,10 @@ from pathlib import Path
 
 import pytest
 
-from feishu_dispatcher import __version__
-from feishu_dispatcher.channel import ChannelMessage
-from feishu_dispatcher.channel.http import HttpChannel, HttpRequest, ensure_token
-from feishu_dispatcher.session_event import (
+from feishu_dispatcher.agent import __version__
+from feishu_dispatcher.agent.channel import ChannelMessage
+from feishu_dispatcher.agent.channel.http import HttpChannel, HttpRequest, ensure_token
+from feishu_dispatcher.agent.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
     AgentOutputMetadata,
@@ -49,13 +49,17 @@ def _raw_request(url: str) -> tuple[int, dict[str, str], bytes]:
 
 def _webui_javascript() -> str:
     return (
-        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "app.js"
+        Path(__file__).parents[1] / "feishu_dispatcher" / "agent" / "webui" / "app.js"
     ).read_text(encoding="utf-8")
 
 
 def _webui_storage_javascript() -> str:
     return (
-        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "storage.js"
+        Path(__file__).parents[1]
+        / "feishu_dispatcher"
+        / "agent"
+        / "webui"
+        / "storage.js"
     ).read_text(encoding="utf-8")
 
 
@@ -124,7 +128,11 @@ async def _wait_for_events(
 
 def test_webui_task_description_truncates_only_on_desktop():
     stylesheet = (
-        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "style.css"
+        Path(__file__).parents[1]
+        / "feishu_dispatcher"
+        / "agent"
+        / "webui"
+        / "style.css"
     ).read_text(encoding="utf-8")
     description = re.search(r"\.task-description\s*\{(?P<rules>[^}]*)\}", stylesheet)
     assert description
@@ -332,10 +340,10 @@ def test_webui_loads_and_paginates_persisted_task_history():
 
 def test_webui_api_logic_isolated_from_app_source():
     app_source = (
-        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "app.ts"
+        Path(__file__).parents[1] / "feishu_dispatcher" / "agent" / "webui" / "app.ts"
     ).read_text(encoding="utf-8")
     api_source = (
-        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "api.ts"
+        Path(__file__).parents[1] / "feishu_dispatcher" / "agent" / "webui" / "api.ts"
     ).read_text(encoding="utf-8")
 
     assert "fetch(" not in app_source
@@ -353,10 +361,14 @@ def test_webui_api_logic_isolated_from_app_source():
 
 def test_webui_storage_logic_isolated_from_app_source():
     app_source = (
-        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "app.ts"
+        Path(__file__).parents[1] / "feishu_dispatcher" / "agent" / "webui" / "app.ts"
     ).read_text(encoding="utf-8")
     storage_source = (
-        Path(__file__).parents[1] / "feishu_dispatcher" / "webui" / "storage.ts"
+        Path(__file__).parents[1]
+        / "feishu_dispatcher"
+        / "agent"
+        / "webui"
+        / "storage.ts"
     ).read_text(encoding="utf-8")
 
     assert "localStorage." not in app_source
@@ -1410,7 +1422,7 @@ async def test_start_failure_releases_listener(monkeypatch):
 
     with monkeypatch.context() as patch:
         patch.setattr(
-            "feishu_dispatcher.channel.http.threading.Thread.start", fail_start
+            "feishu_dispatcher.agent.channel.http.threading.Thread.start", fail_start
         )
         with pytest.raises(RuntimeError, match="thread start boom"):
             channel.start(ignore)

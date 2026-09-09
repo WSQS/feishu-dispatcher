@@ -19,3 +19,11 @@ Conversation 的交互边界。Channel 消费 Session Event，并自行管理输
 ## ACP Session Runtime
 
 通过 Agent Client Protocol 驱动持久 Worker Session 的运行实例。它同时拥有 Turn 队列、取消/终止语义、当前 Turn 归属和 ACP 资源生命周期；daemon 只通过提交、取消、终止等行为接口协作，不读取这些机械状态。
+
+## Agent Zone
+
+当前仓库中承载全部实现的实验 ownership 区域。代码位于 `feishu_dispatcher/agent/`；迁移到这里表示实现尚未被提升为稳定契约，不表示功能行为本身发生变化。
+
+## Promotion
+
+将 Agent Zone 中经过验证的行为、接口或数据形状提升为需要长期兼容和维护的契约。Promotion 是独立的治理决定，不等同于文件移动、目录重命名或分支合并。

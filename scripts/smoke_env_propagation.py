@@ -14,7 +14,7 @@ import asyncio
 import logging
 import sys
 
-from feishu_dispatcher.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
+from feishu_dispatcher.agent.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
 
 WORKDIR = (
     r"C:\Users\wsqsy\AppData\Local\Temp\pty-smoke"  # 有现成 opencode.json（flash 模型）

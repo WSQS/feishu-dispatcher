@@ -8,9 +8,9 @@
     "skipLibCheck": true
   },
   "include": [
-    "feishu_dispatcher/webui/app.ts",
-    "feishu_dispatcher/webui/api.ts",
-    "feishu_dispatcher/webui/storage.ts",
-    "feishu_dispatcher/webui/tasks.ts"
+    "feishu_dispatcher/agent/webui/app.ts",
+    "feishu_dispatcher/agent/webui/api.ts",
+    "feishu_dispatcher/agent/webui/storage.ts",
+    "feishu_dispatcher/agent/webui/tasks.ts"
   ]
 }

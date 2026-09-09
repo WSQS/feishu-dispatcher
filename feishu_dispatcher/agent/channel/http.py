@@ -49,7 +49,7 @@ class HttpConversationRef:
         return f"http:{self.conversation_id}"
 
 
-logger = logging.getLogger("feishu_dispatcher.http_channel")
+logger = logging.getLogger("feishu_dispatcher.agent.http_channel")
 
 _MAX_BODY = 1_000_000
 _DEFAULT_MAX_CONVERSATIONS = 128
@@ -119,7 +119,7 @@ class HttpRequest:
 
 
 def _load_webui_assets() -> dict[str, _WebAsset]:
-    root = files("feishu_dispatcher").joinpath("webui")
+    root = files("feishu_dispatcher.agent").joinpath("webui")
     index = _WebAsset(
         root.joinpath("index.html").read_bytes(), "text/html; charset=utf-8"
     )

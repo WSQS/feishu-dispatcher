@@ -11,9 +11,9 @@ from __future__ import annotations
 import asyncio
 import sys
 
-from feishu_dispatcher.config import Config
-from feishu_dispatcher.llm import build_llm_client
-from feishu_dispatcher.scheduler import build_scheduler_tools, run_tool_loop
+from feishu_dispatcher.agent.config import Config
+from feishu_dispatcher.agent.llm import build_llm_client
+from feishu_dispatcher.agent.scheduler import build_scheduler_tools, run_tool_loop
 
 PROJECTS = [
     {"name": "feishu-dispatcher", "default_agent": "copilot"},

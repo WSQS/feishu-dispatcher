@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from feishu_dispatcher.scheduler import LLMResponse, SchedulerMemory
-from feishu_dispatcher.session import ToolLoopSessionRuntime, TurnRequest
-from feishu_dispatcher.session_event import (
+from feishu_dispatcher.agent.scheduler import LLMResponse, SchedulerMemory
+from feishu_dispatcher.agent.session import ToolLoopSessionRuntime, TurnRequest
+from feishu_dispatcher.agent.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
 )

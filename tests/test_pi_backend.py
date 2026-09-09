@@ -16,12 +16,12 @@ from acp.schema import (
     SessionConfigSelectOption,
 )
 
-from feishu_dispatcher.acp_client import (
+from feishu_dispatcher.agent.acp_client import (
     AgentSpawn,
     _extract_model,
     _extract_model_options,
 )
-from feishu_dispatcher.pi_backend import (
+from feishu_dispatcher.agent.pi_backend import (
     APPROVAL_ENV,
     DEFAULT_APPROVAL,
     PI_BIN_ENV,
