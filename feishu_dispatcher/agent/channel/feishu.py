@@ -40,7 +40,9 @@ from lark_oapi.ws.pb import pbbp2_pb2
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from ..conversation import ConversationRef
+from feishu_dispatcher.channel import ChannelMessage, MessageHandler, OutputStatus
+from feishu_dispatcher.conversation import ConversationRef
+
 from ..session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
@@ -51,7 +53,6 @@ from ..session_event import (
     SessionInputAccepted,
     ToolCallObserved,
 )
-from . import ChannelMessage, MessageHandler, OutputStatus
 from .presentation import format_agent_output_footer, format_agent_output_title
 
 

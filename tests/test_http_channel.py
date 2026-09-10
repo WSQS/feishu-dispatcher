@@ -16,7 +16,6 @@ from pathlib import Path
 import pytest
 
 from feishu_dispatcher.agent import __version__
-from feishu_dispatcher.agent.channel import ChannelMessage
 from feishu_dispatcher.agent.channel.http import HttpChannel, HttpRequest, ensure_token
 from feishu_dispatcher.agent.session_event import (
     AgentOutputDelta,
@@ -30,6 +29,7 @@ from feishu_dispatcher.agent.session_event import (
     ToolCallObserved,
     session_event_to_dict,
 )
+from feishu_dispatcher.channel import ChannelMessage
 from tests.conversation_fakes import (
     ChannelConversationRefFactory as ConversationRef,
 )

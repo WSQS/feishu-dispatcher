@@ -9,7 +9,6 @@ import urllib.request
 
 from feishu_dispatcher.agent import __version__
 from feishu_dispatcher.agent._scan_executor import ScanExecutor
-from feishu_dispatcher.agent.channel import ChannelMessage
 from feishu_dispatcher.agent.channel.http import HttpChannel
 from feishu_dispatcher.agent.config import Project
 from feishu_dispatcher.agent.workspace_api import (
@@ -23,6 +22,7 @@ from feishu_dispatcher.agent.workspace_api import (
 from feishu_dispatcher.agent.workspace_api import (
     tree_children as workspace_tree_children,
 )
+from feishu_dispatcher.channel import ChannelMessage
 
 
 def _get(url: str, token: str | None) -> tuple[int, dict]:

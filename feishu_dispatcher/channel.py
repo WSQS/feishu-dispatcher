@@ -1,0 +1,60 @@
+"""交互通道的最小协议。"""
+
+from __future__ import annotations
+
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from typing import Literal, Protocol
+
+from .agent.session_event import SessionEvent
+from .conversation import ConversationRef
+
+
+@dataclass(frozen=True)
+class ChannelMessage:
+    """通道收到的、已规整的消息。"""
+
+    conversation: ConversationRef
+    message_id: str
+    text: str
+    sender_id: str
+
+
+MessageHandler = Callable[[ChannelMessage], Awaitable[None]]
+OutputStatus = Literal["running", "done", "error", "stopped"]
+
+
+class Channel(Protocol):
+    """一个交互通道实例的最小能力。"""
+
+    def start(self, on_message: MessageHandler) -> None: ...
+
+    def stop(self) -> None: ...
+
+    def is_alive(self) -> bool: ...
+
+    def restart(self) -> None: ...
+
+    def serialize_conversation_ref(
+        self,
+        conversation: ConversationRef,
+    ) -> dict[str, object]: ...
+
+    def deserialize_conversation_ref(
+        self,
+        payload: dict[str, object],
+    ) -> ConversationRef: ...
+
+    def create_thread(self, initial_text: str) -> ConversationRef:
+        """创建新的交互会话并返回其引用。"""
+        ...
+
+    def send_text(self, conversation: ConversationRef, text: str) -> str: ...
+
+    def handle_session_event(
+        self,
+        conversation: ConversationRef,
+        event: SessionEvent,
+        *,
+        trace_sequence: int | None = None,
+    ) -> None: ...

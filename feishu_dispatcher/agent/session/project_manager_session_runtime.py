@@ -6,7 +6,8 @@ import json
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from ..conversation import ConversationRef
+from feishu_dispatcher.conversation import ConversationRef
+
 from ..scheduler import ToolSpec
 from .tool_loop_session_runtime import (
     LLMProvider,

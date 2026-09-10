@@ -7,7 +7,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Literal, Protocol, runtime_checkable
 
-from ..conversation import ConversationRef
+from feishu_dispatcher.conversation import ConversationRef
+
 from ..session_event import SessionEvent, SessionState
 
 

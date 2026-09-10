@@ -10,7 +10,8 @@ import asyncio
 import logging
 from typing import Protocol
 
-from . import OutputStatus
+from feishu_dispatcher.channel import OutputStatus
+
 from .feishu_card import build_card
 
 logger = logging.getLogger(__name__)

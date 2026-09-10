@@ -17,9 +17,11 @@ from typing import Any, cast
 from urllib.parse import parse_qs
 from uuid import uuid4
 
+from feishu_dispatcher.channel import ChannelMessage, MessageHandler, OutputStatus
+from feishu_dispatcher.conversation import ConversationRef
+
 from .. import __version__
 from .._atomic import atomic_write
-from ..conversation import ConversationRef
 from ..session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
@@ -32,7 +34,6 @@ from ..session_event import (
     ToolCallObserved,
     session_event_to_dict,
 )
-from . import ChannelMessage, MessageHandler, OutputStatus
 from .presentation import format_agent_output_footer, format_agent_output_title
 
 

@@ -11,8 +11,9 @@ from dataclasses import InitVar, dataclass, field
 from datetime import datetime, timezone
 from typing import Literal
 
+from feishu_dispatcher.conversation import ConversationRef
+
 from ..acp_client import AcpAgent, AgentOutputChunk, AgentToolCallUpdate
-from ..conversation import ConversationRef
 from ..session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
