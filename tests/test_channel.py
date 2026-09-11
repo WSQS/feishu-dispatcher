@@ -94,8 +94,8 @@ def test_bridge_exposes_factories_but_no_concrete_types() -> None:
     ):
         assert callable(getattr(bridge, name))
     for name in (
-        "FeishuBridge",
-        "HttpChannel",
+        "_FeishuBridge",
+        "_HttpChannel",
         "FeishuConversationRef",
         "HttpConversationRef",
     ):

@@ -30,8 +30,8 @@ from feishu_dispatcher.agent.session_event import (
 )
 from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.channel.agent.implementation.http import (
-    HttpChannel,
     HttpRequest,
+    _HttpChannel,
     ensure_token,
 )
 from tests.conversation_fakes import (
@@ -103,13 +103,13 @@ def _message(
     }
 
 
-def _events_url(channel: HttpChannel, conversation_id: str, after: int = 0) -> str:
+def _events_url(channel: _HttpChannel, conversation_id: str, after: int = 0) -> str:
     query = urllib.parse.urlencode({"conversation_id": conversation_id, "after": after})
     return channel.base_url + "/api/channel/events?" + query
 
 
 async def _wait_for_events(
-    channel: HttpChannel,
+    channel: _HttpChannel,
     conversation_id: str,
     *,
     minimum: int = 1,
@@ -384,7 +384,7 @@ def test_webui_storage_logic_isolated_from_app_source():
 
 
 async def test_webui_assets_are_same_origin_and_do_not_require_token():
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
     )
 
@@ -518,7 +518,7 @@ async def test_webui_assets_are_same_origin_and_do_not_require_token():
 def test_http_conversation_ref_codec_round_trips() -> None:
     loop = asyncio.new_event_loop()
     try:
-        channel = HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
+        channel = _HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
         conversation = ConversationRef("http", "browser-a")
 
         payload = channel.serialize_conversation_ref(conversation)
@@ -532,7 +532,7 @@ def test_http_conversation_ref_codec_round_trips() -> None:
 def test_http_conversation_ref_codec_normalizes_serialized_id() -> None:
     loop = asyncio.new_event_loop()
     try:
-        channel = HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
+        channel = _HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
 
         assert channel.serialize_conversation_ref(
             ConversationRef("http", "  browser-a  ")
@@ -544,7 +544,7 @@ def test_http_conversation_ref_codec_normalizes_serialized_id() -> None:
 def test_http_conversation_ref_codec_rejects_other_channel() -> None:
     loop = asyncio.new_event_loop()
     try:
-        channel = HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
+        channel = _HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
 
         with pytest.raises(ValueError, match="不属于 HTTP Channel"):
             channel.serialize_conversation_ref(ConversationRef("feishu", "om-root"))
@@ -555,7 +555,7 @@ def test_http_conversation_ref_codec_rejects_other_channel() -> None:
 def test_http_conversation_ref_codec_rejects_blank_serialized_id() -> None:
     loop = asyncio.new_event_loop()
     try:
-        channel = HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
+        channel = _HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
 
         with pytest.raises(ValueError, match="ConversationRef 不能为空"):
             channel.serialize_conversation_ref(ConversationRef("http", " "))
@@ -569,7 +569,7 @@ def test_http_conversation_ref_codec_rejects_invalid_payload(
 ) -> None:
     loop = asyncio.new_event_loop()
     try:
-        channel = HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
+        channel = _HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
 
         with pytest.raises(ValueError, match="ConversationRef payload 无效"):
             channel.deserialize_conversation_ref(payload)
@@ -578,7 +578,7 @@ def test_http_conversation_ref_codec_rejects_invalid_payload(
 
 
 async def test_health_requires_token_and_returns_channel_version():
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
     )
 
@@ -616,7 +616,7 @@ async def test_health_requires_token_and_returns_channel_version():
 def test_http_request_dispatch_authenticates_before_reading_body(path: str) -> None:
     loop = asyncio.new_event_loop()
     try:
-        channel = HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
+        channel = _HttpChannel("tok-http", loop, host="127.0.0.1", port=0)
 
         def unexpected_read() -> object | None:
             raise AssertionError("未授权请求不应读取 body")
@@ -643,7 +643,7 @@ async def test_application_post_route_requires_token_and_marshals_body():
             "conversation_id": "http-conversation-a",
         }
 
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http",
         asyncio.get_running_loop(),
         host="127.0.0.1",
@@ -707,7 +707,7 @@ async def test_application_post_route_preserves_channel_capacity_error():
         conversation = channel.create_thread("task")
         return 201, {"conversation_id": conversation.conversation_id}
 
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http",
         asyncio.get_running_loop(),
         host="127.0.0.1",
@@ -744,7 +744,7 @@ async def test_application_post_route_preserves_channel_capacity_error():
 
 
 async def test_message_dispatch_and_reply_round_trip():
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
     )
     received: list[ChannelMessage] = []
@@ -785,7 +785,7 @@ async def test_message_dispatch_and_reply_round_trip():
 
 
 async def test_conversations_are_isolated_and_target_conflicts_are_rejected():
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
     )
     handled = asyncio.Event()
@@ -839,7 +839,7 @@ async def test_conversations_are_isolated_and_target_conflicts_are_rejected():
 
 
 async def test_invalid_requests_do_not_enter_dispatcher():
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
     )
     seen: list[ChannelMessage] = []
@@ -888,7 +888,7 @@ async def test_invalid_requests_do_not_enter_dispatcher():
 
 
 async def test_cursor_expiry_invalid_cursor_and_conversation_capacity():
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http",
         asyncio.get_running_loop(),
         host="127.0.0.1",
@@ -956,7 +956,7 @@ async def test_cursor_expiry_invalid_cursor_and_conversation_capacity():
 
 async def test_thread_reply_session_event_output_and_restart():
     port = _available_port()
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http",
         asyncio.get_running_loop(),
         host="127.0.0.1",
@@ -1076,7 +1076,7 @@ async def test_session_input_event_projects_to_thread_message():
         serialized.append(conversation)
         return {"opaque_id": conversation.to_log_string()}
 
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http",
         asyncio.get_running_loop(),
         host="127.0.0.1",
@@ -1138,7 +1138,7 @@ async def test_session_input_event_projects_to_thread_message():
 
 
 async def test_empty_session_input_event_does_not_create_message():
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
     )
 
@@ -1171,7 +1171,7 @@ async def test_empty_session_input_event_does_not_create_message():
 
 
 async def test_agent_output_events_project_as_session_events():
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
     )
 
@@ -1232,7 +1232,7 @@ async def test_agent_output_events_project_as_session_events():
 
 
 async def test_output_close_unregisters_pending_and_active_outputs(monkeypatch):
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
     )
     unregister_calls = []
@@ -1296,7 +1296,7 @@ async def test_output_close_unregisters_pending_and_active_outputs(monkeypatch):
 
 
 async def test_interrupted_output_projects_stopped_status():
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
     )
     try:
@@ -1331,7 +1331,7 @@ async def test_interrupted_output_projects_stopped_status():
 
 
 async def test_session_event_presentation_is_the_only_live_output_path():
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
     )
 
@@ -1396,10 +1396,10 @@ async def test_session_event_presentation_is_the_only_live_output_path():
 
 
 async def test_new_http_channel_object_gets_new_instance_id():
-    first = HttpChannel(
+    first = _HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
     )
-    second = HttpChannel(
+    second = _HttpChannel(
         "tok-http", asyncio.get_running_loop(), host="127.0.0.1", port=0
     )
     try:
@@ -1411,7 +1411,7 @@ async def test_new_http_channel_object_gets_new_instance_id():
 
 async def test_start_failure_releases_listener(monkeypatch):
     port = _available_port()
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http",
         asyncio.get_running_loop(),
         host="127.0.0.1",
@@ -1444,7 +1444,7 @@ async def test_start_failure_releases_listener(monkeypatch):
 
 
 async def test_target_capacity_is_bounded():
-    channel = HttpChannel(
+    channel = _HttpChannel(
         "tok-http",
         asyncio.get_running_loop(),
         host="127.0.0.1",
@@ -1499,7 +1499,7 @@ def test_http_channel_rejects_blank_token():
     loop = asyncio.new_event_loop()
     try:
         with pytest.raises(ValueError, match="token"):
-            HttpChannel(" ", loop, host="127.0.0.1", port=0)
+            _HttpChannel(" ", loop, host="127.0.0.1", port=0)
     finally:
         loop.close()
 
@@ -1508,7 +1508,7 @@ def test_http_channel_requires_session_conversation_callbacks_as_a_pair():
     loop = asyncio.new_event_loop()
     try:
         with pytest.raises(ValueError, match="标题与打开回调必须同时提供"):
-            HttpChannel(
+            _HttpChannel(
                 "tok-http",
                 loop,
                 host="127.0.0.1",
@@ -1516,7 +1516,7 @@ def test_http_channel_requires_session_conversation_callbacks_as_a_pair():
                 session_conversation_header=lambda _session_id: "header",
             )
         with pytest.raises(ValueError, match="标题与打开回调必须同时提供"):
-            HttpChannel(
+            _HttpChannel(
                 "tok-http",
                 loop,
                 host="127.0.0.1",
@@ -1534,7 +1534,7 @@ def test_http_channel_rejects_duplicate_task_conversation_route():
     loop = asyncio.new_event_loop()
     try:
         with pytest.raises(ValueError, match="路由不能重复注册"):
-            HttpChannel(
+            _HttpChannel(
                 "tok-http",
                 loop,
                 host="127.0.0.1",
