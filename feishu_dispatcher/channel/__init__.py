@@ -6,8 +6,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Literal, Protocol
 
-from .agent.session_event import SessionEvent
-from .conversation import ConversationRef
+from feishu_dispatcher.agent.session_event import SessionEvent
+from feishu_dispatcher.conversation import ConversationRef
 
 
 @dataclass(frozen=True)

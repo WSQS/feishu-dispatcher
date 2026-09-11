@@ -9,7 +9,6 @@ import pytest
 from playwright.async_api import Error as PlaywrightError
 from playwright.async_api import async_playwright
 
-from feishu_dispatcher.agent.channel.http import HttpChannel
 from feishu_dispatcher.agent.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
@@ -20,6 +19,7 @@ from feishu_dispatcher.agent.session_event import (
     session_event_to_dict,
 )
 from feishu_dispatcher.channel import ChannelMessage
+from feishu_dispatcher.channel.agent.implementation.http import HttpChannel
 from tests.conversation_fakes import (
     ChannelConversationRefFactory as ConversationRef,
 )

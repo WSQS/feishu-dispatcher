@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from feishu_dispatcher.agent.channel.feishu import FeishuConversationRef
-from feishu_dispatcher.agent.channel.http import HttpConversationRef
+from feishu_dispatcher.channel.agent.implementation.feishu import FeishuConversationRef
+from feishu_dispatcher.channel.agent.implementation.http import HttpConversationRef
 from feishu_dispatcher.conversation import ConversationRef
 
 
