@@ -822,7 +822,11 @@ class FeishuBridge:
         conversation = FeishuConversationRef(conversation_id)
         title = format_agent_output_title(metadata)
         footer = format_agent_output_footer(metadata)
-        if self._stream_mode == "card":
+        # 控制台主线是群 chat_id 本身，没有可 reply 的话题根（LiveCard 建卡即 reply
+        # 到话题根），故与 send_text 同一条寻址规则：非话题会话只能走文本投影。
+        if self._stream_mode == "card" and not self._is_control_conversation(
+            conversation_id
+        ):
             from .feishu_livecard import LiveCard
 
             output = LiveCard(
@@ -892,6 +896,10 @@ class FeishuBridge:
         root_message_id = self.send_root_message(self._chat_whitelist, initial_text)
         return FeishuConversationRef(root_message_id)
 
+    def _is_control_conversation(self, conversation_id: str) -> bool:
+        """该会话是否控制台主线（群 chat_id 本身，而非话题根 message_id）。"""
+        return bool(self._chat_whitelist) and conversation_id == self._chat_whitelist
+
     def control_conversation(self) -> FeishuConversationRef | None:
         """返回配置的控制会话；未配置控制群聊时返回 None。"""
         chat_id = self._chat_whitelist.strip()
@@ -903,7 +911,7 @@ class FeishuBridge:
         """向 Conversation 发送文本。"""
         conversation = self._require_feishu_conversation(conversation)
         conversation_id = conversation.conversation_id
-        if conversation_id == self._chat_whitelist:
+        if self._is_control_conversation(conversation_id):
             return self.send_root_message(conversation_id, text)
         return self.reply_in_thread(conversation_id, text)
 
