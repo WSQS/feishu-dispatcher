@@ -7,11 +7,7 @@ import asyncio
 import pytest
 
 from feishu_dispatcher.agent.scheduler import LLMResponse, SchedulerMemory
-from feishu_dispatcher.agent.session import (
-    DispatcherSessionRuntime,
-    SessionRuntime,
-    TurnRequest,
-)
+from feishu_dispatcher.agent.session import DispatcherSessionRuntime
 from feishu_dispatcher.agent.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
@@ -20,6 +16,7 @@ from feishu_dispatcher.agent.session_event import (
     SessionInputAccepted,
     SessionStateChanged,
 )
+from feishu_dispatcher.session_runtime import SessionRuntime, TurnRequest
 from tests.conversation_fakes import ConversationRefFactory as ConversationRef
 
 

@@ -19,8 +19,6 @@ from feishu_dispatcher.agent.session import (
     AcpSessionRuntime,
     AcpSessionRuntimeHooks,
     AcpTurnResult,
-    SessionRuntime,
-    TurnRequest,
 )
 from feishu_dispatcher.agent.session_event import (
     AgentOutputDelta,
@@ -33,6 +31,7 @@ from feishu_dispatcher.agent.session_event import (
     SessionStateChanged,
     ToolCallObserved,
 )
+from feishu_dispatcher.session_runtime import SessionRuntime, TurnRequest
 from tests.conversation_fakes import ConversationRefFactory as ConversationRef
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .session_runtime import SessionRuntime
+from feishu_dispatcher.session_runtime import SessionRuntime
 
 
 class SessionRuntimeRegistry:

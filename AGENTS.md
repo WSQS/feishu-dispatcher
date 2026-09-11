@@ -4,16 +4,17 @@
 
 ## 范围
 
-- Human Zone 包含两个已提升的契约：`feishu_dispatcher/conversation.py` 与 `feishu_dispatcher/channel/__init__.py`。它们的定义、签名和语义只有得到用户针对该变更的明确授权后才能修改。
+- Human Zone 包含已提升的契约：`feishu_dispatcher/conversation.py`、`feishu_dispatcher/channel/__init__.py` 与 `feishu_dispatcher/session_runtime.py`。它们的定义、签名和语义只有得到用户针对该变更的明确授权后才能修改。
 - Human Zone 还包含 Channel 域的 Governed Bridge：`feishu_dispatcher/channel/agent/bridge.py`。它的工厂签名是稳定面，改动同样需授权；它也是唯一获准引用该域候选实现的地方。
-- `feishu_dispatcher/agent/` 是应用侧孵化器，包含 Session、Store、ACP、CLI、控制面和 WebUI 等候选实现，直接引用上述契约，不复制或重新导出旧路径兼容定义。
+- `feishu_dispatcher/agent/` 是应用侧孵化器，包含 Session Runtime 实现、Store、ACP、CLI、控制面和 WebUI 等候选实现，直接引用上述契约，不复制或重新导出旧路径兼容定义。
 - `feishu_dispatcher/channel/agent/implementation/` 是 Channel 域的候选实现孵化器，只由该域的桥引用；域外不直接 import 它。
+- `feishu_dispatcher/agent/session/` 是 Session 运行时候选实现包（Acp / ToolLoop / Project Manager / Dispatcher），不重新导出已提升契约；Session 域的 bridge 与域包拆分尚未进行。
 - 根目录 `feishu_dispatcher/__init__.py` 仅作为包容器，不提供旧模块的兼容导入。
 - `tests/`、`scripts/`、构建配置和文档用于验证、运行或描述 Agent Zone；它们不是稳定业务契约。
 
 ## 当前治理判断
 
-用户已明确提升上述两个契约文件并接受该桥；其它模块不因此获得稳定契约地位。`SessionEvent` 仍定义在 `feishu_dispatcher/agent/session_event.py`，本轮不提升、不复制其定义。
+用户已明确提升上述契约文件并接受该桥；其它模块不因此获得稳定契约地位。`SessionEvent` 仍定义在 `feishu_dispatcher/agent/session_event.py`，本轮不提升、不复制其定义；Session 的 Runtime 实现在 `feishu_dispatcher/agent/session/`，仍是候选，尚未做域拆分。
 
 迁移只改变 ownership 和 import 路径，不改变产品行为。后续若要提升稳定契约，必须单独明确：
 
@@ -28,7 +29,7 @@
 
 当前阶段允许 Agent Zone 内部自由重组，但不得通过旧路径重新导出兼容 facade。候选实现应依赖已提升契约，已提升契约原则上不得反向依赖候选实现——唯一获准的例外是 Governed Bridge：它把固定的工厂签名委托给同域的候选实现。
 
-本轮用户接受的唯一暂时例外：`feishu_dispatcher/channel/__init__.py` 的事件参数引用 `feishu_dispatcher.agent.session_event.SessionEvent`。这是尚未消除的类型依赖，不代表 SessionEvent 已提升，也不授权其它反向依赖。
+本轮用户接受的暂时例外：`feishu_dispatcher/channel/__init__.py` 的事件参数引用 `feishu_dispatcher.agent.session_event.SessionEvent`；`feishu_dispatcher/session_runtime.py` 的协议签名同样引用该模块的 `SessionEvent` / `SessionState`。这是尚未消除的类型依赖，不代表 SessionEvent 已提升，也不授权其它反向依赖。
 
 ## 修改与验证
 

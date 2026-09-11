@@ -12,6 +12,13 @@ from datetime import datetime, timezone
 from typing import Literal
 
 from feishu_dispatcher.conversation import ConversationRef
+from feishu_dispatcher.session_runtime import (
+    SessionEventListener,
+    SessionRuntime,
+    TurnReceipt,
+    TurnRef,
+    TurnRequest,
+)
 
 from ..acp_client import AcpAgent, AgentOutputChunk, AgentToolCallUpdate
 from ..session_event import (
@@ -27,13 +34,6 @@ from ..session_event import (
     SessionInputAccepted,
     SessionState,
     ToolCallObserved,
-)
-from .session_runtime import (
-    SessionEventListener,
-    SessionRuntime,
-    TurnReceipt,
-    TurnRef,
-    TurnRequest,
 )
 
 logger = logging.getLogger(__name__)
