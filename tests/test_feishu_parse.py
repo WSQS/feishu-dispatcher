@@ -9,7 +9,6 @@ from datetime import datetime, timezone
 
 import pytest
 
-from feishu_dispatcher.agent.channel.feishu import FeishuBridge, _RateLimiter
 from feishu_dispatcher.agent.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
@@ -22,6 +21,10 @@ from feishu_dispatcher.agent.session_event import (
     ToolCallObserved,
 )
 from feishu_dispatcher.channel import ChannelMessage
+from feishu_dispatcher.channel.agent.implementation.feishu import (
+    FeishuBridge,
+    _RateLimiter,
+)
 from tests.conversation_fakes import (
     ChannelConversationRefFactory as ConversationRef,
 )

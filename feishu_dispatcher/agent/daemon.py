@@ -29,6 +29,11 @@ from pathlib import Path
 from typing import Literal
 
 from feishu_dispatcher.channel import Channel, ChannelMessage
+from feishu_dispatcher.channel.agent.bridge import (
+    build_feishu_channel,
+    build_http_channel,
+    ensure_http_channel_token,
+)
 from feishu_dispatcher.conversation import ConversationRef
 
 from . import forge
@@ -43,9 +48,6 @@ from .acp_client import (
     OnToolCall,
     resolve_executable,
 )
-from .channel.feishu import FeishuBridge
-from .channel.http import HttpChannel
-from .channel.http import ensure_token as ensure_http_channel_token
 from .config import DEFAULT_CONFIG_PATH, Config, Project
 from .control import ControlServer
 from .llm import build_llm_client
@@ -356,11 +358,11 @@ async def run(
         store_path = DEFAULT_CONFIG_PATH.parent / "sessions.json"
     loop = asyncio.get_running_loop()
     if channel is None:
-        channel = FeishuBridge(
+        channel = build_feishu_channel(
             app_id=cfg.app_id,
             app_secret=cfg.app_secret,
             main_loop=loop,
-            chat_whitelist=cfg.chat_id,
+            chat_id=cfg.chat_id,
             sender_whitelist=() if discover else cfg.sender_whitelist,
             qps=cfg.feishu_qps,
             stream_mode=cfg.stream_mode,
@@ -1487,9 +1489,9 @@ class _Daemon:
             raise RuntimeError("HTTP Channel 已注册")
         if self._scan_executor is not None:
             raise RuntimeError("扫描执行服务已注册")
-        http_channel = HttpChannel(
-            token,
-            loop,
+        http_channel = build_http_channel(
+            token=token,
+            main_loop=loop,
             host=host,
             port=port,
             routes={

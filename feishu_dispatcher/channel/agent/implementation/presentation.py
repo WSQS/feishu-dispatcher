@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..session_event import AgentOutputMetadata
+from feishu_dispatcher.agent.session_event import AgentOutputMetadata
 
 
 def format_agent_output_title(metadata: AgentOutputMetadata | None) -> str:

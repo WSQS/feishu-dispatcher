@@ -1,7 +1,7 @@
-"""agent 流式输出的批量节流器。
+"""飞书 Channel 文本输出模式的批量节流器。
 
-设计决策 #8：agent 输出全量转发到飞书话题，按 ~500ms 窗口合并，
-避免 token 级碎片消息打爆飞书发送 API。
+设计决策 #8：agent 输出按 ~500ms 窗口合并后成批发消息，避免 token 级碎片
+打爆飞书发送 API。卡片模式（`stream_mode = "card"`）不经过本模块。
 """
 
 from __future__ import annotations

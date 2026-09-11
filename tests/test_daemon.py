@@ -20,14 +20,6 @@ import pytest
 
 import feishu_dispatcher.agent.daemon as daemon_module
 from feishu_dispatcher.agent.acp_client import AgentOutputChunk, AgentToolCallUpdate
-from feishu_dispatcher.agent.channel.feishu import FeishuBridge, FeishuConversationRef
-from feishu_dispatcher.agent.channel.feishu_card import build_card
-from feishu_dispatcher.agent.channel.http import HttpChannel, HttpConversationRef
-from feishu_dispatcher.agent.channel.presentation import (
-    format_agent_output_footer,
-    format_agent_output_title,
-    format_usage_tokens,
-)
 from feishu_dispatcher.agent.config import (
     Config,
     HttpChannelConfig,
@@ -66,6 +58,20 @@ from feishu_dispatcher.agent.store import (
 )
 from feishu_dispatcher.agent.trace_store import SessionTraceStore
 from feishu_dispatcher.channel import ChannelMessage
+from feishu_dispatcher.channel.agent.implementation.feishu import (
+    FeishuBridge,
+    FeishuConversationRef,
+)
+from feishu_dispatcher.channel.agent.implementation.feishu_card import build_card
+from feishu_dispatcher.channel.agent.implementation.http import (
+    HttpChannel,
+    HttpConversationRef,
+)
+from feishu_dispatcher.channel.agent.implementation.presentation import (
+    format_agent_output_footer,
+    format_agent_output_title,
+    format_usage_tokens,
+)
 from feishu_dispatcher.conversation import (
     ConversationRef as ConversationRefProtocol,
 )
@@ -686,19 +692,19 @@ async def test_run_builds_default_feishu_channel_and_injects_it(
             app_id: str,
             app_secret: str,
             main_loop,
-            chat_whitelist: str,
+            chat_id: str,
             sender_whitelist,
             qps: float,
             stream_mode: str,
             throttle_window: float,
         ) -> None:
             super().__init__()
-            self._control_conversation = ConversationRef("feishu", chat_whitelist)
+            self._control_conversation = ConversationRef("feishu", chat_id)
             constructed.update(
                 app_id=app_id,
                 app_secret=app_secret,
                 main_loop=main_loop,
-                chat_whitelist=chat_whitelist,
+                chat_id=chat_id,
                 sender_whitelist=list(sender_whitelist),
                 qps=qps,
                 stream_mode=stream_mode,
@@ -715,7 +721,12 @@ async def test_run_builds_default_feishu_channel_and_injects_it(
         constructed["rebooted"] = rebooted
         return DaemonRunResult()
 
-    monkeypatch.setattr(daemon_module, "FeishuBridge", FakeFeishuChannel)
+    def fake_build_feishu_channel(**kwargs) -> FakeFeishuChannel:
+        return FakeFeishuChannel(**kwargs)
+
+    monkeypatch.setattr(
+        daemon_module, "build_feishu_channel", fake_build_feishu_channel
+    )
     monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
 
     reboot = await daemon_module.run(
@@ -729,7 +740,7 @@ async def test_run_builds_default_feishu_channel_and_injects_it(
     assert constructed["app_id"] == "app-id"
     assert constructed["app_secret"] == "app-secret"
     assert constructed["main_loop"] is asyncio.get_running_loop()
-    assert constructed["chat_whitelist"] == "oc-main"
+    assert constructed["chat_id"] == "oc-main"
     assert constructed["sender_whitelist"] == expected_sender_whitelist
     assert constructed["qps"] == 3.5
     assert constructed["stream_mode"] == "card"
@@ -764,9 +775,9 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
     class FakeHttpChannel(FakeBridge):
         def __init__(
             self,
+            *,
             token: str,
             main_loop,
-            *,
             host: str,
             port: int,
             routes,
@@ -801,8 +812,15 @@ async def test_run_registers_enabled_http_channel_alongside_feishu(
         constructed["token_path"] = path
         return "tok-http"
 
-    monkeypatch.setattr(daemon_module, "FeishuBridge", FakeFeishuChannel)
-    monkeypatch.setattr(daemon_module, "HttpChannel", FakeHttpChannel)
+    def fake_build_http_channel(**kwargs) -> FakeHttpChannel:
+        return FakeHttpChannel(**kwargs)
+
+    monkeypatch.setattr(
+        daemon_module,
+        "build_feishu_channel",
+        lambda **kwargs: FakeFeishuChannel(**kwargs),
+    )
+    monkeypatch.setattr(daemon_module, "build_http_channel", fake_build_http_channel)
     monkeypatch.setattr(daemon_module, "ensure_http_channel_token", fake_token)
     monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
 
@@ -860,7 +878,7 @@ async def test_configure_http_channel_failure_does_not_take_ownership(monkeypatc
     def fail_http_channel(*_args, **_kwargs):
         raise OSError("bind failed")
 
-    monkeypatch.setattr(daemon_module, "HttpChannel", fail_http_channel)
+    monkeypatch.setattr(daemon_module, "build_http_channel", fail_http_channel)
 
     with pytest.raises(OSError, match="bind failed"):
         daemon.configure_http_channel(
@@ -891,7 +909,11 @@ async def test_configure_http_channel_transfers_shutdown_ownership(monkeypatch):
         async def aclose(self) -> None:
             self.close_calls += 1
 
-    monkeypatch.setattr(daemon_module, "HttpChannel", FakeHttpChannel)
+    monkeypatch.setattr(
+        daemon_module,
+        "build_http_channel",
+        lambda **_kwargs: FakeHttpChannel(),
+    )
     scan_executor = FakeScanExecutor()
 
     daemon.configure_http_channel(
@@ -938,7 +960,7 @@ async def test_run_does_not_auto_register_http_for_injected_channel(
     def unexpected_http(*_args, **_kwargs):
         raise AssertionError("injected Channel path must not auto-register HTTP")
 
-    monkeypatch.setattr(daemon_module, "HttpChannel", unexpected_http)
+    monkeypatch.setattr(daemon_module, "build_http_channel", unexpected_http)
     monkeypatch.setattr(_Daemon, "run", fake_daemon_run)
     injected = FakeBridge()
 
@@ -980,7 +1002,11 @@ async def test_enabled_http_channel_bind_failure_is_explicit(monkeypatch, tmp_pa
 
     trace_store = _CountingTraceStore()
     scan_executor = FakeScanExecutor()
-    monkeypatch.setattr(daemon_module, "FeishuBridge", FakeFeishuChannel)
+    monkeypatch.setattr(
+        daemon_module,
+        "build_feishu_channel",
+        lambda **_kwargs: FakeFeishuChannel(),
+    )
     monkeypatch.setattr(daemon_module, "ScanExecutor", lambda: scan_executor)
     monkeypatch.setattr(
         daemon_module,

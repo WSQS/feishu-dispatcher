@@ -22,7 +22,11 @@ Conversation 的交互边界。Channel 消费 Session Event，并自行管理输
 
 ## Agent Zone
 
-承载尚未提升实现的实验 ownership 区域。当前具体实现在 `feishu_dispatcher/agent/`；ConversationRef 与 Channel 契约已由用户提升，具体范围和依赖例外见 AGENTS.md。目录归属变更不表示产品行为本身发生变化。
+承载尚未提升实现的实验 ownership 区域。应用侧实现（Session、Store、ACP、CLI、WebUI 等）在 `feishu_dispatcher/agent/`，Channel 域的实现在 `feishu_dispatcher/channel/agent/implementation/`。ConversationRef 与 Channel 契约已由用户提升，具体范围、桥与依赖例外见 AGENTS.md。目录归属变更不表示产品行为本身发生变化。
+
+## Bridge
+
+一个域内唯一获准依赖具体实现的接缝：它把固定的工厂签名委托给同域的候选实现，对外只暴露契约类型。桥属 Human Zone（签名改动需授权），实现本身仍是候选。
 
 ## Promotion
 
