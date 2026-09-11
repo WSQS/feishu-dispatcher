@@ -844,6 +844,101 @@ async def test_card_output_maps_session_outcome(monkeypatch, outcome, template):
     assert cards[-1]["header"]["template"] == template
 
 
+async def test_control_conversation_streams_text_instead_of_card(monkeypatch):
+    """控制台主线是 chat_id，没有可 reply 的话题根——卡片模式也必须退化为文本。"""
+    bridge = FeishuBridge(
+        app_id="a",
+        app_secret="b",
+        main_loop=asyncio.get_running_loop(),
+        stream_mode="card",
+        chat_whitelist="oc-control",
+    )
+    texts: list[tuple[str, str]] = []
+    cards: list[tuple[str, dict]] = []
+
+    def send_root_message(conversation_id: str, text: str) -> str:
+        texts.append((conversation_id, text))
+        return "om_root"
+
+    def reply_card(root_message_id: str, card: dict) -> str:
+        cards.append((root_message_id, card))
+        return "om_card"
+
+    monkeypatch.setattr(bridge, "send_root_message", send_root_message)
+    monkeypatch.setattr(bridge, "reply_card", reply_card)
+    for index, body in enumerate(
+        [
+            AgentOutputStarted(),
+            AgentOutputDelta(stream="message", text="answer"),
+            AgentOutputFinished(message="answer", thought="", outcome="completed"),
+        ],
+        start=1,
+    ):
+        await asyncio.to_thread(
+            bridge.handle_session_event,
+            ConversationRef("feishu", "oc-control"),
+            SessionEvent(
+                event_id=f"event-{index}",
+                session_id="dispatcher",
+                turn_id="turn-1",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=body,
+            ),
+        )
+
+    assert texts == [("oc-control", "answer")]
+    assert cards == []
+
+
+async def test_thread_conversation_keeps_card_with_control_chat_configured(
+    monkeypatch,
+):
+    bridge = FeishuBridge(
+        app_id="a",
+        app_secret="b",
+        main_loop=asyncio.get_running_loop(),
+        stream_mode="card",
+        chat_whitelist="oc-control",
+    )
+    texts: list[tuple[str, str]] = []
+    cards: list[tuple[str, dict]] = []
+
+    def send_root_message(conversation_id: str, text: str) -> str:
+        texts.append((conversation_id, text))
+        return "om_root"
+
+    def reply_card(root_message_id: str, card: dict) -> str:
+        cards.append((root_message_id, card))
+        return "om_card"
+
+    monkeypatch.setattr(bridge, "send_root_message", send_root_message)
+    monkeypatch.setattr(bridge, "reply_card", reply_card)
+    for index, body in enumerate(
+        [
+            AgentOutputStarted(metadata=AgentOutputMetadata("demo", "copilot")),
+            AgentOutputDelta(stream="message", text="answer"),
+            AgentOutputFinished(message="answer", thought="", outcome="completed"),
+        ],
+        start=1,
+    ):
+        await asyncio.to_thread(
+            bridge.handle_session_event,
+            ConversationRef("feishu", "om_root"),
+            SessionEvent(
+                event_id=f"event-{index}",
+                session_id="t1",
+                turn_id="turn-1",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=body,
+            ),
+        )
+
+    assert texts == []
+    assert len(cards) == 1
+    assert cards[0][0] == "om_root"
+    assert "answer" in cards[0][1]["body"]["elements"][0]["content"]
+
+
 async def test_channel_stop_closes_active_session_outputs():
     bridge = FeishuBridge(
         app_id="a",
