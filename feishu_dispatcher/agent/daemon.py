@@ -35,6 +35,7 @@ from feishu_dispatcher.channel.agent.bridge import (
     ensure_http_channel_token,
 )
 from feishu_dispatcher.conversation import ConversationRef
+from feishu_dispatcher.session_runtime import SessionRuntime, TurnRequest
 
 from . import forge
 from ._scan_executor import ScanExecutor
@@ -62,9 +63,7 @@ from .session import (
     AcpTurnResult,
     DispatcherSessionRuntime,
     ProjectManagerSessionRuntime,
-    SessionRuntime,
     SessionRuntimeRegistry,
-    TurnRequest,
 )
 from .session_event import (
     AgentOutputDelta,

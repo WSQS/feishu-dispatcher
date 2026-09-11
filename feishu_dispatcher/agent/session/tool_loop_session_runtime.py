@@ -11,6 +11,13 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 
 from feishu_dispatcher.conversation import ConversationRef
+from feishu_dispatcher.session_runtime import (
+    SessionEventListener,
+    SessionRuntime,
+    TurnReceipt,
+    TurnRef,
+    TurnRequest,
+)
 
 from ..llm import llm_log_context
 from ..scheduler import LLMClient, ToolSpec, run_tool_loop
@@ -25,13 +32,6 @@ from ..session_event import (
     SessionInputAccepted,
     SessionState,
     SessionStateChanged,
-)
-from .session_runtime import (
-    SessionEventListener,
-    SessionRuntime,
-    TurnReceipt,
-    TurnRef,
-    TurnRequest,
 )
 
 logger = logging.getLogger(__name__)

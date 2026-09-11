@@ -5,11 +5,12 @@ from __future__ import annotations
 import pytest
 
 from feishu_dispatcher.agent.scheduler import LLMResponse, SchedulerMemory
-from feishu_dispatcher.agent.session import ToolLoopSessionRuntime, TurnRequest
+from feishu_dispatcher.agent.session import ToolLoopSessionRuntime
 from feishu_dispatcher.agent.session_event import (
     AgentOutputDelta,
     AgentOutputFinished,
 )
+from feishu_dispatcher.session_runtime import TurnRequest
 from tests.conversation_fakes import ConversationRefFactory as ConversationRef
 
 

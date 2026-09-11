@@ -9,10 +9,10 @@ import pytest
 from feishu_dispatcher.agent.scheduler import LLMResponse, SchedulerMemory, ToolCall
 from feishu_dispatcher.agent.session import (
     ProjectManagerSessionRuntime,
-    TurnRequest,
     build_project_manager_tools,
 )
 from feishu_dispatcher.agent.session_event import AgentOutputDelta
+from feishu_dispatcher.session_runtime import TurnRequest
 from tests.conversation_fakes import ConversationRefFactory as ConversationRef
 
 
