@@ -612,6 +612,42 @@ async def test_channel_projects_message_delta_through_session_events(monkeypatch
     assert calls == [("om_root", "answer", True)]
 
 
+async def test_channel_projects_delta_without_output_object_as_text(monkeypatch):
+    """没有 presenter 的回合（如中途才绑定会话）只能靠文本兜底送达。"""
+    bridge = FeishuBridge(
+        app_id="a",
+        app_secret="b",
+        main_loop=asyncio.get_running_loop(),
+        stream_mode="card",
+    )
+    calls: list[tuple[str, str]] = []
+
+    def send_text(conversation: ConversationRef, text: str) -> str:
+        calls.append((conversation.conversation_id, text))
+        return "om_reply"
+
+    monkeypatch.setattr(bridge, "send_text", send_text)
+    for index, body in enumerate(
+        [
+            AgentOutputDelta(stream="thought", text="thinking"),
+            AgentOutputDelta(stream="message", text="answer"),
+        ],
+        start=1,
+    ):
+        await bridge._project_session_event(
+            "om_root",
+            SessionEvent(
+                event_id=f"event-{index}",
+                session_id="t1",
+                turn_id="turn-1",
+                occurred_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+                body=body,
+            ),
+        )
+
+    assert calls == [("om_root", "answer")]
+
+
 def test_channel_does_not_special_case_dispatcher_finished(monkeypatch):
     bridge = make_bridge()
     calls: list[tuple[str, str]] = []
