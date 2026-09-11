@@ -19,12 +19,12 @@ import sys
 from pathlib import Path
 
 from feishu_dispatcher.agent.acp_client import AcpAgent, AgentOutputChunk, AgentSpawn
-from feishu_dispatcher.agent.channel import ChannelMessage
 from feishu_dispatcher.agent.config import Config, Project
-from feishu_dispatcher.agent.conversation import ConversationRef
 from feishu_dispatcher.agent.daemon import _Daemon
 from feishu_dispatcher.agent.session_event import AgentOutputDelta, SessionEvent
 from feishu_dispatcher.agent.store import ProjectStore, SessionStore
+from feishu_dispatcher.channel import ChannelMessage
+from feishu_dispatcher.conversation import ConversationRef
 
 REPO_ROOT = str(Path(__file__).resolve().parent.parent)
 SECRET = "4287"

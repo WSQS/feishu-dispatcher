@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Literal, TypeAlias, cast
 
-from .conversation import ConversationRef
+from feishu_dispatcher.conversation import ConversationRef
 
 SESSION_EVENT_SCHEMA_VERSION = 1
 

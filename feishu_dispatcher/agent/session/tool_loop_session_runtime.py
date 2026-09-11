@@ -10,7 +10,8 @@ from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
-from ..conversation import ConversationRef
+from feishu_dispatcher.conversation import ConversationRef
+
 from ..llm import llm_log_context
 from ..scheduler import LLMClient, ToolSpec, run_tool_loop
 from ..session_event import (

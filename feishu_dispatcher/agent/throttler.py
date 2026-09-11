@@ -10,7 +10,7 @@ import asyncio
 import logging
 from collections.abc import Awaitable, Callable
 
-from .channel import OutputStatus
+from feishu_dispatcher.channel import OutputStatus
 
 logger = logging.getLogger(__name__)
 

@@ -22,7 +22,7 @@ Conversation 的交互边界。Channel 消费 Session Event，并自行管理输
 
 ## Agent Zone
 
-当前仓库中承载全部实现的实验 ownership 区域。代码位于 `feishu_dispatcher/agent/`；迁移到这里表示实现尚未被提升为稳定契约，不表示功能行为本身发生变化。
+承载尚未提升实现的实验 ownership 区域。当前具体实现在 `feishu_dispatcher/agent/`；ConversationRef 与 Channel 契约已由用户提升，具体范围和依赖例外见 AGENTS.md。目录归属变更不表示产品行为本身发生变化。
 
 ## Promotion
 

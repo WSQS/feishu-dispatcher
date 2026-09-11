@@ -20,7 +20,6 @@ import pytest
 
 import feishu_dispatcher.agent.daemon as daemon_module
 from feishu_dispatcher.agent.acp_client import AgentOutputChunk, AgentToolCallUpdate
-from feishu_dispatcher.agent.channel import ChannelMessage
 from feishu_dispatcher.agent.channel.feishu import FeishuBridge, FeishuConversationRef
 from feishu_dispatcher.agent.channel.feishu_card import build_card
 from feishu_dispatcher.agent.channel.http import HttpChannel, HttpConversationRef
@@ -34,9 +33,6 @@ from feishu_dispatcher.agent.config import (
     HttpChannelConfig,
     LLMSettings,
     Project,
-)
-from feishu_dispatcher.agent.conversation import (
-    ConversationRef as ConversationRefProtocol,
 )
 from feishu_dispatcher.agent.daemon import (
     _DISPATCHER_SESSION_ID,
@@ -69,6 +65,10 @@ from feishu_dispatcher.agent.store import (
     SessionStore,
 )
 from feishu_dispatcher.agent.trace_store import SessionTraceStore
+from feishu_dispatcher.channel import ChannelMessage
+from feishu_dispatcher.conversation import (
+    ConversationRef as ConversationRefProtocol,
+)
 from tests.conversation_fakes import ConversationRefFactory as ConversationRef
 
 
