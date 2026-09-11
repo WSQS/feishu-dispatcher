@@ -274,7 +274,7 @@ class _FeishuSessionEventOutput:
         await self._output.flush()
 
 
-class FeishuBridge:
+class _FeishuBridge:
     """飞书双向通信封装。
 
     - :meth:`start_background` 在后台线程启动 WebSocket 长连接

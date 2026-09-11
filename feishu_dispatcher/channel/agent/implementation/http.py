@@ -156,7 +156,7 @@ def ensure_token(path: Path) -> str:
     return token
 
 
-class HttpChannel:
+class _HttpChannel:
     """一个 HTTP 服务实例，对应稳定 key ``http`` 的 Channel。"""
 
     def __init__(
@@ -676,11 +676,11 @@ class HttpChannel:
     def _parse_message(body: object) -> ChannelMessage:
         if not isinstance(body, dict):
             raise _HttpRequestError(400, "invalid_request", "请求体必须是 JSON object")
-        conversation_id = HttpChannel._clean_identity(
+        conversation_id = _HttpChannel._clean_identity(
             body.get("conversation_id"), "conversation_id"
         )
-        message_id = HttpChannel._clean_identity(body.get("message_id"), "message_id")
-        sender_id = HttpChannel._clean_identity(body.get("sender_id"), "sender_id")
+        message_id = _HttpChannel._clean_identity(body.get("message_id"), "message_id")
+        sender_id = _HttpChannel._clean_identity(body.get("sender_id"), "sender_id")
         text = body.get("text")
         if not isinstance(text, str):
             raise _HttpRequestError(400, "invalid_request", "text 必须是字符串")
@@ -956,7 +956,7 @@ def _parse_query(query: str) -> dict[str, str]:
     return {key: values[0] for key, values in pairs.items()}
 
 
-def _make_handler(channel: HttpChannel):
+def _make_handler(channel: _HttpChannel):
     class _Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002, D401
             return None

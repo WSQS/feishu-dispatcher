@@ -22,7 +22,7 @@ from feishu_dispatcher.agent.session_event import (
 )
 from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.channel.agent.implementation.feishu import (
-    FeishuBridge,
+    _FeishuBridge,
     _RateLimiter,
 )
 from tests.conversation_fakes import (
@@ -65,7 +65,7 @@ def _event_payload(event: dict) -> bytes:
 
 
 def test_parse_root_message_has_no_thread_root():
-    msg = FeishuBridge._parse_event_message(
+    msg = _FeishuBridge._parse_event_message(
         _event(message_id="om_root", root_id=None, content={"text": "hello"})
     )
     assert msg == ChannelMessage(
@@ -77,7 +77,7 @@ def test_parse_root_message_has_no_thread_root():
 
 
 def test_parse_thread_reply_thread_root_is_root_id():
-    msg = FeishuBridge._parse_event_message(
+    msg = _FeishuBridge._parse_event_message(
         _event(
             message_id="om_reply",
             root_id="om_root",
@@ -89,7 +89,7 @@ def test_parse_thread_reply_thread_root_is_root_id():
 
 
 def test_parse_message_where_root_id_equals_message_id_is_root():
-    msg = FeishuBridge._parse_event_message(
+    msg = _FeishuBridge._parse_event_message(
         _event(message_id="om_root", root_id="om_root", content={"text": "x"})
     )
     assert msg.conversation == ConversationRef("feishu", "oc_chat1")
@@ -99,7 +99,7 @@ def test_parse_non_text_message_returns_none_and_logs(caplog):
     import logging
 
     with caplog.at_level(logging.INFO, logger="feishu_dispatcher.agent.feishu"):
-        msg = FeishuBridge._parse_event_message(
+        msg = _FeishuBridge._parse_event_message(
             _event(
                 message_id="om_img",
                 root_id=None,
@@ -117,7 +117,7 @@ def test_parse_p2p_message_returns_none_and_logs(caplog):
     import logging
 
     with caplog.at_level(logging.INFO, logger="feishu_dispatcher.agent.feishu"):
-        msg = FeishuBridge._parse_event_message(
+        msg = _FeishuBridge._parse_event_message(
             _event(
                 message_id="om_p2p",
                 root_id=None,
@@ -144,7 +144,7 @@ def test_parse_post_message_extracts_text():
             [{"tag": "at", "user_id": "ou_bot"}, {"tag": "text", "text": "加日志"}],
         ]
     )
-    msg = FeishuBridge._parse_event_message(
+    msg = _FeishuBridge._parse_event_message(
         _event(
             message_id="om_post",
             root_id="om_root",
@@ -163,7 +163,7 @@ def test_parse_post_direct_body_received_shape():
         "title": "",
         "content": [[{"tag": "text", "text": "1. 测试一下你可以收到吗？"}]],
     }
-    msg = FeishuBridge._parse_event_message(
+    msg = _FeishuBridge._parse_event_message(
         _event(
             message_id="om_direct",
             root_id="om_root",
@@ -179,7 +179,7 @@ def test_parse_post_with_title_and_other_locale():
     content = _post_content(
         [[{"tag": "text", "text": "正文"}]], title="标题", locale="en_us"
     )
-    msg = FeishuBridge._parse_event_message(
+    msg = _FeishuBridge._parse_event_message(
         _event(message_id="om_p2", root_id=None, content=content, message_type="post")
     )
     assert msg is not None
@@ -187,7 +187,7 @@ def test_parse_post_with_title_and_other_locale():
 
 
 def test_parse_invalid_content_json_still_returns_empty_text():
-    msg = FeishuBridge._parse_event_message(
+    msg = _FeishuBridge._parse_event_message(
         _event(message_id="om_bad", root_id=None, content="not-json{")
     )
     assert msg is not None
@@ -275,7 +275,7 @@ async def test_channel_rejects_non_whitelisted_chat():
     async def handler(msg: ChannelMessage) -> None:
         received.append(msg)
 
-    bridge = FeishuBridge(
+    bridge = _FeishuBridge(
         app_id="a",
         app_secret="b",
         main_loop=asyncio.get_running_loop(),
@@ -307,7 +307,7 @@ async def test_channel_rejects_non_whitelisted_sender():
     async def handler(msg: ChannelMessage) -> None:
         received.append(msg)
 
-    bridge = FeishuBridge(
+    bridge = _FeishuBridge(
         app_id="a",
         app_secret="b",
         main_loop=asyncio.get_running_loop(),
@@ -341,7 +341,7 @@ async def test_channel_accepts_whitelisted_chat_and_sender():
         received.append(msg)
         delivered.set()
 
-    bridge = FeishuBridge(
+    bridge = _FeishuBridge(
         app_id="a",
         app_secret="b",
         main_loop=asyncio.get_running_loop(),
@@ -520,7 +520,7 @@ def test_channel_projects_session_input_event_to_thread(monkeypatch):
 def test_channel_projects_session_input_event_to_root_chat(monkeypatch):
     loop = asyncio.new_event_loop()
     try:
-        bridge = FeishuBridge(
+        bridge = _FeishuBridge(
             app_id="a",
             app_secret="b",
             main_loop=loop,
@@ -574,7 +574,7 @@ def test_channel_skips_empty_session_input_event(monkeypatch):
 
 
 async def test_channel_projects_message_delta_through_session_events(monkeypatch):
-    bridge = FeishuBridge(
+    bridge = _FeishuBridge(
         app_id="a",
         app_secret="b",
         main_loop=asyncio.get_running_loop(),
@@ -617,7 +617,7 @@ async def test_channel_projects_message_delta_through_session_events(monkeypatch
 
 async def test_channel_projects_delta_without_output_object_as_text(monkeypatch):
     """没有 presenter 的回合（如中途才绑定会话）只能靠文本兜底送达。"""
-    bridge = FeishuBridge(
+    bridge = _FeishuBridge(
         app_id="a",
         app_secret="b",
         main_loop=asyncio.get_running_loop(),
@@ -702,7 +702,7 @@ def test_feishu_card_methods_delegate_to_feishu_card_methods(monkeypatch):
 
 
 async def test_text_output_is_driven_by_session_events(monkeypatch):
-    bridge = FeishuBridge(
+    bridge = _FeishuBridge(
         app_id="a",
         app_secret="b",
         main_loop=asyncio.get_running_loop(),
@@ -764,7 +764,7 @@ async def test_text_output_is_driven_by_session_events(monkeypatch):
 
 
 async def test_card_output_is_driven_by_session_events(monkeypatch):
-    bridge = FeishuBridge(
+    bridge = _FeishuBridge(
         app_id="a",
         app_secret="b",
         main_loop=asyncio.get_running_loop(),
@@ -849,7 +849,7 @@ async def test_card_output_is_driven_by_session_events(monkeypatch):
     ],
 )
 async def test_card_output_maps_session_outcome(monkeypatch, outcome, template):
-    bridge = FeishuBridge(
+    bridge = _FeishuBridge(
         app_id="a",
         app_secret="b",
         main_loop=asyncio.get_running_loop(),
@@ -885,7 +885,7 @@ async def test_card_output_maps_session_outcome(monkeypatch, outcome, template):
 
 async def test_control_conversation_streams_text_instead_of_card(monkeypatch):
     """控制台主线是 chat_id，没有可 reply 的话题根——卡片模式也必须退化为文本。"""
-    bridge = FeishuBridge(
+    bridge = _FeishuBridge(
         app_id="a",
         app_secret="b",
         main_loop=asyncio.get_running_loop(),
@@ -932,7 +932,7 @@ async def test_control_conversation_streams_text_instead_of_card(monkeypatch):
 async def test_thread_conversation_keeps_card_with_control_chat_configured(
     monkeypatch,
 ):
-    bridge = FeishuBridge(
+    bridge = _FeishuBridge(
         app_id="a",
         app_secret="b",
         main_loop=asyncio.get_running_loop(),
@@ -979,7 +979,7 @@ async def test_thread_conversation_keeps_card_with_control_chat_configured(
 
 
 async def test_channel_stop_closes_active_session_outputs():
-    bridge = FeishuBridge(
+    bridge = _FeishuBridge(
         app_id="a",
         app_secret="b",
         main_loop=asyncio.get_running_loop(),
@@ -1014,13 +1014,13 @@ def make_bridge(
     stream_mode: str = "card",
     throttle_window: float = 0.5,
     chat_whitelist: str = "",
-) -> FeishuBridge:
+) -> _FeishuBridge:
     async def _noop(_msg):  # pragma: no cover
         pass
 
     loop = asyncio.new_event_loop()
     try:
-        return FeishuBridge(
+        return _FeishuBridge(
             app_id="a",
             app_secret="b",
             main_loop=loop,

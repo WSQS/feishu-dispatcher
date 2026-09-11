@@ -3,6 +3,10 @@
 外部（daemon 等）经这里的工厂拿到 :class:`feishu_dispatcher.channel.Channel`，
 不直接接触实现类；实现本身在 :mod:`feishu_dispatcher.channel.agent.implementation`
 （候选区）。本文件的工厂签名是稳定面——改动需明确授权。
+
+实现类以私有名声明（``_FeishuBridge`` / ``_HttpChannel``），桥内对这几处引用做
+行级 pyright 豁免：于是任何**其它**模块的越界引用都会被静态检查拦下，而豁免点
+集中留在本文件里、可审计。
 """
 
 from __future__ import annotations
@@ -36,9 +40,11 @@ def build_feishu_channel(
 ) -> Channel:
     """构造飞书 Channel（WebSocket 收消息 + REST 发消息）。"""
     # 延迟 import：飞书实现只认 lark_oapi 的加载顺序（见实现文件头部说明）。
-    from .implementation.feishu import FeishuBridge
+    from .implementation.feishu import (
+        _FeishuBridge,  # pyright: ignore[reportPrivateUsage]
+    )
 
-    return FeishuBridge(
+    return _FeishuBridge(
         app_id=app_id,
         app_secret=app_secret,
         main_loop=main_loop,
@@ -64,9 +70,9 @@ def build_http_channel(
     throttle_window: float = 0.5,
 ) -> Channel:
     """构造 HTTP Channel（WebUI / 应用 API / Conversation 消息事件）。"""
-    from .implementation.http import HttpChannel
+    from .implementation.http import _HttpChannel  # pyright: ignore[reportPrivateUsage]
 
-    return HttpChannel(
+    return _HttpChannel(
         token,
         main_loop,
         host=host,

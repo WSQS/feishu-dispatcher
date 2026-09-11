@@ -59,13 +59,13 @@ from feishu_dispatcher.agent.store import (
 from feishu_dispatcher.agent.trace_store import SessionTraceStore
 from feishu_dispatcher.channel import ChannelMessage
 from feishu_dispatcher.channel.agent.implementation.feishu import (
-    FeishuBridge,
     FeishuConversationRef,
+    _FeishuBridge,
 )
 from feishu_dispatcher.channel.agent.implementation.feishu_card import build_card
 from feishu_dispatcher.channel.agent.implementation.http import (
-    HttpChannel,
     HttpConversationRef,
+    _HttpChannel,
 )
 from feishu_dispatcher.channel.agent.implementation.presentation import (
     format_agent_output_footer,
@@ -1026,7 +1026,7 @@ async def test_enabled_http_channel_bind_failure_is_explicit(monkeypatch, tmp_pa
 async def test_http_channel_help_round_trip_stays_in_http_conversation():
     cfg = Config(app_id="a", app_secret="b", chat_id="oc-main")
     feishu = FakeBridge()
-    http = HttpChannel(
+    http = _HttpChannel(
         "tok-http",
         asyncio.get_running_loop(),
         host="127.0.0.1",
@@ -1093,7 +1093,7 @@ async def test_http_tasks_route_requires_token_and_runs_on_main_loop():
 
     store = TrackingSessionStore()
     daemon, _, _ = make_daemon(store=store)
-    http = HttpChannel(
+    http = _HttpChannel(
         "tok-http",
         asyncio.get_running_loop(),
         host="127.0.0.1",
@@ -1171,7 +1171,7 @@ async def test_http_task_events_route_reads_trace_with_before_after_and_auth(tmp
         trace_store=trace_store,
         channel_key="http",
     )
-    http = HttpChannel(
+    http = _HttpChannel(
         "tok-http",
         asyncio.get_running_loop(),
         host="127.0.0.1",
@@ -1414,7 +1414,7 @@ async def test_http_create_task_conversation_validates_request_and_task_state():
         status="done",
     )
     daemon, _, _ = make_daemon(store=store)
-    http = HttpChannel(
+    http = _HttpChannel(
         "tok-http",
         asyncio.get_running_loop(),
         host="127.0.0.1",
@@ -1480,7 +1480,7 @@ async def test_http_create_task_conversation_creates_thread_and_binds_task():
         status="idle",
     )
     daemon, _, _ = make_daemon(store=store)
-    http = HttpChannel(
+    http = _HttpChannel(
         "tok-http",
         asyncio.get_running_loop(),
         host="127.0.0.1",
@@ -1527,7 +1527,7 @@ async def test_http_create_task_conversation_creates_thread_and_binds_task():
 async def test_http_create_manager_conversation_uses_session_identity_prefix():
     daemon, _, _ = make_daemon()
     daemon._llm = ScriptedLLM([LLMResponse(content="manager reply")])
-    http = HttpChannel(
+    http = _HttpChannel(
         "tok-http",
         asyncio.get_running_loop(),
         host="127.0.0.1",
@@ -1600,7 +1600,7 @@ async def test_http_task_conversation_round_trip_routes_to_existing_runtime():
         )
     )
     task = task_by_conversation(daemon.store, "om_root1")
-    http = HttpChannel(
+    http = _HttpChannel(
         "tok-http",
         asyncio.get_running_loop(),
         host="127.0.0.1",
@@ -2262,7 +2262,7 @@ async def test_feishu_two_turns_flush_before_completion_notice(
     daemon, _, created = make_daemon(
         agent_cls=CharacterAgent, control_conversation=None
     )
-    bridge = FeishuBridge(
+    bridge = _FeishuBridge(
         app_id="a",
         app_secret="b",
         main_loop=asyncio.get_running_loop(),

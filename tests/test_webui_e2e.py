@@ -19,7 +19,7 @@ from feishu_dispatcher.agent.session_event import (
     session_event_to_dict,
 )
 from feishu_dispatcher.channel import ChannelMessage
-from feishu_dispatcher.channel.agent.implementation.http import HttpChannel
+from feishu_dispatcher.channel.agent.implementation.http import _HttpChannel
 from tests.conversation_fakes import (
     ChannelConversationRefFactory as ConversationRef,
 )
@@ -124,7 +124,7 @@ async def test_webui_browser_help_refresh_cursor_and_token_storage():
     async def list_projects(_context: dict, _request: dict) -> tuple[int, dict]:
         return 200, {"items": []}
 
-    channel = HttpChannel(
+    channel = _HttpChannel(
         token,
         loop,
         host="127.0.0.1",
@@ -264,7 +264,7 @@ async def test_webui_browser_channel_restart_reloads_task_history_from_clean_sta
             "latest_sequence": 1,
         }
 
-    channel = HttpChannel(
+    channel = _HttpChannel(
         token,
         loop,
         host="127.0.0.1",
@@ -435,7 +435,7 @@ async def test_webui_browser_running_task_history_merges_output_deltas(history_f
     async def list_projects(_context: dict, _request: dict) -> tuple[int, dict]:
         return 200, {"items": []}
 
-    channel = HttpChannel(
+    channel = _HttpChannel(
         token,
         loop,
         host="127.0.0.1",
@@ -641,7 +641,7 @@ async def test_webui_browser_task_history_pagination_dedup_and_switch_isolation(
             }
         return 400, {"error": "unexpected_history_request"}
 
-    channel = HttpChannel(
+    channel = _HttpChannel(
         token,
         loop,
         host="127.0.0.1",

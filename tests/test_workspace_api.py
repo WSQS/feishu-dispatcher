@@ -22,7 +22,7 @@ from feishu_dispatcher.agent.workspace_api import (
     tree_children as workspace_tree_children,
 )
 from feishu_dispatcher.channel import ChannelMessage
-from feishu_dispatcher.channel.agent.implementation.http import HttpChannel
+from feishu_dispatcher.channel.agent.implementation.http import _HttpChannel
 
 
 def _get(url: str, token: str | None) -> tuple[int, dict]:
@@ -48,8 +48,8 @@ def _make_channel(
     host: str = "127.0.0.1",
     port: int = 0,
     ctx: dict | None = None,
-) -> HttpChannel:
-    return HttpChannel(
+) -> _HttpChannel:
+    return _HttpChannel(
         token,
         asyncio.get_running_loop(),
         routes=routes,
@@ -59,14 +59,14 @@ def _make_channel(
     )
 
 
-async def _make_server(token: str = "tok-view", routes=None) -> HttpChannel:
+async def _make_server(token: str = "tok-view", routes=None) -> _HttpChannel:
     routes = routes if routes is not None else {("GET", "/api/health"): health}
     vs = _make_channel(token, routes, host="127.0.0.1", port=0)
     vs.start(_ignore)
     return vs
 
 
-def _children_server(ws, *, scan_executor=None) -> tuple[HttpChannel, ScanExecutor]:
+def _children_server(ws, *, scan_executor=None) -> tuple[_HttpChannel, ScanExecutor]:
     """构造带 /tree/children 路由与 scan executor 的 HTTP Channel。"""
     executor = scan_executor if scan_executor is not None else ScanExecutor()
     fake = {"demo": Project(name="demo", path=ws)}
@@ -151,7 +151,7 @@ def test_route_returns_503_when_main_loop_is_unavailable():
     async def ignore(_message: ChannelMessage) -> None:
         return None
 
-    vs = HttpChannel(
+    vs = _HttpChannel(
         "tok-view",
         loop,
         routes={("GET", "/api/tasks"): should_not_run},
